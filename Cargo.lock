@@ -65,7 +65,8 @@ dependencies = [
 [[package]]
 name = "latticefoundry"
 version = "0.0.0"
-source = "git+https://github.com/KarpelesLab/latticefoundry#09d85b3942d65e94b39cf56ffb7972062fb9bc5f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a305bf3abb88774fcfe3e6a1cefc2dca16596f25065356fe134bf25113c8a6e"
 dependencies = [
  "puremp",
  "qld",

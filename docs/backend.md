@@ -24,9 +24,9 @@ machinery any backend needs (SSA IR, verifier, register allocation, encoding,
 ELF, linker, DWARF), and a backend written *in Lode* can't exist until the
 language can express it.
 
-- **Now:** LF is the backend of the Rust compiler. Lode pins an LF commit in
-  `Cargo.lock` and bumps it only to merged, released LF versions. It never
-  builds against a local LF checkout. Features Lode needs are tracked
+- **Now:** LF is the backend of the Rust compiler. Lode depends on released
+  LF versions from crates.io (first: `0.0.0`) and updates only to new
+  releases. It never builds against a local LF checkout. Features Lode needs are tracked
   below; LF bugs Lode finds are reported as reproducible IR tests.
 - **At self-hosting:** the Lode compiler's backend is written in Lode, as a port
   of LF's design (its IR design and tenets are documented). That's the
@@ -83,10 +83,11 @@ This is a living list, roughly in the order Lode will need it. Anything marked
   exposes it for `lf-cc`).
 - [x] Building IR from a frontend, verifying, optimizing, and linking a static
   executable: works for the compiler scaffold.
-- [ ] **A syscall intrinsic** per os/arch (Linux x86-64 first). **Checked: LF IR
-  has none**, and there's no inline asm either; the only syscall in an LF
-  executable is the `exit` in the linker's generated `_start`. This blocks
-  I/O, and so a real hello world. It's the next thing Lode needs from LF.
+- [x] **A syscall intrinsic** (Linux syscall ABI), in LF `0.0.0`: `Syscall`
+  takes a number and up to six `i64`/`ptr` arguments and returns the raw
+  kernel result. It's a full memory clobber that is never removed or
+  reordered. Lode doesn't use it yet; it's what `std/io` needs for a real
+  hello world.
 - [x] Correct comparisons on `i8`/`i16`. The x86-64 encoder compared narrow
   values as 32-bit, so leftover upper register bits (e.g. after an `i8` add
   that wrapped) gave wrong results. C code never hit it because C promotes to

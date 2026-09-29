@@ -60,10 +60,10 @@ target/debug/lode check program.lode
 `cargo test` runs unit tests and the programs in `tests/programs/`; each one
 declares its expected exit status or errors in its first comment lines.
 
-The compiler depends on LatticeFoundry, pinned to a specific commit in
-`Cargo.lock`. It's updated only once the LatticeFoundry changes Lode needs are
-merged and released, with `cargo update -p latticefoundry`. Lode never builds
-against a local LatticeFoundry checkout.
+The compiler depends on released versions of
+[LatticeFoundry from crates.io](https://crates.io/crates/latticefoundry). It's
+updated only once the LatticeFoundry changes Lode needs are released. Lode never
+builds against a local LatticeFoundry checkout.
 
 ## License
 

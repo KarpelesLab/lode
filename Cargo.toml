@@ -19,10 +19,8 @@ name = "lode"
 path = "src/main.rs"
 
 [dependencies]
-# The backend. For local co-development against a checkout next to this one,
-# see "Working on the compiler" in README.md (a gitignored .cargo/config.toml
-# patch makes cargo use ../latticefoundry instead).
-latticefoundry = { git = "https://github.com/KarpelesLab/latticefoundry" }
+# The backend. Updated only to released versions (see README.md).
+latticefoundry = "0.0.0"
 
 [lints.rust]
 unsafe_code = "forbid"
