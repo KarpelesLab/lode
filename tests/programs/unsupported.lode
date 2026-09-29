@@ -1,0 +1,12 @@
+// error: `struct` declarations are not supported by the compiler yet
+// error: `match` is not supported by the compiler yet
+package main
+
+struct Point {
+	x: u32
+}
+
+fn main() {
+	match x {
+	}
+}

@@ -1,0 +1,26 @@
+// exit: 0
+package main
+
+// Ranges of immutable bindings let plain operators through the checker.
+fn main() -> u8 {
+	let a: u8 = 200
+	let b = a + 55
+	let c: i32 = -2147483647
+	let d = -c
+	let q = d / 7
+	let r = d % 7
+	let big: u64 = 18446744073709551615
+	let shifted: u32 = 1 << 31
+	let wrapped: u32 = 1 <<% 33
+	if b != 255 || d != 2147483647 || q != 306783378 || r != 1 {
+		return 1
+	}
+	if big >> 63 != 1 || shifted != 2147483648 || wrapped != 2 {
+		return 2
+	}
+	let widened: u64 = u64(a) + (big - big)
+	if u8(widened) != 200 {
+		return 3
+	}
+	return 0
+}

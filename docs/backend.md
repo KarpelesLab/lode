@@ -14,6 +14,27 @@ The frontend (the Lode compiler) is a separate project that uses LF as a
 library, the same way LF's `lf-cc` C frontend does (see LF ROADMAP §6: frontends
 live outside the framework library).
 
+### LF is the bootstrap backend
+
+**Status:** Decided (2026-09-29)
+
+We considered skipping LF and emitting code directly for one platform, then
+building a Lode backend from that. We keep LF, because it already has the
+machinery any backend needs (SSA IR, verifier, register allocation, encoding,
+ELF, linker, DWARF), and a backend written *in Lode* can't exist until the
+language can express it.
+
+- **Now:** LF is the backend of the Rust compiler. Lode pins an LF commit in
+  `Cargo.lock` and bumps it deliberately. Features Lode needs are tracked
+  below; LF bugs Lode finds are reported as reproducible IR tests.
+- **At self-hosting:** the Lode compiler's backend is written in Lode, as a port
+  of LF's design (its IR design and tenets are documented). That's the
+  "Lode-based LLVM". It also removes the need for a self-hosted compiler to
+  call a Rust library.
+- **Revisit if** LF's priorities keep diverging from Lode's, or if the IR can't
+  grow what Lode needs. The fallback is a small direct backend for x86-64
+  Linux, owned by this repository.
+
 ## Compiler implementation
 
 **Status:** Decided
@@ -31,6 +52,12 @@ live outside the framework library).
 - Keep that eventual port in mind while writing the Rust compiler: plain data
   structures, arenas and indices (LF's style already) rather than Rust-specific
   patterns that won't translate.
+
+**Current state:** a scaffold in `src/`: lexer, parser, checker (types and a
+first version of the proof-obligation checker, using value ranges of
+literals, immutable bindings and types, without narrowing on conditions yet),
+and lowering to LF IR. The `lode` command builds static x86-64 Linux
+executables through LF's own linker. See the README for the supported subset.
 
 ## Why it fits
 
@@ -53,8 +80,18 @@ This is a living list, roughly in the order Lode will need it. Anything marked
 ### Needed for the first working compiler
 - [ ] A stable-enough Rust API for building IR from a frontend (LF already
   exposes it for `lf-cc`).
-- [ ] A syscall lowering intrinsic per os/arch (Linux x86-64 first). *Unknown*
-  whether LF IR has one or `lf-cc` uses asm.
+- [x] Building IR from a frontend, verifying, optimizing, and linking a static
+  executable: works for the compiler scaffold.
+- [ ] **A syscall intrinsic** per os/arch (Linux x86-64 first). **Checked: LF IR
+  has none**, and there's no inline asm either; the only syscall in an LF
+  executable is the `exit` in the linker's generated `_start`. This blocks
+  I/O, and so a real hello world. It's the next thing Lode needs from LF.
+- [x] Correct comparisons on `i8`/`i16`. The x86-64 encoder compared narrow
+  values as 32-bit, so leftover upper register bits (e.g. after an `i8` add
+  that wrapped) gave wrong results. C code never hit it because C promotes to
+  `int` first. Fixed in LF's `SetccCmp` encoding, with a regression test.
+- [ ] The same width issue in LF's `switch` lowering (it always compares 64
+  bits). Lode doesn't emit `switch` yet; needed for `match`.
 - [ ] Volatile load and store, atomics and fences in the IR.
 - [ ] Debug info (DWARF) with source positions from a non-C frontend. LF has
   DWARF with `-g`.

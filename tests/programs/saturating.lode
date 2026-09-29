@@ -1,0 +1,21 @@
+// exit: 0
+package main
+
+fn check_u8(a: u8, b: u8) -> bool {
+	return a +| b == 255 && b -| a == 0
+}
+
+fn check_i8(a: i8, b: i8, c: i8) -> bool {
+	// 100 + 100 saturates to 127; -100 - 100 to -128.
+	return a +| b == 127 && c -| b == -128 && a +% b == -56
+}
+
+fn main() -> u8 {
+	if !check_u8(200, 100) {
+		return 1
+	}
+	if !check_i8(100, 100, -100) {
+		return 2
+	}
+	return 0
+}

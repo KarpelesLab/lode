@@ -1,0 +1,19 @@
+// exit: 25
+package main
+
+// Sum of the odd numbers below 10, using loop, break and continue.
+fn main() -> u8 {
+	var sum: u8 = 0
+	var i: u8 = 0
+	loop {
+		i = i +% 1
+		if i >= 10 {
+			break
+		}
+		if i % 2 == 0 {
+			continue
+		}
+		sum = sum +% i
+	}
+	return sum
+}

@@ -1,0 +1,33 @@
+[package]
+name = "lode"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Mark Karpeles <admin@echelle.co.jp>"]
+repository = "https://github.com/KarpelesLab/lode"
+description = "The Lode programming language compiler"
+
+# A single package (not a workspace): the compiler library plus the `lode`
+# command-line driver.
+[lib]
+name = "lode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lode"
+path = "src/main.rs"
+
+[dependencies]
+# The backend. For local co-development against a checkout next to this one,
+# see "Working on the compiler" in README.md (a gitignored .cargo/config.toml
+# patch makes cargo use ../latticefoundry instead).
+latticefoundry = { git = "https://github.com/KarpelesLab/latticefoundry" }
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

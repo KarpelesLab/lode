@@ -1,0 +1,22 @@
+// exit: 7
+package main
+
+fn fib(n: u32) -> u32 {
+	if n < 2 {
+		return n
+	}
+	return fib(n -% 1) +% fib(n -% 2)
+}
+
+fn main() -> u8 {
+	var total: u32 = 0
+	var i: u32 = 1
+	while i <= 10 {
+		total = total +% i
+		i = i +% 1
+	}
+	if total == 55 && fib(10) == 55 {
+		return 7
+	}
+	return 1
+}

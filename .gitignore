@@ -1,0 +1,3 @@
+/target
+# Local override pointing latticefoundry at a sibling checkout (see README.md).
+/.cargo/config.toml
