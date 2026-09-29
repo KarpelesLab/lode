@@ -15,3 +15,7 @@ The compiler backend is [LatticeFoundry](https://github.com/KarpelesLab/latticef
 
 There is no compiler yet. The design is in [docs/](docs/README.md), starting
 with the [concept](docs/concept.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
