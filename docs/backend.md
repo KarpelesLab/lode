@@ -86,12 +86,18 @@ This is a living list, roughly in the order Lode will need it. Anything marked
 - [x] **A syscall intrinsic** (Linux syscall ABI), in LF `0.0.0`: `Syscall`
   takes a number and up to six `i64`/`ptr` arguments and returns the raw
   kernel result. It's a full memory clobber that is never removed or
-  reordered. Lode doesn't use it yet; it's what `std/io` needs for a real
-  hello world.
+  reordered. Lode's `syscall` intrinsic lowers to it; `std/os` uses it for
+  `write`.
 - [x] Correct comparisons on `i8`/`i16`. The x86-64 encoder compared narrow
   values as 32-bit, so leftover upper register bits (e.g. after an `i8` add
   that wrapped) gave wrong results. C code never hit it because C promotes to
   `int` first. Fixed in LF's `SetccCmp` encoding, with a regression test.
+- [ ] **Smaller executables:** LF's linker starts each segment on a new page
+  in the file, so a hello world with 12 bytes of string data is 4,108 bytes
+  of which about 3 KB is padding. Merging read-only data into the code
+  segment, or placing segments without page-aligning their file offsets
+  (only `offset ≡ vaddr (mod page)` is required), would bring it to about
+  1.1 KB.
 - [ ] The same width issue in LF's `switch` lowering (it always compares 64
   bits). Lode doesn't emit `switch` yet; needed for `match`.
 - [ ] Volatile load and store, atomics and fences in the IR.

@@ -1,0 +1,12 @@
+// error: `SYS_WRITE` is private to package `std/os`
+// error: package `std/os` has no `nope`
+// error: `os` is a package
+package main
+
+import "std/os"
+
+fn main() {
+	let a: usize = os.SYS_WRITE
+	os.nope()
+	let b = os
+}

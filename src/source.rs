@@ -1,23 +1,28 @@
-//! Source files and spans.
+//! Source files, spans, and the map of every file in a build.
+
+pub type FileId = u32;
 
 /// A byte range in one source file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
+    pub file: FileId,
     pub start: u32,
     pub end: u32,
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Span {
+    pub fn new(file: FileId, start: usize, end: usize) -> Span {
         Span {
+            file,
             start: start as u32,
             end: end as u32,
         }
     }
 
-    /// The span covering both `self` and `other`.
+    /// The span covering both `self` and `other` (which must be in the same file).
     pub fn to(self, other: Span) -> Span {
         Span {
+            file: self.file,
             start: self.start.min(other.start),
             end: self.end.max(other.end),
         }
@@ -69,6 +74,27 @@ impl SourceFile {
             .get(idx + 1)
             .map_or(self.text.len(), |&e| e as usize);
         self.text[start..end].trim_end_matches(['\n', '\r'])
+    }
+}
+
+/// Every source file of a build, indexed by [`FileId`].
+#[derive(Debug, Default)]
+pub struct SourceMap {
+    files: Vec<SourceFile>,
+}
+
+impl SourceMap {
+    pub fn new() -> SourceMap {
+        SourceMap::default()
+    }
+
+    pub fn add(&mut self, file: SourceFile) -> FileId {
+        self.files.push(file);
+        (self.files.len() - 1) as FileId
+    }
+
+    pub fn get(&self, id: FileId) -> &SourceFile {
+        &self.files[id as usize]
     }
 }
 

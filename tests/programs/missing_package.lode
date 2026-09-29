@@ -1,0 +1,7 @@
+// error: cannot find package `std/nope`
+package main
+
+import "std/nope"
+
+fn main() {
+}

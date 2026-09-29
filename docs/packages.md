@@ -22,6 +22,21 @@ Go's vocabulary, which is proven:
   package.
 - No import cycles between packages.
 
+## The standard library in the compiler today
+
+**Status:** Implemented subset
+
+- `import "std/x"` loads every `.lode` file in the directory `x` under the
+  standard library root, which is `$LODE_STD` if set and otherwise the `std/`
+  directory of the compiler's source tree. Each file must declare
+  `package x`. Imports are followed transitively; a cycle is an error.
+- Other imports (anything outside `std/`) aren't supported yet.
+- Only `pub` items can be used from another package, as `pkg.name`.
+- Linker symbols are `<import path>.<name>` (`std/io.print`); the program's
+  own package uses its name (`main.main`).
+- So far there are two packages: `std/os` (Linux x86-64 system calls,
+  `write` and `write_all`) and `std/io` (`print` and `eprint`).
+
 ## Imports
 
 **Status:** Decided

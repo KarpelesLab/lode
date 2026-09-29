@@ -102,6 +102,47 @@ So:
   optimizer, and may offer *suggestions* in diagnostics. They never decide
   whether a program is accepted.
 
+### The fact language
+
+**Status:** Proposed; implemented in the compiler (`src/sema/facts.rs`)
+
+The checker tracks two kinds of fact about integer locals:
+
+- **Ranges:** `x` lies in `lo..=hi`.
+- **Relations:** for two locals, `a - b <= c`.
+
+Both are decidable and cheap, and the rules for how they flow are fixed:
+
+| Where | What the checker learns |
+| --- | --- |
+| A literal or constant | Its exact value |
+| An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges) |
+| `let` / `var` / assignment | The value's range; a copy of another local is equal to it. Assigning forgets every relation involving the variable. |
+| `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
+| After an `if` | If one branch always leaves (`return`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
+| `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`) |
+| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two locals, a relation. `x != k` narrows only when `k` is at an end of `x`'s range. |
+| `while cond` / `loop` | Before the loop, everything is forgotten about the variables the loop assigns. The body knows `cond` is true. After a `while` without `break`, `cond` is false. |
+| `x - y` | A known relation bounds the result: `y <= x` proves it doesn't go below zero |
+
+Everything else gives no facts. In particular, facts don't cross function
+calls yet (that's what [refinements](#refinements-in-types) are for), and
+there's no induction beyond the loop condition.
+
+Example, from the standard library's `os.write_all`:
+
+```
+let n = write(fd, p, left)     // n: isize, any value
+if n < 0 {
+	return n                   // leaves: below, n >= 0
+}
+let done = usize(n)            // proven: 0 <= n
+if done == 0 || done > left {
+	return -EIO                // leaves: below, done <= left
+}
+left = left - done             // proven by the relation done - left <= 0
+```
+
 ### Refinements in types
 
 **Status:** Decided (the syntax is still provisional)
@@ -177,12 +218,16 @@ Rules:
   tooling can list every `unsafe` site in the whole dependency tree. Auditing
   should be one command.
 
+What's unsafe so far (implemented): calling `syscall` or an `unsafe fn`,
+reading a `str`'s raw pointer (`s.ptr`), and pointer arithmetic (`p + n`).
+Holding or comparing a pointer is safe; only using it isn't.
+
 Low-level operations are **compiler intrinsics**, not asm in the standard
 library:
 
 | Intrinsic | Purpose |
 | --- | --- |
-| `syscall(nr, args...)` | Lowered per os/arch to the right trap instruction and calling convention |
+| `syscall(nr, args...)` | Lowered per os/arch to the right trap instruction and calling convention. Implemented for Linux x86-64: up to 6 integer or pointer arguments (integers are sign- or zero-extended to 64 bits by their type), returns the raw kernel result as `isize` (`-errno` on failure) |
 | `volatile_load`, `volatile_store` | MMIO |
 | `fence(ordering)` and the atomics | Memory ordering |
 | `context_switch` (name to be decided) | Save and restore register state, for kernels and green threads |

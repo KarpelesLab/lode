@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::diag::Diagnostic;
-use crate::source::Span;
+use crate::source::{FileId, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Tok {
@@ -178,10 +178,12 @@ pub struct Token {
     pub span: Span,
 }
 
-/// Split `src` into tokens. Lexing continues after an error so that several
-/// problems can be reported at once; the token stream always ends with `Eof`.
-pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
+/// Split `src` (the text of `file`) into tokens. Lexing continues after an
+/// error so that several problems can be reported at once; the token stream
+/// always ends with `Eof`.
+pub fn lex(src: &str, file: FileId) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lx = Lexer {
+        file,
         src,
         bytes: src.as_bytes(),
         pos: 0,
@@ -193,6 +195,7 @@ pub fn lex(src: &str) -> (Vec<Token>, Vec<Diagnostic>) {
 }
 
 struct Lexer<'a> {
+    file: FileId,
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
@@ -233,7 +236,7 @@ impl Lexer<'_> {
         self.newline(end);
         self.toks.push(Token {
             tok: Tok::Eof,
-            span: Span::new(end, end),
+            span: Span::new(self.file, end, end),
         });
     }
 
@@ -244,13 +247,13 @@ impl Lexer<'_> {
     fn push(&mut self, tok: Tok, start: usize) {
         self.toks.push(Token {
             tok,
-            span: Span::new(start, self.pos),
+            span: Span::new(self.file, start, self.pos),
         });
     }
 
     fn error(&mut self, start: usize, msg: impl Into<String>) {
         self.diags.push(Diagnostic::error(
-            Span::new(start, self.pos.max(start + 1)),
+            Span::new(self.file, start, self.pos.max(start + 1)),
             msg,
         ));
     }
@@ -269,7 +272,7 @@ impl Lexer<'_> {
         if ends_statement {
             self.toks.push(Token {
                 tok: Tok::Newline,
-                span: Span::new(at, at),
+                span: Span::new(self.file, at, at),
             });
         }
     }
@@ -468,7 +471,7 @@ mod tests {
     use super::*;
 
     fn toks(src: &str) -> Vec<Tok> {
-        let (toks, diags) = lex(src);
+        let (toks, diags) = lex(src, 0);
         assert!(diags.is_empty(), "{diags:?}");
         toks.into_iter().map(|t| t.tok).collect()
     }
@@ -512,7 +515,7 @@ mod tests {
 
     #[test]
     fn reports_bad_input() {
-        let (_, diags) = lex("\"open\n0x");
+        let (_, diags) = lex("\"open\n0x", 0);
         assert_eq!(diags.len(), 2);
     }
 }

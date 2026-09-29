@@ -61,6 +61,12 @@ pub enum Ty {
     Int(IntTy),
     Bool,
     Unit,
+    /// A UTF-8 string view: a pointer and a length in bytes. The standard
+    /// library's `Str[E]` will replace it once there are generics
+    /// (docs/strings.md); `str` stays the name for `Str[utf8]`.
+    Str,
+    /// A raw pointer `*T` to an integer type. Only usable in `unsafe` code.
+    Ptr(IntTy),
 }
 
 impl Ty {
@@ -78,6 +84,8 @@ impl fmt::Display for Ty {
             Ty::Int(t) => t.fmt(f),
             Ty::Bool => f.write_str("bool"),
             Ty::Unit => f.write_str("()"),
+            Ty::Str => f.write_str("str"),
+            Ty::Ptr(t) => write!(f, "*{t}"),
         }
     }
 }
@@ -114,7 +122,8 @@ pub fn primitive(name: &str, ptr_bits: u32) -> Option<Primitive> {
             size: true,
         }))),
         "bool" => Some(Primitive::Ty(Ty::Bool)),
-        "i128" | "u128" | "f16" | "f32" | "f64" | "str" | "string" | "never" => {
+        "str" => Some(Primitive::Ty(Ty::Str)),
+        "i128" | "u128" | "f16" | "f32" | "f64" | "string" | "never" => {
             Some(Primitive::Unsupported)
         }
         _ => None,
@@ -167,6 +176,23 @@ impl Range {
 
     pub fn checked_mul(self, o: Range) -> Option<Range> {
         Range::corners(self, o, i128::checked_mul)
+    }
+
+    /// The values in both ranges, or `None` if there are none.
+    pub fn intersect(self, o: Range) -> Option<Range> {
+        let r = Range {
+            lo: self.lo.max(o.lo),
+            hi: self.hi.min(o.hi),
+        };
+        (r.lo <= r.hi).then_some(r)
+    }
+
+    /// The smallest range containing both.
+    pub fn hull(self, o: Range) -> Range {
+        Range {
+            lo: self.lo.min(o.lo),
+            hi: self.hi.max(o.hi),
+        }
     }
 
     pub fn contains(self, v: i128) -> bool {

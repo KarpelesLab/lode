@@ -1,0 +1,15 @@
+// exit: 0
+package main
+
+// An untyped constant takes its type from where it's used, like a literal.
+const LIMIT = 100
+const SMALL: u8 = 7
+
+fn main() -> u8 {
+	let a: u8 = LIMIT
+	let b: u64 = LIMIT
+	if a + SMALL != 107 || b != 100 {
+		return 1
+	}
+	return SMALL - 7
+}

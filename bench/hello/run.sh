@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds hello world in Go, Rust and Zig with size-oriented flags and reports
+# Builds hello world in Lode, Go, Rust and Zig with size-oriented flags and reports
 # binary size and syscalls after execve. See docs/concept.md.
 set -e
 cd "$(dirname "$0")"
@@ -14,6 +14,8 @@ for f in rs_*.rs; do
 	rustc $RF -C target-feature=+crt-static -o "$out/${f%.rs}_static" "$f"
 done
 for f in zig_*.zig; do zig build-exe -OReleaseSmall -fstrip -femit-bin="$out/${f%.zig}" "$f"; done
+(cd ../.. && cargo build --release --quiet)
+for f in lode_*.lode; do ../../target/release/lode build -O2 -o "$out/${f%.lode}" "$f"; done
 
 printf '%-18s %10s %9s\n' program bytes syscalls
 for b in "$out"/*; do

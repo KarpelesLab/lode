@@ -1,0 +1,895 @@
+//! Checking expressions.
+
+use crate::ast::{self, BinOp, ExprKind, UnOp};
+use crate::diag::Diagnostic;
+use crate::source::Span;
+use crate::types::{IntTy, Primitive, Range, Ty, primitive};
+
+use super::facts::{self, CondFacts, Side};
+use super::tree::*;
+use super::{Checker, ConstVal, FnCx, Item, type_range};
+
+/// A checked expression, plus what the proof checker knows about it.
+pub(super) struct Checked {
+    pub(super) expr: TExpr,
+    /// For integers, the range its value lies in (`None`: its type's range).
+    pub(super) range: Option<Range>,
+    /// The local it reads, if it's (a lossless conversion of) a local.
+    pub(super) term: Option<LocalId>,
+    /// For conditions: the facts it gives when true and when false.
+    pub(super) facts: Option<Box<CondFacts>>,
+}
+
+impl Checked {
+    fn new(kind: TExprKind, ty: Ty, range: Option<Range>) -> Checked {
+        Checked {
+            expr: TExpr { kind, ty },
+            range,
+            term: None,
+            facts: None,
+        }
+    }
+
+    pub(super) fn ty(&self) -> Ty {
+        self.expr.ty
+    }
+
+    /// The known range, or the full range of the type.
+    fn int_range(&self) -> Range {
+        self.range
+            .or_else(|| type_range(self.expr.ty))
+            .unwrap_or(Range::exact(0))
+    }
+
+    fn side(&self) -> Side {
+        Side {
+            term: self.term,
+            range: self.int_range(),
+            full: type_range(self.expr.ty).unwrap_or(Range::exact(0)),
+        }
+    }
+}
+
+fn op_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add | BinOp::AddWrap | BinOp::AddSat => "addition",
+        BinOp::Sub | BinOp::SubWrap | BinOp::SubSat => "subtraction",
+        BinOp::Mul | BinOp::MulWrap | BinOp::MulSat => "multiplication",
+        _ => "operation",
+    }
+}
+
+/// The name of the `syscall` intrinsic (docs/safety.md).
+const SYSCALL: &str = "syscall";
+
+/// The most arguments `syscall` takes after the number (the Linux ABI's six).
+const SYSCALL_MAX_ARGS: usize = 6;
+
+impl Checker<'_> {
+    /// Require an `unsafe` context for `what`.
+    fn require_unsafe(&mut self, cx: &FnCx, span: Span, what: &str) {
+        if cx.unsafe_depth == 0 {
+            self.diags.push(
+                Diagnostic::error(span, format!("{what} is unsafe"))
+                    .with_help("put it in an `unsafe { ... }` block, or in an `unsafe fn`"),
+            );
+        }
+    }
+
+    /// The value of an expression that is an untyped integer: a literal, a
+    /// negated or parenthesized one, or an untyped constant. Such values take
+    /// their type from the context where they're used.
+    pub(super) fn untyped_int(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<i128> {
+        match &e.kind {
+            ExprKind::Int(v) => i128::try_from(*v).ok(),
+            ExprKind::Char(c) => Some(i128::from(*c)),
+            ExprKind::Paren(inner) => self.untyped_int(cx, inner),
+            ExprKind::Unary(UnOp::Neg, inner) => self.untyped_int(cx, inner).map(|v| -v),
+            ExprKind::Name(name) if cx.lookup(name).is_none() => {
+                match self.pkgs[cx.pkg].items.get(name) {
+                    Some(&Item::Const(id)) => match self.const_value(id)? {
+                        ConstVal::Untyped(v) => Some(v),
+                        ConstVal::Typed(..) => None,
+                    },
+                    _ => None,
+                }
+            }
+            ExprKind::Field(base, member) => {
+                let ExprKind::Name(pkg_name) = &base.kind else {
+                    return None;
+                };
+                let pkg = self.imported(cx, pkg_name)?;
+                match self.pkgs[pkg].items.get(&member.name) {
+                    Some(&Item::Const(id)) if pkg == cx.pkg || self.consts[id].decl.is_pub => {
+                        match self.const_value(id)? {
+                            ConstVal::Untyped(v) => Some(v),
+                            ConstVal::Typed(..) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Check that `c` can be used where `target` is expected, inserting a
+    /// lossless widening conversion if needed.
+    pub(super) fn coerce(&mut self, c: Checked, target: Ty, span: Span) -> Option<Checked> {
+        if c.ty() == target {
+            return Some(c);
+        }
+        if let (Ty::Int(from), Ty::Int(to)) = (c.ty(), target)
+            && from.range().within(to.range())
+        {
+            let (range, term) = (c.range, c.term);
+            let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), target, range);
+            out.term = term;
+            return Some(out);
+        }
+        self.error(span, format!("expected `{target}`, found `{}`", c.ty()));
+        None
+    }
+
+    pub(super) fn expr(
+        &mut self,
+        cx: &mut FnCx,
+        e: &ast::Expr,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        if let Some(v) = self.untyped_int(cx, e) {
+            return self.literal(v, e.span, expected);
+        }
+        match &e.kind {
+            ExprKind::Int(_) => {
+                self.error(e.span, "integer literal is too large");
+                None
+            }
+            ExprKind::Char(_) => unreachable!("handled by untyped_int"),
+            ExprKind::Bool(b) => Some(Checked::new(TExprKind::Bool(*b), Ty::Bool, None)),
+            ExprKind::Str(bytes) => {
+                if std::str::from_utf8(bytes).is_err() {
+                    self.error(e.span, "a `str` literal must be valid UTF-8");
+                    return None;
+                }
+                let id = self.intern_string(bytes);
+                Some(Checked::new(TExprKind::Str(id), Ty::Str, None))
+            }
+            ExprKind::Name(name) => self.name(cx, name, e.span),
+            ExprKind::Paren(inner) => self.expr(cx, inner, expected),
+            ExprKind::Unary(op, operand) => self.unary(cx, *op, operand, e.span, expected),
+            ExprKind::Binary(op, lhs, rhs) => self.binary(cx, *op, lhs, rhs, e.span, expected),
+            ExprKind::Call(callee, args) => self.call(cx, callee, args, e.span),
+            ExprKind::Field(base, member) => self.field(cx, base, member, e.span),
+        }
+    }
+
+    fn name(&mut self, cx: &mut FnCx, name: &str, span: Span) -> Option<Checked> {
+        if let Some(local) = cx.lookup(name) {
+            let ty = cx.locals[local].ty;
+            let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(local));
+            c.term = type_range(ty).map(|_| local);
+            return Some(c);
+        }
+        if let Some(&item) = self.pkgs[cx.pkg].items.get(name) {
+            return self.item_value(item, name, span);
+        }
+        let msg = if self.imported(cx, name).is_some() {
+            format!("`{name}` is a package; use one of its members, like `{name}.something`")
+        } else {
+            format!("cannot find `{name}` in this scope")
+        };
+        self.error(span, msg);
+        None
+    }
+
+    /// A package-level item used as a value.
+    fn item_value(&mut self, item: Item, name: &str, span: Span) -> Option<Checked> {
+        match item {
+            Item::Const(id) => match self.const_value(id)? {
+                ConstVal::Typed(ty, v) => {
+                    Some(Checked::new(TExprKind::Int(v), ty, Some(Range::exact(v))))
+                }
+                ConstVal::Untyped(_) => unreachable!("handled by untyped_int"),
+            },
+            Item::Func(_) => {
+                self.error(
+                    span,
+                    format!("`{name}` is a function; call it with `{name}(...)`"),
+                );
+                None
+            }
+        }
+    }
+
+    fn field(
+        &mut self,
+        cx: &mut FnCx,
+        base: &ast::Expr,
+        member: &ast::Ident,
+        span: Span,
+    ) -> Option<Checked> {
+        if let ExprKind::Name(pkg_name) = &base.kind
+            && let Some(pkg) = self.imported(cx, pkg_name)
+        {
+            let item = self.package_item(cx, pkg, &member.name, member.span)?;
+            return self.item_value(item, &format!("{pkg_name}.{}", member.name), span);
+        }
+        let b = self.expr(cx, base, None)?;
+        match (b.ty(), member.name.as_str()) {
+            (Ty::Str, "len") => {
+                // A length is at most the largest `isize`: no object is bigger.
+                let range = Range {
+                    lo: 0,
+                    hi: i128::from(i64::MAX),
+                };
+                let usize_ty = self.usize_ty();
+                Some(Checked::new(
+                    TExprKind::StrLen(Box::new(b.expr)),
+                    usize_ty,
+                    Some(range),
+                ))
+            }
+            (Ty::Str, "ptr") => {
+                self.require_unsafe(cx, span, "taking a string's raw pointer");
+                Some(Checked::new(
+                    TExprKind::StrPtr(Box::new(b.expr)),
+                    Ty::Ptr(IntTy::new(false, 8)),
+                    None,
+                ))
+            }
+            (ty, name) => {
+                self.error(member.span, format!("`{ty}` has no field `{name}`"));
+                None
+            }
+        }
+    }
+
+    fn usize_ty(&self) -> Ty {
+        Ty::Int(IntTy {
+            signed: false,
+            bits: self.ptr_bits,
+            size: true,
+        })
+    }
+
+    fn isize_ty(&self) -> Ty {
+        Ty::Int(IntTy {
+            signed: true,
+            bits: self.ptr_bits,
+            size: true,
+        })
+    }
+
+    fn literal(&mut self, v: i128, span: Span, expected: Option<Ty>) -> Option<Checked> {
+        match expected {
+            Some(Ty::Int(t)) => {
+                if t.range().contains(v) {
+                    Some(Checked::new(
+                        TExprKind::Int(v),
+                        Ty::Int(t),
+                        Some(Range::exact(v)),
+                    ))
+                } else {
+                    self.error(span, format!("`{v}` does not fit in `{t}` ({})", t.range()));
+                    None
+                }
+            }
+            Some(other) => {
+                self.error(span, format!("expected `{other}`, found an integer"));
+                None
+            }
+            None => {
+                self.diags.push(
+                    Diagnostic::error(span, "cannot tell which integer type this literal has")
+                        .with_help("give it a type from context, e.g. `let x: u32 = 5`"),
+                );
+                None
+            }
+        }
+    }
+
+    fn unary(
+        &mut self,
+        cx: &mut FnCx,
+        op: UnOp,
+        operand: &ast::Expr,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        match op {
+            UnOp::Not => {
+                let c = self.expr(cx, operand, Some(Ty::Bool))?;
+                let c = self.coerce(c, Ty::Bool, operand.span)?;
+                let facts = c.facts.map(|f| Box::new(f.negated()));
+                let mut out = Checked::new(
+                    TExprKind::Unary(TUnOp::Not, Box::new(c.expr)),
+                    Ty::Bool,
+                    None,
+                );
+                out.facts = facts;
+                Some(out)
+            }
+            UnOp::BitNot => {
+                let c = self.expr(cx, operand, expected)?;
+                if c.ty().as_int().is_none() {
+                    self.error(span, format!("`~` needs an integer, found `{}`", c.ty()));
+                    return None;
+                }
+                let ty = c.ty();
+                Some(Checked::new(
+                    TExprKind::Unary(TUnOp::BitNot, Box::new(c.expr)),
+                    ty,
+                    None,
+                ))
+            }
+            UnOp::Neg => {
+                let c = self.expr(cx, operand, expected)?;
+                let Some(t) = c.ty().as_int() else {
+                    self.error(span, format!("`-` needs an integer, found `{}`", c.ty()));
+                    return None;
+                };
+                if !t.signed {
+                    self.error(
+                        span,
+                        format!("cannot negate a value of the unsigned type `{t}`"),
+                    );
+                    return None;
+                }
+                let r = c.int_range();
+                if r.lo == t.min() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!("cannot prove that this negation does not overflow `{t}`"),
+                        )
+                        .with_help(format!(
+                            "the operand can be {r}, and `-({})` doesn't fit",
+                            t.min()
+                        )),
+                    );
+                    return None;
+                }
+                let range = Range {
+                    lo: -r.hi,
+                    hi: -r.lo,
+                };
+                Some(Checked::new(
+                    TExprKind::Unary(TUnOp::Neg, Box::new(c.expr)),
+                    Ty::Int(t),
+                    Some(range),
+                ))
+            }
+        }
+    }
+
+    /// Check two operands that must share a type. An untyped integer on one
+    /// side takes the other side's type; otherwise a lossless widening is
+    /// applied to the narrower side.
+    fn operands(
+        &mut self,
+        cx: &mut FnCx,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        expected: Option<Ty>,
+    ) -> Option<(Checked, Checked)> {
+        let l_untyped = self.untyped_int(cx, lhs).is_some();
+        let r_untyped = self.untyped_int(cx, rhs).is_some();
+        let (l, r) = match (l_untyped, r_untyped) {
+            (true, false) => {
+                let r = self.expr(cx, rhs, expected)?;
+                let l = self.expr(cx, lhs, Some(r.ty()))?;
+                (l, r)
+            }
+            (false, true) => {
+                let l = self.expr(cx, lhs, expected)?;
+                let r = self.expr(cx, rhs, Some(l.ty()))?;
+                (l, r)
+            }
+            _ => {
+                let l = self.expr(cx, lhs, expected);
+                let r = self.expr(cx, rhs, expected);
+                (l?, r?)
+            }
+        };
+        if l.ty() == r.ty() {
+            return Some((l, r));
+        }
+        match (l.ty(), r.ty()) {
+            (Ty::Int(a), Ty::Int(b)) if a.range().within(b.range()) => {
+                let t = r.ty();
+                Some((self.coerce(l, t, lhs.span)?, r))
+            }
+            (Ty::Int(a), Ty::Int(b)) if b.range().within(a.range()) => {
+                let t = l.ty();
+                Some((l, self.coerce(r, t, rhs.span)?))
+            }
+            (a, b) => {
+                self.error(
+                    lhs.span.to(rhs.span),
+                    format!("mismatched types: `{a}` and `{b}`"),
+                );
+                None
+            }
+        }
+    }
+
+    fn binary(
+        &mut self,
+        cx: &mut FnCx,
+        op: BinOp,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        match op {
+            BinOp::And | BinOp::Or => {
+                let l = self
+                    .expr(cx, lhs, Some(Ty::Bool))
+                    .and_then(|l| self.coerce(l, Ty::Bool, lhs.span));
+                // The right side is only evaluated when the left side is true
+                // (`&&`) or false (`||`), so it's checked with those facts.
+                let lf = l
+                    .as_ref()
+                    .and_then(|l| l.facts.as_deref().cloned())
+                    .unwrap_or_default();
+                let saved = cx.env.clone();
+                cx.env.apply(if op == BinOp::And {
+                    &lf.when_true
+                } else {
+                    &lf.when_false
+                });
+                let r = self
+                    .expr(cx, rhs, Some(Ty::Bool))
+                    .and_then(|r| self.coerce(r, Ty::Bool, rhs.span));
+                cx.env = saved;
+                let (l, r) = (l?, r?);
+                let rf = r.facts.map(|f| *f).unwrap_or_default();
+                let (le, re) = (Box::new(l.expr), Box::new(r.expr));
+                let (kind, facts) = if op == BinOp::And {
+                    (TExprKind::And(le, re), CondFacts::and(lf, rf))
+                } else {
+                    (TExprKind::Or(le, re), CondFacts::or(lf, rf))
+                };
+                let mut out = Checked::new(kind, Ty::Bool, None);
+                out.facts = Some(Box::new(facts));
+                Some(out)
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let (l, r) = self.operands(cx, lhs, rhs, None)?;
+                let ordered = !matches!(op, BinOp::Eq | BinOp::Ne);
+                match l.ty() {
+                    Ty::Int(_) => {}
+                    Ty::Bool | Ty::Ptr(_) if !ordered => {}
+                    other => {
+                        self.error(
+                            span,
+                            format!("`{}` can't compare values of type `{other}`", op.as_str()),
+                        );
+                        return None;
+                    }
+                }
+                let cmp = match op {
+                    BinOp::Eq => CmpOp::Eq,
+                    BinOp::Ne => CmpOp::Ne,
+                    BinOp::Lt => CmpOp::Lt,
+                    BinOp::Le => CmpOp::Le,
+                    BinOp::Gt => CmpOp::Gt,
+                    _ => CmpOp::Ge,
+                };
+                let facts = l
+                    .ty()
+                    .as_int()
+                    .map(|_| Box::new(facts::comparison(cmp, l.side(), r.side())));
+                let kind = TExprKind::Binary(TBinOp::Cmp(cmp), Box::new(l.expr), Box::new(r.expr));
+                let mut out = Checked::new(kind, Ty::Bool, None);
+                out.facts = facts;
+                Some(out)
+            }
+            BinOp::Shl | BinOp::ShlWrap | BinOp::Shr => self.shift(cx, op, lhs, rhs, expected),
+            _ => self.arith(cx, op, lhs, rhs, span, expected),
+        }
+    }
+
+    /// `p + n` on a raw pointer: move it forward by `n` elements.
+    fn pointer_add(
+        &mut self,
+        cx: &mut FnCx,
+        p: Checked,
+        rhs: &ast::Expr,
+        span: Span,
+    ) -> Option<Checked> {
+        self.require_unsafe(cx, span, "pointer arithmetic");
+        let usize_ty = self.usize_ty();
+        let n = self.expr(cx, rhs, Some(usize_ty))?;
+        let n = self.coerce(n, usize_ty, rhs.span)?;
+        let ty = p.ty();
+        Some(Checked::new(
+            TExprKind::PtrAdd(Box::new(p.expr), Box::new(n.expr)),
+            ty,
+            None,
+        ))
+    }
+
+    fn arith(
+        &mut self,
+        cx: &mut FnCx,
+        op: BinOp,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        if self.untyped_int(cx, lhs).is_none() {
+            // Pointers only take `p + n`; check for them before the usual
+            // same-type operand rules.
+            let probe = self.expr(cx, lhs, expected)?;
+            if let Ty::Ptr(_) = probe.ty() {
+                if op == BinOp::Add {
+                    return self.pointer_add(cx, probe, rhs, span);
+                }
+                self.error(
+                    span,
+                    format!(
+                        "`{}` doesn't apply to pointers; only `p + n` does",
+                        op.as_str()
+                    ),
+                );
+                return None;
+            }
+        }
+        let (l, r) = self.operands(cx, lhs, rhs, expected)?;
+        let Some(t) = l.ty().as_int() else {
+            self.error(
+                span,
+                format!("`{}` needs integers, found `{}`", op.as_str(), l.ty()),
+            );
+            return None;
+        };
+        let (a, b) = (l.int_range(), r.int_range());
+        let full = t.range();
+
+        let (top, range) = match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let mut result = match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    _ => a.checked_mul(b),
+                };
+                // `x - y` of two locals: a known relation between them bounds
+                // the difference (e.g. `y <= x` gives `x - y >= 0`).
+                if op == BinOp::Sub
+                    && let (Some(x), Some(y), Some(res)) = (l.term, r.term, result)
+                {
+                    let lo = cx.env.rel(y, x).map_or(res.lo, |c| res.lo.max(-c));
+                    let hi = cx.env.rel(x, y).map_or(res.hi, |c| res.hi.min(c));
+                    result = Some(Range { lo, hi });
+                }
+                match result {
+                    Some(res) if res.within(full) => {
+                        let top = match op {
+                            BinOp::Add => TBinOp::Add(Mode::Proven),
+                            BinOp::Sub => TBinOp::Sub(Mode::Proven),
+                            _ => TBinOp::Mul(Mode::Proven),
+                        };
+                        (top, res)
+                    }
+                    _ => {
+                        let (wrap, sat) = match op {
+                            BinOp::Add => ("+%", "+|"),
+                            BinOp::Sub => ("-%", "-|"),
+                            _ => ("*%", "*|"),
+                        };
+                        self.diags.push(
+                            Diagnostic::error(
+                                span,
+                                format!("cannot prove that this {} does not overflow `{t}`", op_name(op)),
+                            )
+                            .with_help(format!("the operands can be {a} and {b}"))
+                            .with_help(format!(
+                                "use `{wrap}` to wrap around, `{sat}` to saturate, or check the values first"
+                            )),
+                        );
+                        return None;
+                    }
+                }
+            }
+            BinOp::AddWrap => (TBinOp::Add(Mode::Wrap), full),
+            BinOp::SubWrap => (TBinOp::Sub(Mode::Wrap), full),
+            BinOp::MulWrap => (TBinOp::Mul(Mode::Wrap), full),
+            BinOp::AddSat => (TBinOp::Add(Mode::Saturate), full),
+            BinOp::SubSat => (TBinOp::Sub(Mode::Saturate), full),
+            BinOp::MulSat => {
+                self.error(
+                    span,
+                    "saturating multiplication is not supported by the compiler yet",
+                );
+                return None;
+            }
+            BinOp::Div | BinOp::Rem => {
+                if b.contains(0) {
+                    self.diags.push(
+                        Diagnostic::error(rhs.span, "cannot prove that this divisor is not zero")
+                            .with_help(format!("the divisor can be {b}")),
+                    );
+                    return None;
+                }
+                if t.signed && a.contains(t.min()) && b.contains(-1) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!("cannot prove that this is not `{}` divided by -1", t.min()),
+                        )
+                        .with_help(format!(
+                            "the operands can be {a} and {b}; that one result doesn't fit in `{t}`"
+                        )),
+                    );
+                    return None;
+                }
+                let biggest = a.lo.abs().max(a.hi.abs());
+                let range = if op == BinOp::Div {
+                    if t.signed {
+                        Range {
+                            lo: -biggest,
+                            hi: biggest,
+                        }
+                    } else {
+                        Range { lo: 0, hi: a.hi }
+                    }
+                } else {
+                    let m = b.lo.abs().max(b.hi.abs()) - 1;
+                    if t.signed {
+                        Range { lo: -m, hi: m }
+                    } else {
+                        Range { lo: 0, hi: m }
+                    }
+                };
+                let top = if op == BinOp::Div {
+                    TBinOp::Div
+                } else {
+                    TBinOp::Rem
+                };
+                (
+                    top,
+                    Range {
+                        lo: range.lo.max(full.lo),
+                        hi: range.hi.min(full.hi),
+                    },
+                )
+            }
+            BinOp::BitAnd => {
+                let range = if a.lo >= 0 && b.lo >= 0 {
+                    Range {
+                        lo: 0,
+                        hi: a.hi.min(b.hi),
+                    }
+                } else {
+                    full
+                };
+                (TBinOp::BitAnd, range)
+            }
+            BinOp::BitOr => (TBinOp::BitOr, full),
+            BinOp::BitXor => (TBinOp::BitXor, full),
+            _ => unreachable!("not an arithmetic operator"),
+        };
+        let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
+        Some(Checked::new(kind, Ty::Int(t), Some(range)))
+    }
+
+    fn shift(
+        &mut self,
+        cx: &mut FnCx,
+        op: BinOp,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        let l = self.expr(cx, lhs, expected)?;
+        let Some(t) = l.ty().as_int() else {
+            self.error(
+                lhs.span,
+                format!("`{}` needs an integer, found `{}`", op.as_str(), l.ty()),
+            );
+            return None;
+        };
+        let r = self.expr(cx, rhs, Some(l.ty()))?;
+        if r.ty().as_int().is_none() {
+            self.error(
+                rhs.span,
+                format!("the shift amount must be an integer, found `{}`", r.ty()),
+            );
+            return None;
+        }
+        let amount = r.int_range();
+        if op != BinOp::ShlWrap
+            && !amount.within(Range {
+                lo: 0,
+                hi: i128::from(t.bits) - 1,
+            })
+        {
+            self.diags.push(
+                Diagnostic::error(
+                    rhs.span,
+                    format!(
+                        "cannot prove that this shift amount is less than {}",
+                        t.bits
+                    ),
+                )
+                .with_help(format!("the amount can be {amount}"))
+                .with_help("use `<<%` to take the amount modulo the width"),
+            );
+            return None;
+        }
+        let a = l.int_range();
+        let (top, range) = match op {
+            BinOp::Shl => (TBinOp::Shl, t.range()),
+            BinOp::ShlWrap => (TBinOp::ShlWrap, t.range()),
+            _ if a.lo >= 0 => (TBinOp::Shr, Range { lo: 0, hi: a.hi }),
+            _ => (TBinOp::Shr, t.range()),
+        };
+        let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
+        Some(Checked::new(kind, Ty::Int(t), Some(range)))
+    }
+
+    fn call(
+        &mut self,
+        cx: &mut FnCx,
+        callee: &ast::Expr,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Option<Checked> {
+        let target = match &callee.kind {
+            ExprKind::Name(name) if cx.lookup(name).is_none() => {
+                if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
+                    (id, name.clone())
+                } else if primitive(name, self.ptr_bits).is_some() {
+                    return self.conversion(cx, name, callee.span, args, span);
+                } else if name == SYSCALL {
+                    return self.syscall(cx, args, span);
+                } else {
+                    self.error(callee.span, format!("cannot find function `{name}`"));
+                    return None;
+                }
+            }
+            ExprKind::Field(base, member) if matches!(&base.kind, ExprKind::Name(n) if self.imported(cx, n).is_some()) =>
+            {
+                let ExprKind::Name(pkg_name) = &base.kind else {
+                    unreachable!()
+                };
+                let pkg = self.imported(cx, pkg_name).expect("checked");
+                match self.package_item(cx, pkg, &member.name, member.span)? {
+                    Item::Func(id) => (id, format!("{pkg_name}.{}", member.name)),
+                    Item::Const(_) => {
+                        self.error(
+                            callee.span,
+                            format!("`{pkg_name}.{}` is a constant, not a function", member.name),
+                        );
+                        return None;
+                    }
+                }
+            }
+            ExprKind::Field(..) => {
+                self.error(callee.span, "methods are not supported by the compiler yet");
+                return None;
+            }
+            _ => {
+                self.error(callee.span, "only named functions can be called");
+                return None;
+            }
+        };
+        let (id, name) = target;
+        if self.sigs[id].is_unsafe {
+            self.require_unsafe(
+                cx,
+                callee.span,
+                &format!("calling the `unsafe fn` `{name}`"),
+            );
+        }
+        let (params, ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
+        if args.len() != params.len() {
+            self.error(
+                span,
+                format!(
+                    "`{name}` takes {} argument(s), but {} were given",
+                    params.len(),
+                    args.len()
+                ),
+            );
+            return None;
+        }
+        let mut targs = Vec::new();
+        let mut ok = true;
+        for (arg, &pty) in args.iter().zip(&params) {
+            match self
+                .expr(cx, arg, Some(pty))
+                .and_then(|c| self.coerce(c, pty, arg.span))
+            {
+                Some(c) => targs.push(c.expr),
+                None => ok = false,
+            }
+        }
+        ok.then(|| Checked::new(TExprKind::Call(id, targs), ret, None))
+    }
+
+    /// `syscall(nr, args...)`: the raw operating-system call (unsafe).
+    fn syscall(&mut self, cx: &mut FnCx, args: &[ast::Expr], span: Span) -> Option<Checked> {
+        self.require_unsafe(cx, span, "`syscall`");
+        if args.is_empty() || args.len() > SYSCALL_MAX_ARGS + 1 {
+            self.error(
+                span,
+                format!("`syscall` takes a number and up to {SYSCALL_MAX_ARGS} arguments"),
+            );
+            return None;
+        }
+        let mut targs = Vec::new();
+        let mut ok = true;
+        for arg in args {
+            // An untyped integer is passed as a `usize`, or an `isize` if negative.
+            let expected = match self.untyped_int(cx, arg) {
+                Some(v) if v < 0 => Some(self.isize_ty()),
+                Some(_) => Some(self.usize_ty()),
+                None => None,
+            };
+            match self.expr(cx, arg, expected) {
+                Some(c) if matches!(c.ty(), Ty::Int(_) | Ty::Ptr(_)) => targs.push(c.expr),
+                Some(c) => {
+                    self.error(
+                        arg.span,
+                        format!(
+                            "`syscall` arguments must be integers or pointers, found `{}`",
+                            c.ty()
+                        ),
+                    );
+                    ok = false;
+                }
+                None => ok = false,
+            }
+        }
+        let isize_ty = self.isize_ty();
+        ok.then(|| Checked::new(TExprKind::Syscall(targs), isize_ty, None))
+    }
+
+    /// `u8(x)` and similar: an integer conversion that must be proven lossless.
+    fn conversion(
+        &mut self,
+        cx: &mut FnCx,
+        name: &str,
+        name_span: Span,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Option<Checked> {
+        let Some(Primitive::Ty(Ty::Int(to))) = primitive(name, self.ptr_bits) else {
+            self.error(
+                name_span,
+                format!("`{name}(...)` is not a supported conversion"),
+            );
+            return None;
+        };
+        let [arg] = args else {
+            self.error(span, format!("`{name}(...)` converts exactly one value"));
+            return None;
+        };
+        let c = self.expr(cx, arg, Some(Ty::Int(to)))?;
+        let Some(from) = c.ty().as_int() else {
+            self.error(arg.span, format!("cannot convert `{}` to `{to}`", c.ty()));
+            return None;
+        };
+        let r = c.int_range();
+        if !r.within(to.range()) {
+            self.diags.push(
+                Diagnostic::error(span, format!("cannot prove that this `{from}` value fits in `{to}`"))
+                    .with_help(format!("the value can be {r}, and `{to}` holds {}", to.range()))
+                    .with_help("check the value first; wrapping and saturating conversions are not supported by the compiler yet"),
+            );
+            return None;
+        }
+        if from == to {
+            return Some(c);
+        }
+        let term = c.term;
+        let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), Ty::Int(to), Some(r));
+        out.term = term;
+        Some(out)
+    }
+}

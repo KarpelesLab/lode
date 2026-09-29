@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::source::{SourceFile, Span};
+use crate::source::{SourceMap, Span};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -29,6 +29,13 @@ impl Diagnostic {
         }
     }
 
+    pub fn warning(span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            level: Level::Warning,
+            ..Diagnostic::error(span, message)
+        }
+    }
+
     pub fn with_help(mut self, help: impl Into<String>) -> Diagnostic {
         self.help.push(help.into());
         self
@@ -48,7 +55,8 @@ impl Diagnostic {
     ///   |            ^^^^^
     ///   = help: ...
     /// ```
-    pub fn render(&self, file: &SourceFile) -> String {
+    pub fn render(&self, files: &SourceMap) -> String {
+        let file = files.get(self.span.file);
         let level = match self.level {
             Level::Error => "error",
             Level::Warning => "warning",

@@ -1,0 +1,51 @@
+// exit: 0
+package main
+
+// `i < n` bounds `i`, so `i + 1` can't overflow.
+fn count_up(n: u32) -> u32 {
+	var i: u32 = 0
+	while i < n {
+		i = i + 1
+	}
+	return i
+}
+
+// After an early return, the code below knows the condition was false.
+fn clamp_to_u8(x: i32) -> u8 {
+	if x < 0 {
+		return 0
+	}
+	if x > 255 {
+		return 255
+	}
+	return u8(x)
+}
+
+// A relation between two variables proves each subtraction.
+fn distance(a: u64, b: u64) -> u64 {
+	if a >= b {
+		return a - b
+	}
+	return b - a
+}
+
+// `&&` checks its right side knowing the left side is true.
+fn ratio_above_one(a: u32, b: u32) -> bool {
+	return b != 0 && a / b > 1
+}
+
+fn main() -> u8 {
+	if count_up(10) != 10 {
+		return 1
+	}
+	if clamp_to_u8(-5) != 0 || clamp_to_u8(300) != 255 || clamp_to_u8(42) != 42 {
+		return 2
+	}
+	if distance(3, 10) != 7 || distance(10, 3) != 7 {
+		return 3
+	}
+	if !ratio_above_one(10, 2) || ratio_above_one(1, 0) {
+		return 4
+	}
+	return 0
+}

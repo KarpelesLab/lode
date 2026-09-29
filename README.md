@@ -18,30 +18,52 @@ The design is in [docs/](docs/README.md), starting with the
 
 ## Status
 
-The compiler in `src/` is a scaffold. It compiles a small subset of the
-language to static x86-64 Linux executables:
-
-- functions, `let`/`var`, `if`/`while`/`loop`, `break`/`continue`
-- integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`) and `bool`
-- arithmetic with the proof rules from [docs/safety.md](docs/safety.md): plain
-  `+ - * / % <<` must be proven safe from known value ranges; `+% -% *% <<%`
-  wrap and `+| -|` saturate; `u8(x)` conversions must be proven to fit
-
-There's no standard library yet (so no I/O): a program reports its result
-through `main`'s return value, which becomes the exit status.
+The compiler in `src/` compiles a growing subset of the language to static
+x86-64 Linux executables:
 
 ```
 package main
 
-fn fib(n: u32) -> u32 {
-	if n < 2 {
-		return n
+import "std/io"
+
+fn main() {
+	io.print("hello world\n")
+}
+```
+
+That program is 4.1 KB and makes exactly two system calls, `write` and
+`exit`. `io.print` is ordinary Lode code in [`std/`](std/), down to the
+`syscall` in `std/os`.
+
+What works:
+
+- functions, `let`/`var`, `if`/`while`/`loop`, `break`/`continue`, `const`
+- integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
+- packages: `import "std/..."`, `pub`, `pkg.name`
+- `unsafe` blocks and functions, raw pointers (`*u8`), the `syscall`
+  intrinsic
+- the proof rules from [docs/safety.md](docs/safety.md): plain
+  `+ - * / % <<` and conversions like `u8(x)` must be proven safe. The checker
+  follows value ranges and relations between variables through the program,
+  narrowing on conditions and early returns. `+% -% *% <<%` wrap and `+| -|`
+  saturate.
+
+```
+fn clamp_to_u8(x: i32) -> u8 {
+	if x < 0 {
+		return 0
 	}
-	return fib(n -% 1) +% fib(n -% 2)
+	if x > 255 {
+		return 255
+	}
+	return u8(x)          // proven: 0 <= x <= 255 here
 }
 
-fn main() -> u8 {
-	return u8(fib(10))    // error: cannot prove that this `u32` value fits in `u8`
+fn distance(a: u64, b: u64) -> u64 {
+	if a >= b {
+		return a - b      // proven: b <= a
+	}
+	return b - a          // proven: a < b
 }
 ```
 

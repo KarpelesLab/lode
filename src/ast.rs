@@ -11,6 +11,7 @@ pub struct Ident {
 /// One source file.
 #[derive(Debug)]
 pub struct File {
+    pub id: crate::source::FileId,
     pub package: Option<Ident>,
     pub imports: Vec<Import>,
     pub items: Vec<Item>,
@@ -26,15 +27,29 @@ pub struct Import {
 #[derive(Debug)]
 pub enum Item {
     Fn(FnDecl),
+    Const(ConstDecl),
 }
 
 #[derive(Debug)]
 pub struct FnDecl {
     pub is_pub: bool,
+    /// `unsafe fn`: callers must be in an `unsafe` context.
+    pub is_unsafe: bool,
     pub name: Ident,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// `const NAME: T = value` at package level.
+#[derive(Debug)]
+pub struct ConstDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    /// `None` for an untyped constant, which adapts to its context like a literal.
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -61,13 +76,15 @@ pub enum TypeExpr {
     Named(Ident),
     /// `()`
     Unit(Span),
+    /// A raw pointer `*T`.
+    Ptr(Box<TypeExpr>, Span),
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
-            TypeExpr::Unit(span) => *span,
+            TypeExpr::Unit(span) | TypeExpr::Ptr(_, span) => *span,
         }
     }
 }
@@ -112,6 +129,8 @@ pub enum Stmt {
     },
     Break(Span),
     Continue(Span),
+    /// `unsafe { ... }`
+    Unsafe(Block),
 }
 
 #[derive(Debug)]

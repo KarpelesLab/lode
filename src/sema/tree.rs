@@ -1,0 +1,168 @@
+//! The typed tree: the checker's output and the lowering pass's input.
+//!
+//! Every operation in it is already known to be safe: the checker rejects
+//! arithmetic, division, shifts and conversions it can't prove, so lowering
+//! never needs a run-time check.
+
+use crate::source::Span;
+use crate::types::Ty;
+
+pub type LocalId = usize;
+pub type FuncId = usize;
+
+/// A checked program: the functions of every package, flattened.
+#[derive(Debug)]
+pub struct Program {
+    pub funcs: Vec<Func>,
+    /// The contents of every string literal, indexed by [`TExprKind::Str`].
+    pub strings: Vec<Vec<u8>>,
+    /// The root package's `main` function, if it has one.
+    pub main: Option<FuncId>,
+}
+
+#[derive(Debug)]
+pub struct Func {
+    pub name: String,
+    /// The linker symbol: `<package path>.<name>`, e.g. `std/io.print`.
+    pub symbol: String,
+    pub params: Vec<LocalId>,
+    pub ret: Ty,
+    pub locals: Vec<Local>,
+    pub body: Vec<TStmt>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct Local {
+    pub name: String,
+    pub ty: Ty,
+    pub mutable: bool,
+}
+
+#[derive(Debug)]
+pub enum TStmt {
+    /// Initialize a local.
+    Init(LocalId, TExpr),
+    Assign(LocalId, TExpr),
+    Expr(TExpr),
+    Return(Option<TExpr>),
+    If(TExpr, Vec<TStmt>, Vec<TStmt>),
+    While(TExpr, Vec<TStmt>),
+    Loop(Vec<TStmt>),
+    Break,
+    Continue,
+    /// A nested block (an `unsafe` block).
+    Block(Vec<TStmt>),
+}
+
+#[derive(Clone, Debug)]
+pub struct TExpr {
+    pub kind: TExprKind,
+    pub ty: Ty,
+}
+
+#[derive(Clone, Debug)]
+pub enum TExprKind {
+    Int(i128),
+    Bool(bool),
+    /// A string literal, by index into [`Program::strings`].
+    Str(usize),
+    Local(LocalId),
+    Call(FuncId, Vec<TExpr>),
+    Unary(TUnOp, Box<TExpr>),
+    Binary(TBinOp, Box<TExpr>, Box<TExpr>),
+    /// Short-circuit `&&`.
+    And(Box<TExpr>, Box<TExpr>),
+    /// Short-circuit `||`.
+    Or(Box<TExpr>, Box<TExpr>),
+    /// An integer conversion to `ty`, proven not to lose information.
+    Convert(Box<TExpr>),
+    /// `s.len` of a `str`.
+    StrLen(Box<TExpr>),
+    /// `s.ptr` of a `str` (unsafe).
+    StrPtr(Box<TExpr>),
+    /// `p + n`: a pointer moved forward by `n` elements (unsafe).
+    PtrAdd(Box<TExpr>, Box<TExpr>),
+    /// The `syscall(nr, args...)` intrinsic (unsafe). Integer operands are
+    /// passed as 64-bit values, sign- or zero-extended by their type.
+    Syscall(Vec<TExpr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TUnOp {
+    /// Negation, proven not to overflow.
+    Neg,
+    Not,
+    BitNot,
+}
+
+/// How an arithmetic operator treats a result that doesn't fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The checker proved the result fits.
+    Proven,
+    Wrap,
+    Saturate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TBinOp {
+    Add(Mode),
+    Sub(Mode),
+    Mul(Mode),
+    /// Division, with the divisor proven non-zero (and no `MIN / -1`).
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    /// Shift left, with the amount proven less than the width.
+    Shl,
+    /// Shift left, with the amount taken modulo the width.
+    ShlWrap,
+    Shr,
+    Cmp(CmpOp),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Whether control can't fall off the end of `stmts` (for "missing return").
+pub fn terminates(stmts: &[TStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        TStmt::Return(_) => true,
+        TStmt::If(_, then, otherwise) => terminates(then) && terminates(otherwise),
+        TStmt::Loop(body) => !breaks(body),
+        TStmt::Block(body) => terminates(body),
+        _ => false,
+    })
+}
+
+/// Whether control can't reach the statement after `stmts`: every path ends
+/// in `return`, `break` or `continue`, or an endless loop.
+pub fn diverges(stmts: &[TStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        TStmt::Return(_) | TStmt::Break | TStmt::Continue => true,
+        TStmt::If(_, then, otherwise) => diverges(then) && diverges(otherwise),
+        TStmt::Loop(body) => !breaks(body),
+        TStmt::Block(body) => diverges(body),
+        _ => false,
+    })
+}
+
+/// Whether `stmts` contain a `break` that leaves the enclosing loop.
+pub fn breaks(stmts: &[TStmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        TStmt::Break => true,
+        TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
+        TStmt::Block(body) => breaks(body),
+        _ => false,
+    })
+}

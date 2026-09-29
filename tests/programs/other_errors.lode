@@ -2,10 +2,7 @@
 // error: cannot tell which integer type this literal has
 // error: cannot assign to `x`, which is immutable
 // error: `f` can reach the end of its body without returning a value
-// error: `io.print` is not available yet
 package main
-
-import "std/io"
 
 fn f(a: bool) -> u32 {
 	if a {
@@ -18,5 +15,4 @@ fn main() {
 	let untyped = 5
 	let x: u32 = 1
 	x = 2
-	io.print("hello\n")
 }

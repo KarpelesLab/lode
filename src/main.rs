@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use latticefoundry::transform::pipeline::OptLevel;
-use lode::source::SourceFile;
+use lode::source::{FileId, SourceFile, SourceMap};
 
 const USAGE: &str = "\
 lode: the Lode compiler
@@ -86,17 +86,19 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     })
 }
 
-fn load(path: &str) -> Result<SourceFile, String> {
+fn load(path: &str) -> Result<(SourceMap, FileId), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    Ok(SourceFile::new(path, text))
+    let mut files = SourceMap::new();
+    let root = files.add(SourceFile::new(path, text));
+    Ok((files, root))
 }
 
 /// Print a compile error; returns the failure exit code.
-fn report(file: &SourceFile, err: lode::Error) -> ExitCode {
+fn report(files: &SourceMap, err: lode::Error) -> ExitCode {
     match err {
         lode::Error::Source(diags) => {
             for d in &diags {
-                eprint!("{}", d.render(file));
+                eprint!("{}", d.render(files));
             }
             let errors = diags.iter().filter(|d| d.is_error()).count();
             eprintln!("lode: {errors} error(s)");
@@ -108,28 +110,28 @@ fn report(file: &SourceFile, err: lode::Error) -> ExitCode {
 
 fn check(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
-    let file = load(&opts.input)?;
-    Ok(match lode::check(&file) {
+    let (mut files, root) = load(&opts.input)?;
+    Ok(match lode::check(&mut files, root) {
         Ok(_) => ExitCode::SUCCESS,
-        Err(e) => report(&file, e),
+        Err(e) => report(&files, e),
     })
 }
 
 fn build(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
-    let file = load(&opts.input)?;
+    let (mut files, root) = load(&opts.input)?;
     if opts.emit_ir {
-        return Ok(match lode::ir_text(&file, opts.opt) {
+        return Ok(match lode::ir_text(&mut files, root, opts.opt) {
             Ok(text) => {
                 print!("{text}");
                 ExitCode::SUCCESS
             }
-            Err(e) => report(&file, e),
+            Err(e) => report(&files, e),
         });
     }
-    let image = match lode::build_executable(&file, opts.opt) {
+    let image = match lode::build_executable(&mut files, root, opts.opt) {
         Ok(image) => image,
-        Err(e) => return Ok(report(&file, e)),
+        Err(e) => return Ok(report(&files, e)),
     };
     let output = opts.output.unwrap_or_else(|| default_output(&opts.input));
     latticefoundry::link::write_executable(&output, &image)?;
@@ -138,10 +140,10 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
-    let file = load(&opts.input)?;
-    let image = match lode::build_executable(&file, opts.opt) {
+    let (mut files, root) = load(&opts.input)?;
+    let image = match lode::build_executable(&mut files, root, opts.opt) {
         Ok(image) => image,
-        Err(e) => return Ok(report(&file, e)),
+        Err(e) => return Ok(report(&files, e)),
     };
     let path = temp_path(&opts.input);
     let path_str = path.to_str().ok_or("temporary path is not valid UTF-8")?;

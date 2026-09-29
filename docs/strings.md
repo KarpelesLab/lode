@@ -79,3 +79,20 @@ let c: Str[ascii] = "café"           // error: 'é' is not representable in asc
 - Grapheme clusters (what users see as "a character") come from a Unicode
   library, not the core. They need tables, and the core stays small.
 - Comparing `Str[A]` to `Str[B]` is a type error. Convert first.
+
+## In the compiler today
+
+**Status:** Implemented subset
+
+Until there are generics, `str` is a built-in type: a pointer and a length in
+bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
+
+- string literals, placed in read-only data
+- `str` locals and parameters (passed as two values: pointer and length)
+- `s.len` (a `usize`; the checker knows it's at most the largest `isize`)
+- `s.ptr` (a `*u8`), only in `unsafe` code
+
+Not yet: returning a `str` (it needs the view rules of
+[memory.md](memory.md#views)), comparing or slicing strings, rune iteration,
+and other encodings.
+

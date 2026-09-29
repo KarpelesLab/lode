@@ -1,0 +1,19 @@
+/// Input and output.
+package io
+
+import "std/os"
+
+/// Write `s` to standard output.
+///
+/// Output errors are ignored: `print` is for programs whose output isn't worth
+/// failing over (and a closed pipe already ends the process through SIGPIPE).
+/// To handle errors, use `os.write_all` and check its result. When the compiler
+/// has `throws`, the checked version will be `io.stdout().write(s)`.
+pub fn print(s: str) {
+	os.write_all(os.STDOUT, s)
+}
+
+/// Write `s` to standard error, ignoring errors like `print`.
+pub fn eprint(s: str) {
+	os.write_all(os.STDERR, s)
+}

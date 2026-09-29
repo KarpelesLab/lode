@@ -1,0 +1,53 @@
+/// The operating system interface: Linux on x86-64.
+///
+/// This is the lowest layer of the standard library, the one a project can
+/// replace with its own (docs/backend.md, "Custom os/arch layers"). Other
+/// targets will get their own version of this package, selected with
+/// `if comptime target.os == ...` once the compiler has `comptime`.
+package os
+
+/// Linux x86-64 system call numbers.
+const SYS_WRITE = 1
+
+/// Linux error numbers (a failed system call returns their negation).
+pub const EINTR: isize = 4
+pub const EIO: isize = 5
+
+/// The standard file descriptors.
+pub const STDIN: i32 = 0
+pub const STDOUT: i32 = 1
+pub const STDERR: i32 = 2
+
+/// Write the `len` bytes at `data` to `fd`, once. Returns the number of bytes
+/// written (possibly fewer than `len`), or a negative error number.
+///
+/// The caller must ensure `data` points to `len` readable bytes.
+pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
+	return syscall(SYS_WRITE, fd, data, len)
+}
+
+/// Write all of `s` to `fd`, retrying after partial writes and interrupted
+/// calls. Returns 0, or the negative error number of the first failure.
+pub fn write_all(fd: i32, s: str) -> isize {
+	unsafe {
+		var p = s.ptr
+		var left = s.len
+		while left > 0 {
+			let n = write(fd, p, left)
+			if n < 0 {
+				if n == -EINTR {
+					continue
+				}
+				return n
+			}
+			let done = usize(n)
+			if done == 0 || done > left {
+				// The kernel never reports writing nothing, or more than asked.
+				return -EIO
+			}
+			left = left - done
+			p = p + done
+		}
+	}
+	return 0
+}

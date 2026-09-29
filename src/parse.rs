@@ -7,16 +7,16 @@
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::lex::{Kw, P, Tok, Token};
-use crate::source::Span;
+use crate::source::{FileId, Span};
 
-/// Parse a token stream (as produced by [`crate::lex::lex`]).
-pub fn parse(toks: Vec<Token>) -> (File, Vec<Diagnostic>) {
+/// Parse a token stream (as produced by [`crate::lex::lex`]) of source file `id`.
+pub fn parse(toks: Vec<Token>, id: FileId) -> (File, Vec<Diagnostic>) {
     let mut p = Parser {
         toks,
         pos: 0,
         diags: Vec::new(),
     };
-    let file = p.file();
+    let file = p.file(id);
     (file, p.diags)
 }
 
@@ -189,8 +189,9 @@ impl Parser {
 
     // --- items --------------------------------------------------------------
 
-    fn file(&mut self) -> File {
+    fn file(&mut self, id: FileId) -> File {
         let mut file = File {
+            id,
             package: None,
             imports: Vec::new(),
             items: Vec::new(),
@@ -243,7 +244,12 @@ impl Parser {
         let start = self.span();
         let is_pub = self.eat_kw(Kw::Pub);
         match self.peek().clone() {
-            Tok::Kw(Kw::Fn) => self.fn_decl(is_pub, start).map(Item::Fn),
+            Tok::Kw(Kw::Fn) => self.fn_decl(is_pub, false, start).map(Item::Fn),
+            Tok::Kw(Kw::Unsafe) if *self.peek_at(1) == Tok::Kw(Kw::Fn) => {
+                self.bump();
+                self.fn_decl(is_pub, true, start).map(Item::Fn)
+            }
+            Tok::Kw(Kw::Const) => self.const_decl(is_pub, start).map(Item::Const),
             Tok::Kw(
                 kw @ (Kw::Struct
                 | Kw::Enum
@@ -251,7 +257,6 @@ impl Parser {
                 | Kw::Impl
                 | Kw::Type
                 | Kw::Alias
-                | Kw::Const
                 | Kw::Static
                 | Kw::Unsafe),
             ) => self.error(
@@ -265,7 +270,26 @@ impl Parser {
         }
     }
 
-    fn fn_decl(&mut self, is_pub: bool, start: Span) -> PResult<FnDecl> {
+    fn const_decl(&mut self, is_pub: bool, start: Span) -> PResult<ConstDecl> {
+        self.bump(); // const
+        let name = self.ident("a constant name")?;
+        let ty = if self.eat_p(P::Colon) {
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
+        self.expect_p(P::Eq)?;
+        let value = self.expr()?;
+        Ok(ConstDecl {
+            is_pub,
+            name,
+            ty,
+            span: start.to(value.span),
+            value,
+        })
+    }
+
+    fn fn_decl(&mut self, is_pub: bool, is_unsafe: bool, start: Span) -> PResult<FnDecl> {
         self.bump(); // fn
         let name = self.ident("a function name")?;
         if self.at_p(P::Dot) {
@@ -311,6 +335,7 @@ impl Parser {
         let body = self.block()?;
         Ok(FnDecl {
             is_pub,
+            is_unsafe,
             name,
             params,
             ret,
@@ -347,7 +372,13 @@ impl Parser {
                 let end = self.bump().span;
                 Ok(TypeExpr::Unit(start.to(end)))
             }
-            Tok::P(P::Question | P::LBracket | P::Star) => self.error(
+            Tok::P(P::Star) => {
+                let start = self.bump().span;
+                let inner = self.type_expr()?;
+                let span = start.to(inner.span());
+                Ok(TypeExpr::Ptr(Box::new(inner), span))
+            }
+            Tok::P(P::Question | P::LBracket) => self.error(
                 self.span(),
                 "this kind of type is not supported by the compiler yet",
             ),
@@ -440,6 +471,10 @@ impl Parser {
                     body,
                 })
             }
+            Tok::Kw(Kw::Unsafe) => {
+                self.bump();
+                Ok(Stmt::Unsafe(self.block()?))
+            }
             Tok::Kw(Kw::Break) => Ok(Stmt::Break(self.bump().span)),
             Tok::Kw(Kw::Continue) => Ok(Stmt::Continue(self.bump().span)),
             Tok::Kw(
@@ -449,7 +484,6 @@ impl Parser {
                 | Kw::Errdefer
                 | Kw::Throw
                 | Kw::Scope
-                | Kw::Unsafe
                 | Kw::Comptime),
             ) => self.error(
                 self.span(),
@@ -639,16 +673,16 @@ mod tests {
     use crate::lex::lex;
 
     fn parse_ok(src: &str) -> File {
-        let (toks, diags) = lex(src);
+        let (toks, diags) = lex(src, 0);
         assert!(diags.is_empty(), "{diags:?}");
-        let (file, diags) = parse(toks);
+        let (file, diags) = parse(toks, 0);
         assert!(diags.is_empty(), "{diags:?}");
         file
     }
 
     fn parse_errors(src: &str) -> Vec<String> {
-        let (toks, _) = lex(src);
-        parse(toks).1.into_iter().map(|d| d.message).collect()
+        let (toks, _) = lex(src, 0);
+        parse(toks, 0).1.into_iter().map(|d| d.message).collect()
     }
 
     #[test]
@@ -657,7 +691,9 @@ mod tests {
             "package main\n\nfn add(a: u32, b: u32) -> u32 {\n\tlet c = a +% b\n\treturn c\n}\n",
         );
         assert_eq!(file.package.unwrap().name, "main");
-        let Item::Fn(f) = &file.items[0];
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
         assert_eq!(f.name.name, "add");
         assert_eq!(f.params.len(), 2);
         assert_eq!(f.body.stmts.len(), 2);
@@ -666,7 +702,9 @@ mod tests {
     #[test]
     fn precedence() {
         let file = parse_ok("fn f() -> bool {\n\treturn 1 + 2 * 3 == 7 && true\n}\n");
-        let Item::Fn(f) = &file.items[0];
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
         let Stmt::Return { value: Some(e), .. } = &f.body.stmts[0] else {
             panic!()
         };

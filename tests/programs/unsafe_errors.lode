@@ -1,0 +1,15 @@
+// error: `syscall` is unsafe
+// error: taking a string's raw pointer is unsafe
+// error: pointer arithmetic is unsafe
+// error: calling the `unsafe fn` `raw` is unsafe
+package main
+
+unsafe fn raw() {
+}
+
+fn f(s: str) {
+	syscall(60, 0)
+	let p = s.ptr
+	let q = p + 1
+	raw()
+}
