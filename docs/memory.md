@@ -1,0 +1,273 @@
+# Memory model
+
+## Requirements
+
+- Memory safety with no garbage collector and no runtime.
+- No lifetime annotations in ordinary code. This is the main readability gap
+  with Rust.
+- Works for kernels and 8-bit targets, meaning explicit control over where
+  memory comes from.
+- Data-race freedom follows from the same rules ([concurrency.md](concurrency.md)).
+
+## Chosen direction: mutable value semantics
+
+**Status:** Proposed
+
+This is the model of [Hylo](https://hylo-lang.org) (formerly Val) and, partly,
+Swift. The core idea:
+
+> Variables hold **values**, not references. Assigning or passing copies (or
+> moves) the value. Two variables never observe each other's changes.
+
+Mutation stays cheap because a function does not get a pointer. It gets
+**temporary exclusive access** to the caller's value through a parameter
+convention:
+
+| Convention | Meaning | Rust analogue |
+| --- | --- | --- |
+| *(default)* `x: T` | Read-only access for the duration of the call | `&T` |
+| `inout x: T` | Exclusive read/write access for the duration of the call | `&mut T` |
+| `sink x: T` | Ownership moves into the callee | `T` by value |
+| `set x: T` | The callee initializes `x` | out parameter |
+
+```
+fn push_twice(inout list: List[u32], v: u32) throws(AllocError) {
+	try list.push(v)
+	try list.push(v)
+}
+
+var l = List[u32].new()
+try push_twice(&l, 7)   // the & marks the mutation at the call site
+```
+
+At the call site, `&` marks exclusive access (syntax Open). Mutation is visible
+where it happens, which is good for readability.
+
+**Why this removes lifetimes:** accesses can't escape the call they were
+granted for, so the compiler never needs to track how long a reference lives
+across functions. Exclusivity is checked locally: in one call, an argument
+passed `inout` cannot overlap any other argument.
+
+### Owning pointers are values
+
+**Status:** Proposed
+
+The rule is **no *non-owning* references in structs**. A pointer that *owns*
+what it points to is just a value stored on the heap. It has exactly one owner,
+it moves instead of copying, and it's freed with its owner. `Box[T]` is that
+pointer:
+
+```
+struct Node[T] {
+	value: T
+	next: ?Box[Node[T]]
+}
+```
+
+So any structure where every node has exactly one owner can be written in
+ordinary safe code: singly linked lists, trees owned from the root, tries,
+ASTs.
+
+The compiler-generated `deinit` for a self-recursive owning type must be
+**iterative**: unlink `next`, then loop. Recursive destruction of a long list
+would use one stack frame per node, which overflows the stack and breaks
+[stack bounds](safety.md#stack-bounds).
+
+### Shared and back-pointer structures belong to the standard library
+
+**Status:** Decided
+
+Structures where a node is reached through more than one pointer (doubly
+linked lists, parent pointers, graphs, intrusive lists) are exactly the ones
+that are easy to get wrong. They are written **once, in the standard library**,
+with `unsafe` inside and a safe API outside. User code uses them. It doesn't
+reimplement them.
+
+Candidates (the exact list is Open):
+
+| Container | Covers |
+| --- | --- |
+| `Arena[T]` + `Handle[T]` | The general tool: nodes in one arena, typed generational handles as edges. A stale handle gives `none`, never undefined behavior. |
+| `DList[T]` | Doubly linked list, O(1) insert and remove through cursors or handles |
+| `Tree[T]` | Tree with parent links and sibling navigation (DOM, scene graphs, file trees) |
+| `Graph[N, E]` | Directed graph with node and edge payloads, both directions of traversal |
+| `LruCache[K, V]` | Hash map plus recency list, the classic "needs two pointers per entry" case |
+| `IntrusiveList[T]` | Kernel-style lists where the link lives inside the element. **Open:** needs elements that don't move in memory. Maybe `unsafe` to insert, safe to traverse. |
+
+API rules, so that the safe surface stays safe:
+
+- **Positions are handles or cursors, never pointers.** A handle is a
+  generational index: plain data, safe to store in structs and send between
+  threads. A cursor is a *view* (see [Views](#views)) that borrows the
+  container while it's in use, so the container can't change underneath it.
+- **Mutation goes through the container:** `list.remove(h)`,
+  `tree.move(h, new_parent)`. Invariants (such as "`prev.next == self`") are
+  kept in one place.
+- Removal gives back the value (`sink`), so ownership is never ambiguous.
+
+The standard library's `unsafe` code is held to a higher bar than ordinary
+`unsafe`:
+- every `unsafe` block states the invariant it relies on
+- property-based tests of each container against a simple reference model
+- run under a checking interpreter (LatticeFoundry's IR/MIR interpreters are
+  a starting point) that detects use-after-free and out-of-bounds in tests,
+  Miri-style (**Open**: scope)
+
+User code can still use `unsafe` pointers when nothing in the standard library
+fits. That's the escape hatch, not the expected path.
+
+This is the trade we make. Rust's borrow checker allows stored references at
+the cost of lifetime annotations. We choose readability, and move the hard
+structures into one audited place.
+
+### Views
+
+**Status:** Decided
+
+Slices (`[]T`), string views and iterators are *views* into another value. A
+view is a stored reference in disguise, so its use is restricted:
+
+1. **Views can be parameters, locals and return values. They are never struct
+   fields.** (This is Hylo's "projections".)
+2. **A returned view borrows from the parameters.** The caller can't mutate or
+   destroy what the view came from while the view is in use. There's no syntax
+   for lifetimes: the rule is always the same.
+
+```
+fn trim(s: str) -> str { ... }       // the result borrows from s
+
+let line = read_line()
+let t = trim(line)
+line.clear()                         // error: line is borrowed by t
+print(t)
+```
+
+When a function takes several view parameters and returns a view, the result
+is taken to borrow from **all** of them. That's conservative, and it's never
+wrong. **Open:** do we need a way to narrow it (`-> str from s`) for the rare
+function where that matters?
+
+Iterators and parsers that hold their input are fine, as long as they live in
+locals. They are views themselves. A parser that has to *outlive* its input
+owns a copy or holds [handles](#shared-and-back-pointer-structures-belong-to-the-standard-library).
+This rule also lets scoped threads use views without copying
+([concurrency.md](concurrency.md#structured-concurrency)).
+
+## Copies
+
+**Status:** Proposed
+
+- Small plain types (integers, fixed arrays of them, structs of them) are
+  implicitly copied.
+- Types that own resources (heap memory, file handles) are **moved** by
+  default. Copying them is explicit: `x.copy()`, which can allocate and
+  therefore can throw.
+- The last use of a variable moves instead of copying (the compiler knows).
+
+## Destruction
+
+**Status:** Proposed
+
+Values are destroyed at the end of their scope in reverse order. A type can
+define `fn deinit(sink self)`. Destruction is deterministic and visible in the
+scope structure. Only `defer` and scope end run cleanup, so there is no hidden
+control flow.
+
+**Open:** "linear" types that *must* be consumed explicitly (for example a
+transaction that must be committed or rolled back). This would be valuable, and
+fits the model well.
+
+## Allocation
+
+**Status:** Proposed
+
+- There is no global `malloc` that code can call behind the user's back.
+  Anything that allocates takes an allocator.
+- To keep call sites readable, the allocator is an **implicit context
+  parameter**. Functions that allocate declare it (`uses alloc`), callers
+  inherit their own, and it can be overridden for a scope:
+
+```
+fn build(names: []str) uses alloc throws(AllocError) -> List[str] { ... }
+
+with alloc = arena {
+	let l = try build(names)     // allocates in the arena
+}
+```
+
+- The executable's root allocator comes from the target's os layer
+  ([backend.md](backend.md)). A project can replace it, which covers the goal
+  of reimplementing low-level pieces.
+- A function without `uses alloc` provably doesn't allocate. That is useful in
+  interrupt handlers and real-time code.
+
+### Out of memory
+
+Allocation returns `AllocError`. Because that is noisy for applications, a
+**program-level policy** can turn it into a defined abort:
+
+- `oom = error` (the default for libraries, kernels and embedded code):
+  `AllocError` is propagated like any other error.
+- `oom = abort` (opt-in for applications): allocating functions are no longer
+  `throws(AllocError)` from the caller's point of view.
+
+**Open:** can the same library be compiled under both policies without writing
+it twice? (Probably yes, if `AllocError` is part of an inferred error set, see
+[errors.md](errors.md).)
+
+## Globals
+
+**Status:** Decided (details Proposed)
+
+Package-level state comes in three kinds:
+
+```
+const MAX_USERS = 1024                            // compile-time constant
+let DEFAULT_NAME: str = "guest"                   // immutable, initialized at compile time
+static requests: Atomic[u64] = Atomic.new(0)      // mutable: Atomic only
+static config: Mutex[Config] = Mutex.new(Config.default())   // or Mutex only
+```
+
+- **Mutable globals must be `Atomic[T]` or `Mutex[T]`** (or `RwLock[T]`). A
+  plain mutable global is only allowed in `unsafe` code, for kernels and
+  drivers that manage their own synchronization.
+- **Every global is initialized at compile time.** There are no `init()`
+  functions and no static constructors, so nothing runs before `main`
+  ([pay only for what you use](concept.md#pay-only-for-what-you-use)), and
+  initialization order between packages can't matter. Global state that needs
+  run-time setup is created in `main` and passed down, or uses a lazily
+  initialized standard-library type (**Open:** `Lazy[T]`, whose first access
+  may run code and possibly fail).
+
+### Downgrading when there's no concurrency
+
+**Status:** Proposed
+
+When whole-program analysis shows that nothing can run concurrently, the
+synchronization is compiled away. The source stays the same:
+
+| Program | `Atomic[T]` becomes | `Mutex[T]` becomes |
+| --- | --- | --- |
+| Single OS thread, no green threads, no interrupt or signal handlers | Plain loads and stores | A borrow flag, no atomic instructions |
+| Single OS thread with green threads (cooperative) | Plain loads and stores (a green thread can't be interrupted mid-operation). With [preemption](concurrency.md#preemption) on: single-instruction read-modify-write, safe on one core | A task-level lock without atomics (a green thread can yield while holding it) |
+| Interrupt handlers reach the global (single-core microcontroller) | Target-specific interrupt-safe access, or a short critical section | A critical section (interrupts disabled while held) |
+| Several OS threads | Real atomics | Real mutex |
+
+"Nothing can run concurrently" is decided from the whole program: whether any
+thread spawn, interrupt handler or signal handler is reachable. It's recorded
+in the build output so it isn't a hidden optimization.
+
+The observable behavior must be **identical in every mode**. In particular,
+locking a mutex the same thread already holds must do the same thing whether
+or not the mutex was downgraded. **Open:** make it a compile error where
+detectable, and a defined abort otherwise?
+
+## Comparison
+
+| | Rust | Zig | Lode |
+| --- | --- | --- | --- |
+| Use-after-free prevented | Yes (borrowck) | No | Yes (value semantics) |
+| Lifetime annotations | Yes | No | No |
+| References in structs | Yes | Yes (unchecked) | Owning only (`Box`); shared structures come from std |
+| Explicit allocators | Partly | Yes | Yes, as an implicit context |
+| Fallible allocation | Mostly no | Yes | Yes, or abort by policy |
