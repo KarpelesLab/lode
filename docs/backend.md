@@ -75,12 +75,14 @@ executables through LF's own linker. See the README for the supported subset.
 
 ## What Lode needs from LatticeFoundry
 
+LF tracks this list in
+[issue #3](https://github.com/KarpelesLab/latticefoundry/issues/3); specific
+bugs and small items get their own issues.
+
 This is a living list, roughly in the order Lode will need it. Anything marked
 *unknown* needs to be checked against LF's current state.
 
 ### Needed for the first working compiler
-- [ ] A stable-enough Rust API for building IR from a frontend (LF already
-  exposes it for `lf-cc`).
 - [x] Building IR from a frontend, verifying, optimizing, and linking a static
   executable: works for the compiler scaffold.
 - [x] **A syscall intrinsic** (Linux syscall ABI), in LF `0.0.0`: `Syscall`
@@ -92,14 +94,14 @@ This is a living list, roughly in the order Lode will need it. Anything marked
   values as 32-bit, so leftover upper register bits (e.g. after an `i8` add
   that wrapped) gave wrong results. C code never hit it because C promotes to
   `int` first. Fixed in LF's `SetccCmp` encoding, with a regression test.
-- [ ] **Smaller executables:** LF's linker starts each segment on a new page
+- [ ] **Smaller executables** ([LF #2](https://github.com/KarpelesLab/latticefoundry/issues/2)): LF's linker starts each segment on a new page
   in the file, so a hello world with 12 bytes of string data is 4,108 bytes
   of which about 3 KB is padding. Merging read-only data into the code
   segment, or placing segments without page-aligning their file offsets
   (only `offset ≡ vaddr (mod page)` is required), would bring it to about
   1.1 KB.
-- [ ] The same width issue in LF's `switch` lowering (it always compares 64
-  bits). Lode doesn't emit `switch` yet; needed for `match`.
+- [x] The same width issue in `switch`, division and `cond_br`: fixed in LF
+  `0.0.0`.
 - [ ] Volatile load and store, atomics and fences in the IR.
 - [ ] Debug info (DWARF) with source positions from a non-C frontend. LF has
   DWARF with `-g`.
