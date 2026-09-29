@@ -60,17 +60,10 @@ target/debug/lode check program.lode
 `cargo test` runs unit tests and the programs in `tests/programs/`; each one
 declares its expected exit status or errors in its first comment lines.
 
-The compiler depends on LatticeFoundry through git. To develop both together
-with a checkout next to this one (`../latticefoundry`), create
-`.cargo/config.toml` (it's gitignored):
-
-```toml
-[patch."https://github.com/KarpelesLab/latticefoundry"]
-latticefoundry = { path = "../latticefoundry" }
-
-[net]
-git-fetch-with-cli = true
-```
+The compiler depends on LatticeFoundry, pinned to a specific commit in
+`Cargo.lock`. It's updated only once the LatticeFoundry changes Lode needs are
+merged and released, with `cargo update -p latticefoundry`. Lode never builds
+against a local LatticeFoundry checkout.
 
 ## License
 

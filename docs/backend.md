@@ -25,7 +25,8 @@ ELF, linker, DWARF), and a backend written *in Lode* can't exist until the
 language can express it.
 
 - **Now:** LF is the backend of the Rust compiler. Lode pins an LF commit in
-  `Cargo.lock` and bumps it deliberately. Features Lode needs are tracked
+  `Cargo.lock` and bumps it only to merged, released LF versions. It never
+  builds against a local LF checkout. Features Lode needs are tracked
   below; LF bugs Lode finds are reported as reproducible IR tests.
 - **At self-hosting:** the Lode compiler's backend is written in Lode, as a port
   of LF's design (its IR design and tenets are documented). That's the
