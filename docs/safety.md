@@ -106,8 +106,10 @@ So:
 
 **Status:** Proposed; implemented in the compiler (`src/sema/facts.rs`)
 
-The checker tracks facts about **terms**. A term is an integer local, or the
-length of a view local (`xs.len` of a slice or `str` parameter or local). An
+The checker tracks facts about **terms**. A term is an integer local, the
+length of a view local (`xs.len` of a slice or `str` parameter or local), or
+an integer field of a struct local, reached through fields only (`p.x`,
+`r.min.y`, but not `ps[i].x`). An
 expression can be a term plus a constant: `i`, `i + 1`, `xs.len - 1`. There
 are two kinds of fact:
 
@@ -121,6 +123,8 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | A literal or constant | Its exact value |
 | An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges) |
 | `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
+| A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
+| `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
 | `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length. |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
@@ -142,7 +146,9 @@ the length's (for an array, its constant `N`), or a relation gives
 
 Everything else gives no facts. In particular, facts don't cross function
 calls yet (that's what [refinements](#refinements-in-types) are for), array
-elements have no facts, and there's no induction beyond the loop condition.
+elements (and fields under them) have no facts, a copy of a struct doesn't
+keep its fields' facts, and there's no induction beyond the loop
+condition.
 
 Example, from the standard library's `os.write_all`:
 

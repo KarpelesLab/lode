@@ -44,13 +44,16 @@ What works:
 - integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
 - arrays (`[4]u8`, `[0; 16]`, `[[1, 2], [3, 4]]`) and read-only slices
   (`[]u8`); an array is passed where a slice is expected
+- structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
+  with value semantics: `let q = p` copies, and structs and arrays are passed
+  and returned by value; `==` compares structs and arrays field by field
 - packages: `import "std/..."`, `pub`, `pkg.name`
 - `unsafe` blocks and functions, raw pointers (`*u8`), the `syscall`
   intrinsic
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
-  safe. The checker follows value ranges and relations between variables and
-  lengths through the program, narrowing on conditions, early returns and
+  safe. The checker follows value ranges and relations between variables,
+  struct fields and lengths through the program, narrowing on conditions, early returns and
   `for` loops. `+% -% *% <<%` wrap and `+| -|` saturate.
 
 ```

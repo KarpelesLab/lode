@@ -164,6 +164,21 @@ This rule also lets scoped threads use views without copying
   therefore can throw.
 - The last use of a variable moves instead of copying (the compiler knows).
 
+### In the compiler today
+
+**Status:** Implemented for arrays and structs
+
+- Every array and struct is a plain value, copied by `let`, by assignment
+  and into array elements and fields. Nothing owns resources yet, so nothing
+  moves.
+- A parameter uses the default convention: read-only for the duration of the
+  call. Nothing can change the argument during the call, so an array or a
+  struct is passed as the address of the caller's value, without a copy.
+- A function returning an array or a struct writes the result straight into
+  storage the caller provides: the new variable in `let p = make()`, or else
+  a temporary. So `p = swap(p)` can't overwrite `p` while `swap` still reads
+  it.
+
 ## Destruction
 
 **Status:** Proposed

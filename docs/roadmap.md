@@ -15,11 +15,13 @@ itself is in the other documents; this one is only about order.
   read-only slices `[]T`, `for` over ranges and elements, and `a[i]` that
   compiles only when the checker proves it in bounds, with lengths as terms
   in the fact language (`i < xs.len`).
+- **M3: Structs** (2026-10-04). Nominal structs with value semantics: literals,
+  field access and assignment, passing and returning structs and arrays by
+  value, derived `==`, and fields of struct locals as terms in the fact
+  language.
 
 ## Next
 
-- **M3: Structs.** Value semantics, field access and assignment, passing and
-  returning by value.
 - **M4: Enums, `match`, optionals.** Sum types with exhaustive `match`, and
   `?T` with `if let`, `else` and `??`.
 - **M5: Errors.** `throws`, `try`, `catch`, error sets, `defer`/`errdefer`.

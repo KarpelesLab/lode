@@ -124,6 +124,7 @@ fn main() {
 | Unsafe | `unsafe fn`, `unsafe { ... }` |
 | Cleanup | `defer`, `errdefer` |
 | Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a.len` (see below) |
+| Struct | `struct Point { x: u32 ... }`, `Point{x: 1, y: 2}`, `p.x` (see below) |
 | Loop over a range or elements | `for i in 0..n { ... }`, `for x in xs { ... }` |
 
 ## Arrays, slices and `for`
@@ -170,6 +171,51 @@ fn main() -> u32 {
   `xs` is evaluated once, before the loop: if the body assigns to an array
   `xs`, the loop still goes over the elements it had when it started.
 - The loop variable is immutable. `break` and `continue` work as in `while`.
+
+## Structs
+
+**Status:** Proposed; implemented in the compiler
+
+```
+struct Point {
+	x: i32
+	y: i32
+}
+
+pub struct Rect {
+	min: Point
+	max: Point
+}
+
+fn width(r: Rect) -> i32 {
+	return r.max.x -% r.min.x
+}
+
+fn main() -> i32 {
+	var r = Rect{
+		min: Point{x: 0, y: 0},
+		max: Point{x: 4, y: 3},
+	}
+	r.max.x += 1
+	if r.min == (Point{x: 0, y: 0}) {
+		return width(r)
+	}
+	return 0
+}
+```
+
+- A declaration lists one field per line, `name: Type`. `pub struct` makes
+  the struct usable from other packages.
+- `Name{field: value, ...}` is a literal. Every field is given exactly once,
+  in any order. The values are evaluated in the order they're written. A
+  literal can span lines, with a comma after each field, the last one too.
+- `pkg.Name` is another package's struct, in a type or a literal:
+  `geo.Point{x: 1, y: 2}`.
+- `p.x` is a field. `p.x = v` and `p.a.b op= v` assign to a field of a `var`
+  struct; fields and indexes mix: `ps[i].x`, `p.steps[i]`.
+- In the header of `if`, `while` and `for`, a `{` after a name starts the
+  block, as in Go. A struct literal there goes in parentheses:
+  `if p == (Point{x: 0, y: 0}) {`.
 
 ## Open questions
 

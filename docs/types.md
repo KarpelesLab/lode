@@ -108,9 +108,10 @@ semantics.
   until they're checked.
 - Every `a[i]` must be [proven](safety.md#the-fact-language) to be in
   bounds. The index can have any integer type.
-- Not yet: passing or returning an array by value (take a slice instead),
-  returning a slice, comparing arrays with `==`, slicing (`a[i..j]`), and
-  `a.get(i)`.
+- Arrays are passed and returned by value, like structs (see
+  [Structs](#in-the-compiler-today-1)). `a == b` compares two arrays of the
+  same type element by element.
+- Not yet: returning a slice, slicing (`a[i..j]`), and `a.get(i)`.
 
 ### Structs
 
@@ -128,6 +129,42 @@ let p = Point{x: 1, y: 2}
 - Field order in memory is **unspecified** unless the struct is marked
   `@layout(c)` or `@layout(packed)`. This lets the compiler reorder fields per
   target (for example to reduce padding on 8-bit targets).
+- Structs are **nominal**: two struct declarations are two types, even with
+  the same fields.
+- A struct holds its fields by value, so it can't contain itself, directly or
+  through other structs or arrays. A field can't be a view (`str`, `[]T`):
+  views are never stored in structs ([memory.md](memory.md#views)).
+- **Open:** field visibility. Today a struct's fields are visible wherever
+  the struct is, and `pub` applies to the whole struct. Private fields (for
+  types that keep an invariant) are likely to come with methods.
+
+#### In the compiler today
+
+**Status:** Implemented subset (syntax in [syntax.md](syntax.md#structs))
+
+- Field types: integers, `bool`, arrays and other structs. Arrays and slices
+  of structs work too. Not yet: pointer fields, field defaults, structs
+  without fields, generic structs and `@layout`.
+- A struct is a value, like an array. `let q = p` and `q = p` copy it, and
+  changing `p` afterwards doesn't change `q`. Fields of a `var` struct can be
+  assigned, also nested and with `op=`: `r.min.x = 1`, `ps[i].y += 2`.
+- Structs and arrays are passed and returned by value. A parameter is
+  read-only, so the callee reads the caller's value in place, without a copy
+  ([memory.md](memory.md#in-the-compiler-today)).
+- `a == b` and `a != b` work on two structs of the same type: they compare
+  every field, recursively. Every field type supported today has `==`, so
+  every struct does. Equality is automatic for now; whether it should be
+  opt-in is still Open (see [Operators](#operators)). `<` and the other
+  orderings don't apply to structs.
+- In memory, fields are laid out in declaration order with natural
+  alignment (LatticeFoundry's struct layout). This is not a promise: see the
+  unspecified field order above.
+- Another package's public struct is `pkg.Name`, in types and in literals
+  (`geo.Point{x: 1, y: 2}`). Using a struct that isn't `pub` from another
+  package is an error.
+- The proof checker knows the integer fields of struct locals
+  ([safety.md](safety.md#the-fact-language)): after `if p.x < 10`, `p.x + 1`
+  is proven.
 
 ### Enums (sum types)
 
