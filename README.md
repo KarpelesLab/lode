@@ -66,20 +66,20 @@ fn clamp_to_u8(x: i32) -> u8 {
 	if x > 255 {
 		return 255
 	}
-	return u8(x)          // proven: 0 <= x <= 255 here
+	return u8(x) // proven: 0 <= x <= 255 here
 }
 
 fn distance(a: u64, b: u64) -> u64 {
 	if a >= b {
-		return a - b      // proven: b <= a
+		return a - b // proven: b <= a
 	}
-	return b - a          // proven: a < b
+	return b - a // proven: a < b
 }
 
 fn count_rises(xs: []u32) -> u32 {
 	var n: u32 = 0
 	for i in 1..xs.len {
-		if xs[i - 1] < xs[i] {    // proven: 1 <= i < xs.len
+		if xs[i - 1] < xs[i] { // proven: 1 <= i < xs.len
 			n = n +% 1
 		}
 	}
@@ -96,8 +96,8 @@ target/debug/lode build program.lode -O2  # write ./program
 target/debug/lode build program.lode --emit=ir
 target/debug/lode build program.lode --stack-usage  # frames, worst-case stack
 target/debug/lode check program.lode
-target/debug/lode fmt src/                 # rewrite .lode files in canonical form
-target/debug/lode fmt --check src/         # list non-canonical files, exit 1 if any
+target/debug/lode fmt program.lode        # rewrite in canonical form
+target/debug/lode fmt --check std/        # list non-canonical .lode files, exit 1 if any
 ```
 
 The canonical format is described in
@@ -105,8 +105,9 @@ The canonical format is described in
 
 ## Working on the compiler
 
-`cargo test` runs unit tests and the programs in `tests/programs/`; each one
-declares its expected exit status or errors in its first comment lines.
+`cargo test` runs unit tests, the integration tests in `tests/`, and the
+programs in `tests/programs/`; each program declares its expected exit status,
+standard output or errors in its first comment lines.
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on x86-64
 Linux for every push to `master` and every pull request: `cargo fmt --check`,

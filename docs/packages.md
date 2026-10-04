@@ -124,8 +124,8 @@ Proposal:
 
 1. **Producing C-ABI shared libraries** (`.so`, `.dll`) is supported, so Lode
    can provide libraries to other languages. The exported API uses C types
-   only. LatticeFoundry doesn't output shared libraries yet, so this is a
-   backend requirement ([backend.md](backend.md)).
+   only. LatticeFoundry can output shared libraries since `0.0.2`
+   ([backend.md](backend.md#available-in-lf-002)); Lode doesn't use it yet.
 2. **Consuming C shared libraries** works through FFI, as above.
 3. **Lode-to-Lode dynamic linking with a Lode ABI** is a **non-goal** for
    now. Embedded build metadata covers the tracking use case. Revisit later if

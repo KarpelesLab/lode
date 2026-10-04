@@ -7,6 +7,11 @@ a **Status:** line:
 - **Proposed**: the current best idea, written down so it can be argued with.
 - **Open**: not decided yet. The options are listed.
 
+Sections on what the compiler does today are **Implemented** (or
+**Implemented subset**, when only part of the design is there). A design
+the compiler already follows says so after its status: "Proposed; implemented
+in the compiler".
+
 The syntax in the code examples is provisional (see [syntax.md](syntax.md)).
 The examples show semantics. They are not a grammar.
 

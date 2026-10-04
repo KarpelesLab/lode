@@ -20,6 +20,10 @@ itself is in the other documents; this one is only about order.
   value, derived `==`, and fields of struct locals as terms in the fact
   language.
 
+Alongside the milestones (2026-10-04): `lode fmt`, `lode build
+--stack-usage`, CI on GitHub Actions, and lowering only the functions `main`
+reaches. Hello world is now 655 bytes, still 2 syscalls.
+
 ## Next
 
 - **M4: Enums, `match`, optionals.** Sum types with exhaustive `match`, and
@@ -31,6 +35,7 @@ itself is in the other documents; this one is only about order.
 - **M7: Generics and traits** (and `comptime`, which they're built on).
 
 Later, in no fixed order yet: refinements in signatures, the allocator
-context and heap types, globals with `Atomic`/`Mutex`, stack bounds (LF
-already reports stack usage), green threads, other targets through
-`comptime`, `lode fmt`, and self-hosting.
+context and heap types, globals with `Atomic`/`Mutex`, the rest of stack
+bounds (the bound in the binary, profiles that require one; `--stack-usage`
+already reports it), green threads, other targets through `comptime`, and
+self-hosting.

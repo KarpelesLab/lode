@@ -95,8 +95,8 @@ semantics.
 
 **Status:** Implemented subset (syntax in [syntax.md](syntax.md#arrays-slices-and-for))
 
-- Element types: integers, `bool`, and arrays (`[4][4]u8`). Arrays and slices
-  of other types are not supported yet.
+- Element types: integers, `bool`, arrays (`[4][4]u8`) and structs. Arrays
+  and slices of other types (`str`, pointers, slices) are not supported yet.
 - An array is a value. `let b = a` copies the elements, and changing `a`
   afterwards doesn't change `b`. Array locals live on the stack.
 - A slice is a read-only view, a pointer and a length, like `str`. Assigning
@@ -352,5 +352,5 @@ The compiler guarantees these rules at the language level, and **LatticeFoundry
 must preserve them** through optimization. No pass may turn secret-dependent
 data flow into control flow, and instruction selection must avoid
 variable-time instructions on secrets (for example, division on some CPUs). See
-[backend.md](backend.md#needed-for-the-safety-story). Prior art: FaCT, Jasmin, and the Rust
+[backend.md](backend.md#available-in-lf-002). Prior art: FaCT, Jasmin, and the Rust
 `subtle` crate (which is best-effort, not guaranteed).

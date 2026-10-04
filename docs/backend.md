@@ -25,9 +25,10 @@ ELF, linker, DWARF), and a backend written *in Lode* can't exist until the
 language can express it.
 
 - **Now:** LF is the backend of the Rust compiler. Lode depends on released
-  LF versions from crates.io (first: `0.0.0`) and updates only to new
-  releases. It never builds against a local LF checkout. Features Lode needs are tracked
-  below; LF bugs Lode finds are reported as reproducible IR tests.
+  LF versions from crates.io (first `0.0.0`, now `0.0.2`) and updates only to
+  new releases. It never builds against a local LF checkout. Features Lode
+  needs are tracked below; LF bugs Lode finds are reported as reproducible IR
+  tests.
 - **At self-hosting:** the Lode compiler's backend is written in Lode, as a port
   of LF's design (its IR design and tenets are documented). That's the
   "Lode-based LLVM". It also removes the need for a self-hosted compiler to
@@ -54,10 +55,10 @@ language can express it.
   structures, arenas and indices (LF's style already) rather than Rust-specific
   patterns that won't translate.
 
-**Current state:** a scaffold in `src/`: lexer, parser, checker (types and a
-first version of the proof-obligation checker, using value ranges of
-literals, immutable bindings and types, without narrowing on conditions yet),
-and lowering to LF IR. The `lode` command builds static x86-64 Linux
+**Current state:** the compiler in `src/` has a lexer, a parser, the
+formatter (`lode fmt`), a checker (types, and the flow-sensitive proof checker
+of [safety.md](safety.md#the-fact-language)), and lowering to LF IR of only
+the functions `main` reaches. The `lode` command builds static x86-64 Linux
 executables through LF's own linker. See the README for the supported subset.
 
 ## Why it fits

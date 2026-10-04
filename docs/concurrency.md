@@ -222,8 +222,9 @@ zero. That's why this is the fallback and not the default.
   read-modify-write operations where the target has them (safe against an
   interrupt on the same core, and cheaper than locked atomics), or the
   no-preemption counter otherwise.
-- **Backend.** LatticeFoundry needs to provide the full-context trampoline and
-  the yield-point insertion ([backend.md](backend.md#needed-for-the-safety-story)).
+- **Backend.** LatticeFoundry provides the full-context trampoline, signal
+  preemption and yield-point insertion since `0.0.2`
+  ([backend.md](backend.md#available-in-lf-002)).
 
 ### Still open (green threads)
 
