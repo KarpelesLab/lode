@@ -171,4 +171,7 @@ Decisions made for this subset:
 - **Bugs** (violated invariants) aren't handled at runtime at all. The safety
   model makes them compile errors where it can ([safety.md](safety.md)).
 - **`abort()`** exists for "this program can't continue", but it is explicit,
-  and there is no `panic`/`recover`.
+  and there is no `panic`/`recover`. In the compiler today, it's `os.abort()`,
+  a [`never`](types.md#never-in-the-compiler-today) function that exits with
+  status 134 (what a shell shows for `SIGABRT`), without raising the signal
+  ([packages.md](packages.md)).

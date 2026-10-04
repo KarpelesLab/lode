@@ -41,7 +41,10 @@ What works:
 
 - functions, `let`/`var` (`var x: u32` assigned later),
   `if`/`while`/`loop`/`for`, `break`/`continue`, `const`
-- integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
+- integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`,
+  and `never` for functions that don't return (`fn fail() -> never`): code
+  after a call to one can't be reached, and the checker verifies they don't
+  return
 - arrays (`[4]u8`, `[0; 16]`, `[[1, 2], [3, 4]]`) and slices (`[]u8`),
   read-only except as an `inout` parameter; an array is passed where a slice
   is expected; slicing (`a[i..j]`, `a[i..]`, `a[..j]`), proven in bounds
@@ -79,7 +82,8 @@ What works:
   which throw an `os.Error`
 - input: `io.stdin().read(&buf)` (the bytes it got, 0 at the end) and
   `io.stdin().read_full(&buf)` (until `buf` is full or the input ends),
-  which throw an `os.Error`; `os.exit(code)` ends the process at once
+  which throw an `os.Error`; `os.exit(code)` and `os.abort()` end the
+  process at once
 - `s.bytes()`, the bytes of a `str` as a read-only `[]u8` (sliced with
   `s.bytes()[i..j]`; a `str` itself can't be sliced yet), and returning a
   `str` literal from a function (`fn Day.name(self) -> str`)

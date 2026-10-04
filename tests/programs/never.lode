@@ -1,0 +1,124 @@
+// stdout: 7 9 7 5 7\n
+// exit: 134
+package main
+
+import "std/io"
+import "std/os"
+
+enum Failure {
+	bad
+}
+
+fn check(x: u32) throws(Failure) -> u32 {
+	if x > 100 {
+		throw .bad
+	}
+	return x
+}
+
+// Every path of a `never` function ends in a call to another one, or in an
+// endless loop.
+fn fail(code: i32) -> never {
+	io.print("failing\n")
+	os.exit(code)
+}
+
+fn spin() -> never {
+	loop {}
+}
+
+// After an `if` whose branch calls `fail`, the facts of the other path
+// hold: here `x <= 255`.
+fn to_u8(x: u32) -> u8 {
+	if x > 255 {
+		fail(1)
+	}
+	return u8(x)
+}
+
+// A call to a `never` function leaves, like `return`: `pick` needs no
+// `return` at its end.
+fn pick(n: u32) -> u32 {
+	if n == 0 {
+		spin()
+	}
+	match n {
+		1 => return 7
+		_ => fail(2)
+	}
+}
+
+// In a `let ... else` and in a `catch` block, which must leave.
+fn larger(opt: ?u32, x: u32) -> u32 {
+	let v = opt else {
+		fail(3)
+	}
+	let w = check(x) catch _ {
+		os.exit(4)
+	}
+	if w > v {
+		return w
+	}
+	return v
+}
+
+// Where a value is expected, a call to a `never` function stands for any
+// type: after `??`, it runs only on `none`.
+fn or_fail(opt: ?u32) -> u32 {
+	let v: u32 = opt ?? fail(5)
+	return v
+}
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+// Values of every kind: a view, a value in memory.
+fn name(ok: bool) -> str {
+	if ok {
+		return "name"
+	}
+	return fail(6)
+}
+
+fn origin(opt: ?Point) -> Point {
+	let p: Point = opt ?? fail(7)
+	return p
+}
+
+// In a generic function: `get` needs no `return` after `fail`, and
+// `fail_with` is a generic `never` function.
+fn get[T: Copy](opt: ?T) -> T {
+	if let v = opt {
+		return v
+	}
+	fail(8)
+}
+
+fn fail_with[T: Integer](code: T) -> never {
+	io.print_int(code)
+	os.exit(9)
+}
+
+fn or_fail_with[T: Integer](opt: ?T, code: T) -> T {
+	return opt ?? fail_with(code)
+}
+
+fn main() -> u8 {
+	io.print_int(to_u8(7))
+	io.print(" ")
+	let p = origin(Point{x: 0, y: 1})
+	if name(true).len != 4 || p.y != 1 {
+		return 1
+	}
+	io.print_int(larger(9, 3))
+	io.print(" ")
+	io.print_int(pick(1))
+	io.print(" ")
+	io.print_int(or_fail(5))
+	io.print(" ")
+	io.print_int(get[u16](6) +% u16(or_fail_with[u8](1, 2)))
+	io.print("\n")
+	os.abort()
+}

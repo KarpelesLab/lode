@@ -1,0 +1,64 @@
+// error: `falls_off` is declared `-> never`, but can reach the end of its body
+// error: `generic` is declared `-> never`, but can reach the end of its body
+// error: `on_one_path` is declared `-> never`, but can reach the end of its body
+// error: `breaks_out` is declared `-> never`, but can reach the end of its body
+// error: this function is declared `-> never`, so it can't return
+// error: this call never returns, so there's no value to store
+// error: `never` is only a function's return type
+// error: `never` is only a function's return type
+// error: a `never` function can't throw
+// error: `in_and` can reach the end of its body without returning a value
+// help: end it with a call to another `never` function
+package main
+
+import "std/os"
+
+enum E {
+	bad
+}
+
+fn falls_off() -> never {
+}
+
+fn generic[T: Copy](x: T) -> never {
+	let y = x
+}
+
+fn on_one_path(x: u32) -> never {
+	if x > 0 {
+		os.exit(1)
+	}
+}
+
+fn breaks_out() -> never {
+	loop {
+		break
+	}
+}
+
+fn returns() -> never {
+	return
+}
+
+fn stores() {
+	let x = os.exit(1)
+}
+
+fn takes(x: never) {
+}
+
+fn holds() {
+	var x: ?never = none
+}
+
+fn throws_too() throws(E) -> never {
+	throw .bad
+}
+
+// The right side of `&&` may not run, so it doesn't make the statement
+// leave.
+fn in_and(a: bool) -> u32 {
+	if a && os.exit(1) {
+		return 1
+	}
+}

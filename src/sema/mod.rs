@@ -74,8 +74,11 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
                 ),
             );
         }
-        if !matches!(ret, Ty::Unit | Ty::Int(_)) {
-            ck.error(span, "`main` must return nothing or an integer exit status");
+        if !matches!(ret, Ty::Unit | Ty::Int(_) | Ty::Never) {
+            ck.error(
+                span,
+                "`main` must return nothing, an integer exit status or `never`",
+            );
         }
         if !ck.sigs[id].type_params.is_empty() {
             ck.error(span, "`main` can't be generic");
@@ -303,6 +306,9 @@ const INDEX: &str = "$i";
 /// The hidden local holding the value a `match`, an `if let` or a
 /// `let ... else` looks into, unless it's already a local.
 const MATCHED: &str = "$match";
+
+/// The return type of a function that doesn't return.
+const NEVER: &str = "never";
 
 /// The blocks of the `catch`es in an expression, at any depth.
 fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
@@ -754,7 +760,7 @@ fn storable(ty: Ty) -> Result<(), Option<()>> {
         | Ty::Optional(_)
         | Ty::Param(_) => Ok(()),
         Ty::Str | Ty::Slice(_) => Err(Some(())),
-        Ty::Ptr(_) | Ty::Unit | Ty::Result(_) => Err(None),
+        Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) => Err(None),
     }
 }
 
@@ -1381,6 +1387,13 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            TypeExpr::Named(id) if id.name == NEVER => {
+                self.diags.push(
+                    Diagnostic::error(id.span, "`never` is only a function's return type")
+                        .with_help("there are no values of type `never`: a call to a `never` function doesn't return"),
+                );
+                None
+            }
             TypeExpr::Named(id) if Self::type_param(cx, &id.name).is_some() => {
                 Self::type_param(cx, &id.name)
             }
@@ -1495,6 +1508,16 @@ impl<'a> Checker<'a> {
             params.push((ty, convention, p.name.name.clone()));
         }
         let ret = match &f.ret {
+            // `never` is only a return type (docs/types.md).
+            Some(TypeExpr::Named(id)) if id.name == NEVER => {
+                if f.throws.is_some() {
+                    self.diags.push(
+                        Diagnostic::error(id.span, "a `never` function can't throw")
+                            .with_help("it never returns, with a value or with an error"),
+                    );
+                }
+                Ty::Never
+            }
             Some(t) => match self.resolve_type(cx, t) {
                 // A `str` with static storage can be returned (see
                 // `check_str_returns`).
@@ -1809,7 +1832,18 @@ impl<'a> Checker<'a> {
         self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
         debug_assert!(cx.failed.is_empty() || crate::diag::has_errors(&self.diags));
-        if ret != Ty::Unit && !terminates(&body) {
+        if ret == Ty::Never && !terminates(&body) {
+            self.diags.push(
+                Diagnostic::error(
+                    f.name.span,
+                    format!(
+                        "`{}` is declared `-> never`, but can reach the end of its body",
+                        f.name.name
+                    ),
+                )
+                .with_help("every path must end in a call to another `never` function (like `os.exit`), or an endless `loop`"),
+            );
+        } else if ret != Ty::Unit && !terminates(&body) {
             self.error(
                 f.name.span,
                 format!(
@@ -2298,6 +2332,16 @@ impl<'a> Checker<'a> {
                     self.error(init.span, "this expression has no value to store");
                     return None;
                 }
+                if value.ty() == Ty::Never {
+                    self.diags.push(
+                        Diagnostic::error(
+                            init.span,
+                            "this call never returns, so there's no value to store",
+                        )
+                        .with_help("call it on its own: the code after it can't be reached"),
+                    );
+                    return None;
+                }
                 self.consume(cx, &value.expr, init.span)?;
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
                 self.check_kept_view(cx, &value, init.span)?;
@@ -2410,6 +2454,14 @@ impl<'a> Checker<'a> {
             }),
             // Only reached for a `defer` outside a block's statements.
             Stmt::Defer { body, on_error, .. } => self.defer(cx, body, *on_error, &[]),
+            Stmt::Return { span, .. } if cx.ret == Ty::Never => {
+                self.diags.push(
+                    Diagnostic::error(*span, "this function is declared `-> never`, so it can't return")
+                        .with_help("end it with a call to another `never` function (like `os.exit`), or an endless `loop`"),
+                );
+                // Kept as a `return`, to avoid a cascade of errors.
+                Some(TStmt::Return(None))
+            }
             Stmt::Return { value, span } => {
                 let value = match (value, cx.ret) {
                     (None, Ty::Unit) => None,
@@ -3126,7 +3178,9 @@ impl<'a> Checker<'a> {
                     otherwise.span,
                     "the `else` block of `let ... else` must leave",
                 )
-                .with_help("end it with `return`, `break` or `continue`"),
+                .with_help(
+                    "end it with `return`, `break`, `continue`, or a call to a `never` function like `os.exit`",
+                ),
             );
             // Its type is known: later uses are checked against it.
             if !cx.scopes.last().expect("scope").contains_key(&name.name) {
@@ -3921,7 +3975,8 @@ pub fn table_leaf(ty: Ty) -> Option<Ty> {
 /// strings.
 fn str_origin(cx: &FnCx, e: &TExpr) -> Option<Vec<LocalId>> {
     match &e.kind {
-        TExprKind::Str(_) | TExprKind::Call(..) => Some(Vec::new()),
+        // A call to a `never` function has no value at all.
+        TExprKind::Str(_) | TExprKind::Call(..) | TExprKind::Never(_) => Some(Vec::new()),
         TExprKind::Local(l) if *l >= cx.params => Some(vec![*l]),
         TExprKind::Try(call) => str_origin(cx, call),
         TExprKind::Catch { call, handler, .. } => {

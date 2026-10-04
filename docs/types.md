@@ -87,6 +87,33 @@ semantics.
 | `never` | Type of expressions that don't return (`abort()`, infinite `loop`). |
 | runes | Per encoding, e.g. `utf8.Rune`. See [strings.md](strings.md). |
 
+#### `never` in the compiler today
+
+**Status:** Implemented
+
+- `never` is only a function's return type: `fn fail(code: i32) -> never`.
+  There are no values of type `never`, so it can't be the type of a
+  parameter, a variable, a field or an element.
+- The checker verifies that a `never` function doesn't return: it has no
+  `return`, and every path through its body ends in a call to another
+  `never` function or in an endless `loop` (one without `break`). It can't
+  `throw` either. `os.exit` and `os.abort` are the `never` functions std
+  has ([packages.md](packages.md)).
+- A call to a `never` function leaves, like `return`: the code after it
+  can't be reached, and it counts as leaving for "missing return", for
+  joining facts after `if` and `match`
+  ([safety.md](safety.md#the-fact-language)), and for blocks that must
+  leave (`let ... else`, a `catch` block whose value is used). A statement
+  leaves this way when the call is always evaluated in it, not only on some
+  paths: `f(fail())` leaves, `a && fail()` and `opt ?? fail()` don't.
+- Where a value is expected, a call to a `never` function stands for any
+  type: `let v: u32 = opt ?? fail(1)`, `return fail(2)`. Without an
+  expected type (`let x = fail()`), it's an error: there's no value.
+- `main` may return `never`, and so may a generic function
+  (`fn fail_with[T: Integer](code: T) -> never`). `never` can't be a type
+  argument.
+- Lowering ends each call to a `never` function with `unreachable`.
+
 ## Composite types
 
 ### Arrays and slices

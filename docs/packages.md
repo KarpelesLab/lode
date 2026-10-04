@@ -45,13 +45,19 @@ Go's vocabulary, which is proven:
   - `read(fd, data: *u8, len: usize) -> isize` (one `read` system call,
     `unsafe` like `write`): the number of bytes read, 0 at the end of the
     input, or a negative error number.
-  - `exit(code: i32)` ends the process at once with status `code` (its low
-    8 bits). It's the `exit_group` system call, so it ends every thread, not
-    only the calling one. No `defer` or `errdefer` body runs, in the
-    function or its callers. Output isn't lost: there's no buffer, every
-    write is a system call. The language has no `never` type yet, so `exit`
-    returns `()` as far as the checker knows: a function that returns a
-    value still needs a `return` after the call, which never runs.
+  - `exit(code: i32) -> never` ends the process at once with status `code`
+    (its low 8 bits). It's the `exit_group` system call, so it ends every
+    thread, not only the calling one. No `defer` or `errdefer` body runs, in
+    the function or its callers. Output isn't lost: there's no buffer, every
+    write is a system call. It returns
+    [`never`](types.md#never-in-the-compiler-today), so the code after a call
+    can't be reached and needs no `return`. The checker doesn't know what a
+    system call does, so an endless `loop {}` follows `exit_group` in its
+    body: it never runs, and costs one jump.
+  - `abort() -> never` ends the process because it can't go on
+    ([errors.md](errors.md#what-is-not-an-error)): `exit(134)`, the status a
+    shell shows for a process killed by `SIGABRT`. No signal is raised, so
+    there's no core dump.
   - `Error`, the errors std reports, from the error numbers `write` and
     `read` can give: `bad_fd` (`EBADF`), `broken_pipe` (`EPIPE`), `no_space`
     (`ENOSPC`, `EDQUOT`), `io` (`EIO`, or a result the kernel never gives),

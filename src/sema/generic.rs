@@ -350,7 +350,7 @@ impl Checker<'_> {
                 );
                 None
             }
-            Ty::Ptr(_) | Ty::Unit | Ty::Result(_) => {
+            Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) => {
                 self.error(
                     span,
                     format!("`{ty}` as a type argument is not supported by the compiler yet"),

@@ -63,6 +63,10 @@ pub enum Ty {
     Int(IntTy),
     Bool,
     Unit,
+    /// The return type of a function that never returns (docs/types.md):
+    /// every path in it ends the process or loops forever. A call to one
+    /// has no value; where a value is expected, it stands for any type.
+    Never,
     /// A UTF-8 string view: a pointer and a length in bytes. The standard
     /// library's `Str[E]` will replace it once there are generics
     /// (docs/strings.md); `str` stays the name for `Str[utf8]`.
@@ -805,6 +809,7 @@ impl fmt::Display for Ty {
             Ty::Int(t) => t.fmt(f),
             Ty::Bool => f.write_str("bool"),
             Ty::Unit => f.write_str("()"),
+            Ty::Never => f.write_str("never"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
             Ty::Param(id) => f.write_str(&param_def(*id).name),

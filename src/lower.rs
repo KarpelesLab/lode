@@ -132,7 +132,9 @@ impl Types {
     /// The IR type of a single-valued Lode type.
     fn of(&self, ty: Ty) -> TypeId {
         match ty {
-            Ty::Unit => self.void,
+            // A `never` function returns nothing: its calls are followed by
+            // `unreachable`.
+            Ty::Unit | Ty::Never => self.void,
             Ty::Bool => self.bool,
             Ty::Int(t) => self.int(t),
             Ty::Ptr(_) => self.ptr,
@@ -147,7 +149,7 @@ impl Types {
     /// The IR values a Lode value is made of, as parameter types.
     fn parts(&self, ty: Ty) -> Vec<TypeId> {
         match ty {
-            Ty::Unit => Vec::new(),
+            Ty::Unit | Ty::Never => Vec::new(),
             Ty::Str | Ty::Slice(_) => vec![self.ptr, self.i64],
             _ if ty.in_memory() => vec![self.ptr],
             _ => vec![self.of(ty)],
@@ -1062,12 +1064,12 @@ impl FnLower<'_> {
                 self.throw(value);
                 let dead = self.b.create_block(&[]);
                 self.start_block(dead);
-                if e.ty.in_memory() {
-                    let ir_ty = self.ir_ty(e.ty);
-                    return Val::Mem(self.b.alloca(ir_ty));
-                }
-                let ir_ty = self.t.of(e.ty);
-                self.b.poison(ir_ty)
+                return self.no_value(e.ty);
+            }
+            // The call ends in `unreachable`, in a block of its own.
+            TExprKind::Never(call) => {
+                self.expr(call);
+                return self.no_value(e.ty);
             }
             TExprKind::EnumValue(inner) => {
                 let base = self.place(inner);
@@ -1177,8 +1179,30 @@ impl FnLower<'_> {
         Val::One(v)
     }
 
+    /// A placeholder value of type `ty`, in a block no path reaches (after
+    /// a `throw` or a call to a `never` function).
+    fn no_value(&mut self, ty: Ty) -> Val {
+        match ty {
+            Ty::Unit | Ty::Never => Val::Unit,
+            Ty::Str | Ty::Slice(_) => {
+                let p = self.b.poison(self.t.ptr);
+                Val::View(p, self.b.poison(self.t.i64))
+            }
+            _ if ty.in_memory() => {
+                let ir_ty = self.ir_ty(ty);
+                Val::Mem(self.b.alloca(ir_ty))
+            }
+            _ => {
+                let ir_ty = self.t.of(ty);
+                Val::One(self.b.poison(ir_ty))
+            }
+        }
+    }
+
     /// A call. A result in memory is written to `dst`, which must be fresh
-    /// storage (see the module docs).
+    /// storage (see the module docs). A call to a `never` function is
+    /// followed by `unreachable`, and what comes after it goes in a new
+    /// block that no path reaches.
     fn call(&mut self, f: usize, args: &[TExpr], ret: Ty, dst: Option<ValueId>) -> Val {
         let mut values: Vec<ValueId> = dst.into_iter().collect();
         for a in args {
@@ -1191,7 +1215,13 @@ impl FnLower<'_> {
         } else {
             self.t.of(ret)
         };
-        match (self.b.call(callee, &values, ret_ty), dst) {
+        let result = self.b.call(callee, &values, ret_ty);
+        if ret == Ty::Never {
+            self.b.unreachable();
+            let dead = self.b.create_block(&[]);
+            self.start_block(dead);
+        }
+        match (result, dst) {
             (_, Some(p)) => Val::Mem(p),
             (Some(v), None) => Val::One(v),
             (None, None) => Val::Unit,

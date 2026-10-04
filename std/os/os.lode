@@ -123,11 +123,21 @@ pub fn write_all(fd: i32, b: []u8) -> isize {
 /// or `errdefer` body, in this function or its callers. There's no output
 /// buffer to lose, since every write is a system call.
 ///
-/// The language has no `never` type yet, so `exit` returns `()` as far as
-/// the checker knows: a function that must return a value still needs a
-/// `return` after it, which never runs.
-pub fn exit(code: i32) {
+/// It returns `never`: the code after a call to it can't be reached, and a
+/// function that returns a value needs no `return` after it. `exit_group`
+/// doesn't return, but the checker doesn't know what a system call does, so
+/// an endless `loop` follows it. It never runs, and costs one jump.
+pub fn exit(code: i32) -> never {
 	unsafe {
 		syscall(SYS_EXIT_GROUP, code)
 	}
+	loop {}
+}
+
+/// End the process now, because it can't go on (docs/errors.md): with exit
+/// status 134, the one a shell shows for a process killed by `SIGABRT` (128
+/// plus 6). It's `exit(134)`, written so that it's easy to find: no signal
+/// is raised, so there's no core dump, and nothing else runs.
+pub fn abort() -> never {
+	exit(134)
 }

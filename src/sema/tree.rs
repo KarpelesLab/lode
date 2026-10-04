@@ -265,6 +265,10 @@ pub enum TExprKind {
     /// `inout` slice, or a [`TExprKind::Slice`] of an array or `inout`
     /// slice. Of the place's type.
     Ref(Box<TExpr>),
+    /// A call to a `never` function (a [`TExprKind::Call`] of type
+    /// [`Ty::Never`]) where a value of another type is expected, as in
+    /// `opt ?? fail()`. The call doesn't return, so there's never a value.
+    Never(Box<TExpr>),
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -383,7 +387,8 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::EnumFrom(inner)
         | TExprKind::Try(inner)
         | TExprKind::Throw(inner)
-        | TExprKind::Ref(inner) => vec![inner],
+        | TExprKind::Ref(inner)
+        | TExprKind::Never(inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],
@@ -471,7 +476,8 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::EnumFrom(inner)
         | TExprKind::Try(inner)
         | TExprKind::Throw(inner)
-        | TExprKind::Ref(inner) => vec![inner],
+        | TExprKind::Ref(inner)
+        | TExprKind::Never(inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],
@@ -503,9 +509,32 @@ fn stmt_blocks(s: &TStmt) -> Vec<&[TStmt]> {
     out
 }
 
+/// Whether evaluating `e` always calls a `never` function: `e` is such a
+/// call, or one of the subexpressions always evaluated with it is (not the
+/// right side of `&&`, `||` or `??`, nor a `catch` handler, which may not
+/// run).
+pub fn expr_diverges(e: &TExpr) -> bool {
+    if e.ty == Ty::Never {
+        return true;
+    }
+    match &e.kind {
+        TExprKind::And(l, _) | TExprKind::Or(l, _) | TExprKind::Coalesce(l, _) => expr_diverges(l),
+        TExprKind::Catch { call, .. } => expr_diverges(call),
+        _ => subexprs(e).into_iter().any(expr_diverges),
+    }
+}
+
+/// Whether statement `s` always calls a `never` function in the
+/// expressions it evaluates itself (a value, a condition, a bound): the
+/// code after it can't be reached, as after a `return`.
+fn stmt_calls_never(s: &TStmt) -> bool {
+    stmt_exprs(s).into_iter().any(expr_diverges)
+}
+
 /// Whether control can't fall off the end of `stmts` (for "missing return").
 pub fn terminates(stmts: &[TStmt]) -> bool {
     stmts.iter().any(|s| match s {
+        _ if stmt_calls_never(s) => true,
         TStmt::Return(_) | TStmt::Throw(_) => true,
         TStmt::If(_, then, otherwise) => terminates(then) && terminates(otherwise),
         TStmt::Loop(body) => !breaks(body),
@@ -516,9 +545,11 @@ pub fn terminates(stmts: &[TStmt]) -> bool {
 }
 
 /// Whether control can't reach the statement after `stmts`: every path ends
-/// in `return`, `break` or `continue`, or an endless loop.
+/// in `return`, `break` or `continue`, a call to a `never` function, or an
+/// endless loop.
 pub fn diverges(stmts: &[TStmt]) -> bool {
     stmts.iter().any(|s| match s {
+        _ if stmt_calls_never(s) => true,
         TStmt::Return(_) | TStmt::Throw(_) | TStmt::Break | TStmt::Continue => true,
         TStmt::If(_, then, otherwise) => diverges(then) && diverges(otherwise),
         TStmt::Loop(body) => !breaks(body),

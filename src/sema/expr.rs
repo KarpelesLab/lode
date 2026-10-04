@@ -110,7 +110,7 @@ fn under_optionals(mut ty: Ty) -> Ty {
 /// Whether a value of type `from` can be used where `to` is expected (see
 /// [`Checker::coerce`]).
 pub(super) fn coercible(from: Ty, to: Ty) -> bool {
-    if from == to {
+    if from == to || from == Ty::Never {
         return true;
     }
     match (from, to) {
@@ -523,6 +523,14 @@ impl Checker<'_> {
     ) -> Option<Checked> {
         if c.ty() == target {
             return Some(c);
+        }
+        // A call that doesn't return stands for a value of any type.
+        if c.ty() == Ty::Never && target != Ty::Unit {
+            return Some(Checked::new(
+                TExprKind::Never(Box::new(c.expr)),
+                target,
+                None,
+            ));
         }
         if let Some(inner) = target.as_optional()
             && coercible(c.ty(), inner)
@@ -1017,7 +1025,7 @@ impl Checker<'_> {
                                 "this `catch` block must leave, since the call's value (a `{ty}`) is used"
                             ),
                         )
-                        .with_help("end it with `return`, `throw`, `break` or `continue`")
+                        .with_help("end it with `return`, `throw`, `break`, `continue`, or a call to a `never` function like `os.exit`")
                         .with_help("or give a value to use instead: `catch 0`"),
                     );
                     // The value is kept, so checking goes on without more
@@ -2997,6 +3005,11 @@ impl Checker<'_> {
             }
         }
         cx.call_sets = sets;
+        // Nothing after a call to a `never` function runs: what follows it
+        // can't be reached, as after a `return`.
+        if sig_ret == Ty::Never {
+            cx.env.dead = true;
+        }
         if !ok {
             return None;
         }

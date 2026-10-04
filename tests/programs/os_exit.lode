@@ -5,17 +5,15 @@ package main
 import "std/io"
 import "std/os"
 
-fn stop(code: i32) {
+fn stop(code: i32) -> never {
 	io.print("before exit\n")
 	os.exit(code)
-	io.print("not printed\n")
 }
 
 // `os.exit` ends the process at once, with its status: output already
 // written stays written (there's no buffer), and `defer` bodies don't run.
+// `stop` returns `never`, so `main` needs no `return` after it.
 fn main() -> u8 {
 	defer io.print("deferred, not printed\n")
 	stop(3)
-	// The checker doesn't know `stop` never returns.
-	return 9
 }
