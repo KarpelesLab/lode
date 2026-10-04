@@ -1473,7 +1473,7 @@ impl Checker<'_> {
         };
         for (c, ast) in [(&s, start), (&e, end)] {
             if let (Some(c), Some(ast)) = (c, ast)
-                && c.ty().as_int().is_none()
+                && num(c.ty()).is_none()
             {
                 self.error(
                     ast.span,

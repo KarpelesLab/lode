@@ -437,8 +437,9 @@ high, the only exception we'd consider is a numeric trait with algebraic laws
 
 ## Generics and traits
 
-**Status:** Proposed. The detailed proposal for M7 is in
-[generics.md](generics.md).
+**Status:** Proposed; generic functions over the built-in traits are
+implemented (see [In the compiler today](#in-the-compiler-today-5)). The
+detailed proposal for M7 is in [generics.md](generics.md).
 
 Generics are compile-time parameters (see [comptime.md](comptime.md)).
 **Traits** constrain them so that a generic function is type-checked once, at
@@ -446,11 +447,11 @@ its definition, instead of failing deep inside an instantiation (the Zig and C++
 template problem):
 
 ```
-trait Ordered {
-	fn cmp(a: Self, b: Self) -> Ordering
+trait Ordered: Eq {
+	fn cmp(self, other: Self) -> Ordering
 }
 
-fn max[T: Ordered](a: T, b: T) -> T {
+fn max[T: Ordered](sink a: T, sink b: T) -> T {
 	if a.cmp(b) == .less {
 		return b
 	}
@@ -462,9 +463,38 @@ fn max[T: Ordered](a: T, b: T) -> T {
   choose to share code between instantiations to save space on small targets
   ([backend.md](backend.md)).
 - Dynamic dispatch is explicit: `dyn Trait` (Open: exact form).
-- **Open:** trait coherence (orphan rules). Go-like "interfaces are satisfied
-  implicitly" is easier to read. Rust-like explicit `impl` gives better errors
-  and no accidental conformance. Leaning explicit.
+- Traits are implemented in explicit `impl Trait for T { ... }` blocks
+  (Decided, [generics.md](generics.md#decisions)). Coherence: the
+  recommendation is in [generics.md](generics.md#coherence).
+
+### In the compiler today
+
+**Status:** Implemented subset (M7a; syntax in
+[syntax.md](syntax.md#generic-functions))
+
+- Generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, with
+  bounds from the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`,
+  `Unsigned` and `Signed`, joined with `+`. A generic body is checked once,
+  against its bounds; the errors at a call are about its arguments.
+- `Eq` gives `==` and `!=`. `Ordered` gives the methods `a.cmp(b)` (an
+  `Ordering`: `less`, `equal` or `greater`, a C-style enum of `i8` -1, 0
+  and 1) and `a.lt(b)`, `a.le(b)`, `a.gt(b)`, `a.ge(b)`; the integers and
+  `bool` have them too. Only a numeric bound gives operators, which mean
+  what they mean on the integers.
+- A `T` without `Copy` is moved, never copied: keeping a read-only
+  parameter or an element is an error, and a `let` or a `sink` parameter
+  can't be used after its value was moved out
+  ([generics.md](generics.md#copy-and-moves-in-generic-code)). Every type
+  but such a `T` is `Copy`.
+- Type arguments are written (`max[u32](a, b)`) or inferred from the
+  arguments, then from the type expected for the result. A type argument
+  can't be a view.
+- Each set of type arguments `main` reaches makes an instance with its
+  own symbol: `std/math.max[u32]`.
+- Facts about integer type parameters: [safety.md](safety.md#values-of-a-type-parameter).
+- Not yet: generic structs and enums, value parameters (`[N: usize]`),
+  generic methods, `trait` and `impl` (so `Ordered` for structs and enums),
+  `dyn`.
 
 ## `secret` types
 

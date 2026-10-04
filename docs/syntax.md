@@ -117,7 +117,7 @@ fn main() {
 | Compound assignment | `x += 1`, `x +%= 1`, `flags \|= bit`: every binary operator `op` has `x op= v` |
 | Function | `fn name(a: T, b: U) -> R { ... }` |
 | Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
-| Generic parameters | `fn max[T: Ordered](a: T, b: T) -> T` |
+| Generic parameters | `fn max[T: Ordered](sink a: T, sink b: T) -> T` |
 | Parameter conventions | `inout x: T`, `sink x: T`, `set x: T`, passed `f(&x)` (see below) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
 | Visibility | `pub` (default is package-private) |
@@ -449,14 +449,60 @@ fn main() -> u32 {
   `pkg.Type.name(...)` one of another package.
 - `var name: T` without a value declares a variable to assign later.
 
+## Generic functions
+
+**Status:** Proposed; implemented in the compiler (M7a, semantics in
+[types.md](types.md#in-the-compiler-today-5) and
+[generics.md](generics.md#m7a-in-the-compiler))
+
+```
+import "std/io"
+
+fn largest[T: Ordered + Copy](xs: []T) -> ?T {
+	if xs.len == 0 {
+		return none
+	}
+	var best = xs[0]
+	for x in xs {
+		if best.lt(x) {
+			best = x
+		}
+	}
+	return best
+}
+
+fn sum[T: Integer](xs: []T) -> T {
+	var total: T = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+fn main() {
+	let a: [3]u8 = [4, 9, 2]
+	io.print_int(largest(a) ?? 0)          // T is u8, from the argument
+	io.print_int(sum[u8](a))               // written: u8
+}
+```
+
+- `fn name[T, U: Bound + Bound](...)` declares type parameters in brackets
+  after the name, each with its bounds joined by `+`.
+- `name[u32, ?u8](...)` gives the type arguments of a call, all of them.
+  Without them, they're inferred.
+- `[` after an expression holds an index, a slice, or type arguments. An
+  item that starts with `?`, `??`, `*` or `[` and parses as a type is a
+  type; one expression is an index, which the checker reads as a type
+  argument when the brackets follow the name of a generic function.
+- `T(x)` converts an integer to a type parameter with a numeric bound.
+
+## Open questions
+
 - `match` arms: a block or a single statement now. Should an arm also be a
   single expression, once `match` can be an expression?
 - Is `return` required, or is the last expression the value (as in Rust)?
   Leaning toward requiring `return` in functions and allowing the last
   expression in `match` arms and blocks used as expressions.
-- Generic brackets: `[T]` (Go) avoids the `<>` parsing ambiguity. Leaning `[T]`,
-  with indexing told apart by context
-  ([generics.md](generics.md#t-and-indexing)).
 - The `&` that marks an `inout` or `set` argument: `&x` is familiar from C
   and Rust, but there it takes an address, which Lode code never does. A
   keyword (`f(inout x)`, as in C#'s `ref x`) would read better and say which

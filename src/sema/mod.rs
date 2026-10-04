@@ -2546,7 +2546,7 @@ impl<'a> Checker<'a> {
             _ => Vec::new(),
         };
         let ty = checked.ty();
-        if let Ty::Int(_) | Ty::Bool = ty {
+        if ty == Ty::Bool || generic::num(ty).is_some() {
             return self.value_match(cx, checked, arms, span);
         }
         let Some(def) = ty.sum() else {
@@ -3400,7 +3400,7 @@ impl<'a> Checker<'a> {
                 let untyped =
                     self.untyped_int(cx, a).is_some() && self.untyped_int(cx, b).is_some();
                 let (start, end) = self.operands(cx, a, b, untyped.then_some(usize_ty))?;
-                if start.ty().as_int().is_none() {
+                if generic::num(start.ty()).is_none() {
                     self.error(
                         a.span.to(b.span),
                         format!("a range needs integers, found `{}`", start.ty()),

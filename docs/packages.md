@@ -35,8 +35,10 @@ Go's vocabulary, which is proven:
   only `pub` methods: `pkg.Type.new()`, `value.method()`.
 - Linker symbols are `<import path>.<name>` (`std/io.print`), and
   `<import path>.<Type>.<name>` for a method (`std/io.File.write`); the
-  program's own package uses its name (`main.main`).
-- So far there are two packages, `std/os` and `std/io`.
+  program's own package uses its name (`main.main`). An instance of a
+  generic function adds its type arguments: `std/math.max[u32]`.
+- So far there are four packages: `std/os`, `std/io`, `std/math` and
+  `std/slices`.
 - `std/os` is the Linux x86-64 system calls:
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
     the bytes, retrying), which return a negative error number on failure.
@@ -80,13 +82,25 @@ Go's vocabulary, which is proven:
     `write(s)` is `write_bytes(s.bytes())`.
   - `print(s: str)` and `eprint(s: str)` write a string to standard output
     and standard error.
-  - `print_u64(n: u64)` and `print_i64(n: i64)` write an integer in decimal
-    to standard output, and `eprint_u64` and `eprint_i64` to standard error.
-    Smaller integer types convert implicitly. Each call makes one `write`
-    system call. They're a stopgap until `print("{}", n)`
-    ([comptime.md](comptime.md#format-strings)).
+  - `print_int[T: Integer](n: T)` writes an integer of any type in decimal
+    to standard output, with a `-` if it's negative, and `eprint_int` to
+    standard error: `io.print_int(x)`, or `io.print_int[u64](5)` for a
+    literal, which doesn't tell the type. Each call makes one `write` system
+    call. They're a stopgap until `print("{}", n)`
+    ([generics.md](generics.md#format-strings)).
   - `print` and the others but `File.write` and `File.write_bytes` ignore
     output errors: they're for output that isn't worth failing over.
+- `std/math`, generic:
+  - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
+    (the integers and `bool`). Their parameters are `sink`, so they need no
+    `Copy`.
+  - `abs(x)` for any integer type. It saturates: `abs` of a signed type's
+    smallest value is its largest.
+- `std/slices`, generic:
+  - `sort(inout xs: []T)`, smallest first, for an `Ordered + Copy` element
+    type: a heapsort, with no allocation and a constant stack. `&a` sorts
+    an array, `&a[i..j]` part of one.
+  - `is_sorted(xs: []T) -> bool`.
 
 ## Imports
 

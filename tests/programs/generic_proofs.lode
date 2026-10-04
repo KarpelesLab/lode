@@ -4,6 +4,7 @@
 // stdout: 127 0 -5\n
 // stdout: 250 none 260\n
 // stdout: 4 0 15 12 3\n
+// stdout: 45 zero digit other 3\n
 package main
 
 import "std/io"
@@ -102,6 +103,32 @@ fn at[T: Unsigned](xs: []u8, i: T) -> u8 {
 	return 0
 }
 
+// A range of `T` values, a `match` on one, and a slice from one.
+fn sum_to[T: Unsigned](n: T) -> T {
+	var total: T = 0
+	for i in 0..n {
+		total = total +% i
+	}
+	return total
+}
+
+fn kind[T: Integer](x: T) -> str {
+	match x {
+		0 => return "zero"
+		1..=9 => return "digit"
+		_ => return "other"
+	}
+}
+
+fn tail[T: Unsigned](xs: []u8, from: T) -> usize {
+	let k = usize(from)
+	if k <= xs.len {
+		let rest = xs[k..]
+		return rest.len
+	}
+	return 0
+}
+
 fn space() {
 	io.print(" ")
 }
@@ -158,5 +185,16 @@ fn main() {
 	space()
 	let bytes: [4]u8 = [0, 1, 2, 3]
 	io.print_int(at[u64](bytes, 3))
+	io.print("\n")
+
+	io.print_int(sum_to[u8](10))
+	space()
+	io.print(kind[i16](0))
+	space()
+	io.print(kind[u64](7))
+	space()
+	io.print(kind[i8](-3))
+	space()
+	io.print_int(tail[u32](bytes, 1))
 	io.print("\n")
 }

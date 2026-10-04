@@ -42,10 +42,21 @@ itself is in the other documents; this one is only about order.
   `io.stdout().write(s)`, a method of `io.File`
   ([memory.md](memory.md#parameter-conventions-in-the-compiler-today),
   [types.md](types.md#methods)).
+- **M7a: Generic functions over the built-in traits** (2026-10-04).
+  `fn max[T: Ordered](sink a: T, sink b: T) -> T` with the bounds `Eq`,
+  `Ordered`, `Copy`, `Integer`, `Unsigned` and `Signed`; bodies checked
+  once against their bounds, with facts about integer type parameters
+  ([safety.md](safety.md#values-of-a-type-parameter)); a `T` without
+  `Copy` moved, never copied; type arguments written (`max[u32](a, b)`)
+  or inferred from the arguments and the expected type; one instance per
+  set of type arguments `main` reaches (`src/mono.rs`). std gains
+  `std/math` (`min`, `max`, `clamp`, `abs`), `std/slices` (`sort`,
+  `is_sorted`), and `io.print_int`, which replaces `print_u64` and
+  `print_i64` ([generics.md](generics.md#m7a-in-the-compiler)).
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
-reaches, and decimal integer output (`io.print_u64`, `io.print_i64`). Hello
+reaches, and decimal integer output (now `io.print_int`). Hello
 world is now 655 bytes, still 2 syscalls. The checker keeps facts through
 loops: bounds every iteration keeps survive at the loop head, and after a
 loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
@@ -59,9 +70,11 @@ Slicing `a[i..j]` compiles only when the checker proves
   (`[0; 21]`), even when only the part that's written is ever read. The
   options are in [memory.md](memory.md#uninitialized-buffers); the choice is
   open.
-- **M7: Generics and traits** (and `comptime`, which they're built on).
-  The proposal, split into steps M7a to M7e, is in
-  [generics.md](generics.md#implementation-plan).
+- **M7b to M7e: the rest of generics and traits** (and `comptime`, which
+  they're built on): generic structs and enums with value parameters and
+  generic methods (M7b), user traits and `impl` (M7c), compile-time
+  evaluation and target selection (M7d), format strings (M7e). The
+  proposal is in [generics.md](generics.md#implementation-plan).
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack

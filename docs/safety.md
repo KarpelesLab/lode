@@ -210,6 +210,48 @@ keep its fields' facts, and a loop's head knows only facts of the kinds
 above that held before the loop (there's no counting: the checker can't
 prove that a loop dividing by 10 runs at most 20 times).
 
+#### Values of a type parameter
+
+**Status:** Implemented (M7a; the design is in
+[generics.md](generics.md#facts-about-t-values))
+
+A generic function's body is checked once, for every type its type
+parameters can be. A local whose type is a type parameter `T` with a
+numeric bound (`Integer`, `Unsigned` or `Signed`) is a term, like an
+integer local. With other bounds (`Ordered`, `Eq`, `Copy`, or none), a `T`
+value is not a term and has no facts.
+
+A numeric bound admits integer types: all of them for `Integer`, the
+unsigned ones for `Unsigned`, the signed ones for `Signed` (today `u8` to
+`u64` and `usize`, `i8` to `i64` and `isize`). Two ranges come from them:
+
+- **values**, the hull of their ranges: every value of `T` lies in it,
+  whatever `T` is. `Integer`: the smallest `i64` to the largest `u64`;
+  `Unsigned`: 0 to the largest `u64`; `Signed`: the `i64` range. It is
+  `T`'s range wherever the rules above use a type's range: for a term with
+  no known range, the result of `+%` or `+|`, a dropped range end, and so
+  on.
+- **fits**, the intersection of their ranges: the values every `T` holds.
+  `Integer`: `0..=127`; `Unsigned`: `0..=255`; `Signed`: `-128..=127`.
+
+Where a value must fit in `T`:
+
+| Operation | Proven when |
+| --- | --- |
+| A literal or a constant converted to `T` | It's in fits: `100` for any numeric bound, `200` with `Unsigned`, `-1` with `Signed` |
+| `a + b`, `a - b` of type `T`, and `T(x)` | Each end of the value's range fits on its own. The upper end fits when it's in fits, or when the value is at most a value of type `T`: for `a + b`, `b <= 0` or `a <= 0` (by their ranges); for `a - b`, `b >= 0`; or, for a term plus a constant, a relation (directly or through one other term) `value - t <= 0` with a local `t` of type `T`. The lower end likewise: it's in fits, or `a + b` with `b >= 0` or `a >= 0`, `a - b` with `b <= 0`, or a relation `t - value <= 0` |
+| `a * b` of type `T` | The result's range is in fits |
+| `a / b`, `a % b`, when `T` may be signed (`Integer`, `Signed`) | `b` can't be 0, and `a` is above -128 by its range (so it's no signed type's smallest value) or `b` can't be -1 |
+| `-a` | `T: Signed`, and `a` is above -128 by its range |
+| `a << n`, `a >> n` | `n` is below 8, the narrowest width |
+
+So after `if i < n` (both `T`), `i + 1` fits: the relation gives
+`i + 1 <= n`, and `i + 1 >= i`. After `if b <= a` with `T: Unsigned`,
+`a - b` fits: the relation gives at least 0, and `b >= 0` gives at most `a`.
+A conversion out of `T` is checked against `x`'s range like any other:
+`u64(x)` of an `Unsigned` is always proven, `u8(x)` needs `x <= 255`. A
+failed proof shows the whole values range as "any `T`".
+
 #### Facts through loops
 
 At the head of a loop, the facts before it, `E`, still hold about everything
@@ -217,7 +259,9 @@ the loop doesn't assign. The variables it assigns (`A`: every variable
 assigned anywhere in the body, including in nested loops; for `a[i] = v` and
 `p.x = v`, `a` and `p`; a variable passed with `&`, and the receiver of every
 method call, since the method may take `inout self`; but not an `inout`
-slice, of which only the elements change) can change on each iteration, so
+slice, of which only the elements change, nor another view that isn't
+assigned whole, `xs = ...`, since `&` and a method's receiver only reach its
+elements) can change on each iteration, so
 for them the head
 keeps only facts that every iteration keeps. Those are found by checking the
 body from a few candidate heads, in a fixed order, and taking the first that

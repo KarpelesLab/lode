@@ -290,8 +290,14 @@ yet (its result would hold a view in memory).
 
 - Every array, struct, enum and optional is a plain value, copied by `let`,
   by assignment and into array elements and fields. A `match` binds copies
-  of the payload fields. Nothing owns resources yet, so nothing
-  moves.
+  of the payload fields. Nothing owns resources yet, so a concrete type
+  never moves.
+- In a generic function, a type parameter without the bound `Copy` (and an
+  optional or an array of one) is moved, never copied: keeping the value
+  of a `let`, a `var` or a `sink` parameter moves it out, and the variable
+  can't be used until it's assigned again; keeping an element or another
+  parameter is an error ([generics.md](generics.md#copy-and-moves-in-generic-code)).
+  So generic code already follows the rule move-only types will need.
 - A default parameter is read-only for the duration of the call. Nothing can
   change the argument during the call, so an array or a struct is passed as
   the address of the caller's value, without a copy. An `inout` or `set`

@@ -9,12 +9,13 @@ the options, the trade-offs and a recommendation. The decisions only the user
 can make are collected at the end, in
 [Questions for the user](#decisions).
 
-Nothing here is implemented. Every section is **Proposed** unless it says
-otherwise.
+M7a, generic functions over the built-in traits, is implemented: what the
+compiler does is in [M7a in the compiler](#m7a-in-the-compiler). The rest
+is **Proposed** unless a section says otherwise.
 
 ## Principles
 
-**Status:** Proposed
+**Status:** Decided; followed by the compiler for generic functions (M7a)
 
 Five rules shape the whole proposal. They follow from decisions already made.
 
@@ -39,7 +40,7 @@ Five rules shape the whole proposal. They follow from decisions already made.
 
 ## Generic functions
 
-**Status:** Proposed
+**Status:** Implemented (M7a), except value parameters (M7b)
 
 ```
 fn max[T: Ordered](sink a: T, sink b: T) -> T {
@@ -84,8 +85,8 @@ let s = sum[u64](values)     // explicit
 4. **Full bidirectional inference** (Rust, Swift). Fewer annotations, but
    errors are harder to explain and compile time is harder to predict.
 
-**Recommendation: 3.** It covers the common cases and stays easy to
-explain: "a type argument comes from the first argument that fixes it, or
+**Decided: 3** (implemented in M7a). It covers the common cases and stays
+easy to explain: "a type argument comes from the first argument that fixes it, or
 from the type expected for the result". An untyped literal doesn't fix a type
 argument, as with `let b = 300` today: `max(3, 4)` alone is an error that
 asks for a type, and `let m: u8 = max(3, 4)` works. Explicit arguments are
@@ -108,14 +109,16 @@ are types (`List[u32]` in a type position).
 3. **No explicit arguments in expressions**, only inference or a typed
    `let`. Too limiting: `List[u32].new()` has nothing to infer from.
 
-**Recommendation: 1.** The parser gains one rule: inside `[...]` after an
-expression, each comma-separated item is parsed as a type when it starts
-with a token that only a type can start with (`?`, `*`, `[]`, `fn`), or as a
-`[N]T` array type when `[N]` is directly followed by a type; otherwise as an
-expression, which the checker reinterprets as a type name (`u32`,
-`geo.Point`) when the base is generic. `a[i, j]` on an array stays an
-error, in the checker. The formatter's rule "no space before an index's `[`"
-already gives `max[u32](a, b)` and `fn max[T: Ordered]`.
+**Decided: 1** (implemented in M7a). The parser gains one rule: inside
+`[...]` after an expression, each comma-separated item is parsed as a type
+when it starts with a token that only a type can start with (`?`, `??`,
+`*`), or when it starts with `[` and parses as a slice or array type
+(`[]u8`, `[4]u8`) followed by `,` or `]`; otherwise as an expression, which
+the checker reinterprets as a type name (`u32`, `geo.Point`) when the base
+names a generic function. One expression in brackets is an index node;
+anything else is a type-arguments node. `a[i, j]` on an array stays an
+error, in the checker. The formatter's rule "no space before an index's
+`[`" already gives `max[u32](a, b)` and `fn max[T: Ordered]`.
 
 ### Value parameters
 
@@ -325,11 +328,14 @@ them.
 
 ## Built-in traits
 
-**Status:** Proposed
+**Status:** Proposed; `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
+`Signed` implemented (M7a, built into the compiler)
 
 Some traits are known to the compiler. They are declared in the standard
 library (`std/core`, name Open) so they have documentation and a place in
-the package graph, but some of their impls come from the compiler.
+the package graph, but some of their impls come from the compiler. Until
+`trait` declarations exist (M7c), the compiler knows the six of M7a by
+name, and `Ordering` is a built-in enum.
 
 | Trait | Meaning | Who implements it |
 | --- | --- | --- |
@@ -372,6 +378,8 @@ rule ahead of time.
 
 ### `Copy` and moves in generic code
 
+**Status:** Decided (question 2); implemented (M7a)
+
 memory.md says small plain types are copied implicitly and types that own
 resources move. In generic code, `T` may be either. **Options:**
 
@@ -394,7 +402,7 @@ parts are and it has no `deinit`.
 
 ## Dispatch
 
-**Status:** Proposed
+**Status:** Proposed; monomorphization implemented (M7a)
 
 ### Static by default: monomorphization
 
@@ -405,10 +413,10 @@ and `max[u32]` are two small functions, and an instantiation nothing calls
 isn't emitted.
 
 In the compiler, the checker produces one typed tree per generic function,
-with type parameters in it. A new pass between checking and lowering
-(`src/mono.rs`) walks the call graph from `main`, as `src/reach.rs` does
-today, and produces concrete functions by substitution. `src/lower.rs` then
-sees only concrete types and needs almost no change.
+with type parameters in it. A pass between checking and lowering
+(`src/mono.rs`, which replaced `src/reach.rs`) walks the call graph from
+`main` and produces concrete functions by substitution. `src/lower.rs`
+sees only concrete types.
 
 Linker symbols include the arguments: `std/math.max[u32]`.
 
@@ -451,7 +459,7 @@ coercion rule of its own. It's a good candidate for right after M7.
 
 ## Checking generic bodies
 
-**Status:** Proposed
+**Status:** Implemented (M7a), without refinements, which don't exist yet
 
 ### Against the bounds
 
@@ -497,6 +505,9 @@ shrink the intersection to `0..=0`) is settled with the arbitrary widths of
 [types.md](types.md#integers).
 
 Value parameters (`[N: usize]`) are ordinary terms, as above.
+
+The rule as implemented, with the types the compiler has today (up to 64
+bits), is in [safety.md](safety.md#values-of-a-type-parameter).
 
 ### Refinements on generic code
 
@@ -709,7 +720,7 @@ of `Str[utf8]` ([strings.md](strings.md)).
 
 ## Implementation plan
 
-**Status:** Proposed
+**Status:** M7a implemented; M7b to M7e proposed
 
 Five steps, each shippable on its own with tests, std changes and docs, as
 the earlier milestones were. Sizes are rough estimates of compiler code
@@ -732,6 +743,71 @@ the earlier milestones were. Sizes are rough estimates of compiler code
 - **std gains:** `math.min`, `max`, `clamp`, `abs` for any integer;
   `sort[T: Ordered](inout xs: []T)`; `io.print_int[T: Integer]` replacing
   `print_u64` and `print_i64` (until M7e removes it too).
+
+### M7a in the compiler
+
+**Status:** Implemented (2026-10-04)
+
+What M7a does, and the choices made while implementing it where this
+proposal left room:
+
+- **Declarations.** `fn name[T: A + B, U](...)` declares type parameters,
+  each bounded by built-in traits joined with `+`. A bound that isn't one of
+  the six, a value parameter (`[N: usize]`), a generic method
+  (`fn Point.f[T]`), a generic `main`, and a parameter that is both
+  `Unsigned` and `Signed` are errors.
+- **The traits.** `Eq`: every type the compiler has but views. `Ordered`:
+  the integers and `bool` (structs and enums wait for `impl`, M7c). `Copy`:
+  every type, except a type parameter without the bound and what holds one
+  (`?T`, `[N]T`); a view is `Copy`. `Integer`, `Unsigned`, `Signed`: the
+  integer types. `Ordered` implies `Eq`, and the numeric bounds imply
+  `Ordered` and `Copy`.
+- **`Ordered`'s methods** are `cmp`, `lt`, `le`, `gt` and `ge`, on a `T:
+  Ordered` and on every integer and `bool` (on a numeric type, `a.lt(b)`
+  gives the facts `a < b` gives). `min` and `max` are functions in
+  `std/math` rather than methods for now. `a.cmp(b)` returns the built-in
+  `Ordering`, a C-style enum `i8 { less = -1, equal = 0, greater = 1 }`,
+  so `i8(a.cmp(b))` is the usual -1, 0 or 1. A package may declare its own
+  `Ordering`, which hides the built-in one there.
+- **Operators.** On a type parameter, `==` and `!=` need `Eq`; every other
+  operator (`<`, arithmetic in all its modes, bitwise, shifts, `~`) needs a
+  numeric bound, and `-x` needs `Signed`. `T(x)` converts an integer to a
+  numeric `T`, and `u64(x)` converts a `T` like any integer.
+- **Type arguments.** Explicit and complete, or none. Inferred from the
+  arguments in order: an argument whose parameter's type has an unknown
+  type parameter is checked on its own, and its type fixes it (an array
+  fixes `[]T`, a value fixes `?T`); an argument that takes its type from
+  the context (an integer literal, `none`, `.name`, an array literal) waits
+  until the others and the expected type are used. Then the type expected
+  for the result fixes what's left. A type argument can't be a view, `()`,
+  a pointer or a call's result.
+- **Bounds at a call** are checked where each type argument came from:
+  "`Point` doesn't implement `Ordered`, which `max` requires of `T`".
+- **Copies and moves.** A value of a type that isn't `Copy` is kept (stored
+  in a variable, a field, an element or an optional, returned, passed
+  `sink`, bound by a pattern, taken out by `??`) by moving it. Only a `let`
+  or `var`, or a `sink` parameter, can be moved from, whole, and not from a
+  `defer` block when it's declared outside it; using it again before it's
+  assigned is an error, on any path, loops included. Keeping an element, a
+  read-only parameter or an `inout` one is a copy, an error without `Copy`,
+  as is `[v; n]`. Reading in place (comparing, calling a method, passing to
+  a parameter that isn't `sink`) needs nothing.
+- **Facts** about integer type parameters follow
+  [Facts about `T` values](#facts-about-t-values), over the integer types
+  the compiler has (up to 64 bits): the exact rule is in
+  [safety.md](safety.md#values-of-a-type-parameter).
+- **Instances.** `src/mono.rs` replaces `src/reach.rs`: from `main`, it
+  makes one function per generic function and type arguments reached,
+  ordered like the functions in the program, with symbols like
+  `main.max[u32]` and `std/slices.sort[main.Point]` (a struct or an enum by
+  its package's path). A cycle of calls between generic functions must
+  pass type parameters unchanged (`f[T]` calling `f[?T]` is an error), so
+  there are finitely many instances.
+- **std.** `std/math` (`min`, `max`, `clamp` over `Ordered`, `abs` over
+  `Integer`, saturating), `std/slices` (`sort` for `Ordered + Copy`
+  elements, a heapsort, and `is_sorted`), and `io.print_int[T: Integer]`
+  and `io.eprint_int`, which replace `print_u64`, `print_i64` and their
+  `eprint` forms.
 
 ### M7b: generic structs and enums, value parameters, generic methods
 
@@ -793,10 +869,12 @@ others keep the recommended answer unless the user changes them.
    *Decided.*
 2. **`T` is not copyable by default:** copying needs `T: Copy`, and `max`
    takes `sink` parameters
-   ([`Copy` and moves](#copy-and-moves-in-generic-code)). *Decided.*
+   ([`Copy` and moves](#copy-and-moves-in-generic-code)). *Decided;
+   implemented in M7a.*
 3. **`<` doesn't work on `T: Ordered`:** only sealed numeric bounds get
    operators, `Ordered` gives `a.lt(b)`
-   ([Operators in generic code](#operators-in-generic-code)). *Decided.*
+   ([Operators in generic code](#operators-in-generic-code)). *Decided;
+   implemented in M7a.*
 4. **Equality is derived only:** `Eq` is never written by hand, stays
    automatic as today, and floats (so structs with float fields) aren't
    `Eq`. This closes types.md's "opt-in or automatic" question as automatic.

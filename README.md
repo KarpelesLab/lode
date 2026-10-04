@@ -64,11 +64,17 @@ What works:
 - methods: `fn Point.length(self)`, `fn Point.scale(inout self, k: u32)`,
   `p.scale(2)`, and associated functions like `Point.origin()`, on structs
   and enums ([docs/types.md](docs/types.md#methods))
-- packages: `import "std/..."`, `pub`, `pkg.name`
+- generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, over
+  the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
+  `Signed`, each body checked once against its bounds; `max(a, b)` infers
+  `T`, `max[u32](a, b)` writes it ([docs/generics.md](docs/generics.md#m7a-in-the-compiler))
+- packages: `import "std/..."`, `pub`, `pkg.name`; `std/math` (`min`,
+  `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
+  element type that fits
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic
-- output: `io.print` for strings, `io.print_u64` and `io.print_i64` for
-  integers (and `io.eprint...` for standard error), which ignore errors, and
+- output: `io.print` for strings, `io.print_int` for integers of any type
+  (and `io.eprint...` for standard error), which ignore errors, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`
 - input: `io.stdin().read(&buf)` (the bytes it got, 0 at the end) and
