@@ -560,6 +560,20 @@ impl Parser {
 
     // --- statements ---------------------------------------------------------
 
+    /// The block after an `if` or `while` condition. A `=` there is most
+    /// likely a comparison written as an assignment.
+    fn condition_block(&mut self) -> PResult<Block> {
+        if self.at_p(P::Eq) {
+            let found = self.peek().clone();
+            self.diags.push(
+                Diagnostic::error(self.span(), format!("expected `{{`, found {found}"))
+                    .with_help("use `==` to compare"),
+            );
+            return Err(Failed);
+        }
+        self.block()
+    }
+
     fn block(&mut self) -> PResult<Block> {
         let start = self.expect_p(P::LBrace)?;
         let mut stmts = Vec::new();
@@ -634,7 +648,7 @@ impl Parser {
             Tok::Kw(Kw::While) => {
                 self.bump();
                 let cond = self.header_expr()?;
-                let body = self.block()?;
+                let body = self.condition_block()?;
                 Ok(Stmt::While {
                     cond,
                     span: start.to(body.span),
@@ -823,7 +837,7 @@ impl Parser {
             None
         };
         let cond = self.header_expr()?;
-        let then = self.block()?;
+        let then = self.condition_block()?;
         // `else` belongs on the same line as `}`, but accept it on the next one.
         if *self.peek() == Tok::Newline && *self.peek_at(1) == Tok::Kw(Kw::Else) {
             self.bump();
@@ -1190,6 +1204,20 @@ mod tests {
     fn parse_errors(src: &str) -> Vec<String> {
         let (toks, _) = lex(src, 0);
         parse(toks, 0).1.into_iter().map(|d| d.message).collect()
+    }
+
+    #[test]
+    fn assignment_as_condition() {
+        for src in [
+            "fn f() {\n\tif n = 3 {\n\t}\n}\n",
+            "fn f() {\n\twhile n = 3 {\n\t}\n}\n",
+        ] {
+            let (toks, _) = lex(src, 0);
+            let diags = parse(toks, 0).1;
+            assert_eq!(diags.len(), 1, "{diags:?}");
+            assert_eq!(diags[0].message, "expected `{`, found `=`");
+            assert_eq!(diags[0].help, ["use `==` to compare"]);
+        }
     }
 
     #[test]

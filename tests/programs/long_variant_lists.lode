@@ -1,0 +1,33 @@
+// error: this `match` doesn't handle the variants `v0`, `v1`, `v2`, `v3`, `v4`, `v5`, `v6`, `v7` and 2 more of `Big`
+// warning: `_` hides the variants of `Big` that are added later
+// help: match `v1`, `v2`, `v3`, `v4`, `v5`, `v6`, `v7`, `v8` and 1 more by name
+package main
+
+// Long lists of variants in messages are cut after the first 8.
+enum Big {
+	v0
+	v1
+	v2
+	v3
+	v4
+	v5
+	v6
+	v7
+	v8
+	v9
+}
+
+fn missing(b: Big) {
+	match b {
+	}
+}
+
+fn wildcard(b: Big) -> u8 {
+	match b {
+		v0 => return 0
+		_ => return 1
+	}
+}
+
+fn main() {
+}

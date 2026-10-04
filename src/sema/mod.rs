@@ -497,6 +497,22 @@ fn payload(matched: &TExpr, variant: u32, field: u32, ty: Ty) -> TExpr {
 
 /// Stands in for a condition that failed to check, so the statement around it
 /// is kept for control-flow analysis. Only used when the program has errors.
+/// The most names [`name_list`] shows.
+const LISTED_NAMES: usize = 8;
+
+/// `names` joined with commas for a message, the first [`LISTED_NAMES`] of
+/// them if there are more (with how many are left out).
+fn name_list(names: &[String]) -> String {
+    if names.len() <= LISTED_NAMES {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..LISTED_NAMES].join(", "),
+        names.len() - LISTED_NAMES
+    )
+}
+
 fn placeholder_bool() -> TExpr {
     TExpr {
         kind: TExprKind::Bool(false),
@@ -1854,7 +1870,7 @@ impl<'a> Checker<'a> {
                     span,
                     format!(
                         "this `match` doesn't handle the variant{s} {} of `{ty}`",
-                        missing.join(", ")
+                        name_list(&missing)
                     ),
                 )
                 .with_help("add an arm for each, or `_ => ...` for the rest"),
@@ -1901,7 +1917,7 @@ impl<'a> Checker<'a> {
                 )
                 .with_help(format!(
                     "match {} by name, so a new variant must be handled where `{ty}` is matched",
-                    names.join(", ")
+                    name_list(&names)
                 )),
             );
         }
