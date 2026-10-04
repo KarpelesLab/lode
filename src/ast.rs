@@ -38,6 +38,8 @@ pub enum Item {
 pub struct EnumDecl {
     pub is_pub: bool,
     pub name: Ident,
+    /// The generic parameters of a generic enum, `[L, R]`.
+    pub generics: Vec<GenericParam>,
     /// The integer type of a C-style enum, whose variants have values.
     pub tag: Option<TypeExpr>,
     pub variants: Vec<VariantDecl>,
@@ -58,6 +60,9 @@ pub struct VariantDecl {
 pub struct StructDecl {
     pub is_pub: bool,
     pub name: Ident,
+    /// The generic parameters of a generic struct, `[A, B]` or
+    /// `[N: usize]`.
+    pub generics: Vec<GenericParam>,
     pub fields: Vec<FieldDecl>,
     pub span: Span,
 }
@@ -76,8 +81,13 @@ pub struct FnDecl {
     /// For a method or an associated function, `fn Type.name(...)`: the
     /// type it belongs to (`Type`, or `pkg.Type`, which is an error).
     pub owner: Option<TypeExpr>,
+    /// For a method of a generic type, the names it gives the type's
+    /// parameters, with the bounds it adds: `[A, B]` in
+    /// `fn Pair[A, B].swap`.
+    pub owner_generics: Vec<GenericParam>,
     pub name: Ident,
-    /// The type parameters of a generic function, `[T: Ordered, U]`.
+    /// The generic parameters of a generic function (or the method's own),
+    /// `[T: Ordered, U]`.
     pub generics: Vec<GenericParam>,
     /// The parameters. A method's first is `self`, whose type is the
     /// owner's.
@@ -89,8 +99,9 @@ pub struct FnDecl {
     pub span: Span,
 }
 
-/// A type parameter, `T` or `T: Ordered + Copy`: its name and the traits
-/// bounding it.
+/// A generic parameter, `T` or `T: Ordered + Copy`: its name and the
+/// traits bounding it. A value parameter (`N: usize`) has its integer type
+/// as its one bound.
 #[derive(Debug)]
 pub struct GenericParam {
     pub name: Ident,
@@ -156,6 +167,11 @@ pub enum TypeExpr {
     Slice(Box<TypeExpr>, Span),
     /// An optional `?T`.
     Optional(Box<TypeExpr>, Span),
+    /// A generic type with its arguments: `Pair[u8, bool]`,
+    /// `StackBuf[64]`. The base is a [`TypeExpr::Named`] or a
+    /// [`TypeExpr::Qualified`]; an argument is a type, or a value for a
+    /// value parameter.
+    Generic(Box<TypeExpr>, Vec<TypeArg>, Span),
 }
 
 impl TypeExpr {
@@ -167,7 +183,8 @@ impl TypeExpr {
             | TypeExpr::Ptr(_, span)
             | TypeExpr::Array(_, _, span)
             | TypeExpr::Slice(_, span)
-            | TypeExpr::Optional(_, span) => *span,
+            | TypeExpr::Optional(_, span)
+            | TypeExpr::Generic(_, _, span) => *span,
         }
     }
 }

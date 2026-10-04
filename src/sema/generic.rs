@@ -1,19 +1,22 @@
-//! Generic functions over the built-in traits (docs/generics.md, M7a):
-//! type parameters and their bounds, type arguments at a call (explicit,
-//! or inferred from the arguments and then from the expected result type),
-//! the built-in methods of `Ordered`, the proof rules for type parameters
-//! with a numeric bound, and the rule that a value of a type that isn't
-//! `Copy` is moved, never copied.
+//! Generics over the built-in traits (docs/generics.md, M7a and M7b):
+//! generic parameters of functions, structs, enums and methods (types with
+//! their bounds, and value parameters like `[N: usize]`), generic
+//! arguments (explicit, or inferred from the arguments and then from the
+//! expected type), the bounds of a generic type's instances and of a
+//! method's added bounds, the built-in methods of `Ordered`, the proof
+//! rules for type parameters with a numeric bound, and the rule that a
+//! value of a type that isn't `Copy` is moved, never copied.
 //!
 //! A generic body is checked once, against the bounds of its parameters;
-//! `crate::mono` makes the instances that are lowered.
+//! a value parameter is a local of its integer type there, a term for the
+//! proof checker. `crate::mono` makes the instances that are lowered.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, ExprKind};
 use crate::diag::Diagnostic;
 use crate::source::Span;
-use crate::types::{Bounds, Range, Trait, Ty, primitive};
+use crate::types::{Bounds, IntTy, Len, Primitive, Range, Trait, Ty, primitive};
 
 use super::expr::{Checked, place_text};
 use super::facts::{Linear, Term};
@@ -156,10 +159,17 @@ impl Inference {
             return;
         }
         if let Some((elem, n)) = pattern.as_array() {
-            if let Some((a, m)) = actual.as_array()
-                && m == n
-            {
+            if let Some((a, m)) = actual.as_array() {
+                match n {
+                    Len::Param(p) => self.unify(p, len_ty(m), span),
+                    Len::Known(_) if n != m => return,
+                    Len::Known(_) => {}
+                }
                 self.unify(elem, a, span);
+            }
+        } else if pattern.same_decl(actual) {
+            for (p, a) in pattern.type_args().iter().zip(actual.type_args().iter()) {
+                self.unify(*p, *a, span);
             }
         } else if let Some(elem) = pattern.as_slice() {
             if let Some(a) = actual.elem() {
@@ -196,6 +206,53 @@ impl Inference {
     }
 }
 
+/// A length as a generic argument: a [`Ty::Value`] or a value parameter.
+pub(super) fn len_ty(len: Len) -> Ty {
+    match len {
+        Len::Known(n) => Ty::value(i128::from(n)),
+        Len::Param(p) => p,
+    }
+}
+
+/// The type an expression in brackets names, if it's written like one:
+/// `u32`, `geo.Point`, `Pair[u8, bool]`.
+pub(super) fn expr_type(e: &ast::Expr) -> Option<ast::TypeExpr> {
+    let ident = |name: &str, span| ast::Ident {
+        name: name.to_owned(),
+        span,
+    };
+    Some(match &e.kind {
+        ExprKind::Name(n) => ast::TypeExpr::Named(ident(n, e.span)),
+        ExprKind::Field(base, member) => match &base.kind {
+            ExprKind::Name(p) => ast::TypeExpr::Qualified(ident(p, base.span), member.clone()),
+            _ => return None,
+        },
+        ExprKind::Index(base, index) => ast::TypeExpr::Generic(
+            Box::new(expr_type(base)?),
+            vec![ast::TypeArg::Expr((**index).clone())],
+            e.span,
+        ),
+        ExprKind::TypeArgs(base, items) => {
+            ast::TypeExpr::Generic(Box::new(expr_type(base)?), items.clone(), e.span)
+        }
+        _ => return None,
+    })
+}
+
+/// How a type expression is written, for messages.
+pub(super) fn type_text(t: &ast::TypeExpr) -> String {
+    match t {
+        ast::TypeExpr::Named(id) => id.name.clone(),
+        ast::TypeExpr::Qualified(p, n) => format!("{}.{}", p.name, n.name),
+        ast::TypeExpr::Unit(_) => "()".to_owned(),
+        ast::TypeExpr::Ptr(inner, _) => format!("*{}", type_text(inner)),
+        ast::TypeExpr::Array(_, elem, _) => format!("[...]{}", type_text(elem)),
+        ast::TypeExpr::Slice(elem, _) => format!("[]{}", type_text(elem)),
+        ast::TypeExpr::Optional(inner, _) => format!("?{}", type_text(inner)),
+        ast::TypeExpr::Generic(base, _, _) => format!("{}[...]", type_text(base)),
+    }
+}
+
 /// A call from a generic function to a generic function, for the check
 /// that instances can't grow without end (see
 /// [`Checker::check_generic_recursion`]).
@@ -207,9 +264,10 @@ pub(super) struct GenericEdge {
 }
 
 impl Checker<'_> {
-    /// The type parameters of a generic function, `[T: Ordered + Copy, U]`,
-    /// declared in `cx` so its signature and body can name them, with the
-    /// traits each declares.
+    /// The generic parameters of a generic function, struct or enum,
+    /// `[T: Ordered + Copy, U, N: usize]`, declared in `cx` so its
+    /// signature and body (or its fields) can name them, with the traits
+    /// each declares (none for a value parameter).
     pub(super) fn declare_generics(
         &mut self,
         cx: &mut FnCx,
@@ -218,53 +276,21 @@ impl Checker<'_> {
         let mut out = Vec::new();
         let mut declared = Vec::new();
         for g in generics {
+            if !self.generic_name_ok(g, &out) {
+                continue;
+            }
             let name = &g.name.name;
-            if primitive(name, self.ptr_bits).is_some() {
-                self.error(
-                    g.name.span,
-                    format!("`{name}` is the name of a built-in type"),
-                );
+            if let Some(it) = self.value_param_type(g) {
+                let Some(it) = it else {
+                    continue;
+                };
+                out.push(Ty::new_value_param(name.clone(), it));
+                declared.push(Vec::new());
                 continue;
             }
-            if out
-                .iter()
-                .any(|p: &Ty| p.as_param().is_some_and(|d| &d.name == name))
-            {
-                self.error(
-                    g.name.span,
-                    format!("the type parameter `{name}` is declared twice"),
-                );
-                continue;
-            }
-            let mut traits = Vec::new();
-            for b in &g.bounds {
-                match Trait::from_name(&b.name) {
-                    Some(t) => traits.push(t),
-                    None => {
-                        let mut d = Diagnostic::error(
-                            b.span,
-                            format!("`{}` is not a built-in trait", b.name),
-                        )
-                        .with_help(
-                            "the bounds are `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and `Signed`; traits declared in Lode come later (docs/generics.md, M7c)",
-                        );
-                        if primitive(&b.name, self.ptr_bits).is_some() {
-                            d = d.with_help(
-                                "a value parameter (`[N: usize]`) is not supported by the compiler yet",
-                            );
-                        }
-                        self.diags.push(d);
-                    }
-                }
-            }
-            if traits.contains(&Trait::Unsigned) && traits.contains(&Trait::Signed) {
-                self.error(
-                    g.name.span,
-                    format!("`{name}` can't be both `Unsigned` and `Signed`: no type is"),
-                );
-                traits.retain(|&t| t != Trait::Signed);
-            }
+            let traits = self.bound_traits(g);
             let ty = Ty::new_param(name.clone(), Bounds::new(&traits), self.ptr_bits);
+            self.declared_bounds.insert(ty, traits.clone());
             out.push(ty);
             declared.push(traits);
         }
@@ -272,7 +298,186 @@ impl Checker<'_> {
         (out, declared)
     }
 
-    /// The type parameter of `cx`'s function called `name`.
+    /// The parameters a method of a generic type gives the type's
+    /// (`[A, B]` in `fn Pair[A, B].swap`), like
+    /// [`Checker::declare_generics`]: one for each parameter of `owner`'s
+    /// declaration, of the same kind, with the bounds the declaration gives
+    /// it and those the method adds. `None` if they don't match the
+    /// declaration (reported).
+    pub(super) fn declare_owner_generics(
+        &mut self,
+        owner: Ty,
+        generics: &[ast::GenericParam],
+        span: Span,
+    ) -> Option<(Vec<Ty>, Vec<Vec<Trait>>)> {
+        let decl = owner.decl_params();
+        if decl.len() != generics.len() {
+            let names: Vec<String> = decl.iter().map(Ty::to_string).collect();
+            let d = if decl.is_empty() {
+                Diagnostic::error(span, format!("`{owner}` is not generic"))
+                    .with_help(format!("declare the method as `fn {owner}.name(...)`"))
+            } else if generics.is_empty() {
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "a method of `{}` names the type's parameters",
+                        owner.as_struct().map_or_else(
+                            || owner.as_enum().expect("an enum").name.clone(),
+                            |d| d.name.clone()
+                        )
+                    ),
+                )
+                .with_help(format!("as in `fn {owner}.name(...)`"))
+            } else {
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "`{owner}` has {} parameter(s), but the method names {}",
+                        decl.len(),
+                        generics.len()
+                    ),
+                )
+                .with_help(format!("name them all: `[{}]`", names.join(", ")))
+            };
+            self.diags.push(d);
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut declared = Vec::new();
+        let mut ok = true;
+        for (&p, g) in decl.iter().zip(generics) {
+            if !self.generic_name_ok(g, &out) {
+                ok = false;
+                continue;
+            }
+            let name = &g.name.name;
+            if let Some(it) = p.value_param() {
+                let written = match &g.bounds[..] {
+                    [] => true,
+                    [b] => matches!(
+                        primitive(&b.name, self.ptr_bits),
+                        Some(Primitive::Ty(Ty::Int(t))) if t == it
+                    ),
+                    _ => false,
+                };
+                if !written {
+                    self.diags.push(
+                        Diagnostic::error(
+                            g.name.span,
+                            format!("`{name}` is the value parameter `{p}: {it}` of `{owner}`"),
+                        )
+                        .with_help(format!("write it `{name}` (or `{name}: {it}`)")),
+                    );
+                    ok = false;
+                    continue;
+                }
+                out.push(Ty::new_value_param(name.clone(), it));
+                declared.push(Vec::new());
+                continue;
+            }
+            let mut traits = self.declared_bounds.get(&p).cloned().unwrap_or_default();
+            for t in self.bound_traits(g) {
+                if !traits.contains(&t) {
+                    traits.push(t);
+                }
+            }
+            let ty = Ty::new_param(name.clone(), Bounds::new(&traits), self.ptr_bits);
+            self.declared_bounds.insert(ty, traits.clone());
+            out.push(ty);
+            declared.push(traits);
+        }
+        ok.then_some((out, declared))
+    }
+
+    /// Report a generic parameter whose name can't be used: a built-in
+    /// type's, or one already declared in `taken`.
+    fn generic_name_ok(&mut self, g: &ast::GenericParam, taken: &[Ty]) -> bool {
+        let name = &g.name.name;
+        if primitive(name, self.ptr_bits).is_some() {
+            self.error(
+                g.name.span,
+                format!("`{name}` is the name of a built-in type"),
+            );
+            return false;
+        }
+        if taken
+            .iter()
+            .any(|p: &Ty| p.as_param().is_some_and(|d| &d.name == name))
+        {
+            self.error(
+                g.name.span,
+                format!("the type parameter `{name}` is declared twice"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// For a value parameter (`N: usize`, whose bound is an integer type):
+    /// `Some` with its type, or `Some(None)` if it's in error (reported).
+    /// `None` for a type parameter.
+    fn value_param_type(&mut self, g: &ast::GenericParam) -> Option<Option<IntTy>> {
+        let prim = |b: &ast::Ident| primitive(&b.name, self.ptr_bits);
+        let first = g.bounds.iter().position(|b| prim(b).is_some())?;
+        let b = &g.bounds[first];
+        let name = &g.name.name;
+        match prim(b) {
+            Some(Primitive::Ty(Ty::Int(it))) if g.bounds.len() == 1 => Some(Some(it)),
+            Some(Primitive::Ty(Ty::Int(it))) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        b.span,
+                        format!("the value parameter `{name}` has a type, not bounds"),
+                    )
+                    .with_help(format!("write `{name}: {it}`")),
+                );
+                Some(None)
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        b.span,
+                        format!(
+                            "a value parameter of type `{}` is not supported by the compiler yet",
+                            b.name
+                        ),
+                    )
+                    .with_help("a value parameter is an integer: `[N: usize]`"),
+                );
+                Some(None)
+            }
+        }
+    }
+
+    /// The traits a type parameter's bounds name (each unknown one is
+    /// reported), without both `Unsigned` and `Signed`.
+    fn bound_traits(&mut self, g: &ast::GenericParam) -> Vec<Trait> {
+        let mut traits = Vec::new();
+        for b in &g.bounds {
+            match Trait::from_name(&b.name) {
+                Some(t) => traits.push(t),
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(b.span, format!("`{}` is not a built-in trait", b.name))
+                            .with_help(
+                                "the bounds are `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and `Signed`; traits declared in Lode come later (docs/generics.md, M7c)",
+                            ),
+                    );
+                }
+            }
+        }
+        if traits.contains(&Trait::Unsigned) && traits.contains(&Trait::Signed) {
+            let name = &g.name.name;
+            self.error(
+                g.name.span,
+                format!("`{name}` can't be both `Unsigned` and `Signed`: no type is"),
+            );
+            traits.retain(|&t| t != Trait::Signed);
+        }
+        traits
+    }
+
+    /// The generic parameter of `cx`'s function (or type) called `name`.
     pub(super) fn type_param(cx: &FnCx, name: &str) -> Option<Ty> {
         cx.type_params
             .iter()
@@ -297,29 +502,128 @@ impl Checker<'_> {
         }
     }
 
+    /// The generic argument an item in brackets gives the parameter `param`:
+    /// a type for a type parameter, a value known when compiling (or one of
+    /// `cx`'s value parameters) for a value parameter.
+    pub(super) fn generic_arg(
+        &mut self,
+        cx: &mut FnCx,
+        item: &ast::TypeArg,
+        param: Ty,
+    ) -> Option<Ty> {
+        match param.value_param() {
+            Some(it) => self.value_arg(cx, item, param, it),
+            None => {
+                if let ast::TypeArg::Expr(e) = item
+                    && expr_type(e).is_none()
+                {
+                    self.error(
+                        e.span,
+                        format!(
+                            "expected a type argument, found an expression (`{param}` is a type parameter)"
+                        ),
+                    );
+                    return None;
+                }
+                self.type_arg(cx, item)
+            }
+        }
+    }
+
+    /// The value an item in brackets gives the value parameter `param`, of
+    /// type `it`.
+    fn value_arg(
+        &mut self,
+        cx: &mut FnCx,
+        item: &ast::TypeArg,
+        param: Ty,
+        it: IntTy,
+    ) -> Option<Ty> {
+        let span = item.span();
+        let e = match item {
+            ast::TypeArg::Expr(e) => e.clone(),
+            ast::TypeArg::Type(ast::TypeExpr::Named(id)) => ast::Expr {
+                kind: ExprKind::Name(id.name.clone()),
+                span: id.span,
+            },
+            ast::TypeArg::Type(ast::TypeExpr::Qualified(p, n)) => ast::Expr {
+                kind: ExprKind::Field(
+                    Box::new(ast::Expr {
+                        kind: ExprKind::Name(p.name.clone()),
+                        span: p.span,
+                    }),
+                    n.clone(),
+                ),
+                span,
+            },
+            ast::TypeArg::Type(t) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{param}` is a value parameter, so its argument is a value"),
+                    )
+                    .with_help(format!("found the type `{}`", type_text(t))),
+                );
+                return None;
+            }
+        };
+        if let ExprKind::Name(n) = &e.kind
+            && let Some(p) = Self::type_param(cx, n)
+        {
+            return match p.value_param() {
+                Some(t) if t == it => Some(p),
+                Some(t) => {
+                    self.error(span, format!("`{param}` is a `{it}`, but `{p}` is a `{t}`"));
+                    None
+                }
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!("`{param}` is a value parameter, so its argument is a value"),
+                        )
+                        .with_help(format!("`{p}` is a type")),
+                    );
+                    None
+                }
+            };
+        }
+        if let ExprKind::Name(n) = &e.kind
+            && cx.lookup(n).is_none()
+            && (primitive(n, self.ptr_bits).is_some()
+                || matches!(self.pkgs[cx.pkg].items.get(n), Some(Item::Type(_))))
+        {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("`{param}` is a value parameter, so its argument is a value"),
+                )
+                .with_help(format!("`{n}` is a type")),
+            );
+            return None;
+        }
+        let c = self.expr(cx, &e, Some(Ty::Int(it)))?;
+        let c = self.coerce(cx, c, Ty::Int(it), span)?;
+        match (&c.expr.kind, c.range) {
+            (TExprKind::Int(_), Some(r)) if r.lo == r.hi => Some(Ty::value(r.lo)),
+            _ => {
+                self.error(
+                    span,
+                    format!("the value of `{param}` must be known when compiling"),
+                );
+                None
+            }
+        }
+    }
+
     /// The type an item in brackets names: a type, or an expression that's
-    /// a type's name (`u32`, `geo.Point`).
+    /// a type's name (`u32`, `geo.Point`, `Pair[u8, bool]`).
     pub(super) fn type_arg(&mut self, cx: &mut FnCx, item: &ast::TypeArg) -> Option<Ty> {
         let t = match item {
             ast::TypeArg::Type(t) => t.clone(),
-            ast::TypeArg::Expr(e) => match &e.kind {
-                ExprKind::Name(n) => ast::TypeExpr::Named(ast::Ident {
-                    name: n.clone(),
-                    span: e.span,
-                }),
-                ExprKind::Field(base, member) if matches!(base.kind, ExprKind::Name(_)) => {
-                    let ExprKind::Name(p) = &base.kind else {
-                        unreachable!("matched")
-                    };
-                    ast::TypeExpr::Qualified(
-                        ast::Ident {
-                            name: p.clone(),
-                            span: base.span,
-                        },
-                        member.clone(),
-                    )
-                }
-                _ => {
+            ast::TypeArg::Expr(e) => match expr_type(e) {
+                Some(t) => t,
+                None => {
                     self.error(e.span, "expected a type argument, found an expression");
                     return None;
                 }
@@ -341,7 +645,8 @@ impl Checker<'_> {
             | Ty::Struct(_)
             | Ty::Enum(_)
             | Ty::Optional(_)
-            | Ty::Param(_) => Some(()),
+            | Ty::Param(_)
+            | Ty::Value(_) => Some(()),
             Ty::Str | Ty::Slice(_) => {
                 self.diags.push(
                     Diagnostic::error(span, format!("a type argument can't be a view (`{ty}`)"))
@@ -372,35 +677,71 @@ impl Checker<'_> {
                 ok = false;
                 continue;
             }
-            let def = p.as_param().expect("a type parameter");
-            let declared = &self.sigs[id].bounds[k];
-            let missing = declared.iter().find(|&&t| !arg.satisfies(t)).copied();
-            let Some(t) = missing else {
-                continue;
-            };
-            let mut d = Diagnostic::error(
-                span,
-                format!(
-                    "`{arg}` doesn't implement `{t}`, which `{name}` requires of `{}`",
-                    def.name
-                ),
-            );
-            if let Some(adef) = arg.as_param() {
-                d = d.with_help(format!(
-                    "add the bound to `{}`: `[{}: {t}]`",
-                    adef.name, adef.name
-                ));
-            } else if t == Trait::Copy {
-                d = d.with_help(format!("`{arg}` holds a value that isn't `Copy`"));
-            } else if t == Trait::Ordered && matches!(arg, Ty::Struct(_) | Ty::Enum(_)) {
-                d = d.with_help(format!(
-                    "`impl Ordered for {arg}` is not supported by the compiler yet (docs/generics.md, M7c)"
-                ));
-            }
-            self.diags.push(d);
-            ok = false;
+            let declared = self.sigs[id].bounds[k].clone();
+            ok &= self.arg_satisfies(*p, &declared, arg, name, span);
         }
         ok
+    }
+
+    /// Check that the type arguments of the instance `ty` of a generic
+    /// struct or enum satisfy the bounds of its parameters (reported at
+    /// `span`).
+    pub(super) fn check_type_bounds(&mut self, ty: Ty, span: Span) -> bool {
+        if let Some(pending) = &mut self.pending_bounds {
+            pending.push((ty, span));
+            return true;
+        }
+        let name = match ty.as_struct() {
+            Some(def) => def.name.clone(),
+            None => match ty.as_enum() {
+                Some(def) => def.name.clone(),
+                None => return true,
+            },
+        };
+        let mut ok = true;
+        for (p, arg) in ty.decl_params().into_iter().zip(ty.type_args().iter()) {
+            let declared = self.declared_bounds.get(&p).cloned().unwrap_or_default();
+            ok &= self.arg_satisfies(p, &declared, *arg, &name, span);
+        }
+        ok
+    }
+
+    /// Whether `arg` has the traits `declared` for the parameter `p` of
+    /// `owner` (reported at `span` if not).
+    fn arg_satisfies(
+        &mut self,
+        p: Ty,
+        declared: &[Trait],
+        arg: Ty,
+        owner: &str,
+        span: Span,
+    ) -> bool {
+        let def = p.as_param().expect("a type parameter");
+        let missing = declared.iter().find(|&&t| !arg.satisfies(t)).copied();
+        let Some(t) = missing else {
+            return true;
+        };
+        let mut d = Diagnostic::error(
+            span,
+            format!(
+                "`{arg}` doesn't implement `{t}`, which `{owner}` requires of `{}`",
+                def.name
+            ),
+        );
+        if let Some(adef) = arg.as_param() {
+            d = d.with_help(format!(
+                "add the bound to `{}`: `[{}: {t}]`",
+                adef.name, adef.name
+            ));
+        } else if t == Trait::Copy {
+            d = d.with_help(format!("`{arg}` holds a value that isn't `Copy`"));
+        } else if t == Trait::Ordered && matches!(arg, Ty::Struct(_) | Ty::Enum(_)) {
+            d = d.with_help(format!(
+                "`impl Ordered for {arg}` is not supported by the compiler yet (docs/generics.md, M7c)"
+            ));
+        }
+        self.diags.push(d);
+        false
     }
 
     /// `a.cmp(b)`, `a.lt(b)`, `a.le(b)`, `a.gt(b)` or `a.ge(b)` on a value
@@ -603,6 +944,11 @@ impl Checker<'_> {
             }
             Some(conv) => {
                 let (what, help) = match conv {
+                    Convention::Let if name == "self" && local == 0 => (
+                        "a read-only parameter",
+                        "or declare the method with `sink self`, which moves the value in"
+                            .to_owned(),
+                    ),
                     Convention::Let => (
                         "a read-only parameter",
                         format!(
@@ -684,14 +1030,27 @@ impl Checker<'_> {
                 .iter()
                 .any(|a| a.is_generic() && a.as_param().is_none());
             if grows && reaches(e.callee, e.caller) {
-                let callee = &self.sigs[e.callee].name;
-                let args: Vec<String> = e.args.iter().map(Ty::to_string).collect();
+                let sig = &self.sigs[e.callee];
+                let shown = |args: &[Ty]| {
+                    let names: Vec<String> = args.iter().map(Ty::to_string).collect();
+                    names.join(", ")
+                };
+                // A method of a generic type: `Grow[Pair[T, T]].deeper`.
+                let (owner, own) = e.args.split_at(sig.owner_params);
+                let mut callee = sig.name.clone();
+                if !owner.is_empty()
+                    && let Some((ty, method)) = sig.name.rsplit_once('.')
+                {
+                    callee = format!("{ty}[{}].{method}", shown(owner));
+                }
+                if !own.is_empty() {
+                    callee = format!("{callee}[{}]", shown(own));
+                }
                 diags.push(
                     Diagnostic::error(
                         e.span,
                         format!(
-                            "this calls `{callee}[{}]`, which calls back here: its instances would never end",
-                            args.join(", ")
+                            "this calls `{callee}`, which calls back here: its instances would never end"
                         ),
                     )
                     .with_help(

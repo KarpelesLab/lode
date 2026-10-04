@@ -49,10 +49,18 @@ pub struct Func {
     /// instance of a generic function adds its type arguments:
     /// `std/math.max[u32]`.
     pub symbol: String,
-    /// The type parameters of a generic function ([`Ty::Param`]s), which
-    /// its types mention; empty for a function that isn't generic. Only
-    /// instances of it, made by `crate::mono`, are lowered.
+    /// The generic parameters of a generic function ([`Ty::Param`]s: types
+    /// and values), which its types mention; for a method of a generic
+    /// type, the type's first. Empty for a function that isn't generic.
+    /// Only instances of it, made by `crate::mono`, are lowered.
     pub type_params: Vec<Ty>,
+    /// For a method of a generic type, how many of `type_params` are the
+    /// type's (they come first): the symbol puts their arguments after the
+    /// type's name, `std/buf.StackBuf[64].push`.
+    pub owner_params: usize,
+    /// The locals holding the value parameters among `type_params`, which
+    /// an instance assigns first.
+    pub value_params: Vec<(Ty, LocalId)>,
     pub params: Vec<LocalId>,
     /// The type of the value it returns (`T` in `throws(E) -> T`).
     pub ret: Ty,
@@ -174,9 +182,10 @@ pub enum TExprKind {
     Table(usize),
     Local(LocalId),
     Call(FuncId, Vec<TExpr>),
-    /// A call of a generic function, with its type arguments, which may
-    /// mention the caller's own type parameters. `crate::mono` turns it
-    /// into a [`TExprKind::Call`] of an instance.
+    /// A call of a generic function (or a method of a generic type), with
+    /// its generic arguments (a [`Ty::Value`] for a value parameter), which
+    /// may mention the caller's own parameters. `crate::mono` turns it into
+    /// a [`TExprKind::Call`] of an instance.
     GenericCall(FuncId, Vec<Ty>, Vec<TExpr>),
     /// `a.cmp(b)` of two values of an `Ordered` type (an integer or
     /// `bool`, once instantiated): the `Ordering` of `a` to `b`.
@@ -196,8 +205,9 @@ pub enum TExprKind {
     ArrayLen(Box<TExpr>),
     /// `[a, b, c]`, of type `[N]T`.
     ArrayLit(Vec<TExpr>),
-    /// `[value; N]`; `value` is evaluated once.
-    ArrayRepeat(Box<TExpr>, u64),
+    /// `[value; N]`, `N` being the length of its array type; `value` is
+    /// evaluated once.
+    ArrayRepeat(Box<TExpr>),
     /// `base[index]` of an array or slice, with the index proven to be in
     /// bounds. An array-typed element is a place, like any array value.
     Index(Box<TExpr>, Box<TExpr>),
@@ -378,7 +388,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Convert(inner)
         | TExprKind::ViewLen(inner)
         | TExprKind::ArrayLen(inner)
-        | TExprKind::ArrayRepeat(inner, _)
+        | TExprKind::ArrayRepeat(inner)
         | TExprKind::ToSlice(inner)
         | TExprKind::StrPtr(inner)
         | TExprKind::Bytes(inner)
@@ -467,7 +477,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Convert(inner)
         | TExprKind::ViewLen(inner)
         | TExprKind::ArrayLen(inner)
-        | TExprKind::ArrayRepeat(inner, _)
+        | TExprKind::ArrayRepeat(inner)
         | TExprKind::ToSlice(inner)
         | TExprKind::StrPtr(inner)
         | TExprKind::Bytes(inner)

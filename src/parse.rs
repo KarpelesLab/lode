@@ -298,12 +298,11 @@ impl Parser {
     fn struct_decl(&mut self, is_pub: bool, start: Span) -> PResult<StructDecl> {
         self.bump(); // struct
         let name = self.ident("a struct name")?;
-        if self.at_p(P::LBracket) {
-            return self.error(
-                self.span(),
-                "generic structs are not supported by the compiler yet",
-            );
-        }
+        let generics = if self.at_p(P::LBracket) {
+            self.generic_params()?
+        } else {
+            Vec::new()
+        };
         self.expect_p(P::LBrace)?;
         let mut fields = Vec::new();
         loop {
@@ -329,6 +328,7 @@ impl Parser {
         Ok(StructDecl {
             is_pub,
             name,
+            generics,
             fields,
             span: start.to(end),
         })
@@ -337,12 +337,11 @@ impl Parser {
     fn enum_decl(&mut self, is_pub: bool, start: Span) -> PResult<EnumDecl> {
         self.bump(); // enum
         let name = self.ident("an enum name")?;
-        if self.at_p(P::LBracket) {
-            return self.error(
-                self.span(),
-                "generic enums are not supported by the compiler yet",
-            );
-        }
+        let generics = if self.at_p(P::LBracket) {
+            self.generic_params()?
+        } else {
+            Vec::new()
+        };
         let tag = if self.eat_p(P::Colon) {
             Some(self.type_expr()?)
         } else {
@@ -396,6 +395,7 @@ impl Parser {
         Ok(EnumDecl {
             is_pub,
             name,
+            generics,
             tag,
             variants,
             span: start.to(end),
@@ -405,12 +405,19 @@ impl Parser {
     fn fn_decl(&mut self, is_pub: bool, is_unsafe: bool, start: Span) -> PResult<FnDecl> {
         self.bump(); // fn
         let mut name = self.ident("a function name")?;
-        // `fn Type.name` (a method or an associated function), or
-        // `fn pkg.Type.name`, which the checker rejects.
+        let mut generics = if self.at_p(P::LBracket) {
+            self.generic_params()?
+        } else {
+            Vec::new()
+        };
+        // `fn Type.name` (a method or an associated function), `fn
+        // Type[A, B].name` (of a generic type), or `fn pkg.Type.name`,
+        // which the checker rejects.
         let mut owner = None;
+        let mut owner_generics = Vec::new();
         if self.eat_p(P::Dot) {
             let member = self.ident("a method name")?;
-            if self.eat_p(P::Dot) {
+            if generics.is_empty() && self.eat_p(P::Dot) {
                 let method = self.ident("a method name")?;
                 owner = Some(TypeExpr::Qualified(name, member));
                 name = method;
@@ -418,18 +425,11 @@ impl Parser {
                 owner = Some(TypeExpr::Named(name));
                 name = member;
             }
-        }
-        let generics = if self.at_p(P::LBracket) {
-            if owner.is_some() {
-                return self.error(
-                    self.span(),
-                    "generic methods are not supported by the compiler yet",
-                );
+            owner_generics = std::mem::take(&mut generics);
+            if self.at_p(P::LBracket) {
+                generics = self.generic_params()?;
             }
-            self.generic_params()?
-        } else {
-            Vec::new()
-        };
+        }
         self.expect_p(P::LParen)?;
         let mut params = Vec::new();
         loop {
@@ -492,6 +492,7 @@ impl Parser {
             is_pub,
             is_unsafe,
             owner,
+            owner_generics,
             name,
             generics,
             params,
@@ -532,10 +533,44 @@ impl Parser {
         if params.is_empty() {
             return self.error(
                 open.to(close),
-                "a generic function needs a type parameter in its brackets",
+                "a generic declaration needs a parameter in its brackets",
             );
         }
         Ok(params)
+    }
+
+    /// The arguments of a generic type, after its name: `[u8, bool]`,
+    /// `[64]`, `[T, N]`. Each is a type when it parses as one followed by
+    /// `,` or `]`; otherwise an expression, a value for a value parameter.
+    fn type_args(&mut self) -> PResult<(Vec<TypeArg>, Span)> {
+        let open = self.bump().span; // [
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBracket) {
+                break;
+            }
+            let (pos, diags) = (self.pos, self.diags.len());
+            let item = match self.type_expr() {
+                Ok(t) if self.at_p(P::Comma) || self.at_p(P::RBracket) => TypeArg::Type(t),
+                _ => {
+                    self.pos = pos;
+                    self.diags.truncate(diags);
+                    TypeArg::Expr(self.nested_expr()?)
+                }
+            };
+            items.push(item);
+            self.skip_newlines();
+            if !self.eat_p(P::Comma) {
+                break;
+            }
+        }
+        self.skip_newlines();
+        let close = self.expect_p(P::RBracket)?;
+        if items.is_empty() {
+            return self.error(open.to(close), "expected the type's arguments in brackets");
+        }
+        Ok((items, close))
     }
 
     /// An item in brackets after an expression. It's a type when it starts
@@ -617,11 +652,18 @@ impl Parser {
         match self.peek() {
             Tok::Ident(_) => {
                 let name = self.ident("a type")?;
-                if self.eat_p(P::Dot) {
+                let base = if self.eat_p(P::Dot) {
                     let member = self.ident("a type name")?;
-                    return Ok(TypeExpr::Qualified(name, member));
+                    TypeExpr::Qualified(name, member)
+                } else {
+                    TypeExpr::Named(name)
+                };
+                if !self.at_p(P::LBracket) {
+                    return Ok(base);
                 }
-                Ok(TypeExpr::Named(name))
+                let (args, close) = self.type_args()?;
+                let span = base.span().to(close);
+                Ok(TypeExpr::Generic(Box::new(base), args, span))
             }
             Tok::P(P::LParen) if *self.peek_at(1) == Tok::P(P::RParen) => {
                 let start = self.bump().span;
@@ -1314,6 +1356,13 @@ impl Parser {
                 self.skip_newlines();
                 self.expect_p(P::RBracket)?;
                 let span = start.to(self.prev_span());
+                // `Pair[u8, bool]{...}`: a literal of a generic struct.
+                if self.at_struct_lit()
+                    && let Some(ty) = generic_type(&kind, span)
+                {
+                    e = self.struct_literal(ty)?;
+                    continue;
+                }
                 e = Expr { kind, span };
             } else {
                 return Ok(e);
@@ -1414,6 +1463,34 @@ impl Parser {
             self.bump();
         }
     }
+}
+
+/// The type `kind` names when it's a type's name with arguments
+/// (`Pair[u8, bool]`, `geo.Pair[u8]`), before the `{` of a literal.
+fn generic_type(kind: &ExprKind, span: Span) -> Option<TypeExpr> {
+    let (base, items) = match kind {
+        ExprKind::Index(base, index) => (base, vec![TypeArg::Expr((**index).clone())]),
+        ExprKind::TypeArgs(base, items) => (base, items.clone()),
+        _ => return None,
+    };
+    let base = match &base.kind {
+        ExprKind::Name(n) => TypeExpr::Named(Ident {
+            name: n.clone(),
+            span: base.span,
+        }),
+        ExprKind::Field(pkg, name) => match &pkg.kind {
+            ExprKind::Name(p) => TypeExpr::Qualified(
+                Ident {
+                    name: p.clone(),
+                    span: pkg.span,
+                },
+                name.clone(),
+            ),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(TypeExpr::Generic(Box::new(base), items, span))
 }
 
 fn is_comparison(op: BinOp) -> bool {
@@ -1879,10 +1956,58 @@ mod tests {
         assert!(matches!(g(1), ExprKind::Slice(..)));
         assert!(matches!(g(2), ExprKind::TypeArgs(_, items) if items.len() == 1));
 
-        let errs = parse_errors("fn f[]() {\n}\nfn Point.m[T](self) {\n}\n");
+        let errs = parse_errors("fn f[]() {\n}\nstruct S[] {\n}\n");
         assert_eq!(errs.len(), 2, "{errs:?}");
-        assert!(errs[0].contains("needs a type parameter"));
-        assert!(errs[1].contains("generic methods"));
+        assert!(errs[0].contains("needs a parameter"));
+    }
+
+    #[test]
+    fn generic_types_and_methods() {
+        let file = parse_ok(
+            "struct Pair[A, B: Ordered] {\n\tfirst: A\n\tsecond: B\n}\n\
+             enum Either[L, R] {\n\tleft(v: L)\n\tright(v: R)\n}\n\
+             fn Pair[X, Y: Copy].swap[U](self, b: geo.Box[u8, 4], c: S[N]) -> Pair[Y, X] {\n\
+             \treturn Pair[Y, X]{first: self.second, second: S[2 + 2]{}}\n}\n",
+        );
+        let Item::Struct(pair) = &file.items[0] else {
+            panic!()
+        };
+        assert_eq!(pair.generics.len(), 2);
+        assert!(matches!(&file.items[1], Item::Enum(e) if e.generics.len() == 2));
+        let Item::Fn(swap) = &file.items[2] else {
+            panic!()
+        };
+        assert!(matches!(&swap.owner, Some(TypeExpr::Named(n)) if n.name == "Pair"));
+        let names: Vec<&str> = swap
+            .owner_generics
+            .iter()
+            .map(|g| g.name.name.as_str())
+            .collect();
+        assert_eq!(names, ["X", "Y"]);
+        assert_eq!(swap.generics.len(), 1);
+        let TypeExpr::Generic(base, args, _) = &swap.params[1].ty else {
+            panic!("{:?}", swap.params[1].ty)
+        };
+        assert!(matches!(**base, TypeExpr::Qualified(..)));
+        assert!(matches!(args[..], [TypeArg::Type(_), TypeArg::Expr(_)]));
+        // `S[N]`: a name, read by the checker as a type or a value.
+        assert!(
+            matches!(&swap.params[2].ty, TypeExpr::Generic(_, a, _) if matches!(a[..], [TypeArg::Type(_)]))
+        );
+        let Stmt::Return {
+            value: Some(ret), ..
+        } = &swap.body.stmts[0]
+        else {
+            panic!()
+        };
+        let ExprKind::StructLit(TypeExpr::Generic(_, args, _), fields) = &ret.kind else {
+            panic!("{ret:?}")
+        };
+        assert_eq!((args.len(), fields.len()), (2, 2));
+        assert!(matches!(
+            &fields[1].value.kind,
+            ExprKind::StructLit(TypeExpr::Generic(_, a, _), _) if matches!(a[..], [TypeArg::Expr(_)])
+        ));
     }
 
     #[test]

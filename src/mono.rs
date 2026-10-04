@@ -17,8 +17,12 @@
 //! (`TExprKind::Ref`), whose indexes can call functions.
 //!
 //! An instance's symbol is its function's, followed by its type arguments:
-//! `std/math.max[u32]`, `main.first[main.Point]`. The checker makes sure
-//! the instances are finitely many (`sema`'s check of generic recursion).
+//! `std/math.max[u32]`, `main.first[main.Point]`; for a method of a
+//! generic type, the type's arguments follow the type's name:
+//! `std/buf.StackBuf[64].push`, `main.Pair[u8, bool].swap`. A value
+//! parameter's local is assigned its value at the start of the body. The
+//! checker makes sure the instances are finitely many (`sema`'s check of
+//! generic recursion).
 
 use std::collections::HashMap;
 
@@ -172,12 +176,22 @@ impl Mono<'_> {
         debug_assert_eq!(f.type_params.len(), args.len());
         let params = f.type_params.clone();
         let map = |t: Ty| params.iter().position(|&p| p == t).map(|k| args[k]);
-        let symbol = if args.is_empty() {
-            f.symbol.clone()
-        } else {
+        let names = |args: &[Ty]| -> String {
             let names: Vec<String> = args.iter().map(|&a| self.type_symbol(a)).collect();
-            format!("{}[{}]", f.symbol, names.join(", "))
+            names.join(", ")
         };
+        // A method of a generic type has the type's arguments after the
+        // type's name: `std/buf.StackBuf[64].push`.
+        let (owner, own) = args.split_at(f.owner_params);
+        let mut symbol = f.symbol.clone();
+        if !owner.is_empty()
+            && let Some((ty, method)) = f.symbol.rsplit_once('.')
+        {
+            symbol = format!("{ty}[{}].{method}", names(owner));
+        }
+        if !own.is_empty() {
+            symbol = format!("{symbol}[{}]", names(own));
+        }
         let locals = f
             .locals
             .iter()
@@ -188,7 +202,25 @@ impl Mono<'_> {
                 convention: l.convention,
             })
             .collect();
-        let mut body = f.body.clone();
+        // Each value parameter's local starts with its value.
+        let mut body: Vec<TStmt> = f
+            .value_params
+            .iter()
+            .map(|&(p, local)| {
+                let ty = f.locals[local].ty;
+                let v = map(p)
+                    .and_then(Ty::as_value)
+                    .expect("a value argument for each value parameter");
+                TStmt::Init(
+                    local,
+                    TExpr {
+                        kind: TExprKind::Int(v),
+                        ty,
+                    },
+                )
+            })
+            .collect();
+        body.extend(f.body.iter().cloned());
         for s in &mut body {
             self.stmt(s, &map);
         }
@@ -196,6 +228,8 @@ impl Mono<'_> {
             name: f.name.clone(),
             symbol,
             type_params: Vec::new(),
+            owner_params: 0,
+            value_params: Vec::new(),
             params: f.params.clone(),
             ret: f.ret.subst(&map),
             throws: f.throws.map(|t| t.subst(&map)),
@@ -257,11 +291,18 @@ impl Mono<'_> {
                 None => bare.to_owned(),
             }
         };
+        let with_args = |name: String, args: &[Ty]| {
+            if args.is_empty() {
+                return name;
+            }
+            let args: Vec<String> = args.iter().map(|&a| self.type_symbol(a)).collect();
+            format!("{name}[{}]", args.join(", "))
+        };
         if let Some(def) = ty.as_struct() {
-            return declared(def.pkg, &def.name);
+            return with_args(declared(def.pkg, &def.name), &def.args);
         }
         if let Some(def) = ty.as_enum() {
-            return declared(def.pkg, &def.name);
+            return with_args(declared(def.pkg, &def.name), &def.args);
         }
         if let Some((elem, n)) = ty.as_array() {
             return format!("[{n}]{}", self.type_symbol(elem));

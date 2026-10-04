@@ -15,7 +15,7 @@ use crate::ast::{self, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
-use crate::types::{Field, IntTy, Primitive, Range, Trait, Ty, Variant, primitive};
+use crate::types::{Field, IntTy, Len, Primitive, Range, Trait, Ty, Variant, primitive};
 
 use facts::{Env, Linear, Term};
 pub use tree::*;
@@ -34,6 +34,8 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         tables: Vec::new(),
         string_ids: HashMap::new(),
         generic_calls: Vec::new(),
+        declared_bounds: HashMap::new(),
+        pending_bounds: None,
         ptr_bits,
     };
     ck.collect(packages);
@@ -128,10 +130,13 @@ struct Sig {
     throws: Option<Ty>,
     /// The function name's span.
     span: Span,
-    /// The type parameters of a generic function, and the traits each
-    /// declares as its bounds.
+    /// The generic parameters of a generic function, and the traits each
+    /// declares as its bounds (for a method of a generic type, those of
+    /// the type's declaration too). A method of a generic type has the
+    /// type's parameters first (`owner_params` of them), then its own.
     type_params: Vec<Ty>,
     bounds: Vec<Vec<Trait>>,
+    owner_params: usize,
 }
 
 /// The value of a checked constant.
@@ -178,6 +183,12 @@ struct Checker<'a> {
     /// The calls from generic functions to generic functions, for
     /// [`Checker::check_generic_recursion`].
     generic_calls: Vec<generic::GenericEdge>,
+    /// The traits each type parameter declared as its bounds (closed under
+    /// supertraits in its [`crate::types::ParamDef`]).
+    declared_bounds: HashMap<Ty, Vec<Trait>>,
+    /// While the types' declarations are collected: the instances of
+    /// generic types whose bounds are checked once every type is known.
+    pending_bounds: Option<Vec<(Ty, Span)>>,
     ptr_bits: u32,
 }
 
@@ -224,8 +235,11 @@ struct FnCx {
     strs: StrOrigins,
     /// The function being checked (`None` for a constant or a declaration).
     func: Option<FuncId>,
-    /// The type parameters of a generic function.
+    /// The generic parameters of a generic function (or of the struct or
+    /// enum whose fields are checked).
     type_params: Vec<Ty>,
+    /// The local holding each value parameter, in a function's body.
+    value_locals: Vec<(Ty, LocalId)>,
     /// The locals a value was moved out of somewhere (see
     /// [`Checker::consume`]), for the message when one is used unassigned.
     moved: HashSet<LocalId>,
@@ -287,8 +301,17 @@ impl FnCx {
             strs: StrOrigins::default(),
             func: None,
             type_params: Vec::new(),
+            value_locals: Vec::new(),
             moved: HashSet::new(),
         }
+    }
+
+    /// The local holding the value parameter `p`.
+    fn value_local(&self, p: Ty) -> Option<LocalId> {
+        self.value_locals
+            .iter()
+            .find(|&&(q, _)| q == p)
+            .map(|&(_, l)| l)
     }
 
     fn lookup(&self, name: &str) -> Option<LocalId> {
@@ -706,27 +729,126 @@ fn held_nominal(ty: Ty) -> Option<Ty> {
 /// fields of every variant of an enum, with their names for messages
 /// (`Point.x`, `Shape.circle.r`).
 fn members(ty: Ty) -> Vec<(String, Ty)> {
+    // A generic type as declared is shown by its name alone.
+    let shown = if ty.is_decl_form() {
+        expr::nominal_name(ty)
+    } else {
+        ty.to_string()
+    };
     if let Some(def) = ty.as_struct() {
         return def
             .fields
             .iter()
-            .map(|f| (format!("{ty}.{}", f.name), f.ty))
+            .map(|f| (format!("{shown}.{}", f.name), f.ty))
             .collect();
     }
     let def = ty.as_enum().expect("a struct or an enum");
     def.variants
         .iter()
         .flat_map(|v| {
+            let shown = &shown;
             v.fields
                 .iter()
-                .map(move |f| (format!("{ty}.{}.{}", v.name, f.name), f.ty))
+                .map(move |f| (format!("{shown}.{}.{}", v.name, f.name), f.ty))
         })
         .collect()
+}
+
+/// What the structs and enums of a program hold by value: for each
+/// declaration (by its declared form, [`Ty::decl`]), the declarations of
+/// the structs and enums it holds, and which of its own parameters (by
+/// position) it holds, through other types too. A fixed point over the
+/// declarations, so it's found even when instances grow without end.
+struct HeldBy {
+    types: Vec<Ty>,
+    decls: HashMap<Ty, HashSet<Ty>>,
+    params: HashMap<Ty, HashSet<usize>>,
+}
+
+impl HeldBy {
+    fn new(types: Vec<Ty>) -> HeldBy {
+        let mut h = HeldBy {
+            decls: types.iter().map(|&t| (t, HashSet::new())).collect(),
+            params: types.iter().map(|&t| (t, HashSet::new())).collect(),
+            types,
+        };
+        h.update();
+        h
+    }
+
+    /// Recompute the fixed point (after a member was cleared).
+    fn update(&mut self) {
+        for t in &self.types {
+            self.decls.insert(*t, HashSet::new());
+            self.params.insert(*t, HashSet::new());
+        }
+        loop {
+            let mut changed = false;
+            for &t in &self.types {
+                let own = t.decl_params();
+                let (mut ds, mut ps) = (HashSet::new(), HashSet::new());
+                for (_, m) in members(t) {
+                    self.held(m, &own, &mut ds, &mut ps);
+                }
+                if ds.len() != self.decls[&t].len() || ps.len() != self.params[&t].len() {
+                    changed = true;
+                }
+                self.decls.insert(t, ds);
+                self.params.insert(t, ps);
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// Add what a value of type `ty` holds, inside a declaration whose own
+    /// parameters are `own`, to `ds` and `ps`.
+    fn held(&self, ty: Ty, own: &[Ty], ds: &mut HashSet<Ty>, ps: &mut HashSet<usize>) {
+        match ty {
+            Ty::Param(_) => ps.extend(own.iter().position(|&p| p == ty)),
+            Ty::Array(_) => {
+                let (elem, _) = ty.as_array().expect("an array");
+                self.held(elem, own, ds, ps);
+            }
+            Ty::Optional(_) => {
+                self.held(ty.as_optional().expect("an optional"), own, ds, ps);
+            }
+            Ty::Struct(_) | Ty::Enum(_) => {
+                let key = ty.decl();
+                ds.insert(key);
+                if let Some(more) = self.decls.get(&key) {
+                    ds.extend(more.iter().copied());
+                }
+                let args = ty.type_args();
+                for &k in self.params.get(&key).into_iter().flatten() {
+                    self.held(args[k], own, ds, ps);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The first member of `ty`'s declaration through which it holds
+    /// `target`'s.
+    fn leading_member(&self, ty: Ty, target: Ty) -> usize {
+        let own = ty.decl_params();
+        members(ty)
+            .iter()
+            .position(|&(_, m)| {
+                let (mut ds, mut ps) = (HashSet::new(), HashSet::new());
+                self.held(m, &own, &mut ds, &mut ps);
+                ds.contains(&target)
+            })
+            .expect("a member leads back")
+    }
 }
 
 /// Make member `k` (numbered as in [`members`]) of a struct or an enum `()`,
 /// to break a cycle that was reported.
 fn clear_member(ty: Ty, k: usize) {
+    // In the declaration: an instance's members are its declaration's.
+    let ty = ty.decl();
     if let Some(def) = ty.as_struct() {
         let mut fields = def.fields.clone();
         fields[k].ty = Ty::Unit;
@@ -760,7 +882,7 @@ fn storable(ty: Ty) -> Result<(), Option<()>> {
         | Ty::Optional(_)
         | Ty::Param(_) => Ok(()),
         Ty::Str | Ty::Slice(_) => Err(Some(())),
-        Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) => Err(None),
+        Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) | Ty::Value(_) => Err(None),
     }
 }
 
@@ -910,14 +1032,18 @@ impl<'a> Checker<'a> {
                             // Messages name another package's struct the
                             // way code does: `os.Stat`.
                             let shown = Self::shown_name(packages, pkg, &s.name.name);
-                            let ty = Ty::new_struct(shown, pkg, s.is_pub);
+                            let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
+                            let (params, _) = self.declare_generics(&mut gcx, &s.generics);
+                            let ty = Ty::new_struct(shown, pkg, s.is_pub, params);
                             self.check_type_name(&s.name);
                             structs.push((s, pkg, file.id, ty));
                             (&s.name, Item::Type(ty))
                         }
                         ast::Item::Enum(e) => {
                             let shown = Self::shown_name(packages, pkg, &e.name.name);
-                            let ty = Ty::new_enum(shown, pkg, e.is_pub);
+                            let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
+                            let (params, _) = self.declare_generics(&mut gcx, &e.generics);
+                            let ty = Ty::new_enum(shown, pkg, e.is_pub, params);
                             self.check_type_name(&e.name);
                             enums.push((e, pkg, file.id, ty));
                             (&e.name, Item::Type(ty))
@@ -935,20 +1061,25 @@ impl<'a> Checker<'a> {
         }
         // Field types and signatures come once every item is known: an array
         // length in a type can name a constant declared further down, and a
-        // field's type a struct declared further down.
+        // field's type a struct declared further down. The bounds of the
+        // generic types they name are checked once every field is known.
+        self.pending_bounds = Some(Vec::new());
         for &(s, pkg, file, ty) in &structs {
-            let fields = self.struct_fields(s, pkg, file);
+            let fields = self.struct_fields(s, pkg, file, ty);
             ty.set_fields(fields);
         }
         for &(e, pkg, file, ty) in &enums {
-            let (tag, explicit, variants) = self.enum_variants(e, pkg, file);
+            let (tag, explicit, variants) = self.enum_variants(e, pkg, file, ty);
             ty.set_variants(tag, explicit, variants);
         }
-        for &(s, _, _, ty) in &structs {
-            self.check_recursion(&s.name, "struct", ty);
-        }
-        for &(e, _, _, ty) in &enums {
-            self.check_recursion(&e.name, "enum", ty);
+        let nominal: Vec<(&ast::Ident, &str, Ty)> = structs
+            .iter()
+            .map(|&(s, _, _, ty)| (&s.name, "struct", ty))
+            .chain(enums.iter().map(|&(e, _, _, ty)| (&e.name, "enum", ty)))
+            .collect();
+        self.check_recursion(&nominal);
+        for (ty, span) in self.pending_bounds.take().unwrap_or_default() {
+            self.check_type_bounds(ty, span);
         }
         let mut owners = Vec::new();
         for (id, &(f, pkg, file)) in fns.iter().enumerate() {
@@ -1051,8 +1182,15 @@ impl<'a> Checker<'a> {
 
     /// The fields of a struct declaration. A field whose type is in error
     /// gets the type `()`, so later checks see no more problems with it.
-    fn struct_fields(&mut self, s: &ast::StructDecl, pkg: usize, file: FileId) -> Vec<Field> {
+    fn struct_fields(
+        &mut self,
+        s: &ast::StructDecl,
+        pkg: usize,
+        file: FileId,
+        ty: Ty,
+    ) -> Vec<Field> {
         let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+        cx.type_params = ty.decl_params();
         let mut fields: Vec<Field> = Vec::new();
         if s.fields.is_empty() {
             self.error(
@@ -1130,8 +1268,16 @@ impl<'a> Checker<'a> {
         e: &ast::EnumDecl,
         pkg: usize,
         file: FileId,
+        ty: Ty,
     ) -> (IntTy, bool, Vec<Variant>) {
         let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+        cx.type_params = ty.decl_params();
+        if e.tag.is_some() && !e.generics.is_empty() {
+            self.error(
+                e.name.span,
+                "a C-style enum (with integer values) can't be generic",
+            );
+        }
         let enum_name = &e.name.name;
         if e.variants.is_empty() {
             self.error(
@@ -1266,67 +1412,135 @@ impl<'a> Checker<'a> {
         Some(v)
     }
 
-    /// Report a struct or an enum (`kind`) that holds a value of its own
-    /// type, directly or through other structs, enums, arrays and optionals:
-    /// it would be infinitely large. Each cycle is reported once, at the
-    /// first of its types, and broken (the member closing it becomes `()`)
-    /// so later checks terminate.
-    fn check_recursion(&mut self, name: &ast::Ident, kind: &str, ty: Ty) {
-        // The members leading from `from` back to `ty`, as (type, member index).
-        fn path_back(from: Ty, ty: Ty, seen: &mut Vec<Ty>, path: &mut Vec<(Ty, usize)>) -> bool {
-            if seen.contains(&from) {
+    /// Report each struct or enum (of `decls`, with its name and its kind)
+    /// that holds a value of its own type, directly or through other
+    /// structs, enums, arrays and optionals: it would be infinitely large.
+    /// For a generic one, any instance of it counts (`struct W[T] { w:
+    /// ?W[Pair[T, T]] }`), since every instance holds one in turn. Each
+    /// cycle is reported once, at the first of its types, and broken (its
+    /// member leading back becomes `()`) so later checks terminate.
+    fn check_recursion(&mut self, decls: &[(&ast::Ident, &str, Ty)]) {
+        // The members leading from `from` to an instance of `ty`'s
+        // declaration, as (type, member index), looking at no more than
+        // `budget` types.
+        fn path_back(
+            from: Ty,
+            ty: Ty,
+            seen: &mut Vec<Ty>,
+            path: &mut Vec<(Ty, usize)>,
+            budget: &mut u32,
+        ) -> bool {
+            if seen.contains(&from) || *budget == 0 {
                 return false;
             }
+            *budget -= 1;
             seen.push(from);
             for (i, (_, mty)) in members(from).into_iter().enumerate() {
                 let Some(inner) = held_nominal(mty) else {
                     continue;
                 };
                 path.push((from, i));
-                if inner == ty || path_back(inner, ty, seen, path) {
+                if inner.same_decl(ty) || path_back(inner, ty, seen, path, budget) {
                     return true;
                 }
                 path.pop();
             }
             false
         }
-        loop {
-            let mut path = Vec::new();
-            if !path_back(ty, ty, &mut Vec::new(), &mut path) {
-                return;
-            }
-            let through: Vec<String> = path
-                .iter()
-                .map(|&(t, i)| format!("`{}`", members(t)[i].0))
-                .collect();
-            let holds = if kind == "struct" {
-                "a struct holds its fields by value"
-            } else {
-                "an enum holds its payload by value"
-            };
-            self.diags.push(
-                Diagnostic::error(
+        let mut holds = HeldBy::new(decls.iter().map(|&(_, _, ty)| ty).collect());
+        for &(name, kind, ty) in decls {
+            while holds.decls[&ty].contains(&ty) {
+                let mut path = Vec::new();
+                path_back(ty, ty, &mut Vec::new(), &mut path, &mut 1000);
+                let holds_by = if kind == "struct" {
+                    "a struct holds its fields by value"
+                } else {
+                    "an enum holds its payload by value"
+                };
+                let mut d = Diagnostic::error(
                     name.span,
                     format!("the {kind} `{}` contains itself", name.name),
-                )
-                .with_help(format!("through {}", through.join(", then ")))
-                .with_help(format!("{holds}, so it would be infinitely large")),
-            );
-            let &(last, i) = path.last().expect("a member");
-            clear_member(last, i);
+                );
+                if !path.is_empty() {
+                    let through: Vec<String> = path
+                        .iter()
+                        .map(|&(t, i)| format!("`{}`", members(t)[i].0))
+                        .collect();
+                    d = d.with_help(format!("through {}", through.join(", then ")));
+                }
+                self.diags
+                    .push(d.with_help(format!("{holds_by}, so it would be infinitely large")));
+                // A member of its own that leads back: a member further
+                // on may be another generic type's, which holds a
+                // parameter.
+                clear_member(ty, holds.leading_member(ty, ty));
+                holds.update();
+            }
         }
     }
 
     /// The Lode type a type expression names. `cx` is where it appears: array
-    /// lengths are constant expressions evaluated there.
+    /// lengths are constant expressions evaluated there. A generic struct
+    /// or enum needs its arguments (`Pair[u8, bool]`).
     fn resolve_type(&mut self, cx: &mut FnCx, t: &TypeExpr) -> Option<Ty> {
+        let ty = self.resolve_type_or_decl(cx, t)?;
+        if matches!(t, TypeExpr::Named(_) | TypeExpr::Qualified(..)) && ty.is_decl_form() {
+            let params: Vec<String> = ty.decl_params().iter().map(Ty::to_string).collect();
+            let name = generic::type_text(t);
+            self.diags.push(
+                Diagnostic::error(t.span(), format!("`{name}` needs its generic arguments"))
+                    .with_help(format!(
+                        "it takes {}: `{name}[{}]`",
+                        params.len(),
+                        params.join(", ")
+                    )),
+            );
+            return None;
+        }
+        Some(ty)
+    }
+
+    /// Like [`Checker::resolve_type`], but a generic struct or enum named
+    /// without its arguments (`Pair`) is its declared form, whose
+    /// arguments a literal or a call infers.
+    fn resolve_type_or_decl(&mut self, cx: &mut FnCx, t: &TypeExpr) -> Option<Ty> {
         match t {
             TypeExpr::Unit(_) => Some(Ty::Unit),
             TypeExpr::Array(len, elem, _) => {
                 let elem_ty = self.resolve_type(cx, elem)?;
-                let len = self.const_count(cx, len)?;
+                let len = self.array_len_arg(cx, len)?;
                 self.check_elem(elem_ty, "arrays", elem.span())?;
-                Some(Ty::array(elem_ty, len))
+                Some(Ty::array_of(elem_ty, len))
+            }
+            TypeExpr::Generic(base, items, span) => {
+                let ty = self.resolve_type_or_decl(cx, base)?;
+                let params = ty.decl_params();
+                let name = generic::type_text(base);
+                if params.is_empty() {
+                    self.error(
+                        *span,
+                        format!("`{name}` is not generic: it takes no arguments"),
+                    );
+                    return None;
+                }
+                if items.len() != params.len() {
+                    self.error(
+                        *span,
+                        format!(
+                            "`{name}` takes {} generic argument(s), but {} were given",
+                            params.len(),
+                            items.len()
+                        ),
+                    );
+                    return None;
+                }
+                let mut args = Vec::new();
+                for (item, &p) in items.iter().zip(&params) {
+                    args.push(self.generic_arg(cx, item, p));
+                }
+                let args: Vec<Ty> = args.into_iter().collect::<Option<_>>()?;
+                let inst = ty.instantiate(&args);
+                self.check_type_bounds(inst, *span).then_some(inst)
             }
             TypeExpr::Slice(elem, _) => {
                 let elem_ty = self.resolve_type(cx, elem)?;
@@ -1395,7 +1609,18 @@ impl<'a> Checker<'a> {
                 None
             }
             TypeExpr::Named(id) if Self::type_param(cx, &id.name).is_some() => {
-                Self::type_param(cx, &id.name)
+                let p = Self::type_param(cx, &id.name).expect("checked");
+                if let Some(it) = p.value_param() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            id.span,
+                            format!("`{p}` is a value (a `{it}`), not a type"),
+                        )
+                        .with_help(format!("it can be an array's length: `[{p}]u8`")),
+                    );
+                    return None;
+                }
+                Some(p)
             }
             TypeExpr::Named(id) => match primitive(&id.name, self.ptr_bits) {
                 Some(Primitive::Ty(ty)) => Some(ty),
@@ -1455,6 +1680,30 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// The length in an array type `[len]T`: a constant count, or a value
+    /// parameter of type `usize`.
+    fn array_len_arg(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<Len> {
+        if let ExprKind::Name(n) = &e.kind
+            && let Some(p) = Self::type_param(cx, n)
+        {
+            return match p.value_param() {
+                Some(it) if Ty::Int(it) == self.usize_ty() => Some(Len::Param(p)),
+                Some(it) => {
+                    self.error(
+                        e.span,
+                        format!("an array's length is a `usize`, but `{p}` is a `{it}`"),
+                    );
+                    None
+                }
+                None => {
+                    self.error(e.span, format!("`{p}` is a type, not a length"));
+                    None
+                }
+            };
+        }
+        self.const_count(cx, e).map(Len::Known)
+    }
+
     /// The value of a constant count, like an array length: an untyped
     /// integer, or a typed integer constant.
     pub(super) fn const_count(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<u64> {
@@ -1483,7 +1732,36 @@ impl<'a> Checker<'a> {
     /// The signature of `f`, whose owner type is `owner` for a method or an
     /// associated function (`None` if it's in error).
     fn signature(&mut self, cx: &mut FnCx, f: &ast::FnDecl, owner: Option<Ty>) -> Sig {
-        let (type_params, bounds) = self.declare_generics(cx, &f.generics);
+        // A method of a generic type names the type's parameters first:
+        // `self` is the type with them as arguments.
+        let mut owner = owner;
+        let (mut type_params, mut bounds) = (Vec::new(), Vec::new());
+        if let Some(o) = owner
+            && (!o.decl_params().is_empty() || !f.owner_generics.is_empty())
+        {
+            let span = f.owner.as_ref().map_or(f.name.span, TypeExpr::span);
+            match self.declare_owner_generics(o, &f.owner_generics, span) {
+                Some((ps, bs)) => {
+                    owner = Some(o.instantiate(&ps));
+                    type_params = ps;
+                    bounds = bs;
+                }
+                None => owner = None,
+            }
+        }
+        let owner_params = type_params.len();
+        let (own, own_bounds) = self.declare_generics(cx, &f.generics);
+        for p in &own {
+            if type_params.iter().any(|q| q.to_string() == p.to_string()) {
+                self.error(
+                    f.name.span,
+                    format!("the type parameter `{p}` is declared twice"),
+                );
+            }
+        }
+        type_params.extend(own);
+        bounds.extend(own_bounds);
+        cx.type_params = type_params.clone();
         let mut params = Vec::new();
         let has_self = f.params.first().is_some_and(ast::Param::is_self);
         for p in &f.params {
@@ -1556,6 +1834,7 @@ impl<'a> Checker<'a> {
             span: f.name.span,
             type_params,
             bounds,
+            owner_params,
         }
     }
 
@@ -1732,7 +2011,7 @@ impl<'a> Checker<'a> {
         ty: Ty,
         out: &mut Vec<i128>,
     ) -> Option<()> {
-        let Some((elem, n)) = ty.as_array() else {
+        let Some((elem, n)) = ty.as_known_array() else {
             let c = self.expr(cx, e, Some(ty))?;
             let c = self.coerce(cx, c, ty, e.span)?;
             let v = match (&c.expr.kind, c.range) {
@@ -1828,6 +2107,23 @@ impl<'a> Checker<'a> {
             params.push(local);
         }
         cx.params = params.len();
+        // A value parameter is an immutable local of its type, a term like
+        // any other; an instance assigns it its value first.
+        for p in cx.type_params.clone() {
+            let Some(it) = p.value_param() else {
+                continue;
+            };
+            let name = p.to_string();
+            if cx.scopes[0].contains_key(&name) {
+                self.error(
+                    f.name.span,
+                    format!("`{name}` is both a value parameter and a parameter"),
+                );
+                continue;
+            }
+            let local = Self::declare_local(&mut cx, &name, Ty::Int(it), false, None);
+            cx.value_locals.push((p, local));
+        }
         let body = self.block(&mut cx, &f.body.stmts);
         self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
@@ -1864,6 +2160,8 @@ impl<'a> Checker<'a> {
             symbol: format!("{}.{name}", self.pkgs[pkg].path),
             name,
             type_params: cx.type_params.clone(),
+            owner_params: self.sigs[id].owner_params,
+            value_params: cx.value_locals,
             params,
             ret,
             throws,
@@ -1942,7 +2240,9 @@ impl<'a> Checker<'a> {
 
     /// The help for assigning to the immutable `local`, named `name`.
     pub(super) fn immutable_help(cx: &FnCx, local: LocalId, name: &str) -> String {
-        if name == "self" && local == 0 {
+        if cx.value_locals.iter().any(|&(_, l)| l == local) {
+            format!("`{name}` is a value parameter: its value is fixed when compiling")
+        } else if name == "self" && local == 0 {
             "declare the method with `inout self` to change the value it's called on".to_owned()
         } else if local < cx.params {
             format!(
@@ -2232,15 +2532,22 @@ impl<'a> Checker<'a> {
                     }
                 }
                 // A view of a whole array has the array's length.
-                TExprKind::ToSlice(array) => {
-                    let (_, n) = array.ty.as_array().expect("an array");
-                    let n = i128::from(n);
-                    cx.env.apply(&[facts::Fact::Narrow {
-                        term: Term::Len(local),
-                        bound: Range::exact(n),
-                        full: Range { lo: n, hi: n },
-                    }]);
-                }
+                TExprKind::ToSlice(array) => match array.ty.as_array().expect("an array").1 {
+                    Len::Known(n) => {
+                        let n = i128::from(n);
+                        cx.env.apply(&[facts::Fact::Narrow {
+                            term: Term::Len(local),
+                            bound: Range::exact(n),
+                            full: Range { lo: n, hi: n },
+                        }]);
+                    }
+                    // `[N]T`: the length is the value parameter's local.
+                    Len::Param(p) => {
+                        if let Some(n) = cx.value_local(p) {
+                            cx.env.apply(&equal(Term::Len(local), Term::Local(n), 0));
+                        }
+                    }
+                },
                 _ => {}
             }
         }
@@ -3521,10 +3828,11 @@ impl<'a> Checker<'a> {
                     }
                 };
                 let end = match len {
-                    Some(n) => {
+                    Some(Len::Known(n)) => {
                         let n = i128::from(n);
                         expr::Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)))
                     }
+                    Some(Len::Param(p)) => self.param_len(cx, p),
                     None => self.view_len(cx, seq_t.clone()),
                 };
                 let start = expr::Checked::new(TExprKind::Int(0), usize_ty, Some(Range::exact(0)));
@@ -4115,7 +4423,7 @@ const TABLE_MAX: u64 = 1 << 24;
 
 /// How many scalars an array of type `ty` holds.
 fn table_scalars(ty: Ty) -> u64 {
-    match ty.as_array() {
+    match ty.as_known_array() {
         Some((elem, n)) => n.saturating_mul(table_scalars(elem)),
         None => 1,
     }

@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use crate::ast::{self, BinOp, ExprKind, UnOp};
 use crate::diag::Diagnostic;
 use crate::source::Span;
-use crate::types::{IntTy, Primitive, Range, Trait, Ty, primitive};
+use crate::types::{IntTy, Len, Primitive, Range, Trait, Ty, primitive};
 
 use super::facts::{self, CondFacts, Env, Form, Linear, Side, Term};
-use super::generic::{GenericEdge, Inference, ORDERED_METHODS, num, param_help, show_range};
+use super::generic::{
+    GenericEdge, Inference, ORDERED_METHODS, expr_type, num, param_help, show_range,
+};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
 
@@ -119,6 +121,16 @@ fn needs_context(e: &ast::Expr) -> bool {
         ExprKind::Call(callee, _) => matches!(callee.kind, ExprKind::Dot(_)),
         ExprKind::Paren(inner) => needs_context(inner),
         _ => false,
+    }
+}
+
+/// The name of a struct or an enum, without arguments (`Pair`).
+pub(super) fn nominal_name(ty: Ty) -> String {
+    match ty.as_struct() {
+        Some(def) => def.name.clone(),
+        None => ty
+            .as_enum()
+            .map_or_else(|| ty.to_string(), |d| d.name.clone()),
     }
 }
 
@@ -737,7 +749,7 @@ impl Checker<'_> {
                 );
                 None
             }
-            ExprKind::Field(base, member) => self.field(cx, base, member, e.span),
+            ExprKind::Field(base, member) => self.field(cx, base, member, e.span, expected),
             ExprKind::ArrayLit(elems) => {
                 self.array_literal(cx, elems, e.span, expected.map(under_optionals))
             }
@@ -771,7 +783,9 @@ impl Checker<'_> {
                 );
                 None
             }
-            ExprKind::StructLit(ty, fields) => self.struct_literal(cx, ty, fields, e.span),
+            ExprKind::StructLit(ty, fields) => {
+                self.struct_literal(cx, ty, fields, e.span, expected.map(under_optionals))
+            }
             ExprKind::None => match expected {
                 Some(t @ Ty::Optional(_)) => {
                     Some(Checked::new(TExprKind::Variant(0, Vec::new()), t, None))
@@ -797,8 +811,16 @@ impl Checker<'_> {
     /// The enum (or struct) type an expression names, as in `Shape.circle`
     /// or `geo.Shape.circle`: `None` if it doesn't name a type, `Some(None)`
     /// if it names one it can't use (the error is reported).
-    fn type_path(&mut self, cx: &FnCx, e: &ast::Expr) -> Option<Option<Ty>> {
+    fn type_path(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<Option<Ty>> {
         match &e.kind {
+            // `Pair[u8, bool]`: a generic type with its arguments.
+            ExprKind::Index(base, _) | ExprKind::TypeArgs(base, _) => {
+                if self.type_path(cx, base)?.is_none() {
+                    return Some(None);
+                }
+                let t = expr_type(e)?;
+                Some(self.resolve_type(cx, &t))
+            }
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Type(ty)) => Some(Some(ty)),
@@ -826,7 +848,9 @@ impl Checker<'_> {
     }
 
     /// `E.name` (`args` is `None`) or `E.name(a, b)`: a value of the enum
-    /// `ty`, with its payload fields given in order.
+    /// `ty`, with its payload fields given in order. For a generic enum
+    /// named without its arguments (`Either.left(x)`), they're inferred from
+    /// the payload and the expected type.
     fn enum_variant(
         &mut self,
         cx: &mut FnCx,
@@ -834,6 +858,7 @@ impl Checker<'_> {
         member: &ast::Ident,
         args: Option<&[ast::Expr]>,
         span: Span,
+        expected: Option<Ty>,
     ) -> Option<Checked> {
         let Some(def) = ty.as_enum() else {
             self.error(
@@ -847,20 +872,25 @@ impl Checker<'_> {
             self.error(member.span, format!("`{ty}` has no variant `{name}`"));
             return None;
         };
+        let shown = if ty.is_decl_form() {
+            def.name.clone()
+        } else {
+            ty.to_string()
+        };
         let fields = &variant.fields;
         let args = match (args, fields.is_empty()) {
             (None, true) => &[][..],
             (None, false) => {
                 self.error(
                     span,
-                    format!("`{ty}.{name}` has a payload: give it as `{ty}.{name}(...)`"),
+                    format!("`{shown}.{name}` has a payload: give it as `{shown}.{name}(...)`"),
                 );
                 return None;
             }
             (Some(_), true) => {
                 self.error(
                     span,
-                    format!("`{ty}.{name}` has no payload, so it's written without parentheses"),
+                    format!("`{shown}.{name}` has no payload, so it's written without parentheses"),
                 );
                 return None;
             }
@@ -870,18 +900,30 @@ impl Checker<'_> {
             self.error(
                 span,
                 format!(
-                    "`{ty}.{name}` has {} payload field(s), but {} value(s) were given",
+                    "`{shown}.{name}` has {} payload field(s), but {} value(s) were given",
                     fields.len(),
                     args.len()
                 ),
             );
             return None;
         }
+        let (ty, mut pre) = if ty.is_decl_form() {
+            let values: Vec<(Ty, &ast::Expr)> = fields.iter().map(|f| f.ty).zip(args).collect();
+            let what = format!("`{shown}.{name}`");
+            self.infer_instance(cx, ty, &values, expected, span, &what)?
+        } else {
+            (ty, args.iter().map(|_| None).collect())
+        };
+        let def = ty.as_enum().expect("an enum");
+        let fields = &def.variants[i].fields;
         let mut values = Vec::new();
         let mut ok = true;
-        for (arg, f) in args.iter().zip(fields) {
-            match self
-                .expr(cx, arg, Some(f.ty))
+        for (k, (arg, f)) in args.iter().zip(fields).enumerate() {
+            let c = match pre[k].take() {
+                Some(c) => Some(c),
+                None => self.expr(cx, arg, Some(f.ty)),
+            };
+            match c
                 .and_then(|c| self.coerce(cx, c, f.ty, arg.span))
                 .filter(|c| self.consume(cx, &c.expr, arg.span).is_some())
             {
@@ -890,6 +932,127 @@ impl Checker<'_> {
             }
         }
         ok.then(|| Checked::new(TExprKind::Variant(i as u32, values), ty, None))
+    }
+
+    /// Whether `e` builds a value of a generic struct or enum named
+    /// without its arguments (`Pair{...}`, `Either.left(x)`): it may infer
+    /// them itself, or take them from the context.
+    pub(super) fn generic_literal(&self, cx: &FnCx, e: &ast::Expr) -> bool {
+        let names_generic = |t: &ast::Expr| {
+            let item = match &t.kind {
+                ExprKind::Name(n) if cx.lookup(n).is_none() => self.pkgs[cx.pkg].items.get(n),
+                ExprKind::Field(base, member) => match &base.kind {
+                    ExprKind::Name(p) => self
+                        .imported(cx, p)
+                        .and_then(|pkg| self.pkgs[pkg].items.get(&member.name)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            matches!(item, Some(Item::Type(ty)) if ty.is_decl_form())
+        };
+        match &e.kind {
+            ExprKind::Paren(inner) => self.generic_literal(cx, inner),
+            ExprKind::StructLit(ty, _) => {
+                let as_expr = |id: &ast::Ident| ast::Expr {
+                    kind: ExprKind::Name(id.name.clone()),
+                    span: id.span,
+                };
+                match ty {
+                    ast::TypeExpr::Named(id) => names_generic(&as_expr(id)),
+                    ast::TypeExpr::Qualified(p, id) => names_generic(&ast::Expr {
+                        kind: ExprKind::Field(Box::new(as_expr(p)), id.clone()),
+                        span: id.span,
+                    }),
+                    _ => false,
+                }
+            }
+            ExprKind::Call(callee, _) => {
+                matches!(&callee.kind, ExprKind::Field(base, _) if names_generic(base))
+            }
+            ExprKind::Field(base, _) => names_generic(base),
+            _ => false,
+        }
+    }
+
+    /// The instance a literal (or a variant) of `decl`, a generic struct or
+    /// enum named without its arguments, builds: its arguments are inferred
+    /// like a call's (docs/generics.md), from `values` (each with its
+    /// field's type in the declaration), in order, then from the type
+    /// `expected`. A value that takes its type from the context (a literal,
+    /// `none`, `.name`, an array literal) doesn't fix an argument; a literal
+    /// of a generic type without its arguments waits for the expected type
+    /// too, and fixes them if that doesn't. Returns the values checked on
+    /// the way (by position), to be converted to their fields' types.
+    /// `what` names the literal in messages.
+    pub(super) fn infer_instance(
+        &mut self,
+        cx: &mut FnCx,
+        decl: Ty,
+        values: &[(Ty, &ast::Expr)],
+        expected: Option<Ty>,
+        span: Span,
+        what: &str,
+    ) -> Option<(Ty, Vec<Option<Checked>>)> {
+        let mut inf = Inference::new(decl.decl_params());
+        let mut checked: Vec<Option<Checked>> = values.iter().map(|_| None).collect();
+        let mut ok = true;
+        let mut later = Vec::new();
+        for (k, &(fty, e)) in values.iter().enumerate() {
+            if inf.known(fty) || self.untyped_int(cx, e).is_some() || needs_context(e) {
+                continue;
+            }
+            if self.generic_literal(cx, e) {
+                later.push(k);
+                continue;
+            }
+            match self.expr(cx, e, None) {
+                Some(c) => {
+                    inf.unify(fty, c.ty(), e.span);
+                    checked[k] = Some(c);
+                }
+                None => ok = false,
+            }
+        }
+        if !inf.all_known()
+            && let Some(t) = expected
+        {
+            inf.unify(decl, under_optionals(t), span);
+        }
+        for k in later {
+            let (fty, e) = values[k];
+            if inf.known(fty) {
+                continue;
+            }
+            match self.expr(cx, e, None) {
+                Some(c) => {
+                    inf.unify(fty, c.ty(), e.span);
+                    checked[k] = Some(c);
+                }
+                None => ok = false,
+            }
+        }
+        if !ok {
+            return None;
+        }
+        if let Some(p) = inf.unknown() {
+            let params: Vec<String> = decl.decl_params().iter().map(Ty::to_string).collect();
+            self.diags.push(
+                Diagnostic::error(span, format!("cannot tell what `{p}` is in {what}"))
+                    .with_help(format!(
+                        "write the arguments, as in `{}[{}]`, or give the value a type from context",
+                        nominal_name(decl),
+                        params.join(", ")
+                    ))
+                    .with_help("an integer literal doesn't fix a generic argument"),
+            );
+            return None;
+        }
+        let inst = decl.instantiate(&inf.types());
+        if !self.check_type_bounds(inst, span) {
+            return None;
+        }
+        Some((inst, checked))
     }
 
     /// `.name` (`args` is `None`) or `.name(a, b)`: a variant of the enum
@@ -903,7 +1066,7 @@ impl Checker<'_> {
         cx: &mut FnCx,
     ) -> Option<Checked> {
         match expected.map(under_optionals) {
-            Some(ty @ Ty::Enum(_)) => self.enum_variant(cx, ty, name, args, span),
+            Some(ty @ Ty::Enum(_)) => self.enum_variant(cx, ty, name, args, span, None),
             other => {
                 let found = match other {
                     Some(t) => format!(", and `{t}` is not an enum"),
@@ -1133,23 +1296,50 @@ impl Checker<'_> {
         ))
     }
 
-    /// `T{name: value, ...}`: every field exactly once, in any order.
+    /// `T{name: value, ...}`: every field exactly once, in any order. For
+    /// a generic struct named without its arguments (`Pair{...}`), they're
+    /// inferred from the fields' values and the expected type.
     fn struct_literal(
         &mut self,
         cx: &mut FnCx,
         ty: &ast::TypeExpr,
         inits: &[ast::FieldInit],
         span: Span,
+        expected: Option<Ty>,
     ) -> Option<Checked> {
-        let sty = self.resolve_type(cx, ty)?;
+        let sty = self.resolve_type_or_decl(cx, ty)?;
         let Some(def) = sty.as_struct() else {
             self.error(ty.span(), format!("`{sty}` is not a struct"));
             return None;
         };
+        let mut pre: Vec<Option<Checked>> = inits.iter().map(|_| None).collect();
+        let (sty, def) = if sty.is_decl_form() {
+            // The fields given once, with known names, fix the arguments.
+            let mut seen = Vec::new();
+            let mut idx = Vec::new();
+            let mut values = Vec::new();
+            for (k, init) in inits.iter().enumerate() {
+                if let Some((i, fty)) = def.field(&init.name.name)
+                    && !seen.contains(&i)
+                {
+                    seen.push(i);
+                    idx.push(k);
+                    values.push((fty, &init.value));
+                }
+            }
+            let what = format!("this `{}` literal", def.name);
+            let (inst, checked) = self.infer_instance(cx, sty, &values, expected, span, &what)?;
+            for (k, c) in idx.into_iter().zip(checked) {
+                pre[k] = c;
+            }
+            (inst, inst.as_struct().expect("a struct"))
+        } else {
+            (sty, def)
+        };
         let mut given = vec![false; def.fields.len()];
         let mut out = Vec::new();
         let mut ok = true;
-        for init in inits {
+        for (k, init) in inits.iter().enumerate() {
             let name = &init.name.name;
             let Some((i, fty)) = def.field(name) else {
                 self.error(init.name.span, format!("`{sty}` has no field `{name}`"));
@@ -1165,8 +1355,11 @@ impl Checker<'_> {
                 continue;
             }
             given[i] = true;
-            match self
-                .expr(cx, &init.value, Some(fty))
+            let c = match pre[k].take() {
+                Some(c) => Some(c),
+                None => self.expr(cx, &init.value, Some(fty)),
+            };
+            match c
                 .and_then(|c| self.coerce(cx, c, fty, init.value.span))
                 .filter(|c| self.consume(cx, &c.expr, init.value.span).is_some())
             {
@@ -1197,7 +1390,7 @@ impl Checker<'_> {
 
     /// The element type and length (`None` for a slice) that an array literal
     /// is expected to have, from its context.
-    fn expected_array(expected: Option<Ty>) -> (Option<Ty>, Option<u64>) {
+    fn expected_array(expected: Option<Ty>) -> (Option<Ty>, Option<Len>) {
         match expected {
             Some(t) => match (t.as_array(), t.as_slice()) {
                 (Some((elem, n)), _) => (Some(elem), Some(n)),
@@ -1211,8 +1404,8 @@ impl Checker<'_> {
     /// Report an array literal whose length doesn't match the expected type.
     fn check_literal_len(
         &mut self,
-        found: u64,
-        want: Option<u64>,
+        found: Len,
+        want: Option<Len>,
         expected: Option<Ty>,
         span: Span,
     ) -> Option<()> {
@@ -1260,7 +1453,7 @@ impl Checker<'_> {
             }
         };
         self.check_elem(elem, "arrays", span)?;
-        self.check_literal_len(n, want_len, expected, span)?;
+        self.check_literal_len(Len::Known(n), want_len, expected, span)?;
         let mut ok = true;
         let mut out = Vec::new();
         for (e, done) in elems.iter().zip(checked) {
@@ -1289,7 +1482,7 @@ impl Checker<'_> {
         expected: Option<Ty>,
     ) -> Option<Checked> {
         let (want_elem, want_len) = Self::expected_array(expected);
-        let n = self.const_count(cx, count);
+        let n = self.array_len_arg(cx, count);
         let v = self.expr(cx, value, want_elem);
         let (n, v) = (n?, v?);
         let v = match want_elem {
@@ -1313,10 +1506,46 @@ impl Checker<'_> {
             return None;
         }
         Some(Checked::new(
-            TExprKind::ArrayRepeat(Box::new(v.expr), n),
-            Ty::array(elem, n),
+            TExprKind::ArrayRepeat(Box::new(v.expr)),
+            Ty::array_of(elem, n),
             None,
         ))
+    }
+
+    /// The value parameter `p` (of type `usize`), as an array's length: its
+    /// local, a term.
+    pub(super) fn param_len(&self, cx: &FnCx, p: Ty) -> Checked {
+        let local = cx
+            .value_local(p)
+            .expect("a value parameter of the function being checked");
+        let term = Term::Local(local);
+        let mut c = Checked::new(
+            TExprKind::Local(local),
+            self.usize_ty(),
+            super::read_range(cx, term),
+        );
+        c.term = Some(Linear::of(term));
+        c
+    }
+
+    /// `a.len` of an array: the constant length of its type, or the value
+    /// parameter that's its length (`[N]T`).
+    fn array_len(&self, cx: &FnCx, array: TExpr) -> Checked {
+        let usize_ty = self.usize_ty();
+        let (_, len) = array.ty.as_array().expect("an array");
+        let kind = TExprKind::ArrayLen(Box::new(array));
+        match len {
+            Len::Known(n) => {
+                let n = i128::from(n);
+                Checked::new(kind, usize_ty, Some(Range::exact(n)))
+            }
+            Len::Param(p) => {
+                let n = self.param_len(cx, p);
+                let mut c = Checked::new(kind, usize_ty, n.range);
+                c.term = n.term;
+                c
+            }
+        }
     }
 
     /// The length of a view (a slice or `str`): a term when the view is a
@@ -1408,13 +1637,18 @@ impl Checker<'_> {
         }
         // `the length is 4`, `the length can be 1..=10`, ...
         let (proven, len_desc) = match b.ty().as_array() {
-            Some((_, n)) => (r.hi < i128::from(n), format!("the length is {n}")),
-            None => {
-                let len = self.view_len_of(cx, &b);
+            Some((_, Len::Known(n))) => (r.hi < i128::from(n), format!("the length is {n}")),
+            arr => {
+                let len = match arr {
+                    Some((_, Len::Param(p))) => self.param_len(cx, p),
+                    _ => self.view_len_of(cx, &b),
+                };
                 let lr = len.int_range();
                 let by_range = r.hi < lr.lo;
                 let by_rel = at_most(cx, &i, len.term, -1);
-                let desc = if lr.lo == lr.hi {
+                let desc = if let Some((_, Len::Param(p))) = arr {
+                    format!("the length is `{p}`, which can be {lr}")
+                } else if lr.lo == lr.hi {
                     format!("the length is {lr}")
                 } else if lr.lo == 0 && lr.hi == i128::from(i64::MAX) {
                     "nothing is known about the length".to_owned()
@@ -1485,10 +1719,15 @@ impl Checker<'_> {
         let (view, len) = match b.ty() {
             Ty::Array(_) => {
                 let (elem, n) = b.ty().as_array().expect("an array");
-                let n = i128::from(n);
+                let len = match n {
+                    Len::Known(n) => {
+                        let n = i128::from(n);
+                        Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)))
+                    }
+                    Len::Param(p) => self.param_len(cx, p),
+                };
                 let view =
                     Checked::new(TExprKind::ToSlice(Box::new(b.expr)), Ty::slice(elem), None);
-                let len = Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)));
                 (view, len)
             }
             Ty::Slice(_) => {
@@ -1696,7 +1935,7 @@ impl Checker<'_> {
         let table = &self.tables[id];
         let mut dims = Vec::new();
         let mut ty = table.ty;
-        while let Some((elem, n)) = ty.as_array() {
+        while let Some((elem, n)) = ty.as_known_array() {
             dims.push(n as usize);
             ty = elem;
         }
@@ -1856,10 +2095,11 @@ impl Checker<'_> {
         base: &ast::Expr,
         member: &ast::Ident,
         span: Span,
+        expected: Option<Ty>,
     ) -> Option<Checked> {
         if let Some(ty) = self.type_path(cx, base) {
             let ty = ty?;
-            if self.methods.contains_key(&(ty, member.name.clone())) {
+            if self.methods.contains_key(&(ty.decl(), member.name.clone())) {
                 self.error(
                     span,
                     format!(
@@ -1869,7 +2109,7 @@ impl Checker<'_> {
                 );
                 return None;
             }
-            return self.enum_variant(cx, ty, member, None, span);
+            return self.enum_variant(cx, ty, member, None, span, expected);
         }
         if let ExprKind::Name(pkg_name) = &base.kind
             && let Some(pkg) = self.imported(cx, pkg_name)
@@ -1883,17 +2123,8 @@ impl Checker<'_> {
         let b = self.expr(cx, base, None)?;
         match (b.ty(), member.name.as_str()) {
             (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len_of(cx, &b)),
-            (Ty::Array(_), "len") => {
-                let (_, n) = b.ty().as_array().expect("an array");
-                let n = i128::from(n);
-                let usize_ty = self.usize_ty();
-                Some(Checked::new(
-                    TExprKind::ArrayLen(Box::new(b.expr)),
-                    usize_ty,
-                    Some(Range::exact(n)),
-                ))
-            }
-            (ty, name) if self.methods.contains_key(&(ty, name.to_owned())) => {
+            (Ty::Array(_), "len") => Some(self.array_len(cx, b.expr)),
+            (ty, name) if self.methods.contains_key(&(ty.decl(), name.to_owned())) => {
                 self.error(
                     span,
                     format!("`{name}` is a method of `{ty}`; call it with `.{name}(...)`"),
@@ -2152,12 +2383,18 @@ impl Checker<'_> {
             }
             // An array literal or `none` takes its type from the other side,
             // as in `xs == [1, 2, 3]`.
-            _ if needs_context(rhs) && !needs_context(lhs) => {
+            _ if (needs_context(rhs) || self.generic_literal(cx, rhs))
+                && !needs_context(lhs)
+                && !self.generic_literal(cx, lhs) =>
+            {
                 let l = self.expr(cx, lhs, expected)?;
                 let r = self.expr(cx, rhs, Some(l.ty()))?;
                 (l, r)
             }
-            _ if needs_context(lhs) && !needs_context(rhs) => {
+            _ if (needs_context(lhs) || self.generic_literal(cx, lhs))
+                && !needs_context(rhs)
+                && !self.generic_literal(cx, rhs) =>
+            {
                 let r = self.expr(cx, rhs, expected)?;
                 let l = self.expr(cx, lhs, Some(r.ty()))?;
                 (l, r)
@@ -2731,17 +2968,24 @@ impl Checker<'_> {
         expected: Option<Ty>,
     ) -> Option<Checked> {
         // `f[u32](...)`: type arguments, when the brackets follow the name
-        // of a function (docs/generics.md, `[T]` and indexing).
+        // of a function (docs/generics.md, `[T]` and indexing), or of a
+        // method (`p.conv[u16]()`, its own parameters).
+        let names_fn = |ck: &Self, cx: &FnCx, base: &ast::Expr| {
+            ck.names_function(cx, base) || matches!(base.kind, ExprKind::Field(..))
+        };
         let (callee, explicit) = match &callee.kind {
-            ExprKind::Index(base, item) if self.names_function(cx, base) => (
+            ExprKind::Index(base, item) if names_fn(self, cx, base) => (
                 &**base,
                 Some((vec![ast::TypeArg::Expr((**item).clone())], callee.span)),
             ),
-            ExprKind::TypeArgs(base, items) if self.names_function(cx, base) => {
+            ExprKind::TypeArgs(base, items) if names_fn(self, cx, base) => {
                 (&**base, Some((items.clone(), callee.span)))
             }
             _ => (callee, None),
         };
+        // The type arguments of a generic type the callee is an associated
+        // function of, when written: `Pair[u8, bool].new(...)`.
+        let mut owner_args: Vec<Ty> = Vec::new();
         // The receiver of a method call, with its span.
         let mut receiver: Option<(Checked, Span)> = None;
         let type_of = match &callee.kind {
@@ -2762,10 +3006,20 @@ impl Checker<'_> {
                     .as_enum()
                     .is_some_and(|def| def.variant(&member.name).is_some())
                 {
-                    return self.enum_variant(cx, ty, member, Some(args), span);
+                    return self.enum_variant(cx, ty, member, Some(args), span, expected);
                 }
+                if !ty.is_decl_form() {
+                    owner_args = ty.type_args().to_vec();
+                }
+                let is_enum = ty.as_enum().is_some();
+                let decl = ty.decl();
+                let ty = if ty.is_decl_form() {
+                    nominal_name(ty)
+                } else {
+                    ty.to_string()
+                };
                 let name = format!("{ty}.{}", member.name);
-                match self.find_method(cx, ty, member)? {
+                match self.find_method(cx, decl, member)? {
                     Some(id) if self.sigs[id].has_self => {
                         self.diags.push(
                             Diagnostic::error(
@@ -2781,9 +3035,10 @@ impl Checker<'_> {
                     }
                     Some(id) => (id, name),
                     None => {
-                        let what = match ty.as_enum() {
-                            Some(_) => "variant or function",
-                            None => "function",
+                        let what = if is_enum {
+                            "variant or function"
+                        } else {
+                            "function"
                         };
                         self.error(
                             member.span,
@@ -2864,7 +3119,7 @@ impl Checker<'_> {
                     );
                     return None;
                 }
-                let id = match self.find_method(cx, ty, member)? {
+                let id = match self.find_method(cx, ty.decl(), member)? {
                     Some(id) => id,
                     None => {
                         let msg = match ty.as_struct() {
@@ -2899,9 +3154,10 @@ impl Checker<'_> {
             }
         };
         let type_params = self.sigs[id].type_params.clone();
+        let owner_params = self.sigs[id].owner_params;
         let generic = !type_params.is_empty();
         if let Some((_, bspan)) = &explicit
-            && !generic
+            && type_params.len() == owner_params
         {
             self.error(
                 *bspan,
@@ -2943,21 +3199,25 @@ impl Checker<'_> {
             return None;
         }
         let mut inf = Inference::new(type_params.clone());
+        for (k, &a) in owner_args.iter().enumerate().take(owner_params) {
+            inf.fix(k, a, callee.span);
+        }
         if let Some((items, bspan)) = &explicit {
-            if items.len() != type_params.len() {
+            let own = &type_params[owner_params..];
+            if items.len() != own.len() {
                 self.error(
                     *bspan,
                     format!(
                         "`{name}` takes {} type argument(s), but {} were given",
-                        type_params.len(),
+                        own.len(),
                         items.len()
                     ),
                 );
                 return None;
             }
             for (k, item) in items.iter().enumerate() {
-                let ty = self.type_arg(cx, item)?;
-                inf.fix(k, ty, item.span());
+                let ty = self.generic_arg(cx, item, own[k])?;
+                inf.fix(owner_params + k, ty, item.span());
             }
         }
         let mut targs = Vec::new();
@@ -2965,6 +3225,9 @@ impl Checker<'_> {
         let mut changed = Vec::new();
         let mut ok = true;
         if let Some((recv, rspan)) = receiver {
+            // The receiver gives the type's arguments: `p.swap()` on a
+            // `Pair[u8, bool]`.
+            inf.unify(params[0].0, recv.ty(), rspan);
             let e = match params[0].1 {
                 Convention::Inout => {
                     let place = self.mutable_place(cx, recv.expr, rspan, Changer::Receiver(&name));
@@ -2995,7 +3258,10 @@ impl Checker<'_> {
             targs.push(None);
             let e = if inf.known(pty) {
                 self.call_arg(cx, arg, inf.apply(pty), conv, pname, &name, &mut changed)
-            } else if self.untyped_int(cx, arg).is_some() || needs_context(arg) {
+            } else if self.untyped_int(cx, arg).is_some()
+                || needs_context(arg)
+                || self.generic_literal(cx, arg)
+            {
                 deferred.push(k);
                 continue;
             } else {
@@ -3014,6 +3280,23 @@ impl Checker<'_> {
         for k in deferred {
             let (pty, conv, pname) = &params[skip + k];
             if !inf.known(*pty) {
+                // A literal of a generic type may fix the arguments itself.
+                if self.generic_literal(cx, &args[k]) {
+                    let e = self.infer_arg(
+                        cx,
+                        &args[k],
+                        *pty,
+                        *conv,
+                        pname,
+                        &name,
+                        &mut inf,
+                        &mut changed,
+                    );
+                    match e {
+                        Some(e) => targs[skip + k] = Some(e),
+                        None => ok = false,
+                    }
+                }
                 continue;
             }
             match self.call_arg(
@@ -3031,20 +3314,35 @@ impl Checker<'_> {
         }
         if let Some(p) = inf.unknown() {
             if ok {
+                let write = match name.rsplit_once('.') {
+                    Some((ty, method)) if type_params[..owner_params].contains(&p) => {
+                        format!("write the type's arguments, as in `{ty}[...].{method}(...)`")
+                    }
+                    _ if p.value_param().is_some() => {
+                        format!("write the arguments, as in `{name}[4](...)`")
+                    }
+                    _ => format!("write the type arguments, as in `{name}[u32](...)`"),
+                };
                 self.diags.push(
                     Diagnostic::error(
                         span,
                         format!("cannot tell what `{p}` is in this call of `{name}`"),
                     )
                     .with_help(format!(
-                        "write the type arguments, as in `{name}[u32](...)`, or give the result a type, as in `let x: u32 = {name}(...)`"
+                        "{write}, or give the result a type, as in `let x: u32 = {name}(...)`"
                     ))
                     .with_help("an integer literal doesn't fix a type argument"),
                 );
             }
             return None;
         }
-        if generic && !self.check_bounds(id, &name, &inf) {
+        // A method is named by its type: `Pair.smaller` requires ...
+        let bound_name = if self.sigs[id].has_self {
+            self.sigs[id].name.clone()
+        } else {
+            name.clone()
+        };
+        if generic && !self.check_bounds(id, &bound_name, &inf) {
             ok = false;
         }
         // What the call may have changed: facts about it are forgotten, and

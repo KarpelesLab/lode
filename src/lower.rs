@@ -142,7 +142,7 @@ impl Types {
             Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) | Ty::Result(_) => {
                 unreachable!("{ty} lives in memory")
             }
-            Ty::Param(_) => unreachable!("instances have concrete types"),
+            Ty::Param(_) | Ty::Value(_) => unreachable!("instances have concrete types"),
         }
     }
 
@@ -386,7 +386,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
 /// The IR type of an array of scalars (or of arrays of them), built at
 /// module level, before any function.
 fn ir_array(types: &mut latticefoundry::ir::TypeContext, t: Types, ty: Ty) -> TypeId {
-    match ty.as_array() {
+    match ty.as_known_array() {
         Some((elem, n)) => {
             let elem = ir_array(types, t, elem);
             types.array(elem, n)
@@ -448,7 +448,7 @@ const UNROLL_LIMIT: u64 = 16;
 
 /// The number of scalars in a value of type `ty`.
 fn scalars(ty: Ty) -> u64 {
-    if let Some((elem, n)) = ty.as_array() {
+    if let Some((elem, n)) = ty.as_known_array() {
         return n.saturating_mul(scalars(elem));
     }
     if let Some(def) = ty.sum() {
@@ -1019,7 +1019,7 @@ impl FnLower<'_> {
             },
             TExprKind::ArrayLen(a) => {
                 self.expr(a);
-                let (_, n) = a.ty.as_array().expect("an array");
+                let (_, n) = a.ty.as_known_array().expect("an array");
                 self.b.const_i64(self.t.i64, n as i64)
             }
             TExprKind::ArrayLit(_)
@@ -1097,7 +1097,7 @@ impl FnLower<'_> {
             }
             TExprKind::ToSlice(a) => {
                 let p = self.place(a);
-                let (_, n) = a.ty.as_array().expect("an array");
+                let (_, n) = a.ty.as_known_array().expect("an array");
                 let n = self.b.const_i64(self.t.i64, n as i64);
                 return Val::View(p, n);
             }
@@ -1250,7 +1250,7 @@ impl FnLower<'_> {
     /// The IR type of a value stored in memory: a scalar, or an array or a
     /// struct of them.
     fn ir_ty(&mut self, ty: Ty) -> TypeId {
-        if let Some((elem, n)) = ty.as_array() {
+        if let Some((elem, n)) = ty.as_known_array() {
             let elem = self.ir_ty(elem);
             return self.b.types_mut().array(elem, n);
         }
@@ -1584,7 +1584,7 @@ impl FnLower<'_> {
     /// element and field by field. The two are the same value or don't
     /// overlap.
     fn copy(&mut self, dst: ValueId, src: ValueId, ty: Ty) {
-        if let Some((elem, n)) = ty.as_array() {
+        if let Some((elem, n)) = ty.as_known_array() {
             self.each_elem(n, elem, |this, k| {
                 let s = this.elem_at(src, elem, k);
                 let d = this.elem_at(dst, elem, k);
@@ -1634,7 +1634,7 @@ impl FnLower<'_> {
     }
 
     fn equal_into(&mut self, acc: ValueId, a: ValueId, b: ValueId, ty: Ty) {
-        if let Some((elem, n)) = ty.as_array() {
+        if let Some((elem, n)) = ty.as_known_array() {
             self.each_elem(n, elem, |this, k| {
                 let x = this.elem_at(a, elem, k);
                 let y = this.elem_at(b, elem, k);
@@ -1687,7 +1687,7 @@ impl FnLower<'_> {
     fn fill(&mut self, dst: ValueId, e: &TExpr) {
         match &e.kind {
             TExprKind::ArrayLit(elems) => {
-                let (elem, _) = e.ty.as_array().expect("an array");
+                let (elem, _) = e.ty.as_known_array().expect("an array");
                 for (k, el) in elems.iter().enumerate() {
                     let k = self.b.const_i64(self.t.i64, k as i64);
                     let d = self.elem_at(dst, elem, k);
@@ -1712,10 +1712,10 @@ impl FnLower<'_> {
             }
             TExprKind::EnumFrom(x) => self.enum_from(dst, e.ty, x),
             TExprKind::Compare(a, b) => self.compare(dst, e.ty, a, b),
-            TExprKind::ArrayRepeat(value, n) => {
-                let (elem, _) = e.ty.as_array().expect("an array");
+            TExprKind::ArrayRepeat(value) => {
+                let (elem, n) = e.ty.as_known_array().expect("an array");
                 let v = self.expr(value);
-                self.each_elem(*n, elem, |this, k| {
+                self.each_elem(n, elem, |this, k| {
                     let d = this.elem_at(dst, elem, k);
                     this.write(d, v, elem);
                 });

@@ -93,10 +93,45 @@ pub enum Ty {
     /// Only the checker's hidden locals and temporaries hold one: the
     /// program handles a call's result right away (`try`, `catch`, `match`).
     Result(CompoundId),
-    /// A type parameter of a generic function (`T` in `fn max[T: Ordered]`),
-    /// with its bounds: a [`ParamDef`] in the interner. Only the checker
-    /// sees it; instantiation replaces it with a concrete type.
+    /// A generic parameter (`T` in `fn max[T: Ordered]`, `N` in
+    /// `struct StackBuf[N: usize]`), with its bounds or its integer type: a
+    /// [`ParamDef`] in the interner. Only the checker sees it;
+    /// instantiation replaces a type parameter with a concrete type, and a
+    /// value parameter with a [`Ty::Value`]. A value parameter is never
+    /// the type of a value: it's the length of an array (`[N]u8`) or a
+    /// generic argument (`StackBuf[N]`).
     Param(ParamId),
+    /// An integer known when compiling, as a generic argument for a value
+    /// parameter (`64` in `StackBuf[64]`) or an array's length: a
+    /// [`Compound::Value`] in the interner. Never the type of a value.
+    Value(CompoundId),
+}
+
+/// The length of an array type: a number, or a value parameter (`[N]u8`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Len {
+    Known(u64),
+    /// A value parameter ([`Ty::Param`]) of type `usize`.
+    Param(Ty),
+}
+
+impl Len {
+    /// The length, if it's a number.
+    pub fn known(self) -> Option<u64> {
+        match self {
+            Len::Known(n) => Some(n),
+            Len::Param(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for Len {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Len::Known(n) => write!(f, "{n}"),
+            Len::Param(p) => p.fmt(f),
+        }
+    }
 }
 
 impl Ty {
@@ -140,16 +175,56 @@ impl Ty {
                 .expect("admitted types")
         });
         let signed_min = admitted.iter().filter(|t| t.signed).map(|t| t.min()).max();
-        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
-        let id = ParamId(u32::try_from(tables.params.len()).expect("too many type parameters"));
-        tables.params.push(Arc::new(ParamDef {
+        Ty::push_param(ParamDef {
             name,
             bounds,
             values,
             fits,
             signed_min,
-        }));
+            value: None,
+        })
+    }
+
+    /// Declare a new value parameter named `name`, an integer of type `ty`
+    /// known when compiling (`N` in `[N: usize]`).
+    pub fn new_value_param(name: String, ty: IntTy) -> Ty {
+        Ty::push_param(ParamDef {
+            name,
+            bounds: Bounds::default(),
+            values: None,
+            fits: None,
+            signed_min: None,
+            value: Some(ty),
+        })
+    }
+
+    fn push_param(def: ParamDef) -> Ty {
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let id = ParamId(u32::try_from(tables.params.len()).expect("too many type parameters"));
+        tables.params.push(Arc::new(def));
         Ty::Param(id)
+    }
+
+    /// The integer type of a value parameter (`None` for a type parameter
+    /// or any other type).
+    pub fn value_param(self) -> Option<IntTy> {
+        self.as_param().and_then(|d| d.value)
+    }
+
+    /// The generic argument `v`, for a value parameter.
+    pub fn value(v: i128) -> Ty {
+        Ty::Value(intern(Compound::Value { value: v }))
+    }
+
+    /// The number a [`Ty::Value`] stands for.
+    pub fn as_value(self) -> Option<i128> {
+        match self {
+            Ty::Value(id) => match compound(id) {
+                Compound::Value { value } => Some(value),
+                _ => unreachable!("a value id names another type"),
+            },
+            _ => None,
+        }
     }
 
     /// The built-in enum `Ordering`, what `a.cmp(b)` returns:
@@ -157,7 +232,7 @@ impl Ty {
     pub fn ordering() -> Ty {
         static ORDERING: OnceLock<Ty> = OnceLock::new();
         *ORDERING.get_or_init(|| {
-            let ty = Ty::new_enum("Ordering".to_owned(), usize::MAX, true);
+            let ty = Ty::new_enum("Ordering".to_owned(), usize::MAX, true, Vec::new());
             let variant = |name: &str, value| Variant {
                 name: name.to_owned(),
                 fields: Vec::new(),
@@ -179,22 +254,38 @@ impl Ty {
     /// Whether a value of this type can be copied implicitly (the built-in
     /// trait `Copy`). Every type the compiler has is plain data, so every
     /// type is, except a type parameter without the bound `Copy` and the
-    /// arrays, optionals and results that hold one. A view is `Copy`:
-    /// copying it doesn't copy what it views.
+    /// arrays, optionals, results, structs and enums that hold one. A view
+    /// is `Copy`: copying it doesn't copy what it views.
     pub fn is_copy(self) -> bool {
         match self {
-            Ty::Param(_) => self
-                .as_param()
-                .expect("a parameter")
-                .bounds
-                .has(Trait::Copy),
+            Ty::Param(_) => {
+                let def = self.as_param().expect("a parameter");
+                def.value.is_some() || def.bounds.has(Trait::Copy)
+            }
             Ty::Array(_) => self.as_array().expect("an array").0.is_copy(),
             Ty::Optional(_) => self.as_optional().expect("an optional").is_copy(),
             Ty::Result(_) => {
                 let (ok, err) = self.as_result().expect("a result");
                 ok.is_copy() && err.is_copy()
             }
+            Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|t| t.is_copy()),
             _ => true,
+        }
+    }
+
+    /// The types a struct holds (its fields) or an enum (every payload
+    /// field), as instantiated.
+    pub fn members(self) -> Vec<Ty> {
+        if let Some(def) = self.as_struct() {
+            return def.fields.iter().map(|f| f.ty).collect();
+        }
+        match self.as_enum() {
+            Some(def) => def
+                .variants
+                .iter()
+                .flat_map(|v| v.fields.iter().map(|f| f.ty))
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -210,18 +301,7 @@ impl Ty {
                 Ty::Int(_) | Ty::Bool | Ty::Ptr(_) => true,
                 Ty::Array(_) => self.as_array().expect("an array").0.satisfies(t),
                 Ty::Optional(_) => self.as_optional().expect("an optional").satisfies(t),
-                Ty::Struct(_) => self
-                    .as_struct()
-                    .expect("a struct")
-                    .fields
-                    .iter()
-                    .all(|f| f.ty.satisfies(t)),
-                Ty::Enum(_) => self
-                    .as_enum()
-                    .expect("an enum")
-                    .variants
-                    .iter()
-                    .all(|v| v.fields.iter().all(|f| f.ty.satisfies(t))),
+                Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|m| m.satisfies(t)),
                 _ => false,
             },
             Trait::Ordered => matches!(self, Ty::Int(_) | Ty::Bool),
@@ -239,13 +319,24 @@ impl Ty {
                     out.push(self);
                 }
             }
-            Ty::Array(_) => self.as_array().expect("an array").0.params(out),
+            Ty::Array(_) => {
+                let (elem, len) = self.as_array().expect("an array");
+                elem.params(out);
+                if let Len::Param(p) = len {
+                    p.params(out);
+                }
+            }
             Ty::Slice(_) => self.as_slice().expect("a slice").params(out),
             Ty::Optional(_) => self.as_optional().expect("an optional").params(out),
             Ty::Result(_) => {
                 let (ok, err) = self.as_result().expect("a result");
                 ok.params(out);
                 err.params(out);
+            }
+            Ty::Struct(_) | Ty::Enum(_) => {
+                for a in self.type_args().iter() {
+                    a.params(out);
+                }
             }
             _ => {}
         }
@@ -265,7 +356,17 @@ impl Ty {
             Ty::Param(_) => with(self).unwrap_or(self),
             Ty::Array(_) => {
                 let (elem, len) = self.as_array().expect("an array");
-                Ty::array(elem.subst(with), len)
+                let len = match len {
+                    Len::Known(_) => len,
+                    Len::Param(p) => match p.subst(with) {
+                        v @ Ty::Value(_) => Len::Known(
+                            u64::try_from(v.as_value().expect("a value"))
+                                .expect("a length is a valid `usize`"),
+                        ),
+                        q => Len::Param(q),
+                    },
+                };
+                Ty::array_of(elem.subst(with), len)
             }
             Ty::Slice(_) => Ty::slice(self.as_slice().expect("a slice").subst(with)),
             Ty::Optional(_) => Ty::optional(self.as_optional().expect("an optional").subst(with)),
@@ -273,12 +374,30 @@ impl Ty {
                 let (ok, err) = self.as_result().expect("a result");
                 Ty::result(ok.subst(with), err.subst(with))
             }
+            Ty::Struct(_) | Ty::Enum(_) => {
+                let args = self.type_args();
+                if args.is_empty() {
+                    return self;
+                }
+                let args: Vec<Ty> = args.iter().map(|a| a.subst(with)).collect();
+                self.instantiate(&args)
+            }
             _ => self,
         }
     }
 
     /// The array type `[len]elem`.
     pub fn array(elem: Ty, len: u64) -> Ty {
+        Ty::array_of(elem, Len::Known(len))
+    }
+
+    /// The array type `[len]elem`, of a length that may be a value
+    /// parameter.
+    pub fn array_of(elem: Ty, len: Len) -> Ty {
+        let len = match len {
+            Len::Known(n) => Ty::value(i128::from(n)),
+            Len::Param(p) => p,
+        };
         Ty::Array(intern(Compound::Array { elem, len }))
     }
 
@@ -288,14 +407,30 @@ impl Ty {
     }
 
     /// The element type and length of an array type.
-    pub fn as_array(self) -> Option<(Ty, u64)> {
+    pub fn as_array(self) -> Option<(Ty, Len)> {
         match self {
             Ty::Array(id) => match compound(id) {
-                Compound::Array { elem, len } => Some((elem, len)),
+                Compound::Array { elem, len } => Some((
+                    elem,
+                    match len.as_value() {
+                        Some(n) => Len::Known(n as u64),
+                        None => Len::Param(len),
+                    },
+                )),
                 _ => unreachable!("an array id names another type"),
             },
             _ => None,
         }
+    }
+
+    /// The element type and length of an array type of a known length
+    /// (every array, once instantiated).
+    pub fn as_known_array(self) -> Option<(Ty, u64)> {
+        let (elem, len) = self.as_array()?;
+        Some((
+            elem,
+            len.known().expect("an instance's array has a known length"),
+        ))
     }
 
     /// The element type of a slice type.
@@ -362,13 +497,121 @@ impl Ty {
     }
 
     /// The declaration of an enum type (not an optional: see [`Ty::sum`]).
+    /// For an instance of a generic enum, its payload fields have the
+    /// instance's types (`Either[u8, bool]`'s `left` holds a `u8`).
     pub fn as_enum(self) -> Option<Arc<EnumDef>> {
+        let Ty::Enum(id) = self else {
+            return None;
+        };
+        let Compound::Enum { def, args } = compound(id) else {
+            unreachable!("an enum id names another type")
+        };
+        if args == ArgsId::EMPTY {
+            return Some(enum_def(def));
+        }
+        if let Some(found) = cached(id) {
+            let Def::Enum(d) = found else {
+                unreachable!("an enum's cache entry")
+            };
+            return Some(d);
+        }
+        let decl = enum_def(def);
+        let args = arg_list(args);
+        let map = |p: Ty| decl.params.iter().position(|&q| q == p).map(|k| args[k]);
+        let variants = decl
+            .variants
+            .iter()
+            .map(|v| Variant {
+                fields: subst_fields(&v.fields, &map),
+                ..v.clone()
+            })
+            .collect();
+        let out = Arc::new(EnumDef {
+            variants,
+            args: args.to_vec(),
+            ..EnumDef::clone(&decl)
+        });
+        cache(id, Def::Enum(Arc::clone(&out)));
+        Some(out)
+    }
+
+    /// The type arguments of an instance of a generic struct or enum
+    /// (`[u8, bool]` for `Pair[u8, bool]`); empty for any other type.
+    pub fn type_args(self) -> Arc<[Ty]> {
         match self {
+            Ty::Struct(id) | Ty::Enum(id) => match compound(id) {
+                Compound::Struct { args, .. } | Compound::Enum { args, .. } => arg_list(args),
+                _ => unreachable!("a struct or enum id names another type"),
+            },
+            _ => Arc::from(Vec::new()),
+        }
+    }
+
+    /// The parameters a generic struct or enum declares (`[A, B]` for
+    /// `struct Pair[A, B]`); empty for any other type.
+    pub fn decl_params(self) -> Vec<Ty> {
+        match self {
+            Ty::Struct(id) => match compound(id) {
+                Compound::Struct { def, .. } => struct_def(def).params.clone(),
+                _ => unreachable!("a struct id names another type"),
+            },
             Ty::Enum(id) => match compound(id) {
-                Compound::Enum { def } => Some(enum_def(def)),
+                Compound::Enum { def, .. } => enum_def(def).params.clone(),
                 _ => unreachable!("an enum id names another type"),
             },
-            _ => None,
+            _ => Vec::new(),
+        }
+    }
+
+    /// The same struct or enum declaration with the type arguments `args`
+    /// (as many as it declares parameters).
+    pub fn instantiate(self, args: &[Ty]) -> Ty {
+        let list = intern_args(args);
+        match self {
+            Ty::Struct(id) => match compound(id) {
+                Compound::Struct { def, .. } => {
+                    Ty::Struct(intern(Compound::Struct { def, args: list }))
+                }
+                _ => unreachable!("a struct id names another type"),
+            },
+            Ty::Enum(id) => match compound(id) {
+                Compound::Enum { def, .. } => Ty::Enum(intern(Compound::Enum { def, args: list })),
+                _ => unreachable!("an enum id names another type"),
+            },
+            _ => unreachable!("only a struct or an enum is instantiated: {self}"),
+        }
+    }
+
+    /// A generic struct or enum as declared, with its own parameters as
+    /// arguments (`Pair[A, B]`); any other type itself. Methods are found
+    /// through it.
+    pub fn decl(self) -> Ty {
+        let params = self.decl_params();
+        if params.is_empty() {
+            return self;
+        }
+        self.instantiate(&params)
+    }
+
+    /// Whether this is a generic struct or enum as declared (see
+    /// [`Ty::decl`]): a name written without its type arguments.
+    pub fn is_decl_form(self) -> bool {
+        let params = self.decl_params();
+        !params.is_empty() && *self.type_args() == *params
+    }
+
+    /// Whether two types are instances of the same struct or enum
+    /// declaration.
+    pub fn same_decl(self, other: Ty) -> bool {
+        match (self, other) {
+            (Ty::Struct(a), Ty::Struct(b)) | (Ty::Enum(a), Ty::Enum(b)) => {
+                match (compound(a), compound(b)) {
+                    (Compound::Struct { def: x, .. }, Compound::Struct { def: y, .. })
+                    | (Compound::Enum { def: x, .. }, Compound::Enum { def: y, .. }) => x == y,
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -394,6 +637,8 @@ impl Ty {
                 name: self.to_string(),
                 pkg: usize::MAX,
                 is_pub: true,
+                params: Vec::new(),
+                args: Vec::new(),
                 tag: IntTy::new(false, 8),
                 explicit: false,
                 variants: vec![
@@ -415,6 +660,8 @@ impl Ty {
             name: self.to_string(),
             pkg: usize::MAX,
             is_pub: true,
+            params: Vec::new(),
+            args: Vec::new(),
             tag: IntTy::new(false, 8),
             explicit: false,
             variants: vec![
@@ -436,31 +683,37 @@ impl Ty {
     }
 
     /// Declare a new enum type named `name` (as shown in messages), from
-    /// package `pkg`. Its variants are set once they're resolved, with
-    /// [`Ty::set_variants`].
-    pub fn new_enum(name: String, pkg: usize, is_pub: bool) -> Ty {
+    /// package `pkg`, with the generic parameters `params` (none for an
+    /// enum that isn't generic). Its variants are set once they're
+    /// resolved, with [`Ty::set_variants`]. For a generic enum, the type
+    /// returned is its declared form ([`Ty::decl`]).
+    pub fn new_enum(name: String, pkg: usize, is_pub: bool, params: Vec<Ty>) -> Ty {
         let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
         let def = u32::try_from(tables.enums.len()).expect("too many enums");
         tables.enums.push(Arc::new(EnumDef {
             name,
             pkg,
             is_pub,
+            args: params.clone(),
+            params: params.clone(),
             tag: IntTy::new(false, 8),
             explicit: false,
             variants: Vec::new(),
         }));
         drop(tables);
-        Ty::Enum(intern(Compound::Enum { def }))
+        let args = intern_args(&params);
+        Ty::Enum(intern(Compound::Enum { def, args }))
     }
 
     /// Set the tag type and variants of an enum type declared with
-    /// [`Ty::new_enum`]. `explicit` marks an enum whose variants have
-    /// declared integer values (`enum Color: u8 { red = 1 ... }`).
+    /// [`Ty::new_enum`] (or of its declared form). `explicit` marks an enum
+    /// whose variants have declared integer values (`enum Color: u8 { red
+    /// = 1 ... }`).
     pub fn set_variants(self, tag: IntTy, explicit: bool, variants: Vec<Variant>) {
         let Ty::Enum(id) = self else {
             unreachable!("not an enum: {self}")
         };
-        let Compound::Enum { def } = compound(id) else {
+        let Compound::Enum { def, .. } = compound(id) else {
             unreachable!("an enum id names another type")
         };
         let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
@@ -471,41 +724,67 @@ impl Ty {
             variants,
             ..EnumDef::clone(entry)
         });
+        tables.instances.clear();
     }
 
-    /// The declaration of a struct type.
+    /// The declaration of a struct type. For an instance of a generic
+    /// struct, its fields have the instance's types (`Pair[u8, bool]`'s
+    /// `first` is a `u8`).
     pub fn as_struct(self) -> Option<Arc<StructDef>> {
-        match self {
-            Ty::Struct(id) => match compound(id) {
-                Compound::Struct { def } => Some(struct_def(def)),
-                _ => unreachable!("a struct id names another type"),
-            },
-            _ => None,
+        let Ty::Struct(id) = self else {
+            return None;
+        };
+        let Compound::Struct { def, args } = compound(id) else {
+            unreachable!("a struct id names another type")
+        };
+        if args == ArgsId::EMPTY {
+            return Some(struct_def(def));
         }
+        if let Some(found) = cached(id) {
+            let Def::Struct(d) = found else {
+                unreachable!("a struct's cache entry")
+            };
+            return Some(d);
+        }
+        let decl = struct_def(def);
+        let args = arg_list(args);
+        let map = |p: Ty| decl.params.iter().position(|&q| q == p).map(|k| args[k]);
+        let out = Arc::new(StructDef {
+            fields: subst_fields(&decl.fields, &map),
+            args: args.to_vec(),
+            ..StructDef::clone(&decl)
+        });
+        cache(id, Def::Struct(Arc::clone(&out)));
+        Some(out)
     }
 
     /// Declare a new struct type named `name` (as shown in messages), from
-    /// package `pkg`. Its fields are set once they're resolved, with
-    /// [`Ty::set_fields`].
-    pub fn new_struct(name: String, pkg: usize, is_pub: bool) -> Ty {
+    /// package `pkg`, with the generic parameters `params`. Its fields are
+    /// set once they're resolved, with [`Ty::set_fields`]. For a generic
+    /// struct, the type returned is its declared form ([`Ty::decl`]).
+    pub fn new_struct(name: String, pkg: usize, is_pub: bool, params: Vec<Ty>) -> Ty {
         let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
         let def = u32::try_from(tables.structs.len()).expect("too many structs");
         tables.structs.push(Arc::new(StructDef {
             name,
             pkg,
             is_pub,
+            args: params.clone(),
+            params: params.clone(),
             fields: Vec::new(),
         }));
         drop(tables);
-        Ty::Struct(intern(Compound::Struct { def }))
+        let args = intern_args(&params);
+        Ty::Struct(intern(Compound::Struct { def, args }))
     }
 
-    /// Set the fields of a struct type declared with [`Ty::new_struct`].
+    /// Set the fields of a struct type declared with [`Ty::new_struct`] (or
+    /// of its declared form).
     pub fn set_fields(self, fields: Vec<Field>) {
         let Ty::Struct(id) = self else {
             unreachable!("not a struct: {self}")
         };
-        let Compound::Struct { def } = compound(id) else {
+        let Compound::Struct { def, .. } = compound(id) else {
             unreachable!("a struct id names another type")
         };
         let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
@@ -514,7 +793,19 @@ impl Ty {
             fields,
             ..StructDef::clone(entry)
         });
+        tables.instances.clear();
     }
+}
+
+/// Fields with each parameter `p` replaced by `with(p)`.
+fn subst_fields(fields: &[Field], with: &impl Fn(Ty) -> Option<Ty>) -> Vec<Field> {
+    fields
+        .iter()
+        .map(|f| Field {
+            name: f.name.clone(),
+            ty: f.ty.subst(with),
+        })
+        .collect()
 }
 
 /// A struct declaration: its name, where it's declared and its fields, in
@@ -522,11 +813,16 @@ impl Ty {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructDef {
     /// The name shown in messages: `Point`, or `os.Stat` for a struct of an
-    /// imported package.
+    /// imported package. A generic struct's arguments aren't in it.
     pub name: String,
     /// The index of the declaring package (in the checker's package list).
     pub pkg: usize,
     pub is_pub: bool,
+    /// The generic parameters it declares (empty if it isn't generic).
+    pub params: Vec<Ty>,
+    /// The type arguments of this instance (its own `params` for the
+    /// declared form; empty if it isn't generic).
+    pub args: Vec<Ty>,
     pub fields: Vec<Field>,
 }
 
@@ -554,6 +850,10 @@ pub struct EnumDef {
     /// The index of the declaring package (`usize::MAX` for an optional).
     pub pkg: usize,
     pub is_pub: bool,
+    /// The generic parameters it declares, as for [`StructDef::params`].
+    pub params: Vec<Ty>,
+    /// The type arguments of this instance, as for [`StructDef::args`].
+    pub args: Vec<Ty>,
     /// The type of the tag that tells the variants apart in memory.
     pub tag: IntTy,
     /// Whether the variants have declared integer values (a C-style enum).
@@ -712,6 +1012,9 @@ pub struct ParamDef {
     /// admits (-128 for `i8`), if it admits any: a value above it is no
     /// signed type's smallest.
     pub signed_min: Option<i128>,
+    /// For a value parameter (`N: usize`), its integer type; `None` for a
+    /// type parameter.
+    pub value: Option<IntTy>,
 }
 
 /// The index of a type parameter in the global type interner.
@@ -727,21 +1030,29 @@ pub struct CompoundId(u32);
 /// same [`CompoundId`], so comparing ids compares the types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Compound {
+    /// `[len]elem`: `len` is a [`Ty::Value`], or a value parameter.
     Array {
         elem: Ty,
-        len: u64,
+        len: Ty,
     },
     Slice {
         elem: Ty,
     },
-    /// A struct, by the index of its declaration: two declarations are two
-    /// types, even with the same fields.
+    /// A struct, by the index of its declaration and its type arguments:
+    /// two declarations are two types, even with the same fields, and so
+    /// are two instances of a generic struct with different arguments.
     Struct {
         def: u32,
+        args: ArgsId,
     },
-    /// An enum, by the index of its declaration.
+    /// An enum, by the index of its declaration and its type arguments.
     Enum {
         def: u32,
+        args: ArgsId,
+    },
+    /// An integer generic argument, for a value parameter.
+    Value {
+        value: i128,
     },
     /// `?inner`.
     Optional {
@@ -754,15 +1065,53 @@ pub enum Compound {
     },
 }
 
+/// A list of type arguments in the interner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArgsId(u32);
+
+impl ArgsId {
+    /// No arguments: a struct or an enum that isn't generic.
+    const EMPTY: ArgsId = ArgsId(0);
+}
+
+/// An instantiated declaration, cached by [`Ty::as_struct`] and
+/// [`Ty::as_enum`].
+#[derive(Clone)]
+enum Def {
+    Struct(Arc<StructDef>),
+    Enum(Arc<EnumDef>),
+}
+
 /// The interner's tables. Entries are only ever appended, so an id stays
 /// valid for the life of the process.
-#[derive(Default)]
 struct Interner {
     entries: Vec<Compound>,
     ids: HashMap<Compound, CompoundId>,
     structs: Vec<Arc<StructDef>>,
     enums: Vec<Arc<EnumDef>>,
     params: Vec<Arc<ParamDef>>,
+    /// The lists of type arguments, `ArgsId::EMPTY` first.
+    arg_lists: Vec<Arc<[Ty]>>,
+    arg_ids: HashMap<Arc<[Ty]>, ArgsId>,
+    /// The declarations of the instances of generic types, with their
+    /// fields' types substituted; cleared when a declaration changes.
+    instances: HashMap<CompoundId, Def>,
+}
+
+impl Default for Interner {
+    fn default() -> Interner {
+        let empty: Arc<[Ty]> = Arc::from(Vec::new());
+        Interner {
+            entries: Vec::new(),
+            ids: HashMap::new(),
+            structs: Vec::new(),
+            enums: Vec::new(),
+            params: Vec::new(),
+            arg_ids: HashMap::from([(Arc::clone(&empty), ArgsId::EMPTY)]),
+            arg_lists: vec![empty],
+            instances: HashMap::new(),
+        }
+    }
 }
 
 fn interner() -> &'static Mutex<Interner> {
@@ -786,6 +1135,34 @@ pub fn intern(c: Compound) -> CompoundId {
 pub fn compound(id: CompoundId) -> Compound {
     let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
     tables.entries[id.0 as usize]
+}
+
+/// The id of a list of type arguments, adding it if it's new.
+fn intern_args(args: &[Ty]) -> ArgsId {
+    let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&id) = tables.arg_ids.get(args) {
+        return id;
+    }
+    let id = ArgsId(u32::try_from(tables.arg_lists.len()).expect("too many types"));
+    let list: Arc<[Ty]> = Arc::from(args);
+    tables.arg_lists.push(Arc::clone(&list));
+    tables.arg_ids.insert(list, id);
+    id
+}
+
+fn arg_list(id: ArgsId) -> Arc<[Ty]> {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(&tables.arg_lists[id.0 as usize])
+}
+
+fn cached(id: CompoundId) -> Option<Def> {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    tables.instances.get(&id).cloned()
+}
+
+fn cache(id: CompoundId, def: Def) {
+    let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    tables.instances.insert(id, def);
 }
 
 fn struct_def(def: u32) -> Arc<StructDef> {
@@ -818,17 +1195,41 @@ impl fmt::Display for Ty {
             | Ty::Struct(id)
             | Ty::Enum(id)
             | Ty::Optional(id)
-            | Ty::Result(id) => match compound(*id) {
+            | Ty::Result(id)
+            | Ty::Value(id) => match compound(*id) {
                 Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
                 Compound::Slice { elem } => write!(f, "[]{elem}"),
-                Compound::Struct { def } => f.write_str(&struct_def(def).name),
-                Compound::Enum { def } => f.write_str(&enum_def(def).name),
+                Compound::Struct { def, args } => {
+                    f.write_str(&struct_def(def).name)?;
+                    write_args(f, &arg_list(args))
+                }
+                Compound::Enum { def, args } => {
+                    f.write_str(&enum_def(def).name)?;
+                    write_args(f, &arg_list(args))
+                }
                 Compound::Optional { inner } => write!(f, "?{inner}"),
                 Compound::Result { ok: Ty::Unit, err } => write!(f, "throws({err})"),
                 Compound::Result { ok, err } => write!(f, "throws({err}) -> {ok}"),
+                Compound::Value { value } => write!(f, "{value}"),
             },
         }
     }
+}
+
+/// `[a, b]` after a generic type's name (nothing if there are no
+/// arguments).
+fn write_args(f: &mut fmt::Formatter<'_>, args: &[Ty]) -> fmt::Result {
+    if args.is_empty() {
+        return Ok(());
+    }
+    f.write_str("[")?;
+    for (k, a) in args.iter().enumerate() {
+        if k > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{a}")?;
+    }
+    f.write_str("]")
 }
 
 /// The result of looking up a primitive type name.
@@ -986,7 +1387,7 @@ mod tests {
         assert_ne!(a, Ty::array(u8_, 5));
         assert_ne!(Ty::slice(u8_), Ty::slice(Ty::Bool));
         let nested = Ty::array(a, 3);
-        assert_eq!(nested.as_array(), Some((a, 3)));
+        assert_eq!(nested.as_array(), Some((a, Len::Known(3))));
         assert_eq!(nested.to_string(), "[3][4]u8");
         assert_eq!(Ty::slice(a).to_string(), "[][4]u8");
         assert_eq!(Ty::slice(a).as_slice(), Some(a));
@@ -1000,8 +1401,8 @@ mod tests {
     #[test]
     fn structs_are_nominal() {
         let u8_ = Ty::Int(IntTy::new(false, 8));
-        let a = Ty::new_struct("P".into(), 0, false);
-        let b = Ty::new_struct("P".into(), 1, true);
+        let a = Ty::new_struct("P".into(), 0, false, Vec::new());
+        let b = Ty::new_struct("P".into(), 1, true, Vec::new());
         let fields = vec![Field {
             name: "x".into(),
             ty: u8_,
@@ -1081,7 +1482,7 @@ mod tests {
     #[test]
     fn enums_and_optionals() {
         let u8_ = Ty::Int(IntTy::new(false, 8));
-        let e = Ty::new_enum("E".into(), 0, true);
+        let e = Ty::new_enum("E".into(), 0, true, Vec::new());
         e.set_variants(
             IntTy::new(false, 8),
             false,
