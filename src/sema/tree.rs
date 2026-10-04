@@ -112,7 +112,8 @@ pub enum TExprKind {
     Field(Box<TExpr>, u32),
     /// An array viewed as a slice of all its elements.
     ToSlice(Box<TExpr>),
-    /// `s.ptr` of a `str` (unsafe).
+    /// `s.ptr` of a `str` or a slice (unsafe). For an array, `a.ptr` is this
+    /// over a [`TExprKind::ToSlice`] of it.
     StrPtr(Box<TExpr>),
     /// `p + n`: a pointer moved forward by `n` elements (unsafe).
     PtrAdd(Box<TExpr>, Box<TExpr>),

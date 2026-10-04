@@ -111,6 +111,9 @@ semantics.
 - Arrays are passed and returned by value, like structs (see
   [Structs](#in-the-compiler-today-1)). `a == b` compares two arrays of the
   same type element by element.
+- In `unsafe` code, `a.ptr` of an array or slice of integers is a raw
+  pointer to its first element (`*u8` for `[N]u8` and `[]u8`). An array's
+  pointer points to the array itself, not to a copy.
 - Not yet: returning a slice, slicing (`a[i..j]`), and `a.get(i)`.
 
 ### Structs

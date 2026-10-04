@@ -601,6 +601,28 @@ impl Checker<'_> {
                     None,
                 ))
             }
+            // The first element of an array or slice of integers. An array is
+            // viewed in place, as when it's passed where a slice is expected.
+            (ty @ (Ty::Array(_) | Ty::Slice(_)), "ptr")
+                if matches!(ty.elem(), Some(Ty::Int(_))) =>
+            {
+                let Some(Ty::Int(elem)) = ty.elem() else {
+                    unreachable!("an integer element")
+                };
+                self.require_unsafe(cx, span, "taking an array's or slice's raw pointer");
+                let view = match ty {
+                    Ty::Array(_) => TExpr {
+                        kind: TExprKind::ToSlice(Box::new(b.expr)),
+                        ty: Ty::slice(Ty::Int(elem)),
+                    },
+                    _ => b.expr,
+                };
+                Some(Checked::new(
+                    TExprKind::StrPtr(Box::new(view)),
+                    Ty::Ptr(elem),
+                    None,
+                ))
+            }
             (ty, name) => {
                 self.error(member.span, format!("`{ty}` has no field `{name}`"));
                 None

@@ -2,6 +2,9 @@
 // error: taking a string's raw pointer is unsafe
 // error: pointer arithmetic is unsafe
 // error: calling the `unsafe fn` `raw` is unsafe
+// error: taking an array's or slice's raw pointer is unsafe
+// error: taking an array's or slice's raw pointer is unsafe
+// error: `[2]bool` has no field `ptr`
 package main
 
 unsafe fn raw() {
@@ -12,4 +15,13 @@ fn f(s: str) {
 	let p = s.ptr
 	let q = p + 1
 	raw()
+}
+
+// Only arrays and slices of integers have a raw pointer.
+fn g(xs: []u16) {
+	let a: [4]u8 = [0; 4]
+	let p = a.ptr
+	let q = xs.ptr
+	let flags: [2]bool = [true, false]
+	let r = flags.ptr
 }

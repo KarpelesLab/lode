@@ -255,7 +255,8 @@ Rules:
   should be one command.
 
 What's unsafe so far (implemented): calling `syscall` or an `unsafe fn`,
-reading a `str`'s raw pointer (`s.ptr`), and pointer arithmetic (`p + n`).
+reading the raw pointer of a `str`, an array or a slice (`s.ptr`), and
+pointer arithmetic (`p + n`).
 Holding or comparing a pointer is safe; only using it isn't.
 
 Low-level operations are **compiler intrinsics**, not asm in the standard
