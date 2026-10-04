@@ -3234,7 +3234,7 @@ impl Checker<'_> {
                 let from_trait = if own {
                     None
                 } else {
-                    self.trait_method(self_ty, &member.name, member.span)?
+                    self.trait_method(cx.pkg, self_ty, &member.name, member.span)?
                 };
                 let found = match from_trait {
                     Some(id) => {
@@ -3350,7 +3350,7 @@ impl Checker<'_> {
                 };
                 let found = match found {
                     Some(id) => Some(id),
-                    None => self.trait_method(ty, &member.name, member.span)?,
+                    None => self.trait_method(cx.pkg, ty, &member.name, member.span)?,
                 };
                 if found.is_none()
                     && ordered

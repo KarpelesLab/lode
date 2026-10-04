@@ -8,8 +8,8 @@
 //! makes) → LatticeFoundry's verify, optimize, codegen and link. The design
 //! of the language is in `docs/`.
 //!
-//! This is an early compiler: it supports functions, generic functions over
-//! the built-in traits, integers, `bool`, `str`,
+//! This is an early compiler: it supports functions, generic functions,
+//! traits and `impl` blocks, integers, `bool`, `str`,
 //! arrays and slices, structs, enums and `match`, optionals, raw pointers in
 //! `unsafe` code, constants computed at compile time, `if comptime`,
 //! local variables, arithmetic, control flow (including `for` loops) and

@@ -1,4 +1,4 @@
-//! Generics over the built-in traits (docs/generics.md, M7a and M7b):
+//! Generics (docs/generics.md, M7a and M7b; traits are in `traits`):
 //! generic parameters of functions, structs, enums and methods (types with
 //! their bounds, and value parameters like `[N: usize]`), generic
 //! arguments (explicit, or inferred from the arguments and then from the

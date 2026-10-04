@@ -304,6 +304,11 @@ trait Secret {
 	fn s(self)
 }
 
+impl Secret for geo.Point {
+	fn s(self) {
+	}
+}
+
 impl Area for geo.Point {
 	fn area(self) -> i32 {
 		return self.x *| self.y
@@ -354,7 +359,7 @@ fn main() -> i32 {
          impl shapes.Area for geo.Shape {\n\tfn area(self) -> i32 {\n\t\treturn 0\n\t}\n}\n\n\
          fn f[T: shapes.Secret](x: T) {\n}\n\n\
          impl shapes.Area for geo.Point {\n\tfn area(self) -> i32 {\n\t\treturn 0\n\t}\n}\n\n\
-         fn main() {\n}\n",
+         fn main() {\n\tgeo.origin().s()\n}\n",
         &[("shapes", SHAPES)],
     )
     .expect_err("fails to check");
@@ -362,6 +367,7 @@ fn main() -> i32 {
         "`impl shapes.Area for geo.Shape` must be in the package of `shapes.Area` (`std/shapes`) or of `geo.Shape` (`std/geo`)",
         "`impl shapes.Area for geo.Point` must be in the package of `shapes.Area` (`std/shapes`) or of `geo.Point` (`std/geo`)",
         "`Secret` is private to package `std/shapes`",
+        "`geo.Point` has no method `s`",
     ];
     assert_eq!(errors, expected);
 }

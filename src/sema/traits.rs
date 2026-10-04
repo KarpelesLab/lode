@@ -968,10 +968,12 @@ impl<'a> Checker<'a> {
 
     /// The trait method `name` of `ty` found through its traits: a type
     /// parameter's bounds, or the impls of a struct, an enum or a
-    /// primitive. `Some(None)` if there's none; `None` if several traits
-    /// give one (reported at `span`, with the qualified form to use).
+    /// primitive, those of the traits package `pkg` can see. `Some(None)`
+    /// if there's none; `None` if several traits give one (reported at
+    /// `span`, with the qualified form to use).
     pub(super) fn trait_method(
         &mut self,
+        pkg: usize,
         ty: Ty,
         name: &str,
         span: Span,
@@ -979,10 +981,14 @@ impl<'a> Checker<'a> {
         let found: Vec<(Trait, FuncId)> = if ty.as_param().is_some() {
             self.param_methods(ty, name)
         } else {
-            self.impl_methods
+            let mut found = self
+                .impl_methods
                 .get(&(ty.decl(), name.to_owned()))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default();
+            // The methods of a trait private to another package.
+            found.retain(|&(_, id)| self.sigs[id].is_pub || self.sigs[id].pkg == pkg);
+            found
         };
         match found.as_slice() {
             [] => Some(None),
