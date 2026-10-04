@@ -1,0 +1,174 @@
+// stdout: 7 200 -5 true 9\n
+// stdout: 3 4 10 5 -1 127 0\n
+// stdout: less equal greater -1\n
+// stdout: 2 none 1 3\n
+// stdout: 6 12 255\n
+// stdout: 9 4 21\n
+// stdout: 5 3\n
+package main
+
+import "std/io"
+import "std/math"
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+enum Shape {
+	dot
+	circle(r: u8)
+}
+
+// `a` and `b` are moved in: a `T` that isn't `Copy` can be returned.
+fn larger[T: Ordered](sink a: T, sink b: T) -> T {
+	if a.lt(b) {
+		return b
+	}
+	return a
+}
+
+// Calls another generic function with its own type parameter.
+fn largest3[T: Ordered](sink a: T, sink b: T, sink c: T) -> T {
+	return larger(larger(a, b), c)
+}
+
+fn name(o: Ordering) -> str {
+	match o {
+		less => return "less"
+		equal => return "equal"
+		greater => return "greater"
+	}
+}
+
+// Reads elements in place: no `Copy` needed.
+fn find[T: Eq](xs: []T, v: T) -> ?usize {
+	for i in 0..xs.len {
+		if xs[i] == v {
+			return i
+		}
+	}
+	return none
+}
+
+// Returns a copy of an element: `Copy` needed.
+fn last[T: Copy](xs: []T) -> ?T {
+	if xs.len == 0 {
+		return none
+	}
+	return xs[xs.len - 1]
+}
+
+fn swap[T: Copy](inout a: T, inout b: T) {
+	let t = a
+	a = b
+	b = t
+}
+
+fn fill[T: Copy](set out: [3]T, v: T) {
+	out = [v, v, v]
+}
+
+// Recursion with its type parameter unchanged.
+fn gcd[T: Unsigned](a: T, b: T) -> T {
+	if b == 0 {
+		return a
+	}
+	return gcd(b, a % b)
+}
+
+// Two type parameters.
+fn widen[A: Unsigned, B: Unsigned](a: A, b: B) -> u64 {
+	return u64(a) +| u64(b)
+}
+
+fn space() {
+	io.print(" ")
+}
+
+fn main() -> u8 {
+	// Inferred from the arguments; a literal takes the type the other
+	// argument fixed.
+	let a: u32 = 3
+	io.print_int(larger(a, 7))
+	space()
+	// Explicit.
+	io.print_int(larger[u8](200, 100))
+	space()
+	// Inferred from the expected type.
+	let c: i64 = larger(-5, -9)
+	io.print_int(c)
+	space()
+	if larger(true, false) {
+		io.print("true")
+	}
+	space()
+	io.print_int(largest3[u16](4, 9, 2))
+	io.print("\n")
+
+	let m: u8 = math.min(3, 4)
+	io.print_int(m)
+	space()
+	io.print_int(math.max[i16](-4, 4))
+	space()
+	io.print_int(math.clamp[u64](12, 5, 10))
+	space()
+	io.print_int(math.clamp[i8](-3, 5, 10))
+	space()
+	io.print_int(math.clamp[i8](-1, -10, 10))
+	space()
+	io.print_int(math.abs[i8](-128))
+	space()
+	io.print_int(math.abs[u8](0))
+	io.print("\n")
+
+	let x: i32 = -2
+	io.print(name(x.cmp(5)))
+	space()
+	io.print(name(a.cmp(3)))
+	space()
+	io.print(name(true.cmp(false)))
+	space()
+	io.print_int(i8(x.cmp(0)))
+	io.print("\n")
+
+	let ps: [3]Point = [Point{x: 1, y: 2}, Point{x: 3, y: 4}, Point{x: 5, y: 6}]
+	let found = find(ps, Point{x: 5, y: 6})
+	io.print_int(found ?? 9)
+	space()
+	if find(ps, Point{x: 0, y: 0}) == none {
+		io.print("none")
+	}
+	space()
+	let shapes: [2]Shape = [.dot, .circle(3)]
+	io.print_int(find(shapes, Shape.circle(3)) ?? 9)
+	space()
+	let ls = last(shapes) ?? .dot
+	match ls {
+		dot => io.print("dot")
+		circle(r) => io.print_int(r)
+	}
+	io.print("\n")
+
+	var p: u8 = 6
+	var q: u8 = 12
+	swap(&p, &q)
+	io.print_int(q)
+	space()
+	io.print_int(p)
+	space()
+	var three: [3]u8
+	fill(&three, 255)
+	io.print_int(three[2])
+	io.print("\n")
+
+	io.print_int(gcd[u32](36, 27))
+	space()
+	io.print_int(gcd[usize](12, 8))
+	space()
+	let small: u8 = 1
+	let big: u64 = 20
+	io.print_int(widen(small, big))
+	io.print("\n")
+	return 0
+}
