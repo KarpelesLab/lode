@@ -14,7 +14,7 @@ use crate::ast::{self, Convention, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
-use crate::types::{Field, Primitive, Range, Ty, primitive};
+use crate::types::{Field, IntTy, Primitive, Range, Ty, Variant, primitive};
 
 use facts::{Env, Linear, Term};
 pub use tree::*;
@@ -71,6 +71,7 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         funcs,
         strings: ck.strings,
         main,
+        warnings: Vec::new(),
     };
     (program, ck.diags)
 }
@@ -79,8 +80,8 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
 enum Item {
     Func(FuncId),
     Const(usize),
-    /// A struct type.
-    Struct(Ty),
+    /// A struct or an enum type.
+    Type(Ty),
 }
 
 struct PkgInfo {
@@ -174,6 +175,10 @@ const SEQ: &str = "$seq";
 /// The hidden index of a `for x in xs` loop.
 const INDEX: &str = "$i";
 
+/// The hidden local holding the value a `match`, an `if let` or a
+/// `let ... else` looks into, unless it's already a local.
+const MATCHED: &str = "$match";
+
 /// Names assigned anywhere in `stmts` (for forgetting facts at loop heads).
 fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
@@ -183,6 +188,14 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
                 let root = place_root(target);
                 if let ExprKind::Name(n) = &root.kind {
                     out.insert(n.clone());
+                }
+            }
+            Stmt::Let {
+                otherwise: Some(b), ..
+            } => assigned_names(&b.stmts, out),
+            Stmt::Match { arms, .. } => {
+                for arm in arms {
+                    assigned_names(&arm.body.stmts, out);
                 }
             }
             Stmt::If(i) => {
@@ -219,13 +232,116 @@ fn place_root(mut e: &ast::Expr) -> &ast::Expr {
     e
 }
 
-/// The struct types a value of type `ty` holds directly (not behind a view):
-/// itself if it's a struct, or its element type's.
-fn held_struct(ty: Ty) -> Option<Ty> {
+/// The struct or enum type a value of type `ty` holds directly (not behind
+/// a view): itself if it's a struct or an enum, or the one in its element
+/// type or optional's value.
+fn held_nominal(ty: Ty) -> Option<Ty> {
     match ty {
-        Ty::Struct(_) => Some(ty),
-        Ty::Array(_) => held_struct(ty.as_array()?.0),
+        Ty::Struct(_) | Ty::Enum(_) => Some(ty),
+        Ty::Array(_) => held_nominal(ty.as_array()?.0),
+        Ty::Optional(_) => held_nominal(ty.as_optional()?),
         _ => None,
+    }
+}
+
+/// The values a struct or an enum holds: a struct's fields, or the payload
+/// fields of every variant of an enum, with their names for messages
+/// (`Point.x`, `Shape.circle.r`).
+fn members(ty: Ty) -> Vec<(String, Ty)> {
+    if let Some(def) = ty.as_struct() {
+        return def
+            .fields
+            .iter()
+            .map(|f| (format!("{ty}.{}", f.name), f.ty))
+            .collect();
+    }
+    let def = ty.as_enum().expect("a struct or an enum");
+    def.variants
+        .iter()
+        .flat_map(|v| {
+            v.fields
+                .iter()
+                .map(move |f| (format!("{ty}.{}.{}", v.name, f.name), f.ty))
+        })
+        .collect()
+}
+
+/// Make member `k` (numbered as in [`members`]) of a struct or an enum `()`,
+/// to break a cycle that was reported.
+fn clear_member(ty: Ty, k: usize) {
+    if let Some(def) = ty.as_struct() {
+        let mut fields = def.fields.clone();
+        fields[k].ty = Ty::Unit;
+        ty.set_fields(fields);
+        return;
+    }
+    let def = ty.as_enum().expect("a struct or an enum");
+    let mut variants = def.variants.clone();
+    let mut k = k;
+    for v in &mut variants {
+        if k < v.fields.len() {
+            v.fields[k].ty = Ty::Unit;
+            break;
+        }
+        k -= v.fields.len();
+    }
+    ty.set_variants(def.tag, def.explicit, variants);
+}
+
+/// What a value of type `ty` can be stored in: a struct field, a payload
+/// field, an array element or an optional. `Err` says why not: `Some` for a
+/// view, which can never be stored, `None` for a type the compiler can't
+/// store yet.
+fn storable(ty: Ty) -> Result<(), Option<()>> {
+    match ty {
+        Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) => {
+            Ok(())
+        }
+        Ty::Str | Ty::Slice(_) => Err(Some(())),
+        Ty::Ptr(_) | Ty::Unit => Err(None),
+    }
+}
+
+/// The local a `match` (or an `if let`, or a `let ... else`) looks into:
+/// `value` itself if it's a local, or else a hidden local it's stored in
+/// first, by a statement added to `before`.
+fn matched_local(cx: &mut FnCx, value: expr::Checked, before: &mut Vec<TStmt>) -> TExpr {
+    if let TExprKind::Local(_) = value.expr.kind {
+        return value.expr;
+    }
+    let ty = value.ty();
+    let id = cx.locals.len();
+    cx.locals.push(Local {
+        name: MATCHED.to_owned(),
+        ty,
+        mutable: false,
+    });
+    cx.scopes
+        .last_mut()
+        .expect("scope")
+        .insert(MATCHED.to_owned(), id);
+    cx.env.assign(id, None);
+    before.push(TStmt::Init(id, value.expr));
+    TExpr {
+        kind: TExprKind::Local(id),
+        ty,
+    }
+}
+
+/// Statements, wrapped in a block if there's more than one.
+fn one_stmt(mut stmts: Vec<TStmt>) -> TStmt {
+    if stmts.len() == 1 {
+        stmts.pop().expect("one statement")
+    } else {
+        TStmt::Block(stmts)
+    }
+}
+
+/// `matched`'s payload field `field` of variant `variant`.
+fn payload(matched: &TExpr, variant: u32, field: u32, ty: Ty) -> TExpr {
+    TExpr {
+        kind: TExprKind::Payload(Box::new(matched.clone()), variant, field),
+        ty,
     }
 }
 
@@ -243,12 +359,23 @@ impl<'a> Checker<'a> {
         self.diags.push(Diagnostic::error(span, msg));
     }
 
+    /// The name shown in messages for a type declared in package `pkg`:
+    /// `Point`, or `os.Stat` for a type of an imported package.
+    fn shown_name(packages: &[Package], pkg: usize, name: &str) -> String {
+        if pkg == packages.len().saturating_sub(1) {
+            name.to_owned()
+        } else {
+            let last = packages[pkg].path.rsplit('/').next().unwrap_or_default();
+            format!("{last}.{name}")
+        }
+    }
+
     /// Build the package and item tables, every file's imports, and every
     /// function's signature.
     fn collect(&mut self, packages: &'a [Package]) {
         let mut fns = Vec::new();
         let mut structs = Vec::new();
-        let root = packages.len().saturating_sub(1);
+        let mut enums = Vec::new();
         for (pkg, package) in packages.iter().enumerate() {
             self.pkgs.push(PkgInfo {
                 path: package.path.clone(),
@@ -292,21 +419,18 @@ impl<'a> Checker<'a> {
                         ast::Item::Struct(s) => {
                             // Messages name another package's struct the
                             // way code does: `os.Stat`.
-                            let shown = if pkg == root {
-                                s.name.name.clone()
-                            } else {
-                                let last = package.path.rsplit('/').next().unwrap_or_default();
-                                format!("{last}.{}", s.name.name)
-                            };
+                            let shown = Self::shown_name(packages, pkg, &s.name.name);
                             let ty = Ty::new_struct(shown, pkg, s.is_pub);
-                            if primitive(&s.name.name, self.ptr_bits).is_some() {
-                                self.error(
-                                    s.name.span,
-                                    format!("`{}` is the name of a built-in type", s.name.name),
-                                );
-                            }
+                            self.check_type_name(&s.name);
                             structs.push((s, pkg, file.id, ty));
-                            (&s.name, Item::Struct(ty))
+                            (&s.name, Item::Type(ty))
+                        }
+                        ast::Item::Enum(e) => {
+                            let shown = Self::shown_name(packages, pkg, &e.name.name);
+                            let ty = Ty::new_enum(shown, pkg, e.is_pub);
+                            self.check_type_name(&e.name);
+                            enums.push((e, pkg, file.id, ty));
+                            (&e.name, Item::Type(ty))
                         }
                     };
                     if self.pkgs[pkg].items.contains_key(&name.name) {
@@ -326,8 +450,15 @@ impl<'a> Checker<'a> {
             let fields = self.struct_fields(s, pkg, file);
             ty.set_fields(fields);
         }
+        for &(e, pkg, file, ty) in &enums {
+            let (tag, explicit, variants) = self.enum_variants(e, pkg, file);
+            ty.set_variants(tag, explicit, variants);
+        }
         for &(s, _, _, ty) in &structs {
-            self.check_recursion(s, ty);
+            self.check_recursion(&s.name, "struct", ty);
+        }
+        for &(e, _, _, ty) in &enums {
+            self.check_recursion(&e.name, "enum", ty);
         }
         for (f, pkg, file) in fns {
             let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
@@ -358,54 +489,215 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            let ty = self.resolve_type(&mut cx, &f.ty).unwrap_or(Ty::Unit);
-            let ok = match ty {
-                Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) | Ty::Unit => true,
-                Ty::Str | Ty::Slice(_) => {
-                    self.diags.push(
-                        Diagnostic::error(
-                            f.ty.span(),
-                            format!("a struct field can't be a view (`{ty}`)"),
-                        )
-                        .with_help(
-                            "views are never stored in structs, so they can't outlive what they view (docs/memory.md, Views)",
-                        )
-                        .with_help("store the data itself, for example in an array"),
-                    );
-                    false
-                }
-                Ty::Ptr(_) => {
-                    self.error(
-                        f.ty.span(),
-                        format!(
-                            "struct fields of type `{ty}` are not supported by the compiler yet"
-                        ),
-                    );
-                    false
-                }
-            };
+            let ty = self.field_type(&mut cx, &f.ty, "struct");
             fields.push(Field {
                 name: f.name.name.clone(),
-                ty: if ok { ty } else { Ty::Unit },
+                ty,
             });
         }
         fields
     }
 
-    /// Report a struct that holds a value of its own type, directly or
-    /// through other structs and arrays: it would be infinitely large. Each
-    /// cycle is reported once, at the first of its structs, and broken (the
-    /// field closing it becomes `()`) so later checks terminate.
-    fn check_recursion(&mut self, s: &ast::StructDecl, ty: Ty) {
-        // The fields leading from `from` back to `ty`, as (struct, field index).
+    /// Report a struct or an enum named like a primitive type.
+    fn check_type_name(&mut self, name: &ast::Ident) {
+        if primitive(&name.name, self.ptr_bits).is_some() {
+            self.error(
+                name.span,
+                format!("`{}` is the name of a built-in type", name.name),
+            );
+        }
+    }
+
+    /// The type of a field of a `what` (a struct or a payload), which must
+    /// be one that can be stored. A field whose type is in error gets the
+    /// type `()`, so later checks see no more problems with it.
+    fn field_type(&mut self, cx: &mut FnCx, t: &TypeExpr, what: &str) -> Ty {
+        let Some(ty) = self.resolve_type(cx, t) else {
+            return Ty::Unit;
+        };
+        match storable(ty) {
+            Ok(()) => ty,
+            Err(Some(())) => {
+                let (field, holder) = match what {
+                    "struct" => ("a struct field", "structs"),
+                    _ => ("a payload field", "enums"),
+                };
+                self.diags.push(
+                    Diagnostic::error(t.span(), format!("{field} can't be a view (`{ty}`)"))
+                        .with_help(format!(
+                            "views are never stored in {holder}, so they can't outlive what they view (docs/memory.md, Views)"
+                        ))
+                        .with_help("store the data itself, for example in an array"),
+                );
+                Ty::Unit
+            }
+            Err(None) => {
+                self.error(
+                    t.span(),
+                    format!("{what} fields of type `{ty}` are not supported by the compiler yet"),
+                );
+                Ty::Unit
+            }
+        }
+    }
+
+    /// The tag type, whether the variants have declared values, and the
+    /// variants of an enum declaration.
+    fn enum_variants(
+        &mut self,
+        e: &ast::EnumDecl,
+        pkg: usize,
+        file: FileId,
+    ) -> (IntTy, bool, Vec<Variant>) {
+        let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+        let enum_name = &e.name.name;
+        if e.variants.is_empty() {
+            self.error(
+                e.name.span,
+                "enums without variants are not supported by the compiler yet",
+            );
+        }
+        let explicit = e.tag.is_some();
+        let tag = match &e.tag {
+            Some(t) => match self.resolve_type(&mut cx, t) {
+                Some(Ty::Int(it)) => Some(it),
+                Some(other) => {
+                    self.error(
+                        t.span(),
+                        format!("the values of an enum must be integers, not `{other}`"),
+                    );
+                    None
+                }
+                None => None,
+            },
+            None => None,
+        };
+        let mut variants: Vec<Variant> = Vec::new();
+        for v in &e.variants {
+            let name = &v.name.name;
+            if variants.iter().any(|w| &w.name == name) {
+                self.error(
+                    v.name.span,
+                    format!("`{enum_name}` has more than one variant `{name}`"),
+                );
+                continue;
+            }
+            let mut fields: Vec<Field> = Vec::new();
+            match &v.fields {
+                Some(decls) if decls.is_empty() => self.error(
+                    v.name.span,
+                    format!("`{name}` has no payload, so it's written without parentheses"),
+                ),
+                Some(_) if explicit => self.error(
+                    v.name.span,
+                    format!(
+                        "`{name}` can't have a payload: the variants of `{enum_name}` are integer values"
+                    ),
+                ),
+                Some(decls) => {
+                    for f in decls {
+                        if fields.iter().any(|g| g.name == f.name.name) {
+                            self.error(
+                                f.name.span,
+                                format!(
+                                    "`{name}` has more than one field `{}`",
+                                    f.name.name
+                                ),
+                            );
+                            continue;
+                        }
+                        let ty = self.field_type(&mut cx, &f.ty, "payload");
+                        fields.push(Field {
+                            name: f.name.name.clone(),
+                            ty,
+                        });
+                    }
+                }
+                None => {}
+            }
+            let value = match (&v.value, tag) {
+                (Some(expr), Some(it)) => self.variant_value(&mut cx, expr, it, &variants),
+                (Some(_), None) if explicit => None,
+                (Some(expr), None) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            expr.span,
+                            "only the variants of an enum with an integer type have values",
+                        )
+                        .with_help(format!("declare the type: `enum {enum_name}: u8 {{`")),
+                    );
+                    None
+                }
+                (None, _) if explicit => {
+                    self.error(
+                        v.name.span,
+                        format!(
+                            "`{name}` needs a value, like every variant of `{enum_name}`: `{name} = 1`"
+                        ),
+                    );
+                    None
+                }
+                (None, _) => Some(variants.len() as i128),
+            };
+            variants.push(Variant {
+                name: name.clone(),
+                fields,
+                value: value.unwrap_or(variants.len() as i128),
+            });
+        }
+        let tag = tag.unwrap_or(if variants.len() <= 256 {
+            IntTy::new(false, 8)
+        } else {
+            IntTy::new(false, 16)
+        });
+        (tag, explicit, variants)
+    }
+
+    /// The value of a C-style enum's variant: a constant of the tag type
+    /// that no earlier variant has.
+    fn variant_value(
+        &mut self,
+        cx: &mut FnCx,
+        e: &ast::Expr,
+        tag: IntTy,
+        earlier: &[Variant],
+    ) -> Option<i128> {
+        let c = self.expr(cx, e, Some(Ty::Int(tag)))?;
+        let c = self.coerce(c, Ty::Int(tag), e.span)?;
+        let v = match c.range {
+            Some(r) if r.lo == r.hi => r.lo,
+            _ => {
+                self.error(
+                    e.span,
+                    "the value of a variant must be known when compiling",
+                );
+                return None;
+            }
+        };
+        if let Some(other) = earlier.iter().find(|w| w.value == v) {
+            self.error(
+                e.span,
+                format!("`{}` already has the value {v}", other.name),
+            );
+            return None;
+        }
+        Some(v)
+    }
+
+    /// Report a struct or an enum (`kind`) that holds a value of its own
+    /// type, directly or through other structs, enums, arrays and optionals:
+    /// it would be infinitely large. Each cycle is reported once, at the
+    /// first of its types, and broken (the member closing it becomes `()`)
+    /// so later checks terminate.
+    fn check_recursion(&mut self, name: &ast::Ident, kind: &str, ty: Ty) {
+        // The members leading from `from` back to `ty`, as (type, member index).
         fn path_back(from: Ty, ty: Ty, seen: &mut Vec<Ty>, path: &mut Vec<(Ty, usize)>) -> bool {
             if seen.contains(&from) {
                 return false;
             }
             seen.push(from);
-            let def = from.as_struct().expect("a struct");
-            for (i, f) in def.fields.iter().enumerate() {
-                let Some(inner) = held_struct(f.ty) else {
+            for (i, (_, mty)) in members(from).into_iter().enumerate() {
+                let Some(inner) = held_nominal(mty) else {
                     continue;
                 };
                 path.push((from, i));
@@ -421,27 +713,26 @@ impl<'a> Checker<'a> {
             if !path_back(ty, ty, &mut Vec::new(), &mut path) {
                 return;
             }
-            self.report_cycle(s, &path);
+            let through: Vec<String> = path
+                .iter()
+                .map(|&(t, i)| format!("`{}`", members(t)[i].0))
+                .collect();
+            let holds = if kind == "struct" {
+                "a struct holds its fields by value"
+            } else {
+                "an enum holds its payload by value"
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    name.span,
+                    format!("the {kind} `{}` contains itself", name.name),
+                )
+                .with_help(format!("through {}", through.join(", then ")))
+                .with_help(format!("{holds}, so it would be infinitely large")),
+            );
+            let &(last, i) = path.last().expect("a member");
+            clear_member(last, i);
         }
-    }
-
-    fn report_cycle(&mut self, s: &ast::StructDecl, path: &[(Ty, usize)]) {
-        let through: Vec<String> = path
-            .iter()
-            .map(|&(t, i)| format!("`{t}.{}`", t.as_struct().expect("a struct").fields[i].name))
-            .collect();
-        self.diags.push(
-            Diagnostic::error(
-                s.name.span,
-                format!("the struct `{}` contains itself", s.name.name),
-            )
-            .with_help(format!("through {}", through.join(", then ")))
-            .with_help("a struct holds its fields by value, so it would be infinitely large"),
-        );
-        let &(last, i) = path.last().expect("a field");
-        let mut fields = last.as_struct().expect("a struct").fields.clone();
-        fields[i].ty = Ty::Unit;
-        last.set_fields(fields);
     }
 
     /// The Lode type a type expression names. `cx` is where it appears: array
@@ -459,6 +750,26 @@ impl<'a> Checker<'a> {
                 let elem_ty = self.resolve_type(cx, elem)?;
                 self.check_elem(elem_ty, "slices", elem.span())?;
                 Some(Ty::slice(elem_ty))
+            }
+            TypeExpr::Optional(inner, span) => {
+                let ty = self.resolve_type(cx, inner)?;
+                match storable(ty) {
+                    Ok(()) => Some(Ty::optional(ty)),
+                    Err(Some(())) => {
+                        self.diags.push(
+                            Diagnostic::error(*span, format!("an optional can't hold a view (`{ty}`)"))
+                                .with_help("views are never stored, so they can't outlive what they view (docs/memory.md, Views)"),
+                        );
+                        None
+                    }
+                    Err(None) => {
+                        self.error(
+                            *span,
+                            format!("optionals of `{ty}` are not supported by the compiler yet"),
+                        );
+                        None
+                    }
+                }
             }
             TypeExpr::Ptr(inner, span) => match self.resolve_type(cx, inner)? {
                 Ty::Int(it) => Some(Ty::Ptr(it)),
@@ -484,7 +795,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 match self.package_item(cx, pkg, &name.name, name.span)? {
-                    Item::Struct(ty) => Some(ty),
+                    Item::Type(ty) => Some(ty),
                     _ => {
                         self.error(
                             t.span(),
@@ -507,7 +818,7 @@ impl<'a> Checker<'a> {
                     None
                 }
                 None => match self.pkgs[cx.pkg].items.get(&id.name) {
-                    Some(Item::Struct(ty)) => Some(*ty),
+                    Some(Item::Type(ty)) => Some(*ty),
                     Some(_) => {
                         self.error(id.span, format!("`{}` is not a type", id.name));
                         None
@@ -524,7 +835,12 @@ impl<'a> Checker<'a> {
     /// Whether `elem` can be the element type of an array or slice (`what`).
     fn check_elem(&mut self, elem: Ty, what: &str, span: Span) -> Option<()> {
         match elem {
-            Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) => Some(()),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Array(_)
+            | Ty::Struct(_)
+            | Ty::Enum(_)
+            | Ty::Optional(_) => Some(()),
             other => {
                 self.error(
                     span,
@@ -611,7 +927,10 @@ impl<'a> Checker<'a> {
         let is_pub = match item {
             Item::Func(id) => self.sigs[id].is_pub,
             Item::Const(id) => self.consts[id].decl.is_pub,
-            Item::Struct(ty) => ty.as_struct().expect("a struct").is_pub,
+            Item::Type(ty) => match ty.as_struct() {
+                Some(def) => def.is_pub,
+                None => ty.as_enum().expect("a struct or an enum").is_pub,
+            },
         };
         if pkg != cx.pkg && !is_pub {
             let path = self.pkgs[pkg].path.clone();
@@ -851,8 +1170,17 @@ impl<'a> Checker<'a> {
                 mutable,
                 name,
                 ty,
+                init: Some(init),
+                otherwise: Some(otherwise),
+                ..
+            } => self.let_else(cx, *mutable, name, ty.as_ref(), init, otherwise),
+            Stmt::Let {
+                mutable,
+                name,
+                ty,
                 init,
                 span,
+                ..
             } => {
                 let annotated = match ty {
                     Some(t) => Some(self.resolve_type(cx, t)?),
@@ -1027,7 +1355,372 @@ impl<'a> Checker<'a> {
                 cx.unsafe_depth -= 1;
                 Some(TStmt::Block(body))
             }
+            Stmt::Match { value, arms, span } => {
+                cx.scopes.push(HashMap::new());
+                let out = self.match_stmt(cx, value, arms, *span);
+                cx.scopes.pop();
+                out
+            }
         }
+    }
+
+    /// The facts after statements that branch: `envs` are the facts at the
+    /// end of each branch, with whether it always leaves. A branch that
+    /// leaves contributes nothing; the others are joined.
+    fn join_branches(envs: Vec<(Env, bool)>) -> Env {
+        envs.into_iter()
+            .filter(|(_, leaves)| !leaves)
+            .map(|(env, _)| env)
+            .reduce(Env::join)
+            .unwrap_or_else(Env::unreachable)
+    }
+
+    /// `match value { pattern => body ... }` on an enum or an optional, in
+    /// a scope of its own (for the hidden local holding `value`, if any).
+    /// Every variant must be matched by exactly one arm.
+    fn match_stmt(
+        &mut self,
+        cx: &mut FnCx,
+        value: &ast::Expr,
+        arms: &[ast::Arm],
+        span: Span,
+    ) -> Option<TStmt> {
+        let checked = self.expr(cx, value, None)?;
+        let ty = checked.ty();
+        let Some(def) = ty.sum() else {
+            self.error(
+                value.span,
+                format!("`match` needs an enum or an optional, found `{ty}`"),
+            );
+            return None;
+        };
+        let mut before = Vec::new();
+        let matched = matched_local(cx, checked, &mut before);
+        let entry = cx.env.clone();
+        let mut covered = vec![false; def.variants.len()];
+        let mut wildcard: Option<Span> = None;
+        let mut ok = true;
+        let mut envs = Vec::new();
+        let mut tarms = Vec::new();
+        for arm in arms {
+            cx.env = entry.clone();
+            if wildcard.is_some() {
+                self.diags.push(
+                    Diagnostic::error(
+                        arm.pattern.span(),
+                        "this arm is never used: it comes after `_`",
+                    )
+                    .with_help("`_` matches every variant not matched before it"),
+                );
+                ok = false;
+            }
+            // The variants the arm handles, and its payload bindings.
+            let mut variants = Vec::new();
+            let mut bindings: Vec<(&ast::Ident, u32, Ty)> = Vec::new();
+            match &arm.pattern {
+                ast::Pattern::Wildcard(wspan) => {
+                    variants = (0..covered.len() as u32)
+                        .filter(|&v| !covered[v as usize])
+                        .collect();
+                    self.lint_wildcard(cx, ty, &def, &variants, *wspan);
+                    covered.fill(true);
+                    wildcard = wildcard.or(Some(*wspan));
+                }
+                ast::Pattern::Variant {
+                    name,
+                    bindings: names,
+                    ..
+                } => match def.variant(&name.name) {
+                    None => {
+                        self.error(name.span, format!("`{ty}` has no variant `{}`", name.name));
+                        ok = false;
+                    }
+                    Some((v, variant)) => {
+                        if covered[v] && wildcard.is_none() {
+                            self.error(
+                                name.span,
+                                format!("`{}` is already matched by an earlier arm", name.name),
+                            );
+                            ok = false;
+                        }
+                        covered[v] = true;
+                        variants.push(v as u32);
+                        match names {
+                            Some(names) if names.len() != variant.fields.len() => {
+                                let msg = if variant.fields.is_empty() {
+                                    format!(
+                                        "`{}` has no payload, so it's matched without parentheses",
+                                        name.name
+                                    )
+                                } else {
+                                    format!(
+                                        "`{}` has {} payload field(s), but the pattern binds {}",
+                                        name.name,
+                                        variant.fields.len(),
+                                        names.len()
+                                    )
+                                };
+                                self.error(arm.pattern.span(), msg);
+                                ok = false;
+                            }
+                            Some(names) => {
+                                for (k, (b, f)) in names.iter().zip(&variant.fields).enumerate() {
+                                    if b.name == "_" {
+                                        continue;
+                                    }
+                                    if bindings.iter().any(|(o, ..)| o.name == b.name) {
+                                        self.error(
+                                            b.span,
+                                            format!("`{}` is bound twice in this pattern", b.name),
+                                        );
+                                        ok = false;
+                                        continue;
+                                    }
+                                    bindings.push((b, k as u32, f.ty));
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                },
+            }
+            cx.scopes.push(HashMap::new());
+            let mut body = Vec::new();
+            if let [v] = variants[..] {
+                for (b, k, fty) in bindings {
+                    let local = self.declare(cx, &b.name, fty, false);
+                    let value = expr::Checked::new(
+                        TExprKind::Payload(Box::new(matched.clone()), v, k),
+                        fty,
+                        None,
+                    );
+                    Self::record_value(cx, local, &value);
+                    body.push(TStmt::Init(local, value.expr));
+                }
+            }
+            body.extend(self.block(cx, &arm.body.stmts));
+            cx.scopes.pop();
+            envs.push((std::mem::take(&mut cx.env), diverges(&body)));
+            tarms.push(TArm { variants, body });
+        }
+        let missing: Vec<String> = def
+            .variants
+            .iter()
+            .zip(&covered)
+            .filter(|&(_, &c)| !c)
+            .map(|(v, _)| format!("`{}`", v.name))
+            .collect();
+        cx.env = Self::join_branches(envs);
+        if !missing.is_empty() {
+            let s = if missing.len() == 1 { "" } else { "s" };
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "this `match` doesn't handle the variant{s} {} of `{ty}`",
+                        missing.join(", ")
+                    ),
+                )
+                .with_help("add an arm for each, or `_ => ...` for the rest"),
+            );
+            ok = false;
+        }
+        if !ok {
+            return None;
+        }
+        before.push(TStmt::Match {
+            value: matched,
+            arms: tarms,
+        });
+        Some(one_stmt(before))
+    }
+
+    /// Warn about a `_` arm that hides variants added later (on an enum of
+    /// the same package, which can list them all), or that matches nothing.
+    fn lint_wildcard(
+        &mut self,
+        cx: &FnCx,
+        ty: Ty,
+        def: &crate::types::EnumDef,
+        rest: &[u32],
+        span: Span,
+    ) {
+        let names: Vec<String> = rest
+            .iter()
+            .map(|&v| format!("`{}`", def.variants[v as usize].name))
+            .collect();
+        if rest.is_empty() {
+            // On another package's enum, `_` handles variants it may add.
+            if def.pkg == cx.pkg || ty.as_optional().is_some() {
+                self.diags.push(Diagnostic::warning(
+                    span,
+                    format!("this `_` matches nothing: every variant of `{ty}` is matched above"),
+                ));
+            }
+        } else if def.pkg == cx.pkg {
+            self.diags.push(
+                Diagnostic::warning(
+                    span,
+                    format!("`_` hides the variants of `{ty}` that are added later"),
+                )
+                .with_help(format!(
+                    "match {} by name, so a new variant must be handled where `{ty}` is matched",
+                    names.join(", ")
+                )),
+            );
+        }
+    }
+
+    /// `if let name = opt { ... } else { ... }`: a `match` on the optional
+    /// `opt`, with `name` bound to its value in the first block.
+    fn if_let(&mut self, cx: &mut FnCx, i: &ast::IfStmt, name: &ast::Ident) -> TStmt {
+        let checked = self.expr(cx, &i.cond, None);
+        let inner = match &checked {
+            Some(c) => match c.ty().as_optional() {
+                Some(inner) => Some(inner),
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            i.cond.span,
+                            format!("`if let` needs an optional, found `{}`", c.ty()),
+                        )
+                        .with_help("use `match` for an enum"),
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut before = Vec::new();
+        cx.scopes.push(HashMap::new());
+        let matched = match (checked, inner) {
+            (Some(c), Some(_)) => Some(matched_local(cx, c, &mut before)),
+            _ => None,
+        };
+        let entry = cx.env.clone();
+
+        cx.scopes.push(HashMap::new());
+        // The value's type, or `()` if it's in error (only to keep checking).
+        let local = self.declare(cx, &name.name, inner.unwrap_or(Ty::Unit), false);
+        cx.env.assign(local, None);
+        let mut then = Vec::new();
+        if let (Some(m), Some(t)) = (&matched, inner) {
+            then.push(TStmt::Init(local, payload(m, 1, 0, t)));
+        }
+        then.extend(self.block(cx, &i.then.stmts));
+        cx.scopes.pop();
+        let then_env = std::mem::replace(&mut cx.env, entry);
+
+        let otherwise = match &i.otherwise {
+            None => Vec::new(),
+            Some(ast::Else::Block(b)) => self.block(cx, &b.stmts),
+            Some(ast::Else::If(inner)) => vec![self.if_stmt(cx, inner)],
+        };
+        cx.scopes.pop();
+        let else_env = std::mem::take(&mut cx.env);
+        cx.env = Self::join_branches(vec![
+            (then_env, diverges(&then)),
+            (else_env, diverges(&otherwise)),
+        ]);
+        let Some(matched) = matched else {
+            // In error: kept for control-flow analysis only.
+            return TStmt::If(placeholder_bool(), then, otherwise);
+        };
+        before.push(TStmt::Match {
+            value: matched,
+            arms: vec![
+                TArm {
+                    variants: vec![1],
+                    body: then,
+                },
+                TArm {
+                    variants: vec![0],
+                    body: otherwise,
+                },
+            ],
+        });
+        one_stmt(before)
+    }
+
+    /// `let name = opt else { ... }`: `name` is the value of the optional
+    /// `opt`, and the block, which must leave, runs when it's `none`.
+    fn let_else(
+        &mut self,
+        cx: &mut FnCx,
+        mutable: bool,
+        name: &ast::Ident,
+        ty: Option<&TypeExpr>,
+        init: &ast::Expr,
+        otherwise: &ast::Block,
+    ) -> Option<TStmt> {
+        let annotated = match ty {
+            Some(t) => Some(self.resolve_type(cx, t)?),
+            None => None,
+        };
+        let checked = self.expr(cx, init, annotated.map(Ty::optional))?;
+        let Some(inner) = checked.ty().as_optional() else {
+            self.diags.push(
+                Diagnostic::error(
+                    init.span,
+                    format!("`let ... else` needs an optional, found `{}`", checked.ty()),
+                )
+                .with_help("the `else` block runs when the optional is `none`"),
+            );
+            return None;
+        };
+        if let Some(t) = annotated
+            && t != inner
+        {
+            self.error(
+                init.span,
+                format!("expected `?{t}`, found `{}`", checked.ty()),
+            );
+            return None;
+        }
+        let mut before = Vec::new();
+        let matched = matched_local(cx, checked, &mut before);
+        let entry = cx.env.clone();
+        let else_body = self.block(cx, &otherwise.stmts);
+        cx.env = entry;
+        if !diverges(&else_body) {
+            self.diags.push(
+                Diagnostic::error(
+                    otherwise.span,
+                    "the `else` block of `let ... else` must leave",
+                )
+                .with_help("end it with `return`, `break` or `continue`"),
+            );
+            return None;
+        }
+        if cx.scopes.last().expect("scope").contains_key(&name.name) {
+            self.error(
+                name.span,
+                format!("`{}` is already declared in this block", name.name),
+            );
+            return None;
+        }
+        let local = self.declare(cx, &name.name, inner, mutable);
+        let value = expr::Checked::new(
+            TExprKind::Payload(Box::new(matched.clone()), 1, 0),
+            inner,
+            None,
+        );
+        Self::record_value(cx, local, &value);
+        before.push(TStmt::Match {
+            value: matched,
+            arms: vec![
+                TArm {
+                    variants: vec![0],
+                    body: else_body,
+                },
+                TArm {
+                    variants: vec![1],
+                    body: Vec::new(),
+                },
+            ],
+        });
+        before.push(TStmt::Init(local, value.expr));
+        Some(TStmt::Block(before))
     }
 
     /// At the head of a loop: forget the facts about every variable the loop
@@ -1394,6 +2087,9 @@ impl<'a> Checker<'a> {
     }
 
     fn if_stmt(&mut self, cx: &mut FnCx, i: &ast::IfStmt) -> TStmt {
+        if let Some(name) = &i.binding {
+            return self.if_let(cx, i, name);
+        }
         let (cond, facts) = self.condition(cx, &i.cond);
         let before = cx.env.clone();
 

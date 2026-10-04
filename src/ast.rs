@@ -29,6 +29,28 @@ pub enum Item {
     Fn(FnDecl),
     Const(ConstDecl),
     Struct(StructDecl),
+    Enum(EnumDecl),
+}
+
+/// `enum Name { variant ... }` or `enum Name: T { variant = value ... }`,
+/// one variant per line.
+#[derive(Debug)]
+pub struct EnumDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    /// The integer type of a C-style enum, whose variants have values.
+    pub tag: Option<TypeExpr>,
+    pub variants: Vec<VariantDecl>,
+    pub span: Span,
+}
+
+/// `name`, `name(field: T, ...)` or `name = value`.
+#[derive(Debug)]
+pub struct VariantDecl {
+    pub name: Ident,
+    /// The payload fields; `None` without parentheses.
+    pub fields: Option<Vec<FieldDecl>>,
+    pub value: Option<Expr>,
 }
 
 /// `struct Name { field: T ... }`, one field per line.
@@ -100,6 +122,8 @@ pub enum TypeExpr {
     Array(Box<Expr>, Box<TypeExpr>, Span),
     /// A slice `[]T`.
     Slice(Box<TypeExpr>, Span),
+    /// An optional `?T`.
+    Optional(Box<TypeExpr>, Span),
 }
 
 impl TypeExpr {
@@ -110,7 +134,8 @@ impl TypeExpr {
             TypeExpr::Unit(span)
             | TypeExpr::Ptr(_, span)
             | TypeExpr::Array(_, _, span)
-            | TypeExpr::Slice(_, span) => *span,
+            | TypeExpr::Slice(_, span)
+            | TypeExpr::Optional(_, span) => *span,
         }
     }
 }
@@ -124,11 +149,14 @@ pub struct Block {
 #[derive(Debug)]
 pub enum Stmt {
     /// `let x: T = e` (`mutable: false`) or `var x: T = e` (`mutable: true`).
+    /// With `otherwise`, `let x = opt else { ... }`: `e` is an optional, and
+    /// the block runs (and must leave) when it's `none`.
     Let {
         mutable: bool,
         name: Ident,
         ty: Option<TypeExpr>,
         init: Option<Expr>,
+        otherwise: Option<Block>,
         span: Span,
     },
     /// `target = value`, or `target op= value` when `op` is set.
@@ -164,6 +192,41 @@ pub enum Stmt {
     Continue(Span),
     /// `unsafe { ... }`
     Unsafe(Block),
+    /// `match value { pattern => body ... }`
+    Match {
+        value: Expr,
+        arms: Vec<Arm>,
+        span: Span,
+    },
+}
+
+/// `pattern => body` in a `match`. A body written as a single statement is
+/// a block of that statement.
+#[derive(Debug)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub body: Block,
+}
+
+#[derive(Debug)]
+pub enum Pattern {
+    /// `_`: every variant not matched by an earlier arm.
+    Wildcard(Span),
+    /// `name` or `name(a, _, c)`: a variant, binding its payload fields by
+    /// position (`_` skips one).
+    Variant {
+        name: Ident,
+        bindings: Option<Vec<Ident>>,
+        span: Span,
+    },
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard(span) | Pattern::Variant { span, .. } => *span,
+        }
+    }
 }
 
 /// What a `for` loop goes over.
@@ -177,6 +240,9 @@ pub enum ForIter {
 
 #[derive(Debug)]
 pub struct IfStmt {
+    /// `if let name = cond`: `cond` is an optional, and the `then` block
+    /// runs with its value bound to `name` when it's not `none`.
+    pub binding: Option<Ident>,
     pub cond: Expr,
     pub then: Block,
     pub otherwise: Option<Else>,
@@ -215,6 +281,8 @@ pub enum ExprKind {
     Index(Box<Expr>, Box<Expr>),
     /// `Point{x: 1, y: 2}`: a struct literal, with its fields in source order.
     StructLit(TypeExpr, Vec<FieldInit>),
+    /// `none`: the empty optional.
+    None,
 }
 
 /// `name: value` in a struct literal.
@@ -258,6 +326,8 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    /// `a ?? b`: the value of the optional `a`, or `b` if it's `none`.
+    Coalesce,
 }
 
 impl BinOp {
@@ -288,6 +358,7 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::And => "&&",
             BinOp::Or => "||",
+            BinOp::Coalesce => "??",
         }
     }
 }

@@ -28,6 +28,24 @@ pub fn origin() -> Point {
 pub fn shift(p: Point, dx: i32) -> Point {
 	return Point{x: p.x +% dx, y: p.y}
 }
+
+pub enum Shape {
+	circle(center: Point, radius: u8)
+	dot
+}
+
+pub enum Level: u8 {
+	low = 1
+	high = 9
+}
+
+enum Hidden {
+	a
+}
+
+pub fn unit() -> Shape {
+	return Shape.circle(origin(), 1)
+}
 ";
 
 /// A standard library root holding only `std/geo`, unique to `name`.
@@ -108,6 +126,51 @@ fn main() -> i32 {
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         assert_eq!(run(&program, "public"), 7);
     }
+}
+
+#[test]
+fn a_public_enum_is_used_from_another_package() {
+    let main = "\
+package main
+
+import \"std/geo\"
+
+fn radius(s: geo.Shape) -> u8 {
+	match s {
+		circle(_, r) => return r
+		dot => return 0
+	}
+}
+
+// `_` on another package's enum is not linted: it handles the variants
+// that package may add.
+fn is_dot(s: geo.Shape) -> bool {
+	match s {
+		dot => return true
+		_ => return false
+	}
+}
+
+fn main() -> u8 {
+	let big = geo.Shape.circle(geo.Point{x: 0, y: 0}, 5)
+	let level = geo.Level(9) ?? geo.Level.low
+	if is_dot(big) || !is_dot(geo.Shape.dot) || level != geo.Level.high {
+		return 100
+	}
+	return radius(big) +% radius(geo.unit()) +% u8(level)
+}
+";
+    // `check` fails on any diagnostic, warnings too.
+    let program = check("enums", main).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "enums"), 15);
+    }
+    let errors = check(
+        "private-enum",
+        "package main\n\nimport \"std/geo\"\n\nfn main() {\n\tlet h = geo.Hidden.a\n}\n",
+    )
+    .expect_err("fails to check");
+    assert_eq!(errors, ["`Hidden` is private to package `std/geo`"]);
 }
 
 #[test]

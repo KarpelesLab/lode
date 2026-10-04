@@ -108,6 +108,12 @@ impl Uses {
                     self.stmt(s);
                 }
             }
+            TStmt::Match { value, arms } => {
+                self.expr(value);
+                for s in arms.iter().flat_map(|a| &a.body) {
+                    self.stmt(s);
+                }
+            }
             TStmt::Break | TStmt::Continue => {}
         }
     }
@@ -120,7 +126,9 @@ impl Uses {
                     self.expr(a);
                 }
             }
-            TExprKind::ArrayLit(items) | TExprKind::Syscall(items) => {
+            TExprKind::ArrayLit(items)
+            | TExprKind::Syscall(items)
+            | TExprKind::Variant(_, items) => {
                 for a in items {
                     self.expr(a);
                 }
@@ -129,7 +137,8 @@ impl Uses {
             | TExprKind::And(l, r)
             | TExprKind::Or(l, r)
             | TExprKind::Index(l, r)
-            | TExprKind::PtrAdd(l, r) => {
+            | TExprKind::PtrAdd(l, r)
+            | TExprKind::Coalesce(l, r) => {
                 self.expr(l);
                 self.expr(r);
             }
@@ -145,7 +154,10 @@ impl Uses {
             | TExprKind::ArrayLen(inner)
             | TExprKind::ArrayRepeat(inner, _)
             | TExprKind::ToSlice(inner)
-            | TExprKind::StrPtr(inner) => self.expr(inner),
+            | TExprKind::StrPtr(inner)
+            | TExprKind::Payload(inner, ..)
+            | TExprKind::EnumValue(inner)
+            | TExprKind::EnumFrom(inner) => self.expr(inner),
             TExprKind::Str(id) => self.strings.push(*id),
             TExprKind::Int(_) | TExprKind::Bool(_) | TExprKind::Local(_) => {}
         }

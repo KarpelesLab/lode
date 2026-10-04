@@ -20,6 +20,20 @@
 //! field at the next offset aligned for it, the size rounded up to the
 //! largest alignment.
 //!
+//! Enums and optionals (an optional `?T` is an enum with the variants `none`
+//! and `some(value: T)`) live in memory too. Their IR type is an LF struct
+//! of the tag and a payload area: `{ tag, [K x iA] }`, where `A` is the
+//! largest alignment of the variants' payloads (each payload is an LF struct
+//! of its fields) and `K` words of `A` bytes hold the largest one. A variant
+//! without payload stores only the tag, and an enum where no variant has a
+//! payload is just `{ tag }`. The tag is the enum's tag type (`u8` unless a
+//! C-style enum declares another), holding the variant's position, or its
+//! declared value in a C-style enum. A payload field is reached by viewing
+//! the payload area's address as the variant's payload struct, so every
+//! field is at an offset aligned for it. Code that depends on the variant
+//! (`match`, copies, `==`, `??`) tests the tag and branches; only the active
+//! variant's payload is ever read.
+//!
 //! Calls pass a value in memory as a pointer to it. Parameters are read-only
 //! for the duration of the call (docs/memory.md), and nothing can change the
 //! argument while the callee runs, so the pointer is to the caller's own
@@ -41,6 +55,17 @@ use crate::reach::Reach;
 use crate::sema::{CmpOp, Func, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
 use crate::types::{IntTy, Ty};
 
+/// The IR layout of an enum or an optional (see the module docs).
+struct SumIr {
+    /// `{ tag, [K x iA] }`, or `{ tag }` without payloads.
+    ty: TypeId,
+    tag: IntTy,
+    /// Each variant's payload struct, if it has a payload.
+    payloads: Vec<Option<TypeId>>,
+    /// Each variant's tag value.
+    values: Vec<i128>,
+}
+
 /// The name of the entry wrapper, for a program whose `main` is also called
 /// from Lode code (see [`lower`]).
 pub const ENTRY_WRAPPER: &str = "main";
@@ -57,6 +82,8 @@ pub struct Lowered {
     /// Read-only data the object must define: `(symbol, bytes)` for each
     /// string literal.
     pub strings: Vec<(String, Vec<u8>)>,
+    /// The program's warnings ([`Program::warnings`]).
+    pub warnings: Vec<crate::diag::Diagnostic>,
 }
 
 /// IR types for every Lode type, interned up front (the function builder
@@ -81,7 +108,9 @@ impl Types {
             Ty::Int(t) => self.int(t),
             Ty::Ptr(_) => self.ptr,
             Ty::Str | Ty::Slice(_) => unreachable!("a view is two values"),
-            Ty::Array(_) | Ty::Struct(_) => unreachable!("{ty} lives in memory"),
+            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) => {
+                unreachable!("{ty} lives in memory")
+            }
         }
     }
 
@@ -90,7 +119,7 @@ impl Types {
         match ty {
             Ty::Unit => Vec::new(),
             Ty::Str | Ty::Slice(_) => vec![self.ptr, self.i64],
-            Ty::Array(_) | Ty::Struct(_) => vec![self.ptr],
+            _ if ty.in_memory() => vec![self.ptr],
             _ => vec![self.of(ty)],
         }
     }
@@ -126,7 +155,7 @@ enum Val {
     One(ValueId),
     /// A view (`str` or slice): pointer and length.
     View(ValueId, ValueId),
-    /// An array or a struct: a pointer to its storage.
+    /// An array, a struct, an enum or an optional: a pointer to its storage.
     Mem(ValueId),
 }
 
@@ -279,6 +308,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         syms,
         entry,
         strings,
+        warnings: program.warnings.clone(),
     }
 }
 
@@ -326,6 +356,15 @@ const UNROLL_LIMIT: u64 = 16;
 fn scalars(ty: Ty) -> u64 {
     if let Some((elem, n)) = ty.as_array() {
         return n.saturating_mul(scalars(elem));
+    }
+    if let Some(def) = ty.sum() {
+        // The tag and the largest payload.
+        let payload = def.variants.iter().map(|v| {
+            v.fields
+                .iter()
+                .fold(0, |n: u64, f| n.saturating_add(scalars(f.ty)))
+        });
+        return payload.max().unwrap_or(0).saturating_add(1);
     }
     match ty.as_struct() {
         Some(def) => def
@@ -388,7 +427,7 @@ impl FnLower<'_> {
                     ptr: self.b.alloca(self.t.ptr),
                     len: self.b.alloca(self.t.i64),
                 },
-                ty @ (Ty::Array(_) | Ty::Struct(_)) => {
+                ty if ty.in_memory() => {
                     let ir_ty = self.ir_ty(ty);
                     Slot::Mem(self.b.alloca(ir_ty))
                 }
@@ -584,6 +623,26 @@ impl FnLower<'_> {
                 self.terminated = true;
             }
             TStmt::Block(body) => self.stmts(body),
+            TStmt::Match { value, arms } => {
+                let base = self.place(value);
+                let tag = self.load_tag(base, value.ty);
+                let blocks: Vec<BlockId> = arms.iter().map(|_| self.b.create_block(&[])).collect();
+                let join = self.b.create_block(&[]);
+                let targets: Vec<(Vec<u32>, BlockId)> = arms
+                    .iter()
+                    .zip(&blocks)
+                    .map(|(a, &bb)| (a.variants.clone(), bb))
+                    .collect();
+                self.branch_on_tag(tag, value.ty, &targets);
+                for (arm, bb) in arms.iter().zip(blocks) {
+                    self.start_block(bb);
+                    self.stmts(&arm.body);
+                    if !self.terminated {
+                        self.b.br(join, &[]);
+                    }
+                }
+                self.start_block(join);
+            }
         }
     }
 
@@ -653,15 +712,24 @@ impl FnLower<'_> {
                 let (_, n) = a.ty.as_array().expect("an array");
                 self.b.const_i64(self.t.i64, n as i64)
             }
-            TExprKind::ArrayLit(_) | TExprKind::ArrayRepeat(..) | TExprKind::StructLit(_) => {
+            TExprKind::ArrayLit(_)
+            | TExprKind::ArrayRepeat(..)
+            | TExprKind::StructLit(_)
+            | TExprKind::Variant(..)
+            | TExprKind::EnumFrom(_) => {
                 let ir_ty = self.ir_ty(e.ty);
                 let tmp = self.b.alloca(ir_ty);
                 self.fill(tmp, e);
                 return Val::Mem(tmp);
             }
-            TExprKind::Index(..) | TExprKind::Field(..) => {
+            TExprKind::Index(..) | TExprKind::Field(..) | TExprKind::Payload(..) => {
                 let addr = self.address(e);
                 return self.read(addr, e.ty);
+            }
+            TExprKind::Coalesce(opt, default) => return self.coalesce(opt, default, e.ty),
+            TExprKind::EnumValue(inner) => {
+                let base = self.place(inner);
+                self.load_tag(base, inner.ty)
             }
             TExprKind::ToSlice(a) => {
                 let p = self.place(a);
@@ -775,6 +843,9 @@ impl FnLower<'_> {
             let elem = self.ir_ty(elem);
             return self.b.types_mut().array(elem, n);
         }
+        if ty.sum().is_some() {
+            return self.sum_ir(ty).ty;
+        }
         match ty.as_struct() {
             Some(def) => {
                 let fields = def.fields.iter().map(|f| self.ir_ty(f.ty)).collect();
@@ -782,6 +853,201 @@ impl FnLower<'_> {
             }
             None => self.t.of(ty),
         }
+    }
+
+    /// The IR layout of an enum or an optional (see the module docs).
+    fn sum_ir(&mut self, ty: Ty) -> SumIr {
+        let def = ty.sum().expect("an enum or an optional");
+        let tag = self.t.int(def.tag);
+        let payloads: Vec<Option<TypeId>> = def
+            .variants
+            .iter()
+            .map(|v| {
+                if v.fields.is_empty() {
+                    return None;
+                }
+                let fields = v.fields.iter().map(|f| self.ir_ty(f.ty)).collect();
+                Some(self.b.types_mut().struct_(fields))
+            })
+            .collect();
+        let (mut size, mut align) = (0, 1);
+        for &p in payloads.iter().flatten() {
+            let layout = self.b.types().layout(p);
+            size = size.max(layout.size);
+            align = align.max(layout.align);
+        }
+        let ir = if size == 0 {
+            self.b.types_mut().struct_(vec![tag])
+        } else {
+            let word = self.b.types_mut().int(align as u32 * 8);
+            let area = self.b.types_mut().array(word, size.div_ceil(align));
+            self.b.types_mut().struct_(vec![tag, area])
+        };
+        SumIr {
+            ty: ir,
+            tag: def.tag,
+            payloads,
+            values: def.variants.iter().map(|v| v.value).collect(),
+        }
+    }
+
+    /// The tag of the enum or optional of type `ty` at `base`.
+    fn load_tag(&mut self, base: ValueId, ty: Ty) -> ValueId {
+        let sum = self.sum_ir(ty);
+        let addr = self.b.struct_field(base, sum.ty, 0);
+        let tag = self.t.int(sum.tag);
+        self.b.load(tag, addr, align_of(Ty::Int(sum.tag)))
+    }
+
+    /// Make the enum or optional of type `ty` at `base` variant `variant`
+    /// (its payload is written separately).
+    fn store_tag(&mut self, base: ValueId, ty: Ty, variant: u32) {
+        let sum = self.sum_ir(ty);
+        let addr = self.b.struct_field(base, sum.ty, 0);
+        let tag = self.t.int(sum.tag);
+        let v = self
+            .b
+            .const_i64(tag, const_bits(sum.values[variant as usize], sum.tag));
+        self.b.store(tag, addr, v, align_of(Ty::Int(sum.tag)));
+    }
+
+    /// The address of payload field `field` of variant `variant` of the enum
+    /// or optional of type `ty` at `base`.
+    fn payload_at(&mut self, base: ValueId, ty: Ty, variant: u32, field: u32) -> ValueId {
+        let sum = self.sum_ir(ty);
+        let area = self.b.struct_field(base, sum.ty, 1);
+        let payload = sum.payloads[variant as usize].expect("a variant with a payload");
+        self.b.struct_field(area, payload, field)
+    }
+
+    /// Branch on `tag`, the tag of a value of the enum or optional type
+    /// `ty`: to `targets[k].1` when it's one of the variants in
+    /// `targets[k].0`. Every variant is in exactly one target, so the last
+    /// target (with variants) is taken without a test. The current block is
+    /// left terminated.
+    fn branch_on_tag(&mut self, tag: ValueId, ty: Ty, targets: &[(Vec<u32>, BlockId)]) {
+        let sum = self.sum_ir(ty);
+        let tag_ty = self.t.int(sum.tag);
+        let live: Vec<&(Vec<u32>, BlockId)> =
+            targets.iter().filter(|(v, _)| !v.is_empty()).collect();
+        for (i, (variants, bb)) in live.iter().enumerate() {
+            if i + 1 == live.len() {
+                self.b.br(*bb, &[]);
+                break;
+            }
+            let mut cond = None;
+            for &v in variants {
+                let value = self
+                    .b
+                    .const_i64(tag_ty, const_bits(sum.values[v as usize], sum.tag));
+                let is = self.b.icmp(IntPred::Eq, tag, value);
+                cond = Some(match cond {
+                    None => is,
+                    Some(c) => self.b.bin(IrOp::Or, c, is, Flags::NONE),
+                });
+            }
+            let next = self.b.create_block(&[]);
+            self.b
+                .cond_br(cond.expect("a variant"), *bb, &[], next, &[]);
+            self.start_block(next);
+        }
+        self.terminated = true;
+    }
+
+    /// For each variant of the enum or optional of type `ty` that has a
+    /// payload, a block, run `body` in it with the variant, and go on after
+    /// all of them. `tag` is the value's tag.
+    fn each_payload(&mut self, tag: ValueId, ty: Ty, mut body: impl FnMut(&mut Self, u32)) {
+        let def = ty.sum().expect("an enum or an optional");
+        let with: Vec<u32> = (0..def.variants.len() as u32)
+            .filter(|&v| !def.variants[v as usize].fields.is_empty())
+            .collect();
+        if with.is_empty() {
+            return;
+        }
+        let without: Vec<u32> = (0..def.variants.len() as u32)
+            .filter(|v| !with.contains(v))
+            .collect();
+        let join = self.b.create_block(&[]);
+        let mut targets: Vec<(Vec<u32>, BlockId)> = with
+            .iter()
+            .map(|&v| (vec![v], self.b.create_block(&[])))
+            .collect();
+        let blocks: Vec<(u32, BlockId)> = targets.iter().map(|(v, bb)| (v[0], *bb)).collect();
+        targets.push((without, join));
+        self.branch_on_tag(tag, ty, &targets);
+        for (v, bb) in blocks {
+            self.start_block(bb);
+            body(self, v);
+            self.b.br(join, &[]);
+        }
+        self.start_block(join);
+    }
+
+    /// `opt ?? default`, of type `ty`.
+    fn coalesce(&mut self, opt: &TExpr, default: &TExpr, ty: Ty) -> Val {
+        let base = self.place(opt);
+        let tag = self.load_tag(base, opt.ty);
+        let some_bb = self.b.create_block(&[]);
+        let none_bb = self.b.create_block(&[]);
+        let targets = [(vec![1], some_bb), (vec![0], none_bb)];
+        if ty.in_memory() {
+            let ir_ty = self.ir_ty(ty);
+            let tmp = self.b.alloca(ir_ty);
+            let join = self.b.create_block(&[]);
+            self.branch_on_tag(tag, opt.ty, &targets);
+            self.start_block(some_bb);
+            let src = self.payload_at(base, opt.ty, 1, 0);
+            self.copy(tmp, src, ty);
+            self.b.br(join, &[]);
+            self.start_block(none_bb);
+            self.fill(tmp, default);
+            self.b.br(join, &[]);
+            self.start_block(join);
+            return Val::Mem(tmp);
+        }
+        let join = self.b.create_block(&[self.t.of(ty)]);
+        self.branch_on_tag(tag, opt.ty, &targets);
+        self.start_block(some_bb);
+        let src = self.payload_at(base, opt.ty, 1, 0);
+        let v = self.read(src, ty).one();
+        self.b.br(join, &[v]);
+        self.start_block(none_bb);
+        let d = self.expr(default).one();
+        self.b.br(join, &[d]);
+        self.start_block(join);
+        Val::One(self.b.param(join, 0))
+    }
+
+    /// Write `E(x)` (a `?E` for the C-style enum `E`) to `dst`: the variant
+    /// whose value is `x`, or `none`.
+    fn enum_from(&mut self, dst: ValueId, opt: Ty, x: &TExpr) {
+        let enum_ty = opt.as_optional().expect("an optional");
+        let def = enum_ty.as_enum().expect("an enum");
+        let it = x.ty.as_int().expect("an integer");
+        let v = self.expr(x).one();
+        let join = self.b.create_block(&[]);
+        for (k, variant) in def.variants.iter().enumerate() {
+            if !it.range().contains(variant.value) {
+                continue;
+            }
+            let value = self
+                .b
+                .const_i64(self.t.int(it), const_bits(variant.value, it));
+            let is = self.b.icmp(IntPred::Eq, v, value);
+            let found = self.b.create_block(&[]);
+            let next = self.b.create_block(&[]);
+            self.b.cond_br(is, found, &[], next, &[]);
+            self.start_block(found);
+            self.store_tag(dst, opt, 1);
+            let inner = self.payload_at(dst, opt, 1, 0);
+            self.store_tag(inner, enum_ty, k as u32);
+            self.b.br(join, &[]);
+            self.start_block(next);
+        }
+        self.store_tag(dst, opt, 0);
+        self.b.br(join, &[]);
+        self.start_block(join);
     }
 
     /// The storage of an expression whose value lives in memory.
@@ -804,6 +1070,10 @@ impl FnLower<'_> {
         if let TExprKind::Field(base, i) = &e.kind {
             let p = self.place(base);
             return self.field_at(p, base.ty, *i);
+        }
+        if let TExprKind::Payload(base, v, k) = &e.kind {
+            let p = self.place(base);
+            return self.payload_at(p, base.ty, *v, *k);
         }
         let TExprKind::Index(base, index) = &e.kind else {
             unreachable!("not an element or a field: {e:?}")
@@ -891,6 +1161,25 @@ impl FnLower<'_> {
             });
             return;
         }
+        if let Some(def) = ty.sum() {
+            // The tag, then the active variant's payload fields.
+            let sum = self.sum_ir(ty);
+            let tag_ty = self.t.int(sum.tag);
+            let align = align_of(Ty::Int(sum.tag));
+            let s = self.b.struct_field(src, sum.ty, 0);
+            let d = self.b.struct_field(dst, sum.ty, 0);
+            let tag = self.b.load(tag_ty, s, align);
+            self.b.store(tag_ty, d, tag, align);
+            self.each_payload(tag, ty, |this, v| {
+                for (k, f) in def.variants[v as usize].fields.iter().enumerate() {
+                    let s = this.payload_at(src, ty, v, k as u32);
+                    let d = this.payload_at(dst, ty, v, k as u32);
+                    let val = this.read(s, f.ty);
+                    this.write(d, val, f.ty);
+                }
+            });
+            return;
+        }
         let def = ty.as_struct().expect("copying an array or a struct");
         for (i, f) in def.fields.iter().enumerate() {
             let s = self.field_at(src, ty, i as u32);
@@ -925,6 +1214,30 @@ impl FnLower<'_> {
                 let y = self.field_at(b, ty, i as u32);
                 self.equal_into(acc, x, y, f.ty);
             }
+        } else if let Some(def) = ty.sum() {
+            // The same variant, and then the same payload.
+            let ta = self.load_tag(a, ty);
+            let tb = self.load_tag(b, ty);
+            let same = self.b.icmp(IntPred::Eq, ta, tb);
+            let so_far = self.b.load(self.t.bool, acc, 1);
+            let both = self.b.bin(IrOp::And, so_far, same, Flags::NONE);
+            self.b.store(self.t.bool, acc, both, 1);
+            if def.variants.iter().all(|v| v.fields.is_empty()) {
+                return;
+            }
+            let payloads = self.b.create_block(&[]);
+            let done = self.b.create_block(&[]);
+            self.b.cond_br(same, payloads, &[], done, &[]);
+            self.start_block(payloads);
+            self.each_payload(ta, ty, |this, v| {
+                for (k, f) in def.variants[v as usize].fields.iter().enumerate() {
+                    let x = this.payload_at(a, ty, v, k as u32);
+                    let y = this.payload_at(b, ty, v, k as u32);
+                    this.equal_into(acc, x, y, f.ty);
+                }
+            });
+            self.b.br(done, &[]);
+            self.start_block(done);
         } else {
             let ir_ty = self.t.of(ty);
             let x = self.b.load(ir_ty, a, align_of(ty));
@@ -958,6 +1271,14 @@ impl FnLower<'_> {
             TExprKind::Call(f, args) => {
                 self.call(*f, args, e.ty, Some(dst));
             }
+            TExprKind::Variant(v, values) => {
+                self.store_tag(dst, e.ty, *v);
+                for (k, value) in values.iter().enumerate() {
+                    let d = self.payload_at(dst, e.ty, *v, k as u32);
+                    self.fill_or_write(d, value);
+                }
+            }
+            TExprKind::EnumFrom(x) => self.enum_from(dst, e.ty, x),
             TExprKind::ArrayRepeat(value, n) => {
                 let (elem, _) = e.ty.as_array().expect("an array");
                 let v = self.expr(value);

@@ -19,6 +19,9 @@ pub struct Program {
     pub strings: Vec<Vec<u8>>,
     /// The root package's `main` function, if it has one.
     pub main: Option<FuncId>,
+    /// Warnings about the program (it has no errors). They don't stop it
+    /// from compiling.
+    pub warnings: Vec<crate::diag::Diagnostic>,
 }
 
 #[derive(Debug)]
@@ -67,6 +70,22 @@ pub enum TStmt {
     Continue,
     /// A nested block (an `unsafe` block).
     Block(Vec<TStmt>),
+    /// `match value { ... }` on an enum or an optional. `value` is a local
+    /// (the checker copies anything else into a hidden one first), so arms
+    /// can read its payload with [`TExprKind::Payload`]. Every variant is
+    /// in exactly one arm.
+    Match {
+        value: TExpr,
+        arms: Vec<TArm>,
+    },
+}
+
+/// One arm of a [`TStmt::Match`]: the variants it handles (by index) and
+/// its body, which starts by binding the payload fields it names.
+#[derive(Debug)]
+pub struct TArm {
+    pub variants: Vec<u32>,
+    pub body: Vec<TStmt>,
 }
 
 #[derive(Clone, Debug)]
@@ -120,6 +139,22 @@ pub enum TExprKind {
     /// The `syscall(nr, args...)` intrinsic (unsafe). Integer operands are
     /// passed as 64-bit values, sign- or zero-extended by their type.
     Syscall(Vec<TExpr>),
+    /// A value of an enum or an optional: variant number `n` (in
+    /// declaration order; for an optional, 0 is `none` and 1 is `some`) and
+    /// its payload fields, in order (the order they're evaluated in).
+    Variant(u32, Vec<TExpr>),
+    /// `base`'s payload field `field` of variant `variant`, which `base` is
+    /// known to hold (it's read in the arm of a `match` for that variant).
+    /// A place, like a struct field.
+    Payload(Box<TExpr>, u32, u32),
+    /// `opt ?? default`: the value in the optional `opt`, or else `default`,
+    /// which is only evaluated when `opt` is `none`.
+    Coalesce(Box<TExpr>, Box<TExpr>),
+    /// The integer value of a C-style enum value (of the enum's tag type).
+    EnumValue(Box<TExpr>),
+    /// The C-style enum value whose value is the integer operand, as an
+    /// optional of the enum: `none` if no variant has that value.
+    EnumFrom(Box<TExpr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +210,7 @@ pub fn terminates(stmts: &[TStmt]) -> bool {
         TStmt::If(_, then, otherwise) => terminates(then) && terminates(otherwise),
         TStmt::Loop(body) => !breaks(body),
         TStmt::Block(body) => terminates(body),
+        TStmt::Match { arms, .. } => arms.iter().all(|a| terminates(&a.body)),
         _ => false,
     })
 }
@@ -187,6 +223,7 @@ pub fn diverges(stmts: &[TStmt]) -> bool {
         TStmt::If(_, then, otherwise) => diverges(then) && diverges(otherwise),
         TStmt::Loop(body) => !breaks(body),
         TStmt::Block(body) => diverges(body),
+        TStmt::Match { arms, .. } => arms.iter().all(|a| diverges(&a.body)),
         _ => false,
     })
 }
@@ -197,6 +234,7 @@ pub fn breaks(stmts: &[TStmt]) -> bool {
         TStmt::Break => true,
         TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
         TStmt::Block(body) => breaks(body),
+        TStmt::Match { arms, .. } => arms.iter().any(|a| breaks(&a.body)),
         _ => false,
     })
 }

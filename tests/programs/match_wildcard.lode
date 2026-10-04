@@ -1,0 +1,28 @@
+// exit: 3
+// warning: `_` hides the variants of `Fruit` that are added later
+// warning: this `_` matches nothing: every variant of `?u8` is matched above
+package main
+
+enum Fruit {
+	apple
+	pear
+	plum
+}
+
+// `_` on an enum of this package builds, with a warning: a variant added
+// to `Fruit` later would go to `_` without anyone noticing.
+fn score(f: Fruit) -> u8 {
+	match f {
+		apple => return 1
+		_ => return 2
+	}
+}
+
+fn main() -> u8 {
+	let o: ?u8 = 0
+	match o {
+		some(v) => return v +| score(Fruit.plum) +| 1
+		none => return 0
+		_ => return 9
+	}
+}

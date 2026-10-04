@@ -1,0 +1,131 @@
+// error: `Shape` has more than one variant `dot`
+// error: a payload field can't be a view (`str`)
+// error: a payload field can't be a view (`[]u8`)
+// error: the enum `List` contains itself
+// error: `red` needs a value, like every variant of `Color`: `red = 1`
+// error: `green` already has the value 2
+// error: `big` can't have a payload: the variants of `Color` are integer values
+// error: only the variants of an enum with an integer type have values
+// error: an optional can't hold a view (`str`)
+// error: this `match` doesn't handle the variants `rect`, `dot` of `Shape`
+// error: `Shape` has no variant `square`
+// error: `circle` is already matched by an earlier arm
+// error: this arm is never used: it comes after `_`
+// error: `circle` has 2 payload field(s), but the pattern binds 1
+// error: `dot` has no payload, so it's matched without parentheses
+// error: `match` needs an enum or an optional, found `u32`
+// error: `Shape` has no variant `square`
+// error: `Shape.circle` has 2 payload field(s), but 1 value(s) were given
+// error: expected `u32`, found `bool`
+// error: `Shape.circle` has a payload: give it as `Shape.circle(...)`
+// error: `Shape.dot` has no payload, so it's written without parentheses
+// error: cannot tell which optional type this `none` has
+// error: expected `u32`, found `none`
+// error: the `else` block of `let ... else` must leave
+// error: `let ... else` needs an optional, found `u32`
+// error: `if let` needs an optional, found `Shape`
+// error: `??` needs an optional on its left, found `u32`
+// error: `<` can't compare values of type `Shape`
+// error: `Shape(...)` converts an integer, but the variants of `Shape` have no values
+// error: `Shape` is a type; use one of its variants, like `Shape.circle`
+// error: cannot prove that this `u16` value fits in `u8`
+// warning: `_` hides the variants of `Shape` that are added later
+// warning: `_` hides the variants of `Shape` that are added later
+package main
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+enum Shape {
+	circle(center: Point, radius: u32)
+	rect(min: Point, max: Point)
+	dot
+	dot
+}
+
+enum Views {
+	name(s: str)
+	bytes(b: []u8)
+}
+
+enum List {
+	empty
+	cons(head: u32, tail: List)
+}
+
+enum Color: u16 {
+	red
+	green = 2
+	blue = 2
+	big(x: u8) = 3
+	huge = 300
+}
+
+enum Plain {
+	a = 1
+}
+
+fn holder(o: ?str) {
+}
+
+fn matches(s: Shape, n: u32) {
+	match s {
+		circle(_, _) => {
+		}
+	}
+	match s {
+		square => {
+		}
+		circle => {
+		}
+		circle => {
+		}
+		_ => {
+		}
+		dot => {
+		}
+	}
+	match s {
+		circle(c) => {
+		}
+		dot(x) => {
+		}
+		_ => {
+		}
+	}
+	match n {
+		_ => {
+		}
+	}
+}
+
+fn construct() {
+	let a = Shape.square
+	let b = Shape.circle(Point{x: 1, y: 2})
+	let c = Shape.circle(Point{x: 1, y: 2}, true)
+	let d = Shape.circle
+	let e = Shape.dot()
+	let f = none
+	let g: u32 = none
+}
+
+fn optionals(s: Shape, n: u32, o: ?u32) -> u32 {
+	let a = o else {
+	}
+	let b = n else {
+		return 0
+	}
+	if let c = s {
+	}
+	let d = n ?? 1
+	let lt = s < s
+	let e = Shape(1)
+	let f = Shape
+	let g = u8(Color.huge)
+	return 0
+}
+
+fn main() {
+}

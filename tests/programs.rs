@@ -9,6 +9,9 @@
 //!   exit status is given.
 //! - `// error: text`: compiling fails with an error whose message contains
 //!   `text` (one line per expected error; every error must be listed).
+//! - `// warning: text`: checking gives a warning whose message contains
+//!   `text` (one line per expected warning; every warning must be listed,
+//!   with or without errors). A program without this line has no warnings.
 
 use std::path::{Path, PathBuf};
 
@@ -18,6 +21,34 @@ use lode::source::{SourceFile, SourceMap};
 enum Expect {
     Run { exit: i32, stdout: Option<String> },
     Errors(Vec<String>),
+}
+
+/// The `// warning:` lines of a program.
+fn expected_warnings(text: &str) -> Vec<String> {
+    text.lines()
+        .take_while(|l| l.starts_with("//"))
+        .filter_map(|l| l.strip_prefix("// warning:"))
+        .map(|w| w.trim().to_owned())
+        .collect()
+}
+
+/// Compare the messages of `found` with the `expected` ones (each contained
+/// in one message, and as many of them): the failures.
+fn compare(name: &str, what: &str, expected: &[String], found: &[&str]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for want in expected {
+        if !found.iter().any(|m| m.contains(want.as_str())) {
+            failures.push(format!("{name}: missing {what} `{want}`; got {found:#?}"));
+        }
+    }
+    if found.len() != expected.len() {
+        failures.push(format!(
+            "{name}: expected {} {what}s, got {}: {found:#?}",
+            expected.len(),
+            found.len()
+        ));
+    }
+    failures
 }
 
 fn expectation(text: &str) -> Expect {
@@ -88,10 +119,20 @@ fn programs_behave_as_declared() {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(&path).expect("read program");
         let expect = expectation(&text);
+        let warnings = expected_warnings(&text);
         let mut files = SourceMap::new();
         let root = files.add(SourceFile::new(path.display().to_string(), text));
         match expect {
             Expect::Run { exit, stdout } => {
+                // Errors are reported by the build below.
+                if let Ok(program) = lode::check(&mut files, root) {
+                    let found: Vec<&str> = program
+                        .warnings
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect();
+                    failures.extend(compare(&name, "warning", &warnings, &found));
+                }
                 if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
                     continue;
                 }
@@ -126,20 +167,15 @@ fn programs_behave_as_declared() {
             Expect::Errors(expected) => match lode::check(&mut files, root) {
                 Ok(_) => failures.push(format!("{name}: compiled, but errors were expected")),
                 Err(lode::Error::Source(diags)) => {
-                    let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
-                    for want in &expected {
-                        if !messages.iter().any(|m| m.contains(want.as_str())) {
-                            failures
-                                .push(format!("{name}: missing error `{want}`; got {messages:#?}"));
-                        }
-                    }
-                    if messages.len() != expected.len() {
-                        failures.push(format!(
-                            "{name}: expected {} errors, got {}: {messages:#?}",
-                            expected.len(),
-                            messages.len()
-                        ));
-                    }
+                    let of = |error: bool| -> Vec<&str> {
+                        diags
+                            .iter()
+                            .filter(|d| d.is_error() == error)
+                            .map(|d| d.message.as_str())
+                            .collect()
+                    };
+                    failures.extend(compare(&name, "error", &expected, &of(true)));
+                    failures.extend(compare(&name, "warning", &warnings, &of(false)));
                 }
                 Err(lode::Error::Backend(msg)) => failures.push(format!("{name}: {msg}")),
             },

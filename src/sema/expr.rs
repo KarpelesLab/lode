@@ -51,11 +51,40 @@ impl Checked {
     }
 }
 
-fn is_array_literal(e: &ast::Expr) -> bool {
+/// Whether `e` takes its type from its context: an array literal or
+/// `none`. In `xs == [1, 2, 3]` or `opt == none`, it takes the other side's.
+fn needs_context(e: &ast::Expr) -> bool {
     match &e.kind {
-        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => true,
-        ExprKind::Paren(inner) => is_array_literal(inner),
+        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) | ExprKind::None => true,
+        ExprKind::Paren(inner) => needs_context(inner),
         _ => false,
+    }
+}
+
+/// The type under any optionals: `T` for `??T`. Where a `?T` is expected, a
+/// literal is a `T` (made optional by [`Checker::coerce`]).
+fn under_optionals(mut ty: Ty) -> Ty {
+    while let Some(inner) = ty.as_optional() {
+        ty = inner;
+    }
+    ty
+}
+
+/// Whether a value of type `from` can be used where `to` is expected (see
+/// [`Checker::coerce`]).
+pub(super) fn coercible(from: Ty, to: Ty) -> bool {
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        (Ty::Int(a), Ty::Int(b)) => a.range().within(b.range()),
+        _ if from
+            .as_array()
+            .is_some_and(|(e, _)| Some(e) == to.as_slice()) =>
+        {
+            true
+        }
+        _ => to.as_optional().is_some_and(|inner| coercible(from, inner)),
     }
 }
 
@@ -157,10 +186,21 @@ impl Checker<'_> {
     }
 
     /// Check that `c` can be used where `target` is expected, inserting a
-    /// lossless widening conversion if needed.
+    /// lossless widening conversion if needed, or making a value of `T` an
+    /// optional `?T` that holds it.
     pub(super) fn coerce(&mut self, c: Checked, target: Ty, span: Span) -> Option<Checked> {
         if c.ty() == target {
             return Some(c);
+        }
+        if let Some(inner) = target.as_optional()
+            && coercible(c.ty(), inner)
+        {
+            let value = self.coerce(c, inner, span)?;
+            return Some(Checked::new(
+                TExprKind::Variant(1, vec![value.expr]),
+                target,
+                None,
+            ));
         }
         if let (Ty::Int(from), Ty::Int(to)) = (c.ty(), target)
             && from.range().within(to.range())
@@ -192,7 +232,7 @@ impl Checker<'_> {
         expected: Option<Ty>,
     ) -> Option<Checked> {
         if let Some(v) = self.untyped_int(cx, e) {
-            return self.literal(v, e.span, expected);
+            return self.literal(v, e.span, expected.map(under_optionals));
         }
         match &e.kind {
             ExprKind::Int(_) => {
@@ -215,13 +255,171 @@ impl Checker<'_> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(cx, *op, lhs, rhs, e.span, expected),
             ExprKind::Call(callee, args) => self.call(cx, callee, args, e.span),
             ExprKind::Field(base, member) => self.field(cx, base, member, e.span),
-            ExprKind::ArrayLit(elems) => self.array_literal(cx, elems, e.span, expected),
+            ExprKind::ArrayLit(elems) => {
+                self.array_literal(cx, elems, e.span, expected.map(under_optionals))
+            }
             ExprKind::ArrayRepeat(value, count) => {
-                self.array_repeat(cx, value, count, e.span, expected)
+                self.array_repeat(cx, value, count, e.span, expected.map(under_optionals))
             }
             ExprKind::Index(base, index) => self.index(cx, base, index),
             ExprKind::StructLit(ty, fields) => self.struct_literal(cx, ty, fields, e.span),
+            ExprKind::None => match expected {
+                Some(t @ Ty::Optional(_)) => {
+                    Some(Checked::new(TExprKind::Variant(0, Vec::new()), t, None))
+                }
+                Some(t) => {
+                    self.error(e.span, format!("expected `{t}`, found `none`"));
+                    None
+                }
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            e.span,
+                            "cannot tell which optional type this `none` has",
+                        )
+                        .with_help("give it a type from context, e.g. `let x: ?u32 = none`"),
+                    );
+                    None
+                }
+            },
         }
+    }
+
+    /// The enum (or struct) type an expression names, as in `Shape.circle`
+    /// or `geo.Shape.circle`: `None` if it doesn't name a type, `Some(None)`
+    /// if it names one it can't use (the error is reported).
+    fn type_path(&mut self, cx: &FnCx, e: &ast::Expr) -> Option<Option<Ty>> {
+        match &e.kind {
+            ExprKind::Name(name) if cx.lookup(name).is_none() => {
+                match self.pkgs[cx.pkg].items.get(name) {
+                    Some(&Item::Type(ty)) => Some(Some(ty)),
+                    _ => None,
+                }
+            }
+            ExprKind::Field(base, member) => {
+                let ExprKind::Name(pkg_name) = &base.kind else {
+                    return None;
+                };
+                let pkg = self.imported(cx, pkg_name)?;
+                match self.pkgs[pkg].items.get(&member.name) {
+                    Some(Item::Type(_)) => {
+                        match self.package_item(cx, pkg, &member.name, member.span) {
+                            Some(Item::Type(ty)) => Some(Some(ty)),
+                            _ => Some(None),
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `E.name` (`args` is `None`) or `E.name(a, b)`: a value of the enum
+    /// `ty`, with its payload fields given in order.
+    fn enum_variant(
+        &mut self,
+        cx: &mut FnCx,
+        ty: Ty,
+        member: &ast::Ident,
+        args: Option<&[ast::Expr]>,
+        span: Span,
+    ) -> Option<Checked> {
+        let Some(def) = ty.as_enum() else {
+            self.error(
+                member.span,
+                format!("`{ty}` is a struct; it has no variants"),
+            );
+            return None;
+        };
+        let name = &member.name;
+        let Some((i, variant)) = def.variant(name) else {
+            self.error(member.span, format!("`{ty}` has no variant `{name}`"));
+            return None;
+        };
+        let fields = &variant.fields;
+        let args = match (args, fields.is_empty()) {
+            (None, true) => &[][..],
+            (None, false) => {
+                self.error(
+                    span,
+                    format!("`{ty}.{name}` has a payload: give it as `{ty}.{name}(...)`"),
+                );
+                return None;
+            }
+            (Some(_), true) => {
+                self.error(
+                    span,
+                    format!("`{ty}.{name}` has no payload, so it's written without parentheses"),
+                );
+                return None;
+            }
+            (Some(args), false) => args,
+        };
+        if args.len() != fields.len() {
+            self.error(
+                span,
+                format!(
+                    "`{ty}.{name}` has {} payload field(s), but {} value(s) were given",
+                    fields.len(),
+                    args.len()
+                ),
+            );
+            return None;
+        }
+        let mut values = Vec::new();
+        let mut ok = true;
+        for (arg, f) in args.iter().zip(fields) {
+            match self
+                .expr(cx, arg, Some(f.ty))
+                .and_then(|c| self.coerce(c, f.ty, arg.span))
+            {
+                Some(c) => values.push(c.expr),
+                None => ok = false,
+            }
+        }
+        ok.then(|| Checked::new(TExprKind::Variant(i as u32, values), ty, None))
+    }
+
+    /// `E(x)` for a C-style enum `E`: the variant whose value is the integer
+    /// `x`, as a `?E` that's `none` if there's no such variant.
+    fn enum_from(
+        &mut self,
+        cx: &mut FnCx,
+        ty: Ty,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> Option<Checked> {
+        let def = ty.as_enum().expect("an enum");
+        if !def.explicit {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "`{ty}(...)` converts an integer, but the variants of `{ty}` have no values"
+                    ),
+                )
+                .with_help(format!(
+                    "build a value with a variant, like `{ty}.{}`",
+                    def.variants.first().map_or("name", |v| v.name.as_str())
+                )),
+            );
+            return None;
+        }
+        let [arg] = args else {
+            self.error(span, format!("`{ty}(...)` converts exactly one value"));
+            return None;
+        };
+        let c = self.expr(cx, arg, Some(Ty::Int(def.tag)))?;
+        if c.ty().as_int().is_none() {
+            self.error(arg.span, format!("cannot convert `{}` to `{ty}`", c.ty()));
+            return None;
+        }
+        Some(Checked::new(
+            TExprKind::EnumFrom(Box::new(c.expr)),
+            Ty::optional(ty),
+            None,
+        ))
     }
 
     /// `T{name: value, ...}`: every field exactly once, in any order.
@@ -538,11 +736,20 @@ impl Checker<'_> {
                 );
                 None
             }
-            Item::Struct(_) => {
-                self.error(
-                    span,
-                    format!("`{name}` is a type; build a value with `{name}{{...}}`"),
-                );
+            Item::Type(ty) => {
+                match ty.as_enum() {
+                    Some(def) => self.error(
+                        span,
+                        format!(
+                            "`{name}` is a type; use one of its variants, like `{name}.{}`",
+                            def.variants.first().map_or("name", |v| v.name.as_str())
+                        ),
+                    ),
+                    None => self.error(
+                        span,
+                        format!("`{name}` is a type; build a value with `{name}{{...}}`"),
+                    ),
+                }
                 None
             }
         }
@@ -555,6 +762,9 @@ impl Checker<'_> {
         member: &ast::Ident,
         span: Span,
     ) -> Option<Checked> {
+        if let Some(ty) = self.type_path(cx, base) {
+            return self.enum_variant(cx, ty?, member, None, span);
+        }
         if let ExprKind::Name(pkg_name) = &base.kind
             && let Some(pkg) = self.imported(cx, pkg_name)
         {
@@ -771,14 +981,14 @@ impl Checker<'_> {
                 let r = self.expr(cx, rhs, Some(l.ty()))?;
                 (l, r)
             }
-            // An array literal takes its type from the other side, as in
-            // `xs == [1, 2, 3]`.
-            _ if is_array_literal(rhs) && !is_array_literal(lhs) => {
+            // An array literal or `none` takes its type from the other side,
+            // as in `xs == [1, 2, 3]`.
+            _ if needs_context(rhs) && !needs_context(lhs) => {
                 let l = self.expr(cx, lhs, expected)?;
                 let r = self.expr(cx, rhs, Some(l.ty()))?;
                 (l, r)
             }
-            _ if is_array_literal(lhs) && !is_array_literal(rhs) => {
+            _ if needs_context(lhs) && !needs_context(rhs) => {
                 let r = self.expr(cx, rhs, expected)?;
                 let l = self.expr(cx, lhs, Some(r.ty()))?;
                 (l, r)
@@ -793,14 +1003,9 @@ impl Checker<'_> {
             return Some((l, r));
         }
         match (l.ty(), r.ty()) {
-            (Ty::Int(a), Ty::Int(b)) if a.range().within(b.range()) => {
-                let t = r.ty();
-                Some((self.coerce(l, t, lhs.span)?, r))
-            }
-            (Ty::Int(a), Ty::Int(b)) if b.range().within(a.range()) => {
-                let t = l.ty();
-                Some((l, self.coerce(r, t, rhs.span)?))
-            }
+            // A widening, or a value compared with an optional.
+            (a, b) if coercible(a, b) && !b.is_view() => Some((self.coerce(l, b, lhs.span)?, r)),
+            (a, b) if coercible(b, a) && !a.is_view() => Some((l, self.coerce(r, a, rhs.span)?)),
             (a, b) => {
                 self.error(
                     lhs.span.to(rhs.span),
@@ -860,7 +1065,13 @@ impl Checker<'_> {
                     Ty::Int(_) => {}
                     // Arrays and structs compare element by element, field
                     // by field: every type they can hold has `==`.
-                    Ty::Bool | Ty::Ptr(_) | Ty::Array(_) | Ty::Struct(_) if !ordered => {}
+                    Ty::Bool
+                    | Ty::Ptr(_)
+                    | Ty::Array(_)
+                    | Ty::Struct(_)
+                    | Ty::Enum(_)
+                    | Ty::Optional(_)
+                        if !ordered => {}
                     other => {
                         self.error(
                             span,
@@ -887,8 +1098,34 @@ impl Checker<'_> {
                 Some(out)
             }
             BinOp::Shl | BinOp::ShlWrap | BinOp::Shr => self.shift(cx, op, lhs, rhs, expected),
+            BinOp::Coalesce => self.coalesce(cx, lhs, rhs, expected),
             _ => self.arith(cx, op, lhs, rhs, span, expected),
         }
+    }
+
+    /// `opt ?? default`: the value in `opt`, or `default` if it's `none`.
+    fn coalesce(
+        &mut self,
+        cx: &mut FnCx,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        let l = self.expr(cx, lhs, expected.map(Ty::optional))?;
+        let Some(inner) = l.ty().as_optional() else {
+            self.error(
+                lhs.span,
+                format!("`??` needs an optional on its left, found `{}`", l.ty()),
+            );
+            return None;
+        };
+        let r = self.expr(cx, rhs, Some(inner))?;
+        let r = self.coerce(r, inner, rhs.span)?;
+        Some(Checked::new(
+            TExprKind::Coalesce(Box::new(l.expr), Box::new(r.expr)),
+            inner,
+            None,
+        ))
     }
 
     /// `p + n` on a raw pointer: move it forward by `n` elements.
@@ -1154,11 +1391,19 @@ impl Checker<'_> {
         args: &[ast::Expr],
         span: Span,
     ) -> Option<Checked> {
+        if let ExprKind::Field(base, member) = &callee.kind
+            && let Some(ty) = self.type_path(cx, base)
+        {
+            return self.enum_variant(cx, ty?, member, Some(args), span);
+        }
         let target = match &callee.kind {
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
                 if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
                     (id, name.clone())
-                } else if let Some(Item::Struct(_)) = self.pkgs[cx.pkg].items.get(name) {
+                } else if let Some(&Item::Type(ty)) = self.pkgs[cx.pkg].items.get(name) {
+                    if ty.as_enum().is_some() {
+                        return self.enum_from(cx, ty, args, span);
+                    }
                     self.error(
                         callee.span,
                         format!("`{name}` is a struct; build one with `{name}{{...}}`"),
@@ -1181,7 +1426,10 @@ impl Checker<'_> {
                 let pkg = self.imported(cx, pkg_name).expect("checked");
                 match self.package_item(cx, pkg, &member.name, member.span)? {
                     Item::Func(id) => (id, format!("{pkg_name}.{}", member.name)),
-                    Item::Const(_) | Item::Struct(_) => {
+                    Item::Type(ty) if ty.as_enum().is_some() => {
+                        return self.enum_from(cx, ty, args, span);
+                    }
+                    Item::Const(_) | Item::Type(_) => {
                         self.error(
                             callee.span,
                             format!("`{pkg_name}.{}` is not a function", member.name),
@@ -1291,7 +1539,19 @@ impl Checker<'_> {
             self.error(span, format!("`{name}(...)` converts exactly one value"));
             return None;
         };
-        let c = self.expr(cx, arg, Some(Ty::Int(to)))?;
+        let mut c = self.expr(cx, arg, Some(Ty::Int(to)))?;
+        // A C-style enum converts to its value.
+        if let Some(def) = c.ty().as_enum()
+            && def.explicit
+        {
+            let lo = def.variants.iter().map(|v| v.value).min().unwrap_or(0);
+            let hi = def.variants.iter().map(|v| v.value).max().unwrap_or(0);
+            c = Checked::new(
+                TExprKind::EnumValue(Box::new(c.expr)),
+                Ty::Int(def.tag),
+                Some(Range { lo, hi }),
+            );
+        }
         let Some(from) = c.ty().as_int() else {
             self.error(arg.span, format!("cannot convert `{}` to `{to}`", c.ty()));
             return None;

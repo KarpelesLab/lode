@@ -1,0 +1,145 @@
+// exit: 0
+package main
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+enum Color: u8 {
+	red = 1
+	green = 2
+	blue = 200
+}
+
+enum Delta: i16 {
+	down = -1
+	up = 1
+}
+
+// The index of the first `v` in `xs`, if any.
+fn find(xs: []u32, v: u32) -> ?usize {
+	for i in 0..xs.len {
+		if xs[i] == v {
+			return i // a `usize` becomes a `?usize`
+		}
+	}
+	return none
+}
+
+fn origin_if(yes: bool) -> ?Point {
+	if yes {
+		return Point{x: 0, y: 0}
+	}
+	return none
+}
+
+// `if let`, `let ... else` and `??`.
+fn flows() -> bool {
+	let xs: [4]u32 = [5, 6, 7, 8]
+	var found: usize = 99
+	if let i = find(xs, 7) {
+		found = i
+	}
+	if let i = find(xs, 9) {
+		return false
+	} else {
+		found = found +% 10
+	}
+	let j = find(xs, 8) ?? 0
+	let k = find(xs, 1) ?? 42
+	let p = origin_if(false) ?? Point{x: 3, y: 4}
+	let q = origin_if(true) ?? Point{x: 3, y: 4}
+	return found == 12 && j == 3 && k == 42 && p.y == 4 && q.y == 0
+}
+
+fn first_even(xs: []u32) -> u32 {
+	for x in xs {
+		let half = halve(x) else {
+			continue
+		}
+		return half
+	}
+	return 0
+}
+
+fn halve(x: u32) -> ?u32 {
+	if x % 2 == 0 {
+		return x / 2
+	}
+	return none
+}
+
+// Facts known before `let ... else` are kept after it.
+fn let_else(n: u32) -> u32 {
+	if n > 100 {
+		return 0
+	}
+	let h = halve(n) else {
+		return 1
+	}
+	if let x = halve(h) {
+		return n + 1 +% x // proven: n <= 100 here still
+	}
+	return n + 1 +% h
+}
+
+// Optionals as values: in locals, structs and arrays, compared with `==`.
+struct Slot {
+	value: ?u8
+}
+
+fn values() -> bool {
+	var o: ?u8 = none
+	let none_before = o == none
+	o = 5
+	var slots: [3]Slot = [Slot{value: none}; 3]
+	slots[1].value = o
+	var count: u8 = 0
+	for s in slots {
+		if let v = s.value {
+			count = count +% v
+		}
+	}
+	let nested: ??u8 = none
+	let inner: ??u8 = 7
+	return none_before && o == 5 && o != none && count == 5 && nested == none && inner != none && (inner ?? none) == 7
+}
+
+// C-style enums: to and from integers.
+fn colors() -> bool {
+	let c = Color.blue
+	let v = u8(c)
+	let wide = u32(Color.green)
+	let back = Color(v) ?? Color.red
+	let missing = Color(3)
+	let from_wide = Color(wide)
+	var ok = back == Color.blue && missing == none && from_wide == Color.green
+	match Color(1) ?? Color.blue {
+		red => ok = ok && v == 200
+		green => return false
+		blue => return false
+	}
+	let d = i16(Delta.down)
+	return ok && d == -1 && Delta(-1) == Delta.down && Delta(0) == none
+}
+
+fn main() -> u8 {
+	if !flows() {
+		return 1
+	}
+	let evens: [3]u32 = [3, 5, 10]
+	if first_even(evens) != 5 {
+		return 2
+	}
+	if let_else(10) != 16 || let_else(4) != 6 || let_else(9) != 1 || let_else(200) != 0 {
+		return 3
+	}
+	if !values() {
+		return 4
+	}
+	if !colors() {
+		return 5
+	}
+	return 0
+}

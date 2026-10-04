@@ -119,6 +119,13 @@ fn load(path: &str) -> Result<(SourceMap, FileId), String> {
     Ok((files, root))
 }
 
+/// Print the warnings of a program that compiled.
+fn warn(files: &SourceMap, warnings: &[lode::diag::Diagnostic]) {
+    for d in warnings {
+        eprint!("{}", d.render(files));
+    }
+}
+
 /// Print a compile error; returns the failure exit code.
 fn report(files: &SourceMap, err: lode::Error) -> ExitCode {
     match err {
@@ -139,7 +146,10 @@ fn check(args: &[String]) -> Result<ExitCode, String> {
     build_only(&opts, "check")?;
     let (mut files, root) = load(&opts.input)?;
     Ok(match lode::check(&mut files, root) {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(program) => {
+            warn(&files, &program.warnings);
+            ExitCode::SUCCESS
+        }
         Err(e) => report(&files, e),
     })
 }
@@ -151,8 +161,10 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     }
     let (mut files, root) = load(&opts.input)?;
     if opts.emit_ir {
-        return Ok(match lode::ir_text(&mut files, root, opts.opt) {
-            Ok(text) => {
+        return Ok(match lode::compile_ir(&mut files, root, opts.opt) {
+            Ok(lowered) => {
+                warn(&files, &lowered.warnings);
+                let text = latticefoundry::ir::text::print_module(&lowered.module, &lowered.syms);
                 print!("{text}");
                 ExitCode::SUCCESS
             }
@@ -164,6 +176,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         Ok(exe) => exe,
         Err(e) => return Ok(report(&files, e)),
     };
+    warn(&files, &exe.warnings);
     let output = opts.output.unwrap_or_else(|| default_output(&opts.input));
     latticefoundry::link::write_executable(&output, &exe.image)?;
     if opts.stack_usage {
@@ -176,8 +189,12 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
     build_only(&opts, "run")?;
     let (mut files, root) = load(&opts.input)?;
-    let image = match lode::build_executable(&mut files, root, opts.opt) {
-        Ok(image) => image,
+    let build_options = lode::BuildOptions { opt: opts.opt };
+    let image = match lode::build(&mut files, root, &build_options) {
+        Ok(exe) => {
+            warn(&files, &exe.warnings);
+            exe.image
+        }
         Err(e) => return Ok(report(&files, e)),
     };
     let path = temp_path(&opts.input);

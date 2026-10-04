@@ -389,7 +389,16 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
                     }
                 });
                 let unary = match &t.tok {
-                    Tok::P(P::Minus | P::Bang | P::Tilde | P::Star | P::Amp | P::Question) => prev
+                    // `??` in a type, as in `??u8`, is two prefix `?`.
+                    Tok::P(
+                        P::Minus
+                        | P::Bang
+                        | P::Tilde
+                        | P::Star
+                        | P::Amp
+                        | P::Question
+                        | P::Coalesce,
+                    ) => prev
                         .as_ref()
                         .is_none_or(|p| !p.operand_end || (p.prefix_close && t.glued)),
                     _ => false,
@@ -531,7 +540,9 @@ fn space_before(prev: &Prev, cur: &TokInfo<'_>, cur_unary: bool) -> bool {
         && cur.glued
         && matches!(
             cur.tok,
-            Tok::Ident(_) | Tok::Kw(Kw::Fn) | Tok::P(P::Star | P::Question | P::LBracket)
+            Tok::Ident(_)
+                | Tok::Kw(Kw::Fn)
+                | Tok::P(P::Star | P::Question | P::Coalesce | P::LBracket)
         )
     {
         return false;
@@ -704,6 +715,11 @@ mod tests {
         assert_eq!(
             fmt("fn f() {\n\tx  +=  u8( a )-1\n\tp = p+done\n}\n"),
             "fn f() {\n\tx += u8(a) - 1\n\tp = p + done\n}\n"
+        );
+        // `??` is a prefix in a type and a binary operator in an expression.
+        assert_eq!(
+            fmt("fn f(o: ?? u8, p: [2]?u8) -> u8 {\n\treturn o??p[0]?? 1\n}\n"),
+            "fn f(o: ??u8, p: [2]?u8) -> u8 {\n\treturn o ?? p[0] ?? 1\n}\n"
         );
     }
 

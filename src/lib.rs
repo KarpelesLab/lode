@@ -66,17 +66,20 @@ pub fn std_root() -> PathBuf {
 }
 
 /// Load, parse and check the program whose root file is `root`, along with
-/// every package it imports.
+/// every package it imports. Warnings don't fail the check: they're in the
+/// program's [`sema::Program::warnings`] (or with the errors, if there are
+/// any).
 pub fn check(files: &mut SourceMap, root: FileId) -> Result<sema::Program, Error> {
     let (packages, mut diags) = load::load(files, root, &std_root());
     if has_errors(&diags) {
         return Err(Error::Source(diags));
     }
-    let (program, sema_diags) = sema::check(&packages, PTR_BITS);
+    let (mut program, sema_diags) = sema::check(&packages, PTR_BITS);
     diags.extend(sema_diags);
     if has_errors(&diags) {
         return Err(Error::Source(diags));
     }
+    program.warnings = diags;
     Ok(program)
 }
 
@@ -112,6 +115,8 @@ pub struct Executable {
     pub image: Vec<u8>,
     /// Every function's stack frame, and the program's worst-case stack depth.
     pub stack: StackReport,
+    /// Warnings about the program, which compiled anyway.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Compile a program to a static x86-64 Linux executable, with its stack
@@ -147,6 +152,7 @@ pub fn build(
     Ok(Executable {
         image,
         stack: StackReport::new(compiled.stack, entry),
+        warnings: lowered.warnings,
     })
 }
 

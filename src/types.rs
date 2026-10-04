@@ -77,6 +77,12 @@ pub enum Ty {
     /// A struct: a [`Compound::Struct`] in the interner. Structs are nominal,
     /// so each declaration is a type of its own.
     Struct(CompoundId),
+    /// An enum (a sum type): a [`Compound::Enum`] in the interner. Nominal,
+    /// like structs.
+    Enum(CompoundId),
+    /// An optional `?T`: a [`Compound::Optional`] in the interner. It works
+    /// like an enum with two variants, `none` and `some(value: T)`.
+    Optional(CompoundId),
 }
 
 impl Ty {
@@ -130,10 +136,110 @@ impl Ty {
         matches!(self, Ty::Str | Ty::Slice(_))
     }
 
-    /// Whether values of this type live in memory, as places (arrays and
-    /// structs), rather than in registers.
+    /// The optional type `?inner`.
+    pub fn optional(inner: Ty) -> Ty {
+        Ty::Optional(intern(Compound::Optional { inner }))
+    }
+
+    /// The type an optional `?T` holds, `T`.
+    pub fn as_optional(self) -> Option<Ty> {
+        match self {
+            Ty::Optional(id) => match compound(id) {
+                Compound::Optional { inner } => Some(inner),
+                _ => unreachable!("an optional id names another type"),
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether values of this type live in memory, as places (arrays,
+    /// structs, enums and optionals), rather than in registers.
     pub fn in_memory(self) -> bool {
-        matches!(self, Ty::Array(_) | Ty::Struct(_))
+        matches!(
+            self,
+            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_)
+        )
+    }
+
+    /// The declaration of an enum type (not an optional: see [`Ty::sum`]).
+    pub fn as_enum(self) -> Option<Arc<EnumDef>> {
+        match self {
+            Ty::Enum(id) => match compound(id) {
+                Compound::Enum { def } => Some(enum_def(def)),
+                _ => unreachable!("an enum id names another type"),
+            },
+            _ => None,
+        }
+    }
+
+    /// The variants of an enum or an optional, which share their layout and
+    /// their operations. An optional `?T` is `none` (tag 0) or
+    /// `some(value: T)` (tag 1).
+    pub fn sum(self) -> Option<Arc<EnumDef>> {
+        if let Some(def) = self.as_enum() {
+            return Some(def);
+        }
+        let inner = self.as_optional()?;
+        Some(Arc::new(EnumDef {
+            name: self.to_string(),
+            pkg: usize::MAX,
+            is_pub: true,
+            tag: IntTy::new(false, 8),
+            explicit: false,
+            variants: vec![
+                Variant {
+                    name: "none".to_owned(),
+                    fields: Vec::new(),
+                    value: 0,
+                },
+                Variant {
+                    name: "some".to_owned(),
+                    fields: vec![Field {
+                        name: "value".to_owned(),
+                        ty: inner,
+                    }],
+                    value: 1,
+                },
+            ],
+        }))
+    }
+
+    /// Declare a new enum type named `name` (as shown in messages), from
+    /// package `pkg`. Its variants are set once they're resolved, with
+    /// [`Ty::set_variants`].
+    pub fn new_enum(name: String, pkg: usize, is_pub: bool) -> Ty {
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let def = u32::try_from(tables.enums.len()).expect("too many enums");
+        tables.enums.push(Arc::new(EnumDef {
+            name,
+            pkg,
+            is_pub,
+            tag: IntTy::new(false, 8),
+            explicit: false,
+            variants: Vec::new(),
+        }));
+        drop(tables);
+        Ty::Enum(intern(Compound::Enum { def }))
+    }
+
+    /// Set the tag type and variants of an enum type declared with
+    /// [`Ty::new_enum`]. `explicit` marks an enum whose variants have
+    /// declared integer values (`enum Color: u8 { red = 1 ... }`).
+    pub fn set_variants(self, tag: IntTy, explicit: bool, variants: Vec<Variant>) {
+        let Ty::Enum(id) = self else {
+            unreachable!("not an enum: {self}")
+        };
+        let Compound::Enum { def } = compound(id) else {
+            unreachable!("an enum id names another type")
+        };
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut tables.enums[def as usize];
+        *entry = Arc::new(EnumDef {
+            tag,
+            explicit,
+            variants,
+            ..EnumDef::clone(entry)
+        });
     }
 
     /// The declaration of a struct type.
@@ -209,6 +315,42 @@ impl StructDef {
     }
 }
 
+/// An enum declaration (or the variants of an optional, see [`Ty::sum`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumDef {
+    /// The name shown in messages, like [`StructDef::name`].
+    pub name: String,
+    /// The index of the declaring package (`usize::MAX` for an optional).
+    pub pkg: usize,
+    pub is_pub: bool,
+    /// The type of the tag that tells the variants apart in memory.
+    pub tag: IntTy,
+    /// Whether the variants have declared integer values (a C-style enum).
+    pub explicit: bool,
+    pub variants: Vec<Variant>,
+}
+
+/// One variant of an enum: its name, its payload fields (none for a
+/// variant without payload) and its tag value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Variant {
+    pub name: String,
+    pub fields: Vec<Field>,
+    /// The tag value: the declared value of a C-style enum's variant, or
+    /// else the variant's position.
+    pub value: i128,
+}
+
+impl EnumDef {
+    /// The index and declaration of the variant called `name`.
+    pub fn variant(&self, name: &str) -> Option<(usize, &Variant)> {
+        self.variants
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.name == name)
+    }
+}
+
 /// The index of a compound type in the global type interner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CompoundId(u32);
@@ -230,6 +372,14 @@ pub enum Compound {
     Struct {
         def: u32,
     },
+    /// An enum, by the index of its declaration.
+    Enum {
+        def: u32,
+    },
+    /// `?inner`.
+    Optional {
+        inner: Ty,
+    },
 }
 
 /// The interner's tables. Entries are only ever appended, so an id stays
@@ -239,6 +389,7 @@ struct Interner {
     entries: Vec<Compound>,
     ids: HashMap<Compound, CompoundId>,
     structs: Vec<Arc<StructDef>>,
+    enums: Vec<Arc<EnumDef>>,
 }
 
 fn interner() -> &'static Mutex<Interner> {
@@ -269,6 +420,11 @@ fn struct_def(def: u32) -> Arc<StructDef> {
     Arc::clone(&tables.structs[def as usize])
 }
 
+fn enum_def(def: u32) -> Arc<EnumDef> {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(&tables.enums[def as usize])
+}
+
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -277,11 +433,15 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
-            Ty::Array(id) | Ty::Slice(id) | Ty::Struct(id) => match compound(*id) {
-                Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
-                Compound::Slice { elem } => write!(f, "[]{elem}"),
-                Compound::Struct { def } => f.write_str(&struct_def(def).name),
-            },
+            Ty::Array(id) | Ty::Slice(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Optional(id) => {
+                match compound(*id) {
+                    Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
+                    Compound::Slice { elem } => write!(f, "[]{elem}"),
+                    Compound::Struct { def } => f.write_str(&struct_def(def).name),
+                    Compound::Enum { def } => f.write_str(&enum_def(def).name),
+                    Compound::Optional { inner } => write!(f, "?{inner}"),
+                }
+            }
         }
     }
 }
@@ -469,5 +629,40 @@ mod tests {
         assert!(def.is_pub && def.pkg == 1);
         assert_eq!(def.field("x"), Some((0, u8_)));
         assert!(a.in_memory() && !a.is_view() && Ty::array(a, 2).in_memory());
+    }
+
+    #[test]
+    fn enums_and_optionals() {
+        let u8_ = Ty::Int(IntTy::new(false, 8));
+        let e = Ty::new_enum("E".into(), 0, true);
+        e.set_variants(
+            IntTy::new(false, 8),
+            false,
+            vec![
+                Variant {
+                    name: "a".into(),
+                    fields: Vec::new(),
+                    value: 0,
+                },
+                Variant {
+                    name: "b".into(),
+                    fields: vec![Field {
+                        name: "x".into(),
+                        ty: u8_,
+                    }],
+                    value: 1,
+                },
+            ],
+        );
+        assert_eq!(e.to_string(), "E");
+        let def = e.sum().expect("an enum");
+        assert_eq!(def.variant("b").map(|(i, _)| i), Some(1));
+        let o = Ty::optional(e);
+        assert_eq!(o, Ty::optional(e));
+        assert_eq!(o.to_string(), "?E");
+        assert_eq!(o.as_optional(), Some(e));
+        let sum = o.sum().expect("an optional");
+        assert_eq!(sum.variants[1].fields[0].ty, e);
+        assert!(e.in_memory() && o.in_memory() && o.as_enum().is_none());
     }
 }

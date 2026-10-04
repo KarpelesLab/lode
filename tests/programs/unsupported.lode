@@ -1,12 +1,14 @@
-// error: `enum` declarations are not supported by the compiler yet
-// error: `match` is not supported by the compiler yet
+// error: `trait` declarations are not supported by the compiler yet
+// error: `throws` clauses are not supported by the compiler yet
 package main
 
-enum Shape {
-	circle
+trait Shape {
+	area
+}
+
+fn parse() throws -> u32 {
+	return 0
 }
 
 fn main() {
-	match x {
-	}
 }

@@ -48,28 +48,34 @@ fn binop_info(tok: &Tok) -> Option<(BinOp, u8)> {
         P::Le => (BinOp::Le, 3),
         P::Gt => (BinOp::Gt, 3),
         P::Ge => (BinOp::Ge, 3),
-        P::Pipe => (BinOp::BitOr, 4),
-        P::Caret => (BinOp::BitXor, 5),
-        P::Amp => (BinOp::BitAnd, 6),
-        P::Shl => (BinOp::Shl, 7),
-        P::ShlWrap => (BinOp::ShlWrap, 7),
-        P::Shr => (BinOp::Shr, 7),
-        P::Plus => (BinOp::Add, 8),
-        P::Minus => (BinOp::Sub, 8),
-        P::AddWrap => (BinOp::AddWrap, 8),
-        P::SubWrap => (BinOp::SubWrap, 8),
-        P::AddSat => (BinOp::AddSat, 8),
-        P::SubSat => (BinOp::SubSat, 8),
-        P::Star => (BinOp::Mul, 9),
-        P::Slash => (BinOp::Div, 9),
-        P::Percent => (BinOp::Rem, 9),
-        P::MulWrap => (BinOp::MulWrap, 9),
-        P::MulSat => (BinOp::MulSat, 9),
+        P::Coalesce => (BinOp::Coalesce, COALESCE),
+        P::Pipe => (BinOp::BitOr, 5),
+        P::Caret => (BinOp::BitXor, 6),
+        P::Amp => (BinOp::BitAnd, 7),
+        P::Shl => (BinOp::Shl, 8),
+        P::ShlWrap => (BinOp::ShlWrap, 8),
+        P::Shr => (BinOp::Shr, 8),
+        P::Plus => (BinOp::Add, 9),
+        P::Minus => (BinOp::Sub, 9),
+        P::AddWrap => (BinOp::AddWrap, 9),
+        P::SubWrap => (BinOp::SubWrap, 9),
+        P::AddSat => (BinOp::AddSat, 9),
+        P::SubSat => (BinOp::SubSat, 9),
+        P::Star => (BinOp::Mul, 10),
+        P::Slash => (BinOp::Div, 10),
+        P::Percent => (BinOp::Rem, 10),
+        P::MulWrap => (BinOp::MulWrap, 10),
+        P::MulSat => (BinOp::MulSat, 10),
         _ => return None,
     })
 }
 
 const COMPARISON: u8 = 3;
+
+/// `??` binds tighter than comparisons (`x ?? 0 == 1` compares the value),
+/// looser than arithmetic, and groups to the right: `a ?? b ?? c` is
+/// `a ?? (b ?? c)`.
+const COALESCE: u8 = 4;
 
 impl Parser {
     // --- token helpers ------------------------------------------------------
@@ -256,14 +262,9 @@ impl Parser {
             }
             Tok::Kw(Kw::Const) => self.const_decl(is_pub, start).map(Item::Const),
             Tok::Kw(Kw::Struct) => self.struct_decl(is_pub, start).map(Item::Struct),
+            Tok::Kw(Kw::Enum) => self.enum_decl(is_pub, start).map(Item::Enum),
             Tok::Kw(
-                kw @ (Kw::Enum
-                | Kw::Trait
-                | Kw::Impl
-                | Kw::Type
-                | Kw::Alias
-                | Kw::Static
-                | Kw::Unsafe),
+                kw @ (Kw::Trait | Kw::Impl | Kw::Type | Kw::Alias | Kw::Static | Kw::Unsafe),
             ) => self.error(
                 self.span(),
                 format!(
@@ -329,6 +330,74 @@ impl Parser {
             is_pub,
             name,
             fields,
+            span: start.to(end),
+        })
+    }
+
+    fn enum_decl(&mut self, is_pub: bool, start: Span) -> PResult<EnumDecl> {
+        self.bump(); // enum
+        let name = self.ident("an enum name")?;
+        if self.at_p(P::LBracket) {
+            return self.error(
+                self.span(),
+                "generic enums are not supported by the compiler yet",
+            );
+        }
+        let tag = if self.eat_p(P::Colon) {
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
+        self.expect_p(P::LBrace)?;
+        let mut variants = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBrace) {
+                break;
+            }
+            let vname = self.ident("a variant name or `}`")?;
+            let fields = if self.eat_p(P::LParen) {
+                let mut fields = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.eat_p(P::RParen) {
+                        break;
+                    }
+                    let field = self.ident("a payload field name")?;
+                    self.expect_p(P::Colon)?;
+                    let ty = self.type_expr()?;
+                    fields.push(FieldDecl { name: field, ty });
+                    self.skip_newlines();
+                    if !self.eat_p(P::Comma) {
+                        self.skip_newlines();
+                        self.expect_p(P::RParen)?;
+                        break;
+                    }
+                }
+                Some(fields)
+            } else {
+                None
+            };
+            let value = if self.eat_p(P::Eq) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            variants.push(VariantDecl {
+                name: vname,
+                fields,
+                value,
+            });
+            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                return self.expected("a new line after the variant");
+            }
+        }
+        let end = self.bump().span;
+        Ok(EnumDecl {
+            is_pub,
+            name,
+            tag,
+            variants,
             span: start.to(end),
         })
     }
@@ -442,10 +511,26 @@ impl Parser {
                 let span = start.to(elem.span());
                 Ok(TypeExpr::Array(Box::new(len), Box::new(elem), span))
             }
-            Tok::P(P::Question) => self.error(
-                self.span(),
-                "this kind of type is not supported by the compiler yet",
-            ),
+            Tok::P(P::Question) => {
+                let start = self.bump().span;
+                let inner = self.type_expr()?;
+                let span = start.to(inner.span());
+                Ok(TypeExpr::Optional(Box::new(inner), span))
+            }
+            // `??T` lexes as one `??` token: an optional of an optional.
+            Tok::P(P::Coalesce) => {
+                let start = self.bump().span;
+                let inner = self.type_expr()?;
+                let span = start.to(inner.span());
+                let mid = Span {
+                    start: start.start + 1,
+                    ..span
+                };
+                Ok(TypeExpr::Optional(
+                    Box::new(TypeExpr::Optional(Box::new(inner), mid)),
+                    span,
+                ))
+            }
             _ => self.expected("a type"),
         }
     }
@@ -496,11 +581,17 @@ impl Parser {
                 } else {
                     None
                 };
+                let otherwise = if init.is_some() && self.eat_kw(Kw::Else) {
+                    Some(self.block()?)
+                } else {
+                    None
+                };
                 Ok(Stmt::Let {
                     mutable: kw == Kw::Var,
                     name,
                     ty,
                     init,
+                    otherwise,
                     span: start.to(self.prev_span()),
                 })
             }
@@ -561,12 +652,12 @@ impl Parser {
                     body,
                 })
             }
-            Tok::Kw(
-                kw @ (Kw::Match | Kw::Defer | Kw::Errdefer | Kw::Throw | Kw::Scope | Kw::Comptime),
-            ) => self.error(
-                self.span(),
-                format!("`{}` is not supported by the compiler yet", kw.as_str()),
-            ),
+            Tok::Kw(Kw::Match) => self.match_stmt(),
+            Tok::Kw(kw @ (Kw::Defer | Kw::Errdefer | Kw::Throw | Kw::Scope | Kw::Comptime)) => self
+                .error(
+                    self.span(),
+                    format!("`{}` is not supported by the compiler yet", kw.as_str()),
+                ),
             _ => {
                 let target = self.expr()?;
                 let op = match self.peek() {
@@ -592,11 +683,101 @@ impl Parser {
         }
     }
 
+    /// `match value { pattern => body ... }`, one arm per line. A body is a
+    /// block, or a single statement on the arm's line.
+    fn match_stmt(&mut self) -> PResult<Stmt> {
+        let start = self.bump().span; // match
+        let value = self.header_expr()?;
+        self.expect_p(P::LBrace)?;
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            match self.peek() {
+                Tok::P(P::RBrace) => break,
+                Tok::Eof => return self.expected("`}`"),
+                _ => {}
+            }
+            match self.arm() {
+                Ok(arm) => {
+                    arms.push(arm);
+                    if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                        let _ = self.expected::<()>("end of line after the arm");
+                        self.sync_statement();
+                    }
+                }
+                Err(Failed) => self.sync_statement(),
+            }
+        }
+        let end = self.bump().span;
+        Ok(Stmt::Match {
+            value,
+            arms,
+            span: start.to(end),
+        })
+    }
+
+    fn arm(&mut self) -> PResult<Arm> {
+        let pattern = self.pattern()?;
+        self.expect_p(P::FatArrow)?;
+        let body = if self.at_p(P::LBrace) {
+            self.block()?
+        } else {
+            let start = self.span();
+            let stmt = self.stmt()?;
+            Block {
+                stmts: vec![stmt],
+                span: start.to(self.prev_span()),
+            }
+        };
+        Ok(Arm { pattern, body })
+    }
+
+    fn pattern(&mut self) -> PResult<Pattern> {
+        let name = match self.peek().clone() {
+            Tok::Ident(n) if n == "_" => return Ok(Pattern::Wildcard(self.bump().span)),
+            Tok::Ident(_) => self.ident("a variant name")?,
+            // The variants of an optional are `none` and `some`.
+            Tok::Kw(Kw::None) => Ident {
+                name: "none".to_owned(),
+                span: self.bump().span,
+            },
+            _ => return self.expected("a variant name or `_`"),
+        };
+        let bindings = if self.eat_p(P::LParen) {
+            let mut names = Vec::new();
+            loop {
+                self.skip_newlines();
+                if self.eat_p(P::RParen) {
+                    break;
+                }
+                names.push(self.ident("a name to bind, or `_`")?);
+                self.skip_newlines();
+                if !self.eat_p(P::Comma) {
+                    self.skip_newlines();
+                    self.expect_p(P::RParen)?;
+                    break;
+                }
+            }
+            Some(names)
+        } else {
+            None
+        };
+        Ok(Pattern::Variant {
+            span: name.span.to(self.prev_span()),
+            name,
+            bindings,
+        })
+    }
+
     fn if_stmt(&mut self) -> PResult<IfStmt> {
         let start = self.bump().span; // if
-        if self.at_kw(Kw::Let) {
-            return self.error(self.span(), "`if let` is not supported by the compiler yet");
-        }
+        let binding = if self.eat_kw(Kw::Let) {
+            let name = self.ident("a variable name")?;
+            self.expect_p(P::Eq)?;
+            Some(name)
+        } else {
+            None
+        };
         let cond = self.header_expr()?;
         let then = self.block()?;
         // `else` belongs on the same line as `}`, but accept it on the next one.
@@ -618,6 +799,7 @@ impl Parser {
             None => then.span,
         };
         Ok(IfStmt {
+            binding,
             cond,
             then,
             otherwise,
@@ -689,7 +871,11 @@ impl Parser {
                 break;
             }
             let op_span = self.bump().span;
-            let rhs = self.binary(prec + 1)?;
+            let rhs = if op == BinOp::Coalesce {
+                self.binary(prec)?
+            } else {
+                self.binary(prec + 1)?
+            };
             if prec == COMPARISON
                 && matches!(lhs.kind, ExprKind::Binary(prev, ..) if is_comparison(prev))
             {
@@ -807,7 +993,8 @@ impl Parser {
                 });
             }
             Tok::P(P::LBracket) => return self.array_literal(),
-            Tok::Kw(kw @ (Kw::Try | Kw::None)) => {
+            Tok::Kw(Kw::None) => ExprKind::None,
+            Tok::Kw(kw @ Kw::Try) => {
                 return self.error(
                     span,
                     format!("`{}` is not supported by the compiler yet", kw.as_str()),
@@ -1010,13 +1197,68 @@ mod tests {
     }
 
     #[test]
+    fn enums_match_and_optionals() {
+        let file = parse_ok(
+            "pub enum Shape {\n\tcircle(c: Point, r: u32)\n\tdot\n}\nenum Color: u8 {\n\tred = 1\n}\n\
+             fn f(s: Shape, o: ?u8, p: ??u8) {\n\tmatch s {\n\t\tcircle(_, r) => return r\n\
+             \t\tdot => {\n\t\t}\n\t\t_ => g()\n\t}\n\tif let v = o {\n\t}\n\
+             \tlet w = o else {\n\t\treturn\n\t}\n\tlet x = o ?? p ?? 1 + 2 == 3\n\tlet n: ?u8 = none\n}\n",
+        );
+        let Item::Enum(e) = &file.items[0] else {
+            panic!()
+        };
+        assert!(e.is_pub && e.tag.is_none() && e.variants.len() == 2);
+        assert_eq!(e.variants[0].fields.as_ref().map(Vec::len), Some(2));
+        assert!(e.variants[1].fields.is_none());
+        let Item::Enum(c) = &file.items[1] else {
+            panic!()
+        };
+        assert!(c.tag.is_some() && c.variants[0].value.is_some());
+        let Item::Fn(f) = &file.items[2] else {
+            panic!()
+        };
+        assert!(matches!(&f.params[2].ty, TypeExpr::Optional(inner, _)
+            if matches!(**inner, TypeExpr::Optional(..))));
+        let Stmt::Match { arms, .. } = &f.body.stmts[0] else {
+            panic!()
+        };
+        assert_eq!(arms.len(), 3);
+        assert!(
+            matches!(&arms[0].pattern, Pattern::Variant { bindings: Some(b), .. } if b.len() == 2)
+        );
+        assert!(matches!(arms[2].pattern, Pattern::Wildcard(_)));
+        assert!(matches!(&f.body.stmts[1], Stmt::If(i) if i.binding.is_some()));
+        assert!(matches!(
+            &f.body.stmts[2],
+            Stmt::Let {
+                otherwise: Some(_),
+                ..
+            }
+        ));
+        // `o ?? (p ?? (1 + 2))`, compared with 3.
+        let Stmt::Let { init: Some(x), .. } = &f.body.stmts[3] else {
+            panic!()
+        };
+        let ExprKind::Binary(BinOp::Eq, lhs, _) = &x.kind else {
+            panic!("{x:?}")
+        };
+        let ExprKind::Binary(BinOp::Coalesce, _, rest) = &lhs.kind else {
+            panic!()
+        };
+        assert!(
+            matches!(&rest.kind, ExprKind::Binary(BinOp::Coalesce, _, sum)
+            if matches!(sum.kind, ExprKind::Binary(BinOp::Add, ..)))
+        );
+    }
+
+    #[test]
     fn else_on_next_line_and_multiline_args() {
         parse_ok("fn f() {\n\tif a {\n\t\tg(1,\n\t\t\t2)\n\t}\n\telse {\n\t}\n}\n");
     }
 
     #[test]
     fn reports_and_recovers() {
-        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\nenum S {}\n");
+        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntrait S {}\n");
         assert_eq!(errs.len(), 3, "{errs:?}");
         assert!(errs[1].contains("chained"));
         assert!(errs[2].contains("not supported"));
