@@ -24,6 +24,14 @@ itself is in the other documents; this one is only about order.
   an enum of the same package), and `?T` with `none`, `if let`,
   `let ... else` and `??`. Enums and optionals are values in memory, like
   structs, with derived `==`.
+- **M5: Errors** (2026-10-04). `throws(E)` with an enum of errors, `try`,
+  `catch` (a block, a fallback value, or `_`), `match` on `ok` and `err`,
+  `throw`, `defer` and `errdefer`, and the `.variant` short form wherever
+  an enum is expected. An unhandled call is an error. A result is an enum
+  in the caller's storage: no unwinding. `io.write` is the checked way to
+  write, throwing an `os.Error`. Not yet: inferred error sets, conversion
+  between error sets, error return traces
+  ([errors.md](errors.md#in-the-compiler-today)).
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
@@ -38,10 +46,8 @@ loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
   (`[0; 21]`), even when only the part that's written is ever read. The
   options are in [memory.md](memory.md#uninitialized-buffers); the choice is
   open.
-- **M5: Errors.** `throws`, `try`, `catch`, error sets, `defer`/`errdefer`.
-  `io.stdout().write` becomes the checked way to write.
 - **M6: Methods and parameter conventions.** `fn T.name(self)`, `inout`,
-  `sink`.
+  `sink`. `io.write(os.STDOUT, s)` becomes `io.stdout().write(s)`.
 - **M7: Generics and traits** (and `comptime`, which they're built on).
 
 Later, in no fixed order yet: refinements in signatures, the allocator

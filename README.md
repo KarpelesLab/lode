@@ -49,12 +49,18 @@ What works:
   and returned by value; `==` compares structs and arrays field by field
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match`, and optionals
-  `?T` with `none`, `if let`, `let ... else` and `??`
+  `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and
+  `.circle(p, 2)` where the enum is known
+- errors as return values: `fn parse(s: []u8) throws(ParseError) -> u32`,
+  `throw .empty`, and every call handled with `try f()`,
+  `f() catch e { ... }`, `f() catch 0`, `f() catch _ {}` or `match`;
+  `defer` and `errdefer` ([docs/errors.md](docs/errors.md))
 - packages: `import "std/..."`, `pub`, `pkg.name`
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic
 - output: `io.print` for strings, `io.print_u64` and `io.print_i64` for
-  integers (and `io.eprint...` for standard error)
+  integers (and `io.eprint...` for standard error), which ignore errors, and
+  `io.write(fd, s)`, which throws an `os.Error`
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe. The checker follows value ranges and relations between variables,

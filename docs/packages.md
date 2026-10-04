@@ -34,8 +34,20 @@ Go's vocabulary, which is proven:
 - Only `pub` items can be used from another package, as `pkg.name`.
 - Linker symbols are `<import path>.<name>` (`std/io.print`); the program's
   own package uses its name (`main.main`).
-- So far there are two packages: `std/os` (Linux x86-64 system calls,
-  `write` and `write_all`) and `std/io`:
+- So far there are two packages, `std/os` and `std/io`.
+- `std/os` is the Linux x86-64 system calls:
+  - `write` (one `write` system call) and `write_all` (all of a string,
+    retrying), which return a negative error number on failure.
+  - `Error`, the errors std reports, from the error numbers `write` can
+    give: `bad_fd` (`EBADF`), `broken_pipe` (`EPIPE`), `no_space`
+    (`ENOSPC`, `EDQUOT`), `io` (`EIO`, or a result the kernel never gives),
+    and `other(errno)` for any other number. `error(n)` converts a failed
+    call's result to an `Error`.
+- `std/io`:
+  - `write(fd: i32, s: str) throws(os.Error)` writes all of `s` to `fd`
+    (like `os.STDOUT`), or throws the error that stopped it. It's the
+    checked way to write. Once types have methods (M6), it will be
+    `io.stdout().write(s)`.
   - `print(s: str)` and `eprint(s: str)` write a string to standard output
     and standard error.
   - `print_u64(n: u64)` and `print_i64(n: i64)` write an integer in decimal
@@ -43,7 +55,8 @@ Go's vocabulary, which is proven:
     Smaller integer types convert implicitly. Each call makes one `write`
     system call. They're a stopgap until `print("{}", n)`
     ([comptime.md](comptime.md#format-strings)).
-  - All of them ignore output errors.
+  - `print` and the others but `write` ignore output errors: they're for
+    output that isn't worth failing over.
 
 ## Imports
 

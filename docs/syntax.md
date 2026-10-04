@@ -112,7 +112,7 @@ fn main() {
 | Immutable binding | `let x = 5` |
 | Mutable binding | `var x: u32 = 0` |
 | Function | `fn name(a: T, b: U) -> R { ... }` |
-| Function that can fail | `fn name(a: T) throws(E) -> R` |
+| Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
 | Generic parameters | `fn max[T: Ordered](a: T, b: T) -> T` |
 | Parameter conventions | `inout x: T`, `sink x: T` ([memory.md](memory.md)) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
@@ -261,6 +261,10 @@ fn main() -> u32 {
   order, like the arguments of a call. A variant without payload is
   `E.variant`, without parentheses. `pkg.E.variant(...)` for another
   package's enum.
+- Where the context expects an enum `E` (or a `?E`), `.variant` and
+  `.variant(a, b)` are short for `E.variant` and `E.variant(a, b)`:
+  `let s: Shape = .dot`, `area(.circle(p, 2))`, `return .dot`,
+  `s == .dot`, `throw .empty`. Without such a context, it's an error.
 - `E(x)` converts an integer to a C-style enum, as an optional. `u8(c)`
   converts one to an integer.
 - `match value { ... }` has one arm per line: a pattern, `=>`, then a block,
@@ -306,6 +310,55 @@ fn main() -> usize {
 - `a ?? b` binds tighter than comparisons and looser than arithmetic, and
   groups to the right: `a ?? b ?? c` is `a ?? (b ?? c)`, and
   `x ?? 0 == 1` compares `x ?? 0`.
+
+## Errors
+
+**Status:** Proposed; implemented in the compiler (semantics in
+[errors.md](errors.md#in-the-compiler-today))
+
+```
+enum ParseError {
+	empty
+	invalid_digit(pos: usize)
+}
+
+fn parse(s: []u8) throws(ParseError) -> u32 {
+	if s.len == 0 {
+		throw .empty
+	}
+	defer cleanup()
+	errdefer log_failure()
+	...
+}
+
+fn sum(a: []u8, b: []u8) throws(ParseError) -> u32 {
+	return (try parse(a)) +% (try parse(b))
+}
+
+fn main() -> u32 {
+	let n = parse(input) catch e {
+		return 1
+	}
+	let m = parse(other) catch 0
+	parse(input) catch _ {}
+	match parse(input) {
+		ok(v) => return v
+		err(e) => return 2
+	}
+}
+```
+
+- `throws(E)` comes after the parameters and before `-> T`.
+- `try call` applies to the call that follows it: `try f() + 1` adds 1 to
+  the value.
+- `call catch name { ... }`, `call catch _ { ... }`, `call catch value`.
+  `catch` binds like `??`: tighter than comparisons, looser than
+  arithmetic, grouping to the right. After `catch`, a `{` following a
+  name starts the block; a struct literal fallback goes in parentheses,
+  `catch (Point{x: 0, y: 0})`.
+- `throw value` is a statement. In an expression, it can only follow
+  `??`: `opt ?? throw .missing`.
+- `defer` and `errdefer` take a block, or one statement on the same line.
 
 ## Open questions
 

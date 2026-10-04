@@ -11,7 +11,8 @@
 
 ## Model: typed `throws`, compiled as return values
 
-**Status:** Proposed
+**Status:** Decided; implemented in the compiler (see
+[In the compiler today](#in-the-compiler-today))
 
 It reads like exceptions and is implemented like `Result`. This is Swift's
 typed-throws model with Zig's error sets.
@@ -69,7 +70,8 @@ match parse_u32(s) {                       // full control
 
 ## Error sets
 
-**Status:** Proposed
+**Status:** Proposed. The compiler has only named error types, with no
+conversion (below).
 
 - `throws(E)` names a concrete error type.
 - `throws` alone means "**inferred**": the compiler computes the union of every
@@ -81,7 +83,7 @@ match parse_u32(s) {                       // full control
 
 ## Error return traces
 
-**Status:** Proposed
+**Status:** Proposed. Not implemented.
 
 In debug builds, each `try` that propagates an error records its location in a
 small fixed-size buffer. When an error reaches the top unhandled (in `main`),
@@ -90,7 +92,7 @@ unwinding. Release builds drop it, or keep it by profile choice.
 
 ## Cleanup: `defer` and `errdefer`
 
-**Status:** Proposed
+**Status:** Decided; implemented in the compiler
 
 ```
 fn open_both(a: str, b: str) uses alloc throws(IoError) -> (File, File) {
@@ -103,6 +105,64 @@ fn open_both(a: str, b: str) uses alloc throws(IoError) -> (File, File) {
 
 `deinit` ([memory.md](memory.md#destruction)) covers most cleanup. `defer`
 and `errdefer` cover the rest.
+
+## In the compiler today
+
+**Status:** Implemented subset (syntax in [syntax.md](syntax.md#errors))
+
+- `fn f(...) throws(E) -> T` (or `throws(E)` alone, for no value). `E`
+  must be an enum: its variants are the errors.
+- A call to a function that throws must be handled. A call that isn't is
+  an error: "`f` can throw, and its error must be handled".
+  - `try f()` is the call's value. On an error, the function leaves with
+    it. Only a function that throws can use `try`, and only with the same
+    error type: there's no conversion between error sets yet. To convert,
+    catch and throw: `f() catch e { throw .io(...) }`.
+  - `f() catch e { ... }` runs the block with `e` bound to the error.
+    When the call's value is used (`let n = f() catch e { ... }`), the
+    block must leave (`return`, `throw`, `break` or `continue`): a block
+    has no value. As a statement on its own, the block may end normally.
+  - `f() catch v` uses `v` when the call fails. `v` is only evaluated
+    then, as with `??`.
+  - `f() catch _ { ... }` doesn't bind the error. `f() catch _ {}` ignores
+    it, explicitly.
+  - `match f() { ok(v) => ..., err(e) => ... }` handles both. A function
+    that throws and returns nothing gives `ok` without a value. Patterns
+    don't nest yet, so `err(.empty)` is written as `err(e)` and a `match`
+    on `e`.
+- `throw value` leaves with the error `value`, of the function's error
+  type. `throw .name(...)` takes the variant from it. `opt ?? throw .name`
+  throws when `opt` is `none`; elsewhere, `throw` is a statement.
+- `defer` and `errdefer` take a block or one statement. They run when
+  control leaves the block they're in: at its end, and at every `return`,
+  `throw`, `try` that fails, `break` and `continue` that leaves it, in
+  reverse order. `errdefer` runs only when the function leaves with an
+  error, and only in a function that throws. A `return` runs them after
+  computing its value.
+- A `defer` body can't leave itself (`return`, `throw`, `try`, or a
+  `break` or `continue` out of it), and can't assign variables declared
+  outside it. So running it changes no facts. It's checked where it's
+  written, with the facts there about the variables nothing after it
+  assigns ([safety.md](safety.md#the-fact-language)).
+- `main` can't throw: it handles its errors and returns an exit status.
+- Under the hood, a function that throws returns a result, an enum
+  `{ ok(T), err(E) }` laid out like any enum
+  ([types.md](types.md#in-the-compiler-today)), in storage the caller
+  passes. `try`, `catch` and `match` test its tag. There's no unwinding.
+- Not yet: inferred error sets (`throws` alone is an error: "name the
+  error type"), conversion between error sets on `try`, error return
+  traces, and `errdefer` with the error (`errdefer |e|` in Zig).
+
+Decisions made for this subset:
+
+- A `catch` block has no value. Lode has no block expressions; a fallback
+  value is written `catch v`.
+- After `catch`, a `{` following a name starts the block, as after `if`:
+  `catch e {`. A struct literal fallback goes in parentheses:
+  `catch (Point{x: 0, y: 0})`.
+- Public functions name their error type, since nothing else is supported.
+  Whether the compiler or a lint enforces that once inference exists is
+  still Open.
 
 ## What is *not* an error
 

@@ -210,7 +210,9 @@ match tok {
   struct field types: integers, `bool`, arrays, structs, enums and optionals.
   An enum can't contain itself, directly or through other types.
 - `Shape.circle(p, 2)` builds a variant, with its payload fields in
-  declaration order, and `Shape.dot` one without payload.
+  declaration order, and `Shape.dot` one without payload. Where a `Shape`
+  (or a `?Shape`) is expected, `.circle(p, 2)` and `.dot` are short for
+  them.
 - An enum is a value, like a struct: copied by `let` and assignment, passed
   and returned by value, stored in structs and arrays.
 - `a == b` compares two enums of the same type: the same variant, then the
@@ -233,8 +235,7 @@ match tok {
   variant without payload uses only the tag. The layout is not a promise.
 - Not yet: generic enums, `match` as an expression, `match` on integers,
   patterns that nest (`some(circle(c, r))`) or list several variants
-  (`a | b`), the short form `.circle(...)` where the type is known, and
-  methods.
+  (`a | b`), and methods.
 
 ### Optional
 
