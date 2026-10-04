@@ -205,11 +205,37 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let status = status.map_err(|e| format!("cannot run the program: {e}"))?;
     Ok(match status.code() {
         Some(code) => ExitCode::from(code as u8),
-        None => {
-            eprintln!("lode: the program was killed by a signal");
-            ExitCode::FAILURE
-        }
+        None => killed(&status),
     })
+}
+
+/// Report a program killed by a signal; exit like a shell would, with
+/// 128 plus the signal number (Linux numbering; the only target).
+#[cfg(target_os = "linux")]
+fn killed(status: &std::process::ExitStatus) -> ExitCode {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(signal) = status.signal() else {
+        eprintln!("lode: the program was killed by a signal");
+        return ExitCode::FAILURE;
+    };
+    // Signals 1 to 31, in order.
+    const NAMES: &str = "HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM \
+                         STKFLT CHLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF WINCH \
+                         IO PWR SYS";
+    let name = usize::try_from(signal)
+        .ok()
+        .and_then(|n| NAMES.split(' ').nth(n.checked_sub(1)?));
+    match name {
+        Some(name) => eprintln!("lode: the program was killed by SIG{name} (signal {signal})"),
+        None => eprintln!("lode: the program was killed by signal {signal}"),
+    }
+    ExitCode::from((128 + signal).clamp(0, 255) as u8)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn killed(_: &std::process::ExitStatus) -> ExitCode {
+    eprintln!("lode: the program was killed");
+    ExitCode::FAILURE
 }
 
 /// The input's file name without its extension, in the current directory.
