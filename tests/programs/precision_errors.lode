@@ -1,0 +1,25 @@
+// error: cannot prove that this addition does not overflow `u64`
+// error: cannot prove that this multiplication does not overflow `i64`
+// error: cannot prove that this addition does not overflow `u32`
+package main
+
+// Dividing by 1 keeps the whole range.
+fn div_one(x: u64) -> u64 {
+	let d = x / 1
+	return d + 1
+}
+
+// Half the range, tripled, doesn't fit.
+fn triple_half(x: i64) -> i64 {
+	return (x / 2) * 3
+}
+
+// `|` with an operand that can have the top bit set can be the largest
+// `u32`.
+fn or_top(x: u32) -> u32 {
+	let v = x | 1
+	return v + 1
+}
+
+fn main() {
+}

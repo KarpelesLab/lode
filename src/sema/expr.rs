@@ -306,6 +306,63 @@ pub(super) fn forget_changed(cx: &mut FnCx, e: &TExpr) {
     }
 }
 
+/// The parts of a divisor's range without 0: the negative values, then the
+/// positive ones.
+fn nonzero_parts(b: Range) -> impl Iterator<Item = Range> {
+    let neg = (b.lo <= -1).then(|| Range {
+        lo: b.lo,
+        hi: b.hi.min(-1),
+    });
+    let pos = (b.hi >= 1).then(|| Range {
+        lo: b.lo.max(1),
+        hi: b.hi,
+    });
+    neg.into_iter().chain(pos)
+}
+
+/// The range of `a / b` (rounded toward zero) for a divisor `b` that isn't
+/// 0. On each side of 0, the quotient only moves one way as either operand
+/// grows, so its extremes are at the corners.
+fn quotient_range(a: Range, b: Range) -> Range {
+    nonzero_parts(b)
+        .map(|b| {
+            let vals = [a.lo / b.lo, a.lo / b.hi, a.hi / b.lo, a.hi / b.hi];
+            Range {
+                lo: *vals.iter().min().expect("four values"),
+                hi: *vals.iter().max().expect("four values"),
+            }
+        })
+        .reduce(Range::hull)
+        .unwrap_or(a)
+}
+
+/// The range of `a % b` for a divisor `b` that isn't 0: smaller than `b` in
+/// size, with the sign of `a`. (Not also "no further from 0 than `a`": the
+/// range only depends on the divisor, so `a = (a + x) % m` in a loop has the
+/// same range at every iteration, and the loop's head can keep it.)
+fn remainder_range(a: Range, b: Range) -> Range {
+    let m =
+        b.lo.unsigned_abs()
+            .max(b.hi.unsigned_abs())
+            .saturating_sub(1);
+    let m = i128::try_from(m).unwrap_or(i128::MAX);
+    Range {
+        lo: if a.lo >= 0 { 0 } else { -m },
+        hi: if a.hi <= 0 { 0 } else { m },
+    }
+}
+
+/// The smallest `2^k - 1` that is at least `x` (for `x >= 0`): no value
+/// without a bit above those of `x` is larger.
+fn all_ones(x: i128) -> i128 {
+    let bits = 128 - x.leading_zeros();
+    if bits >= 127 {
+        i128::MAX
+    } else {
+        (1i128 << bits) - 1
+    }
+}
+
 fn op_name(op: BinOp) -> &'static str {
     match op {
         BinOp::Add | BinOp::AddWrap | BinOp::AddSat => "addition",
@@ -1839,23 +1896,10 @@ impl Checker<'_> {
                     );
                     return None;
                 }
-                let biggest = a.lo.abs().max(a.hi.abs());
                 let range = if op == BinOp::Div {
-                    if t.signed {
-                        Range {
-                            lo: -biggest,
-                            hi: biggest,
-                        }
-                    } else {
-                        Range { lo: 0, hi: a.hi }
-                    }
+                    quotient_range(a, b)
                 } else {
-                    let m = b.lo.abs().max(b.hi.abs()) - 1;
-                    if t.signed {
-                        Range { lo: -m, hi: m }
-                    } else {
-                        Range { lo: 0, hi: m }
-                    }
+                    remainder_range(a, b)
                 };
                 let top = if op == BinOp::Div {
                     TBinOp::Div
@@ -1870,17 +1914,35 @@ impl Checker<'_> {
                     },
                 )
             }
+            // With a non-negative operand, `a & b` lies between 0 and it.
             BinOp::BitAnd => {
-                let range = if a.lo >= 0 && b.lo >= 0 {
-                    Range {
+                let range = match (a.lo >= 0, b.lo >= 0) {
+                    (true, true) => Range {
                         lo: 0,
                         hi: a.hi.min(b.hi),
-                    }
-                } else {
-                    full
+                    },
+                    (true, false) => Range { lo: 0, hi: a.hi },
+                    (false, true) => Range { lo: 0, hi: b.hi },
+                    (false, false) => full,
                 };
                 (TBinOp::BitAnd, range)
             }
+            // Of non-negative operands, `a | b` is at least the larger one,
+            // and neither `|` nor `^` sets a bit above their highest.
+            BinOp::BitOr if a.lo >= 0 && b.lo >= 0 => (
+                TBinOp::BitOr,
+                Range {
+                    lo: a.lo.max(b.lo),
+                    hi: all_ones(a.hi.max(b.hi)),
+                },
+            ),
+            BinOp::BitXor if a.lo >= 0 && b.lo >= 0 => (
+                TBinOp::BitXor,
+                Range {
+                    lo: 0,
+                    hi: all_ones(a.hi.max(b.hi)),
+                },
+            ),
             BinOp::BitOr => (TBinOp::BitOr, full),
             BinOp::BitXor => (TBinOp::BitXor, full),
             _ => unreachable!("not an arithmetic operator"),
@@ -1939,8 +2001,21 @@ impl Checker<'_> {
         let (top, range) = match op {
             BinOp::Shl => (TBinOp::Shl, t.range()),
             BinOp::ShlWrap => (TBinOp::ShlWrap, t.range()),
-            _ if a.lo >= 0 => (TBinOp::Shr, Range { lo: 0, hi: a.hi }),
-            _ => (TBinOp::Shr, t.range()),
+            // `a >> n` is `a` divided by `2^n`, rounded down (an arithmetic
+            // shift for signed types): its extremes are at the corners.
+            _ => {
+                let vals = [
+                    a.lo >> amount.lo,
+                    a.lo >> amount.hi,
+                    a.hi >> amount.lo,
+                    a.hi >> amount.hi,
+                ];
+                let range = Range {
+                    lo: *vals.iter().min().expect("four values"),
+                    hi: *vals.iter().max().expect("four values"),
+                };
+                (TBinOp::Shr, range)
+            }
         };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
         Some(Checked::new(kind, Ty::Int(t), Some(range)))

@@ -121,7 +121,10 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | Where | What the checker learns |
 | --- | --- |
 | A literal or constant | Its exact value |
-| An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges) |
+| An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges), as below |
+| `a / b`, `a >> n` | For `/`, on each side of 0 of the divisor's range, the four quotients of the ranges' ends (rounded toward zero) bound the result; the two sides are joined. For `>>`, the four `a.lo >> n.lo` ... `a.hi >> n.hi` (rounded down). So `x / 10` and `x >> 4` of a `u64` are at most a tenth and a sixteenth of the largest `u64` |
+| `a % b` | Smaller in size than `b` can be, with the sign of `a`: in `-m..=m`, with `m` the largest size of `b` minus 1, and 0 for an end where `a` can't have that sign. It doesn't depend on `a`'s size, so `a = (a + x) % m` has the same range at every iteration of a loop |
+| `a & b`, `a \| b`, `a ^ b` | `&`: with a non-negative operand, `0..=` its largest value (the smaller of both, if both are). `\|`, `^`: when both are non-negative, at most the smallest `2^k - 1` that's at least both largest values; `\|` is also at least the larger of both smallest values. Otherwise, the type's range |
 | `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
 | A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |

@@ -1,0 +1,62 @@
+// exit: 0
+package main
+
+// Division and shifts by constants narrow the range: `x / 2` and `x >> 1`
+// are at most half the largest `u64`, so adding 1 can't overflow.
+fn half_plus_one(x: u64) -> u64 {
+	let d = x / 2
+	let s = x >> 1
+	return d + 1 + (s - s)
+}
+
+// Signed division rounds toward zero; a signed shift rounds down. Both
+// keep half the range, so doubling the result fits again.
+fn halves(x: i64) -> i64 {
+	let q = x / 2
+	let s = x >> 1
+	return q * 2 + (s - s)
+}
+
+// `%` keeps the sign of the dividend: a non-negative `x % 10` is a digit.
+fn last_digit(x: i32) -> u8 {
+	if x < 0 {
+		return 0
+	}
+	return u8(x % 10)
+}
+
+// Of non-negative values, `|` stays below the next power of two:
+// `v | (v >> 1)` with `v <= 0x7fffffff` is too, so `+ 1` fits a `u32`.
+fn smear(x: u32) -> u32 {
+	var v = x & 0x7fffffff
+	v = v | (v >> 1)
+	v = v | (v >> 2)
+	v = v | (v >> 4)
+	v = v | (v >> 8)
+	v = v | (v >> 16)
+	return v + 1
+}
+
+// `x & mask` with a non-negative mask is in `0..=mask`, whatever `x` is.
+fn low_byte(x: i32) -> u8 {
+	return u8(x & 0xff)
+}
+
+fn main() -> u8 {
+	if half_plus_one(18446744073709551615) != 9223372036854775808 {
+		return 1
+	}
+	if halves(-7) != -6 || halves(7) != 6 {
+		return 2
+	}
+	if last_digit(1234) != 4 || last_digit(-5) != 0 {
+		return 3
+	}
+	if smear(1000) != 1024 || smear(4294967295) != 2147483648 {
+		return 4
+	}
+	if low_byte(-1) != 255 {
+		return 5
+	}
+	return 0
+}

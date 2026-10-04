@@ -73,7 +73,7 @@ fn next_pow2(x: u32) -> u32 {
 	v = v | (v >> 4)
 	v = v | (v >> 8)
 	v = v | (v >> 16)
-	return v +% 1 // WORKAROUND: `|` loses the bound v <= 0x7fffffff
+	return v + 1
 }
 
 fn line(label: str, v: u64) {
