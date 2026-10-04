@@ -54,11 +54,12 @@ pub fn StackBuf[N].push(inout self, b: u8) throws(Error) {
 /// Write `b` before the bytes written so far, or throw `full` when the
 /// storage's front is reached.
 pub fn StackBuf[N].push_front(inout self, b: u8) throws(Error) {
-	let s = self.start
-	if s == 0 || s > N {
+	// `start - 1`, wrapping to the largest `usize` when `start` is 0: one
+	// check covers both a full front and a `start` past the storage.
+	let at = self.start -% 1
+	if at >= N {
 		throw .full
 	}
-	let at = s - 1
 	self.bytes[at] = b
 	self.start = at
 }
