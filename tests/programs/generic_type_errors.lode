@@ -1,0 +1,145 @@
+// error: the struct `Loop` contains itself
+// error: the struct `Holder` contains itself
+// error: the enum `Tree` contains itself
+// error: `Pair[A, B]` has 2 parameter(s), but the method names 1
+// error: `Point` is not generic
+// error: a method of `Pair` names the type's parameters
+// error: `N` is the value parameter `N: usize` of `Buf[N]`
+// error: this copies `self.first`, a read-only parameter, but `A` isn't `Copy`
+// error: this copies `p.second`, a read-only parameter, but `B` isn't `Copy`
+// error: cannot prove that this index is less than the length
+// error: an array's length is a `usize`, but `K` is a `u8`
+// error: unknown type `T`
+// error: `N` is a value (a `usize`), not a type
+// error: this calls `Grow[Pair[T, T]].deeper`, which calls back here: its instances would never end
+// error: `Pair` takes 2 generic argument(s), but 1 were given
+// error: `Pair` needs its generic arguments
+// error: cannot tell what `A` is in this `Pair` literal
+// error: `Point` doesn't implement `Ordered`, which `Sorted` requires of `T`
+// error: `N` is a value parameter, so its argument is a value
+// error: expected a type argument, found an expression (`A` is a type parameter)
+// error: expected `[3]u8`, found an array of 4 element(s)
+// error: `Point` doesn't implement `Ordered`, which `Pair.smaller` requires of `A`
+// error: expected `Buf[8]`, found `Buf[4]`
+// error: cannot tell what `B` is in this call of `Pair.new`
+// error: cannot tell what `N` is in this call of `zeros`
+// error: cannot find `N` in this scope
+// error: `Point` is not generic: it takes no arguments
+// help: write the type's arguments, as in `Pair[...].new(...)`
+// help: write the arguments, as in `zeros[4](...)`
+// help: it takes 2: `Pair[A, B]`
+// help: or declare the method with `sink self`
+package main
+
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+struct Sorted[T: Ordered] {
+	value: T
+}
+
+struct Point {
+	x: u8
+}
+
+struct Buf[N: usize] {
+	bytes: [N]u8
+}
+
+// Recursive generic types: any instance of the type counts.
+struct Loop[T] {
+	inner: ?Loop[Pair[T, T]]
+}
+
+struct Holder {
+	p: Pair[u8, Holder]
+}
+
+enum Tree[T] {
+	leaf(value: T)
+	node(left: Tree[T])
+}
+
+// Methods naming the type's parameters wrongly.
+fn Pair[A].one(self) {
+}
+
+fn Point[T].two(self) {
+}
+
+fn Pair.three(self) {
+}
+
+fn Buf[N: u8].four(self) {
+}
+
+// A read-only `self` (or parameter) can't be copied from without `Copy`.
+fn Pair[A, B].first_of(self) -> A {
+	return self.first
+}
+
+fn second_of[A, B](p: Pair[A, B]) -> B {
+	return p.second
+}
+
+fn Pair[A: Ordered + Copy, B].smaller(self, other: A) -> A {
+	if self.first.lt(other) {
+		return self.first
+	}
+	return other
+}
+
+fn Pair[A, B].new(sink first: A, sink second: B) -> Pair[A, B] {
+	return Pair{first: first, second: second}
+}
+
+// `i` isn't known to be below `N`.
+fn idx[N: usize](a: [N]u8, i: usize) -> u8 {
+	return a[i]
+}
+
+fn bad_len[K: u8](a: [K]u8) {
+}
+
+fn unbound(x: T) {
+}
+
+fn not_a_type[N: usize](x: N) {
+}
+
+fn zeros[N: usize]() -> [N]u8 {
+	return [0; N]
+}
+
+fn take(b: Buf[8]) {
+}
+
+// Instances that would grow without end.
+struct Grow[T] {
+	value: T
+}
+
+fn Grow[T: Copy].deeper(self) {
+	let next = Grow{value: Pair{first: self.value, second: self.value}}
+	next.deeper()
+}
+
+fn main() {
+	let a: Pair[u8] = Pair{first: 1, second: 2}
+	let b: Pair = Pair{first: 1, second: 2}
+	let c = Pair{first: 1, second: 2}
+	let d: Sorted[Point] = Sorted{value: Point{x: 1}}
+	let e: Buf[u8] = Buf{bytes: [0; 4]}
+	let f: Pair[4, u8] = Pair{first: 1, second: 2}
+	let g = Pair{first: Point{x: 1}, second: true}
+	let h = g.smaller(Point{x: 2})
+	let i: Buf[3] = Buf{bytes: [0; 4]}
+	let k = Buf[4]{bytes: [0; 4]}
+	take(k)
+	let m = Pair.new(u8(1), none)
+	let z = zeros()
+	let n: u8 = N
+	let o: Point[u8] = Point{x: 1}
+}

@@ -1,0 +1,135 @@
+// stdout: 3 true 300 7\n
+// stdout: 2 false 1\n
+// stdout: 9 1000 2000 none\n
+// stdout: 5 7 true\n
+// stdout: 6 4 equal\n
+// stdout: 11 12 0\n
+package main
+
+import "std/io"
+
+// Two generic structs and a generic enum, each used with several sets of
+// arguments, nested, in optionals and arrays, and through generic
+// functions.
+
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+struct Boxed[T: Integer] {
+	value: T
+	tag: bool
+}
+
+enum Either[L, R] {
+	left(value: L)
+	right(value: R)
+	neither
+}
+
+fn print_bool(b: bool) {
+	if b {
+		io.print("true")
+	} else {
+		io.print("false")
+	}
+}
+
+fn describe(e: Either[u8, bool]) -> u32 {
+	match e {
+		left(v) => return u32(v)
+		right(b) => {
+			if b {
+				return 1000
+			}
+			return 2000
+		}
+		neither => return 0
+	}
+}
+
+// A generic function over a generic enum: the payloads are `L` and `R`.
+fn left_or[L: Copy, R](e: Either[L, R], d: L) -> L {
+	match e {
+		left(v) => return v
+		right(_) => return d
+		neither => return d
+	}
+}
+
+fn sum_both[T: Integer](p: Pair[T, T]) -> T {
+	return p.first +% p.second
+}
+
+fn boxed_twice[T: Integer](b: Boxed[T]) -> Boxed[T] {
+	return Boxed{value: b.value *% 2, tag: !b.tag}
+}
+
+fn main() {
+	// Inferred from the fields; given; from the expected type.
+	let p = Pair{first: u8(3), second: true}
+	let q = Pair[u16, u8]{first: 300, second: 7}
+	print_int_sp(p.first)
+	print_bool(p.second)
+	io.print(" ")
+	print_int_sp(q.first)
+	io.print_int(q.second)
+	io.print("\n")
+
+	// Nested generics.
+	let n: Pair[Pair[u8, u16], bool] = Pair{first: Pair{first: 1, second: 2}, second: false}
+	print_int_sp(n.first.second)
+	print_bool(n.second)
+	io.print(" ")
+	io.print_int(n.first.first)
+	io.print("\n")
+
+	// A generic enum: a variant from the context, the enum's name
+	// with its arguments inferred, or written.
+	let e: Either[u8, bool] = .left(9)
+	print_int_sp(describe(e))
+	print_int_sp(describe(Either.right(true)))
+	print_int_sp(describe(Either[u8, bool].right(false)))
+	let none_yet: ?Either[u8, bool] = none
+	if none_yet == none && describe(.neither) == 0 {
+		io.print("none")
+	}
+	io.print("\n")
+
+	// Generic functions over generic types.
+	print_int_sp(left_or(e, 5) -| 4)
+	let r: Either[i32, u8] = .right(1)
+	print_int_sp(left_or(r, 7))
+	print_bool(Pair{first: 1, second: 2} == Pair[u8, u8]{first: 1, second: 2})
+	io.print("\n")
+
+	// Instances in arrays and optionals, compared with `==`.
+	let ps: [2]Pair[u8, i8] = [Pair{first: 1, second: -1}, Pair{first: 5, second: 1}]
+	var total: i32 = 0
+	for x in ps {
+		total = total +% i32(x.first) +% i32(x.second)
+	}
+	print_int_sp(total)
+	let o: ?Pair[u8, i8] = ps[1]
+	if let v = o {
+		print_int_sp(sum_both(Pair{first: v.first -| 1, second: u8(0)}))
+	}
+	if ps[0] != ps[1] && o == (Pair[u8, i8]{first: 5, second: 1}) {
+		io.print("equal")
+	}
+	io.print("\n")
+
+	// A bound on the struct's parameter, and two instances of it.
+	let b = boxed_twice(Boxed{value: i64(-5), tag: true})
+	let c = boxed_twice(Boxed{value: u8(6), tag: false})
+	print_int_sp(b.value +% 21)
+	print_int_sp(c.value)
+	io.print_int(boxed_twice(Boxed{value: u16(0), tag: c.tag}).value)
+	io.print("\n")
+}
+
+fn print_int_sp[T: Integer](n: T) {
+	io.print_int(n)
+	io.print(" ")
+}

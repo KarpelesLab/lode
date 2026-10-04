@@ -1,0 +1,111 @@
+// stdout: full 4 3 99\n
+// stdout: abc full 3\n
+// stdout: hello\n
+// stdout: 3 full 0 100 200\n
+// stdout: 200 100 0 none\n
+// stdout: 11 true\n
+// stdout: -42 18446744073709551615 0\n
+package main
+
+import "std/buf"
+import "std/io"
+import "std/vec"
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+fn print_sp[T: Integer](n: T) {
+	io.print_int(n)
+	io.print(" ")
+}
+
+fn main() {
+	// A byte buffer: `push` until it's full.
+	var b = buf.StackBuf[4].new()
+	for k in 0..10 {
+		b.push(u8(k)) catch e {
+			match e {
+				full => {
+					io.print("full ")
+					break
+				}
+			}
+		}
+	}
+	print_sp(b.len())
+	print_sp(b.get(3) ?? 99)
+	io.print_int(b.get(4) ?? 99)
+	io.print("\n")
+
+	// Written from the end, as for digits.
+	var d = buf.StackBuf[3].new_end()
+	for c in "cba".bytes() {
+		d.push_front(c) catch _ {}
+	}
+	for i in 0..d.len() {
+		let c = d.get(i) ?? '?'
+		let one: [1]u8 = [c]
+		io.stdout().write_bytes(one) catch _ {}
+	}
+	d.push_front('z') catch _ {
+		io.print(" full ")
+	}
+	io.print_int(d.len())
+	io.print("\n")
+
+	// Written to a file in one call.
+	var h = buf.StackBuf[16].new()
+	for c in "hello\n".bytes() {
+		h.push(c) catch _ {}
+	}
+	io.stdout().write_buf(h) catch _ {}
+
+	// A vector of any copyable type.
+	var v = vec.ArrayVec[u16, 3].new()
+	for k in 0..5 {
+		v.push(u16(k) * 100) catch _ {
+			if k == 3 {
+				io.print("3 full ")
+			}
+		}
+	}
+	for i in 0..v.len() {
+		let x = v.get(i) ?? 9999
+		if i + 1 == v.len() {
+			io.print_int(x)
+		} else {
+			print_sp(x)
+		}
+	}
+	io.print("\n")
+	loop {
+		let x = v.pop() else {
+			break
+		}
+		print_sp(x)
+	}
+	if v.get(0) == none && v.len() == 0 {
+		io.print("none")
+	}
+	io.print("\n")
+
+	// Of structs, its type from the context.
+	var ps: vec.ArrayVec[Point, 2] = vec.ArrayVec.new()
+	ps.push(Point{x: 1, y: -1}) catch _ {}
+	let replaced = ps.put(0, Point{x: 5, y: 6})
+	let past = ps.put(1, Point{x: 0, y: 0})
+	let p = ps.get(0) ?? Point{x: 0, y: 0}
+	print_sp(p.x +| p.y)
+	if replaced && !past {
+		io.print("true")
+	}
+	io.print("\n")
+
+	// `io.print_int` uses a `StackBuf` for its digits.
+	print_sp(i8(-42))
+	print_sp(u64(18446744073709551615))
+	io.print_int(u8(0))
+	io.print("\n")
+}

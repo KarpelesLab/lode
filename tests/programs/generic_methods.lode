@@ -1,0 +1,137 @@
+// stdout: true 3 | 7 8\n
+// stdout: 5 2 | 1 300\n
+// stdout: 4 9 less\n
+// stdout: 2 7 3\n
+// stdout: 16 none\n
+package main
+
+import "std/io"
+
+// Methods and associated functions of generic types: the method names the
+// type's parameters (`fn Pair[A, B].swap`), may add bounds to them (and
+// then exists only where they hold), and may have parameters of its own.
+
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+/// Associated: `Pair.new(a, b)` infers the arguments, `Pair[u8, u16].new`
+/// gives them.
+fn Pair[A, B].new(sink first: A, sink second: B) -> Pair[A, B] {
+	return Pair{first: first, second: second}
+}
+
+/// Only for copyable parts: `self` is read-only, so the parts are copied.
+fn Pair[A: Copy, B: Copy].swap(self) -> Pair[B, A] {
+	return Pair{first: self.second, second: self.first}
+}
+
+/// Moves the parts out of `self`, so it needs no `Copy`.
+fn Pair[A, B].into_first(sink self) -> A {
+	return self.first
+}
+
+/// Only for ordered first parts.
+fn Pair[A: Ordered + Copy, B].min_first(self, other: A) -> A {
+	if other.lt(self.first) {
+		return other
+	}
+	return self.first
+}
+
+/// Only for integer parts, with their operators.
+fn Pair[A: Integer, B: Integer].sum_wrapped(self) -> A {
+	return self.first +% A(self.second & 0x7f)
+}
+
+/// A parameter of its own, given or inferred.
+fn Pair[A, B: Copy].with_first[C](self, sink c: C) -> Pair[C, B] {
+	return Pair{first: c, second: self.second}
+}
+
+/// A method calling another of the same type: `swap` needs `Copy`, which
+/// this method's bounds give.
+fn Pair[A: Ordered + Copy, B: Copy].first_vs(self, other: A) -> Ordering {
+	return self.swap().second.cmp(other)
+}
+
+enum Opt[T] {
+	some_value(v: T)
+	empty
+}
+
+fn Opt[T: Copy].or(self, d: T) -> T {
+	match self {
+		some_value(v) => return v
+		empty => return d
+	}
+}
+
+fn Opt[T].empty_one() -> Opt[T] {
+	return .empty
+}
+
+fn print_bool(b: bool) {
+	if b {
+		io.print("true")
+	} else {
+		io.print("false")
+	}
+}
+
+fn main() {
+	let p = Pair.new(u8(3), true)
+	let s = p.swap()
+	print_bool(s.first)
+	io.print(" ")
+	io.print_int(s.second)
+	io.print(" | ")
+	let q = Pair[u16, i8].new(7, 8)
+	io.print_int(q.first)
+	io.print(" ")
+	io.print_int(q.into_first() +| 1)
+	io.print("\n")
+
+	io.print_int(Pair.new(u32(9), true).min_first(5))
+	io.print(" ")
+	io.print_int(Pair{first: i64(2), second: false}.min_first(4))
+	io.print(" | ")
+	let w = Pair{first: u8(255), second: u16(0x102)}
+	io.print_int(w.sum_wrapped())
+	io.print(" ")
+	let x = p.with_first(u16(300))
+	io.print_int(x.first)
+	io.print("\n")
+
+	let y = p.with_first[u64](4)
+	io.print_int(y.first)
+	io.print(" ")
+	io.print_int(Pair{first: q, second: u8(9)}.with_first[bool](true).second)
+	io.print(" ")
+	match (Pair{first: u8(1), second: true}).first_vs(5) {
+		less => io.print("less")
+		equal => io.print("equal")
+		greater => io.print("greater")
+	}
+	io.print("\n")
+
+	let o = Opt.some_value(i32(2))
+	io.print_int(o.or(5))
+	io.print(" ")
+	let e: Opt[i32] = Opt.empty_one()
+	io.print_int(e.or(7))
+	io.print(" ")
+	io.print_int(Opt[u8].empty_one().or(3))
+	io.print("\n")
+
+	// Nested instances, and an associated function inferring from the
+	// expected type.
+	io.print_int(Pair.new(Pair.new(u8(16), false), true).into_first().into_first())
+	io.print(" ")
+	let nothing: Opt[Pair[u8, bool]] = Opt.empty_one()
+	if nothing == .empty {
+		io.print("none")
+	}
+	io.print("\n")
+}

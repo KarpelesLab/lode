@@ -1,0 +1,143 @@
+// stdout: 12 12 0\n
+// stdout: 7 none\n
+// stdout: 4 3 99\n
+// stdout: 1 2 3 0 0 \n
+// stdout: 30 20 10\n
+// stdout: 21 8\n
+package main
+
+import "std/io"
+
+// Value parameters: `[N: usize]` sizes arrays and is a term for the
+// checker, so `a[i]` is proven once for every `N`.
+
+/// A ring of the last `N` values pushed.
+struct Ring[T: Copy, N: usize] {
+	items: [N]T
+	next: usize
+	count: usize
+}
+
+fn Ring[T, N].new(fill: T) -> Ring[T, N] {
+	return Ring{items: [fill; N], next: 0, count: 0}
+}
+
+fn Ring[T, N].push(inout self, v: T) {
+	if self.next >= N {
+		// Only when `N` is 0: there's no room at all.
+		return
+	}
+	self.items[self.next] = v
+	self.next += 1
+	if self.next == N {
+		self.next = 0
+	}
+	if self.count < N {
+		self.count += 1
+	}
+}
+
+/// The value pushed `back` pushes ago (0: the last one).
+fn Ring[T, N].back(self, back: usize) -> ?T {
+	if back >= self.count || self.count > N || self.next > N {
+		return none
+	}
+	// `next - 1 - back`, going around the end.
+	var at = self.next
+	for _ in 0..back + 1 {
+		if at == 0 {
+			at = N
+		}
+		at -= 1
+	}
+	if at >= N {
+		return none
+	}
+	return self.items[at]
+}
+
+/// The sum of an array of any length: indexes by `0..N` and by the
+/// array's own `.len`, both proven.
+fn total[N: usize](xs: [N]u32) -> u32 {
+	var sum: u32 = 0
+	for i in 0..N {
+		sum = sum +% xs[i]
+	}
+	for i in 0..xs.len {
+		sum = sum +% xs[i]
+	}
+	return sum
+}
+
+/// The first `N` bytes of `xs`, if it has that many.
+fn first_n[N: usize](xs: []u8) -> ?[N]u8 {
+	if xs.len < N {
+		return none
+	}
+	var out: [N]u8 = [0; N]
+	for i in 0..N {
+		out[i] = xs[i]
+	}
+	return out
+}
+
+/// A value parameter of another type than `usize`, used as a value.
+fn scaled[K: u8](x: u16) -> u16 {
+	return x *| K
+}
+
+fn print_sp[T: Integer](n: T) {
+	io.print_int(n)
+	io.print(" ")
+}
+
+fn main() {
+	let a: [3]u32 = [1, 2, 3]
+	print_sp(total(a))
+	let b: [2]u32 = [2, 4]
+	print_sp(total(b))
+	let none_at_all: [0]u32 = []
+	io.print_int(total(none_at_all))
+	io.print("\n")
+
+	let data: [5]u8 = [5, 6, 7, 8, 9]
+	if let f = first_n[3](data) {
+		print_sp(f[2])
+	}
+	let g: ?[8]u8 = first_n(data)
+	if g == none {
+		io.print("none")
+	}
+	io.print("\n")
+
+	var r = Ring[u8, 3].new(0)
+	for k in 1..5 {
+		r.push(u8(k))
+	}
+	print_sp(r.back(0) ?? 99)
+	print_sp(r.back(1) ?? 99)
+	io.print_int(r.back(3) ?? 99)
+	io.print("\n")
+
+	var w: Ring[i16, 5] = Ring.new(0)
+	for k in 1..4 {
+		w.push(i16(k))
+	}
+	for i in 0..w.items.len {
+		print_sp(w.items[i])
+	}
+	io.print("\n")
+
+	print_sp(scaled[10](3))
+	print_sp(scaled[2](10))
+	io.print_int(scaled[1](10))
+	io.print("\n")
+
+	// One function, several lengths.
+	let x: [6]u32 = [1, 2, 3, 4, 5, 6]
+	print_sp(total(x) / 2)
+	if first_n[1](data) != none {
+		io.print_int(total[2]([1, 3]))
+	}
+	io.print("\n")
+}
