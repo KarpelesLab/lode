@@ -166,10 +166,11 @@ This rule also lets scoped threads use views without copying
 
 ### In the compiler today
 
-**Status:** Implemented for arrays and structs
+**Status:** Implemented for arrays, structs, enums and optionals
 
-- Every array and struct is a plain value, copied by `let`, by assignment
-  and into array elements and fields. Nothing owns resources yet, so nothing
+- Every array, struct, enum and optional is a plain value, copied by `let`,
+  by assignment and into array elements and fields. A `match` binds copies
+  of the payload fields. Nothing owns resources yet, so nothing
   moves.
 - A parameter uses the default convention: read-only for the duration of the
   call. Nothing can change the argument during the call, so an array or a

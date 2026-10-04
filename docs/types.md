@@ -145,8 +145,8 @@ let p = Point{x: 1, y: 2}
 
 **Status:** Implemented subset (syntax in [syntax.md](syntax.md#structs))
 
-- Field types: integers, `bool`, arrays and other structs. Arrays and slices
-  of structs work too. Not yet: pointer fields, field defaults, structs
+- Field types: integers, `bool`, arrays, other structs, enums and
+  optionals. Arrays and slices of structs work too. Not yet: pointer fields, field defaults, structs
   without fields, generic structs and `@layout`.
 - A struct is a value, like an array. `let q = p` and `q = p` copy it, and
   changing `p` afterwards doesn't change `q`. Fields of a `var` struct can be
@@ -173,13 +173,13 @@ let p = Point{x: 1, y: 2}
 
 ```
 enum Token {
-	ident(name: str)
+	ident(start: u32, len: u32)
 	number(value: u64)
 	eof
 }
 
 match tok {
-	ident(n) => ...
+	ident(s, n) => ...
 	number(v) => ...
 	eof => ...
 }
@@ -187,8 +187,54 @@ match tok {
 
 - `match` must be exhaustive. `_` is allowed but linted when used on an enum
   declared in the same package (it hides new variants).
-- C-style enums with explicit integer values: `enum Color: u8 { red = 1, green = 2 }`.
+- A payload holds its fields by value, like a struct. A payload field can't
+  be a view (`str`, `[]T`), for the same reason a struct field can't
+  ([memory.md](memory.md#views)). So a token refers to its text by position
+  (`ident(start, len)`), not with a `str`.
+- C-style enums with explicit integer values:
+
+  ```
+  enum Color: u8 {
+  	red = 1
+  	green = 2
+  }
+  ```
+
   Converting an integer to such an enum returns `?Color`.
+
+#### In the compiler today
+
+**Status:** Implemented subset (syntax in [syntax.md](syntax.md#enums-and-match))
+
+- Variants have named payload fields, or none. Payload field types are the
+  struct field types: integers, `bool`, arrays, structs, enums and optionals.
+  An enum can't contain itself, directly or through other types.
+- `Shape.circle(p, 2)` builds a variant, with its payload fields in
+  declaration order, and `Shape.dot` one without payload.
+- An enum is a value, like a struct: copied by `let` and assignment, passed
+  and returned by value, stored in structs and arrays.
+- `a == b` compares two enums of the same type: the same variant, then the
+  same payload fields. `<` and the other orderings don't apply.
+- `match` is a statement. A missing variant is an error. A `_` arm on an
+  enum of the same package gives a warning, which doesn't fail the build.
+  So does a `_` arm that can match nothing; on another package's enum that's
+  allowed, since the package may add variants.
+- A C-style enum (`enum Color: u8 { red = 1 ... }`) gives every variant a
+  value of its integer type, all different, and no payloads.
+  `Color(x)` converts an integer `x` of any type to a `?Color`: `none` if no
+  variant has that value. `u8(c)` converts back, with the usual proof: the
+  checker knows a `Color` lies between its smallest and largest value.
+- Another package's public enum is `pkg.Name`: `geo.Shape.circle(p, 2)`.
+- The proof checker has no facts about payloads, but it keeps the facts it
+  had before a `match` (or an `if let`, a `let ... else`) and joins the arms'
+  facts after it, as after an `if`.
+- In memory, an enum is its tag (a `u8`, or a C-style enum's integer type)
+  followed by an area that fits the largest payload, aligned for it. A
+  variant without payload uses only the tag. The layout is not a promise.
+- Not yet: generic enums, `match` as an expression, `match` on integers,
+  patterns that nest (`some(circle(c, r))`) or list several variants
+  (`a | b`), the short form `.circle(...)` where the type is known, and
+  methods.
 
 ### Optional
 
@@ -208,6 +254,28 @@ must handle `none`.
 
 Layout: `?T` uses a niche when `T` has one (for example a non-null handle), so
 `?T` is the same size as `T`.
+
+#### In the compiler today
+
+**Status:** Implemented subset (syntax in [syntax.md](syntax.md#optionals))
+
+- `?T` works for every type a struct field can have: integers, `bool`,
+  arrays, structs, enums and optionals (`??u8`). Not for views (`?str`,
+  `?[]u8`), which can't be stored.
+- `none` takes its type from the context: `let x: ?u8 = none`,
+  `return none`, `o == none`. Without one, it's an error.
+- A `T` converts to `?T` where a `?T` is expected: `let x: ?u8 = 5`,
+  `return i`, `o == 5`.
+- `if let v = o { ... } else { ... }` runs the first block with `v` bound to
+  the value when `o` isn't `none`.
+- `let v = o else { ... }` binds the value, or runs the block when `o` is
+  `none`. The block must leave (`return`, `break` or `continue`).
+- `o ?? d` is the value, or `d` when `o` is `none`. `d` is only evaluated
+  then.
+- `?T` is an enum with the variants `none` and `some(value: T)`, so
+  `match o { some(v) => ..., none => ... }` works, and `==` compares two
+  optionals.
+- There's no niche yet: `?T` is a tag plus a `T`, like any enum.
 
 ### Tuples
 

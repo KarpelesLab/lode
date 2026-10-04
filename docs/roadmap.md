@@ -19,6 +19,11 @@ itself is in the other documents; this one is only about order.
   field access and assignment, passing and returning structs and arrays by
   value, derived `==`, and fields of struct locals as terms in the fact
   language.
+- **M4: Enums, `match`, optionals** (2026-10-04). Sum types with payloads,
+  C-style enums with values, exhaustive `match` (the first warning: `_` over
+  an enum of the same package), and `?T` with `none`, `if let`,
+  `let ... else` and `??`. Enums and optionals are values in memory, like
+  structs, with derived `==`.
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
@@ -27,8 +32,6 @@ world is now 655 bytes, still 2 syscalls.
 
 ## Next
 
-- **M4: Enums, `match`, optionals.** Sum types with exhaustive `match`, and
-  `?T` with `if let`, `else` and `??`.
 - **Checker: facts through loops.** Writing `std/io`'s integer output hit
   three gaps in the fact language. They push natural code into unnatural
   shapes, so they come before more language features:

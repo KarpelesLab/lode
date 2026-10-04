@@ -128,6 +128,7 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length. |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
+| `match`, `if let`, `let ... else` | Each arm starts with the facts from before. After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. |
 | `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`) |
 | A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` narrows only when `k` is at an end of `x`'s range. |
 | `while cond` / `loop` | Before the loop, everything is forgotten about the variables the loop assigns. The body knows `cond` is true. After a `while` without `break`, `cond` is false. |

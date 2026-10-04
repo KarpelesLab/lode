@@ -47,6 +47,9 @@ What works:
 - structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
   with value semantics: `let q = p` copies, and structs and arrays are passed
   and returned by value; `==` compares structs and arrays field by field
+- enums with payloads (`Shape.circle(p, 2)`) and C-style enums
+  (`enum Color: u8 { red = 1 ... }`), exhaustive `match`, and optionals
+  `?T` with `none`, `if let`, `let ... else` and `??`
 - packages: `import "std/..."`, `pub`, `pkg.name`
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic

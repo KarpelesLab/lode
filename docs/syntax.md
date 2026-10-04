@@ -125,6 +125,7 @@ fn main() {
 | Cleanup | `defer`, `errdefer` |
 | Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a.len` (see below) |
 | Struct | `struct Point { x: u32 ... }`, `Point{x: 1, y: 2}`, `p.x` (see below) |
+| Enum | `enum Shape { circle(c: Point, r: u32) ... }`, `Shape.circle(p, 2)`, `match s { ... }` (see below) |
 | Loop over a range or elements | `for i in 0..n { ... }`, `for x in xs { ... }` |
 
 ## Arrays, slices and `for`
@@ -217,9 +218,99 @@ fn main() -> i32 {
   block, as in Go. A struct literal there goes in parentheses:
   `if p == (Point{x: 0, y: 0}) {`.
 
+## Enums and `match`
+
+**Status:** Proposed; implemented in the compiler
+
+```
+enum Shape {
+	circle(center: Point, radius: u32)
+	rect(min: Point, max: Point)
+	dot
+}
+
+enum Color: u8 {
+	red = 1
+	green = 2
+}
+
+fn radius(s: Shape) -> u32 {
+	match s {
+		circle(_, r) => return r
+		rect(a, b) => {
+			let w = b.x -% a.x
+			return w / 2
+		}
+		dot => return 0
+	}
+}
+
+fn main() -> u32 {
+	let s = Shape.circle(Point{x: 0, y: 0}, 2)
+	let c = Color(1) ?? Color.green
+	return radius(s) +% u32(c)
+}
+```
+
+- A declaration lists one variant per line: a name, and its payload fields
+  in parentheses, `name: Type`, as in a struct. `pub enum` makes the enum
+  usable from other packages.
+- `Name: T` after the enum's name gives it an integer type, and each variant
+  a value: `red = 1`. Such variants have no payload.
+- `E.variant(a, b)` builds a value, with the payload fields in declaration
+  order, like the arguments of a call. A variant without payload is
+  `E.variant`, without parentheses. `pkg.E.variant(...)` for another
+  package's enum.
+- `E(x)` converts an integer to a C-style enum, as an optional. `u8(c)`
+  converts one to an integer.
+- `match value { ... }` has one arm per line: a pattern, `=>`, then a block,
+  or a single statement on the same line (`dot => return 0`).
+- A pattern is a variant's name. `name(a, b)` binds its payload fields by
+  position; `_` skips one. A variant with a payload can be matched by its
+  name alone, ignoring the payload. `_` matches every variant no earlier
+  arm matched.
+- `match` is a statement. Using it as an expression (each arm's value) is
+  still Open.
+
+## Optionals
+
+**Status:** Proposed; implemented in the compiler
+
+```
+fn find(xs: []u32, v: u32) -> ?usize {
+	for i in 0..xs.len {
+		if xs[i] == v {
+			return i
+		}
+	}
+	return none
+}
+
+fn main() -> usize {
+	let xs: [3]u32 = [4, 5, 6]
+	if let i = find(xs, 5) {
+		return i
+	}
+	let j = find(xs, 6) else {
+		return 1
+	}
+	return find(xs, 7) ?? j
+}
+```
+
+- `?T` is an optional `T`; `??T` is an optional of an optional.
+- `if let name = opt { ... }` runs the block when `opt` isn't `none`, with
+  `name` bound to the value. It can have `else` and `else if`.
+- `let name = opt else { ... }` and `var name = opt else { ... }` bind the
+  value, or run the block, which must leave.
+- `a ?? b` binds tighter than comparisons and looser than arithmetic, and
+  groups to the right: `a ?? b ?? c` is `a ?? (b ?? c)`, and
+  `x ?? 0 == 1` compares `x ?? 0`.
+
 ## Open questions
 
-- `match` arms: single expression, or a block, or both?
+- `match` arms: a block or a single statement now. Should an arm also be a
+  single expression, once `match` can be an expression?
 - Is `return` required, or is the last expression the value (as in Rust)?
   Leaning toward requiring `return` in functions and allowing the last
   expression in `match` arms and blocks used as expressions.
