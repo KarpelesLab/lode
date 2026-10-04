@@ -916,6 +916,9 @@ impl Checker<'_> {
 
     fn name(&mut self, cx: &mut FnCx, name: &str, span: Span) -> Option<Checked> {
         if let Some(local) = cx.lookup(name) {
+            if cx.failed.contains(&local) {
+                return None;
+            }
             let ty = cx.locals[local].ty;
             let term = Term::Local(local);
             let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(term));
@@ -940,15 +943,17 @@ impl Checker<'_> {
 
     /// For `name.member` where `name` is neither a local, a package-level
     /// item nor an imported package: report it (with the import to add, if
-    /// there's a standard package of that name), and return true.
+    /// there's a standard package of that name), and return true. Also true
+    /// for a failed local (see [`FnCx::failed`]), without an error.
     fn unknown_receiver(&mut self, cx: &FnCx, base: &ast::Expr) -> bool {
         let ExprKind::Name(name) = &base.kind else {
             return false;
         };
-        if cx.lookup(name).is_some()
-            || self.pkgs[cx.pkg].items.contains_key(name)
-            || self.imported(cx, name).is_some()
-        {
+        if let Some(local) = cx.lookup(name) {
+            // A failed local: its error is reported.
+            return cx.failed.contains(&local);
+        }
+        if self.pkgs[cx.pkg].items.contains_key(name) || self.imported(cx, name).is_some() {
             return false;
         }
         let mut d = Diagnostic::error(base.span, format!("unknown package or variable `{name}`"));

@@ -167,6 +167,9 @@ struct FnCx {
     env: Env,
     /// How many of the first locals are the function's parameters.
     params: usize,
+    /// Locals whose declaration failed to check, with an error reported:
+    /// any use of them fails without another error.
+    failed: HashSet<LocalId>,
     /// For each loop around the current point, innermost last: where its
     /// body has left an iteration so far.
     loops: Vec<LoopEdges>,
@@ -203,6 +206,7 @@ impl FnCx {
             env: Env::default(),
             loops: Vec::new(),
             params: 0,
+            failed: HashSet::new(),
         }
     }
 
@@ -1232,6 +1236,8 @@ impl<'a> Checker<'a> {
         }
         cx.params = params.len();
         let body = self.block(&mut cx, &f.body.stmts);
+        // A failed local is only declared after its error was reported.
+        debug_assert!(cx.failed.is_empty() || crate::diag::has_errors(&self.diags));
         if ret != Ty::Unit && !terminates(&body) {
             self.error(
                 f.name.span,
@@ -1298,6 +1304,17 @@ impl<'a> Checker<'a> {
                 }
                 _ => self.stmt(cx, s),
             };
+            // A `let` or `var` that failed (its error is reported) still
+            // declares its name, so later uses don't report it as unknown.
+            // Without a known type, it's a failed local: uses of it fail
+            // silently.
+            if checked.is_none()
+                && let Stmt::Let { name, mutable, .. } = s
+                && !cx.scopes.last().expect("scope").contains_key(&name.name)
+            {
+                let local = self.declare(cx, &name.name, Ty::Unit, *mutable);
+                cx.failed.insert(local);
+            }
             out.extend(checked);
         }
         cx.scopes.pop();
@@ -1554,6 +1571,9 @@ impl<'a> Checker<'a> {
                     self.error(target.span, format!("cannot find `{name}` in this scope"));
                     return None;
                 };
+                if cx.failed.contains(&local) {
+                    return None;
+                }
                 if !cx.locals[local].mutable {
                     self.diags.push(
                         Diagnostic::error(
@@ -1878,6 +1898,12 @@ impl<'a> Checker<'a> {
             ok = false;
         }
         if !ok {
+            // Like a `return` that fails to check, a `match` whose arms all
+            // leave still ends control flow, to avoid a "missing return"
+            // error. Lowering never sees it: the program has errors.
+            if !tarms.is_empty() && tarms.iter().all(|a| diverges(&a.body)) {
+                return Some(TStmt::Return(None));
+            }
             return None;
         }
         before.push(TStmt::Match {
@@ -2042,6 +2068,10 @@ impl<'a> Checker<'a> {
                 )
                 .with_help("end it with `return`, `break` or `continue`"),
             );
+            // Its type is known: later uses are checked against it.
+            if !cx.scopes.last().expect("scope").contains_key(&name.name) {
+                self.declare(cx, &name.name, inner, mutable);
+            }
             return None;
         }
         if cx.scopes.last().expect("scope").contains_key(&name.name) {
@@ -2185,6 +2215,7 @@ impl<'a> Checker<'a> {
     fn rollback(&mut self, cx: &mut FnCx, mark: &Mark) {
         self.diags.truncate(mark.diags);
         cx.locals.truncate(mark.locals);
+        cx.failed.retain(|&l| l < mark.locals);
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
             c.state = state;
         }
@@ -2428,6 +2459,9 @@ impl<'a> Checker<'a> {
             self.error(root.span, format!("cannot find `{name}` in this scope"));
             return None;
         };
+        if cx.failed.contains(&local) {
+            return None;
+        }
         self.check_defer_assign(cx, local, name, target.span)?;
         let root_ty = cx.locals[local].ty;
         if root_ty.is_view() {

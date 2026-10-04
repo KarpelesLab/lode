@@ -1,0 +1,56 @@
+// error: cannot tell which integer type this literal has
+// error: cannot prove that this addition does not overflow `u32`
+// error: the `else` block of `let ... else` must leave
+// error: mismatched types: `u8` and `bool`
+// error: this `match` doesn't handle the variant `c` of `E`
+package main
+
+enum E {
+	a
+	b
+	c
+}
+
+struct P {
+	x: u8
+}
+
+// A `let` or `var` whose initializer fails still declares its name: its
+// uses give no more errors.
+fn untyped() -> u8 {
+	var k = 5
+	k = 6
+	k += 1
+	let p = P{x: k}
+	return k
+}
+
+fn unproven(a: u32, b: u32) -> u32 {
+	let c = a + b
+	var d = c
+	d = c * 2
+	return c.len
+}
+
+// With the else block's error, `v` is still a `u8`: its uses are checked.
+fn let_else(o: ?u8) -> u8 {
+	let v = o else {
+	}
+	let w: u8 = v
+	if v == true {
+		return 1
+	}
+	return w
+}
+
+// A `match` that fails to check but whose arms all leave still ends the
+// function: no "missing return" error.
+fn arms(e: E) -> u8 {
+	match e {
+		a => return 1
+		b => return 2
+	}
+}
+
+fn main() {
+}
