@@ -1,0 +1,88 @@
+// exit: 0
+package main
+
+// Twelve loops, one in another. Only the four innermost search for their
+// heads; the others forget what they assign (docs/safety.md, "Facts
+// through loops"), so checking stays fast however deep the nesting goes.
+fn deep() -> u32 {
+	var c: u32 = 0
+	var i1: u32 = 0
+	while i1 < 2 {
+		var i2: u32 = 0
+		while i2 < 2 {
+			var i3: u32 = 0
+			while i3 < 2 {
+				var i4: u32 = 0
+				while i4 < 2 {
+					var i5: u32 = 0
+					while i5 < 2 {
+						var i6: u32 = 0
+						while i6 < 2 {
+							var i7: u32 = 0
+							while i7 < 2 {
+								var i8: u32 = 0
+								while i8 < 2 {
+									var i9: u32 = 0
+									while i9 < 2 {
+										var i10: u32 = 0
+										while i10 < 2 {
+											var i11: u32 = 0
+											while i11 < 2 {
+												var i12: u32 = 0
+												while i12 < 2 {
+													c = c +% 1
+													i12 = i12 + 1
+												}
+												i11 = i11 + 1
+											}
+											i10 = i10 + 1
+										}
+										i9 = i9 + 1
+									}
+									i8 = i8 + 1
+								}
+								i7 = i7 + 1
+							}
+							i6 = i6 + 1
+						}
+						i5 = i5 + 1
+					}
+					i4 = i4 + 1
+				}
+				i3 = i3 + 1
+			}
+			i2 = i2 + 1
+		}
+		i1 = i1 + 1
+	}
+	return c
+}
+
+// A loop of height 4 still searches: `i` counting down from `buf.len`
+// keeps `i <= buf.len`.
+fn four_high() -> u8 {
+	var buf: [8]u8 = [0; 8]
+	var i = buf.len
+	while i > 0 {
+		i = i - 1
+		buf[i] = 1
+		for a in 0..2 {
+			for b in 0..2 {
+				for d in 0..2 {
+					buf[i] = buf[i] +% 1
+				}
+			}
+		}
+	}
+	return buf[0]
+}
+
+fn main() -> u8 {
+	if deep() != 4096 {
+		return 1
+	}
+	if four_high() != 9 {
+		return 2
+	}
+	return 0
+}

@@ -362,60 +362,91 @@ fn changed_names(e: &ast::Expr, out: &mut HashSet<String>) {
     }
 }
 
+/// The blocks nested directly in a statement: its branches, arms and
+/// bodies, and the blocks of the `catch`es in its own expressions.
+fn child_blocks(s: &Stmt) -> Vec<&ast::Block> {
+    let mut blocks = Vec::new();
+    for e in own_exprs(s) {
+        catch_blocks(e, &mut blocks);
+    }
+    match s {
+        Stmt::Let {
+            otherwise: Some(b), ..
+        } => blocks.push(b),
+        Stmt::Match { arms, .. } => blocks.extend(arms.iter().map(|arm| &arm.body)),
+        Stmt::If(i) => {
+            let mut cur = Some(i);
+            while let Some(i) = cur {
+                blocks.push(&i.then);
+                cur = match &i.otherwise {
+                    Some(ast::Else::If(next)) => Some(next),
+                    Some(ast::Else::Block(b)) => {
+                        blocks.push(b);
+                        None
+                    }
+                    None => None,
+                };
+            }
+        }
+        Stmt::While { body, .. }
+        | Stmt::Loop { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::Unsafe(body)
+        | Stmt::Defer { body, .. } => blocks.push(body),
+        _ => {}
+    }
+    blocks
+}
+
 /// Names assigned anywhere in `stmts` (for forgetting facts at loop heads),
 /// including through `&` and method calls (see [`changed_names`]).
 fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
-        // The blocks of `catch`es in its expressions run as part of it.
-        let mut blocks = Vec::new();
         for e in own_exprs(s) {
-            catch_blocks(e, &mut blocks);
             changed_names(e, out);
         }
-        for b in blocks {
-            assigned_names(&b.stmts, out);
+        if let Stmt::Assign { target, .. } = s {
+            // `a[i] = v` and `p.x = v` assign (part of) `a` and `p`.
+            let root = place_root(target);
+            if let ExprKind::Name(n) = &root.kind {
+                out.insert(n.clone());
+            }
         }
-        match s {
-            Stmt::Assign { target, .. } => {
-                // `a[i] = v` and `p.x = v` assign (part of) `a` and `p`.
-                let root = place_root(target);
-                if let ExprKind::Name(n) = &root.kind {
-                    out.insert(n.clone());
-                }
-            }
-            Stmt::Let {
-                otherwise: Some(b), ..
-            } => assigned_names(&b.stmts, out),
-            Stmt::Match { arms, .. } => {
-                for arm in arms {
-                    assigned_names(&arm.body.stmts, out);
-                }
-            }
-            Stmt::If(i) => {
-                let mut cur = Some(i);
-                while let Some(i) = cur {
-                    assigned_names(&i.then.stmts, out);
-                    cur = match &i.otherwise {
-                        Some(ast::Else::If(next)) => Some(next),
-                        Some(ast::Else::Block(b)) => {
-                            assigned_names(&b.stmts, out);
-                            None
-                        }
-                        None => None,
-                    };
-                }
-            }
-            Stmt::While { body, .. }
-            | Stmt::Loop { body, .. }
-            | Stmt::For { body, .. }
-            | Stmt::Unsafe(body)
-            | Stmt::Defer { body, .. } => {
-                assigned_names(&body.stmts, out);
-            }
-            _ => {}
+        for b in child_blocks(s) {
+            assigned_names(&b.stmts, out);
         }
     }
 }
+
+/// The height of the loops in `stmts`: 0 without loops, otherwise one more
+/// than the height of the loops in the body of the highest one (loops at
+/// any depth in blocks count, as do loops in `catch` blocks).
+fn loop_height(stmts: &[Stmt]) -> u32 {
+    stmts
+        .iter()
+        .map(|s| {
+            let inner = child_blocks(s)
+                .iter()
+                .map(|b| loop_height(&b.stmts))
+                .max()
+                .unwrap_or(0);
+            match s {
+                Stmt::While { .. } | Stmt::Loop { .. } | Stmt::For { .. } => inner + 1,
+                _ => inner,
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The highest loop whose head is searched for among the candidates of
+/// docs/safety.md ("Facts through loops"). A higher loop (one with more
+/// than `SEARCH_HEIGHT - 1` loops nested one in another inside it) takes
+/// the simplest head, which forgets every fact about the variables it
+/// assigns, and its body is checked once. So no chain of nested loops
+/// multiplies the checks by more than the search does for this many
+/// loops, whatever the nesting.
+const SEARCH_HEIGHT: u32 = 4;
 
 /// The locals assigned anywhere in `body`, as seen from before it (for the
 /// facts at a loop's head).
@@ -2448,6 +2479,9 @@ impl<'a> Checker<'a> {
     ///    head is `E` with everything about the variables forgotten;
     /// 4. `N`: `E` loosened to cover the back-edges of check 3. If `N` is
     ///    `W` or doesn't hold, the head is `W`.
+    ///
+    /// A loop higher than [`SEARCH_HEIGHT`] doesn't search: its head is `E`
+    /// with everything about the variables forgotten.
     fn loop_body<T>(
         &mut self,
         cx: &mut FnCx,
@@ -2464,6 +2498,19 @@ impl<'a> Checker<'a> {
         };
         let entry = cx.env.clone();
         let mark = self.mark(cx);
+        // The simplest head: everything about the variables forgotten.
+        let forget_all = |entry: Env| {
+            let mut base = entry;
+            for &local in &assigned {
+                base.forget(local);
+            }
+            base
+        };
+        if 1 + loop_height(body) > SEARCH_HEIGHT {
+            let base = forget_all(entry);
+            let (out, edges) = self.loop_pass(cx, base.clone(), &mut check);
+            return (out, base, edges.exits);
+        }
 
         // 1. E
         let (out, edges) = self.loop_pass(cx, entry.clone(), &mut check);
@@ -2483,10 +2530,7 @@ impl<'a> Checker<'a> {
         let (out, edges) = self.loop_pass(cx, w.clone(), &mut check);
         if !holds(&w, &edges) {
             self.rollback(cx, &mark);
-            let mut base = entry;
-            for &local in &assigned {
-                base.forget(local);
-            }
+            let base = forget_all(entry);
             let (out, edges) = self.loop_pass(cx, base.clone(), &mut check);
             return (out, base, edges.exits);
         }

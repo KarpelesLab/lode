@@ -2,6 +2,7 @@
 // error: cannot prove that this index is less than the length
 // error: cannot prove that this index is less than the length
 // error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
 // error: cannot prove that this subtraction does not overflow `usize`
 package main
 
@@ -63,6 +64,25 @@ fn down_by_two() {
 	var i: usize = 7
 	while i > 0 {
 		i = i - 2
+	}
+}
+
+// A loop of height 5 doesn't search for its head: it forgets what it
+// knew about `i`, and `buf[i]` can't be proven (with one loop less, it is).
+fn too_high() {
+	var buf: [8]u8 = [0; 8]
+	var i = buf.len
+	while i > 0 {
+		i = i - 1
+		buf[i] = 1
+		for a in 0..2 {
+			for b in 0..2 {
+				for d in 0..2 {
+					for e in 0..2 {
+					}
+				}
+			}
+		}
 	}
 }
 

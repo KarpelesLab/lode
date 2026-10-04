@@ -197,9 +197,18 @@ The candidates, in order:
 4. `N`: `E` covering the back-edges of the check from `W`. If `N` doesn't
    hold, the head is `W`.
 
-So the body is checked at most five times (a nested loop is checked that
-often for each check of the loop around it), and only the check from the
+So the body is checked at most five times, and only the check from the
 chosen head counts: errors found from other candidates are not reported.
+
+A nested loop is checked that often for each check of the loop around it,
+so the search is limited by the loop's **height**: a loop with no loop in
+its body has height 1, and any other loop one more than the highest loop in
+its body (at any depth: in branches, arms, `catch` and `defer` blocks). A
+loop higher than 4 doesn't search: its head is `E` with every fact about `A`
+forgotten, and its body is checked once. The loops nested in it still
+search if they are low enough. The height depends only on the program text,
+so this limit never makes acceptance depend on time, and a chain of nested
+loops of any depth costs at most what four nested searches cost.
 Step 1 keeps what the loop doesn't change, step 2 one round of change (a
 variable set to a bounded value on some path), step 3 the bounds that only
 move one way (`i` counting down from `buf.len` keeps `i <= buf.len`), and
