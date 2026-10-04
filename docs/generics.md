@@ -9,10 +9,12 @@ the options, the trade-offs and a recommendation. The decisions only the user
 can make are collected at the end, in
 [Questions for the user](#decisions).
 
-M7a, generic functions over the built-in traits, and M7b, generic structs
-and enums, value parameters and generic methods, are implemented: what the
-compiler does is in [M7a in the compiler](#m7a-in-the-compiler) and
-[M7b in the compiler](#m7b-in-the-compiler). The rest is **Proposed**
+M7a, generic functions over the built-in traits, M7b, generic structs
+and enums, value parameters and generic methods, and M7c, traits and
+`impl` blocks, are implemented: what the compiler does is in
+[M7a in the compiler](#m7a-in-the-compiler),
+[M7b in the compiler](#m7b-in-the-compiler) and
+[M7c in the compiler](#m7c-in-the-compiler). The rest is **Proposed**
 unless a section says otherwise.
 
 ## Principles
@@ -229,7 +231,8 @@ fn List[T: Ordered].sort(inout self) { ... }   // only when T: Ordered
 
 ## Traits
 
-**Status:** Proposed
+**Status:** Implemented (M7c), without `uses`; `Ordered` stays built into
+the compiler ([M7c in the compiler](#m7c-in-the-compiler))
 
 ```
 trait Ordered: Eq {
@@ -268,6 +271,8 @@ trait Encoding {
 
 ### Implementations
 
+**Status:** Decided (question 1); implemented (M7c)
+
 **Options:**
 
 1. **Explicit `impl` blocks** holding the trait's methods (Rust):
@@ -303,7 +308,10 @@ anchor. A method in an impl is called like any method, `p.cmp(q)`. A type's
 method names are one namespace: an impl can't bring a method whose name the
 type already has (as a field, a variant, a method, or a method of another
 impl). The rare clash is resolved by calling through the trait:
-`Ordered.cmp(p, q)`.
+`Ordered.cmp(p, q)`. As implemented, the clash isn't an error at the
+`impl`: `p.cmp(q)` finds the type's own method first, and is an error
+when two impls give the method, which then needs `Ordered.cmp(p, q)`
+([M7c in the compiler](#m7c-in-the-compiler)).
 
 Generic and conditional implementations:
 
@@ -313,6 +321,8 @@ impl[T: Ordered] Ordered for List[T] { ... }
 ```
 
 ### Coherence
+
+**Status:** Recommended (question 5); implemented (M7c)
 
 **Options:** (1) Rust's orphan rule: an impl lives in the trait's package or
 the type's package, and there's at most one impl of a trait for a type in a
@@ -337,13 +347,15 @@ them.
 ## Built-in traits
 
 **Status:** Proposed; `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
-`Signed` implemented (M7a, built into the compiler)
+`Signed` implemented (M7a, built into the compiler), and `impl Ordered`
+for structs and enums (M7c)
 
 Some traits are known to the compiler. They are declared in the standard
 library (`std/core`, name Open) so they have documentation and a place in
-the package graph, but some of their impls come from the compiler. Until
-`trait` declarations exist (M7c), the compiler knows the six of M7a by
-name, and `Ordering` is a built-in enum.
+the package graph, but some of their impls come from the compiler. The
+compiler still knows the six of M7a by name, and `Ordering` is a built-in
+enum: `std/core` and an implicit import of it would be needed to declare
+them in Lode, and nothing needs that yet.
 
 | Trait | Meaning | Who implements it |
 | --- | --- | --- |
@@ -726,11 +738,13 @@ milestone right after, and its containers are the first big user of M7.
 `str` stays built in during M7. Moving to `Str[E]` with an `Encoding` trait
 needs associated types and constants (M7c), plus literals re-encoded at
 compile time; it's a separate step after M7, with `str` remaining the name
-of `Str[utf8]` ([strings.md](strings.md)).
+of `Str[utf8]` ([strings.md](strings.md)). M7c ships the trait and two
+encodings as a library over bytes, `std/encoding`
+([M7c in the compiler](#m7c-in-the-compiler)).
 
 ## Implementation plan
 
-**Status:** M7a, M7b and M7d implemented; M7c and M7e proposed
+**Status:** M7a, M7b, M7c and M7d implemented; M7e proposed
 
 Five steps, each shippable on its own with tests, std changes and docs, as
 the earlier milestones were. Sizes are rough estimates of compiler code
@@ -924,6 +938,98 @@ proposal left room:
   `io.File`, the `Encoding` trait and `utf8` (as a library, beside the
   built-in `str`).
 
+### M7c in the compiler
+
+**Status:** Implemented (2026-10-05)
+
+What M7c does, and the choices made while implementing it where this
+proposal left room:
+
+- **Traits.** `trait Shape: Named + Copy { ... }`, or `pub trait` to be
+  used from other packages, holds one item per line: methods (`self`,
+  `inout self` or `sink self`), associated functions (no `self`), a body
+  for a default method, associated types (`type Rune: Copy + Eq`) and
+  associated constants of an integer type (`const MAX_LEN: usize`). In a
+  trait, `Self` is the implementing type, and `Rune` and `MAX_LEN` are
+  `Self.Rune` and `Self.MAX_LEN`. A default method's body is checked once,
+  with `Self` a type parameter bounded by the trait. A trait that is its
+  own supertrait, directly or not, is an error. A trait isn't generic, and
+  its methods have no generic parameters of their own yet.
+- **Bounds** name traits declared in Lode beside the built-in ones, in the
+  package or another: `[W: io.Writer]`, `[T: Shape + Copy]`. A bound brings
+  its supertraits: with `trait Ranked: Ordered`, `T: Ranked` has `lt`.
+- **Impls.** `impl Shape for Rect { ... }` gives the trait's methods, each
+  with the trait's signature, `Self` replaced by the type: the same
+  parameters, conventions, return type and error type (or none where the
+  trait throws). A missing required method, a method the trait doesn't
+  have, and a signature that differs are errors at the impl, with the
+  signature to write. A default method the impl doesn't give is the
+  trait's. The impl also gives every associated type (`type Rune = u32`)
+  and constant (`const MAX_LEN: usize = 4`, known when compiling). Its
+  type must implement the trait's supertraits, and its associated types
+  their bounds.
+- **What an impl is for.** A named type: a struct, an enum, an integer type
+  or `bool`. A generic type is written with the impl's parameters, one per
+  parameter of the type and in order, as a method of the type names them:
+  `impl[A: Ordered] Ordered for Pair[A]`, `impl[N: usize] Writer for
+  buf.StackBuf[N]`. The type's bounds are implied; the impl's own make it
+  conditional: `Pair[Point]` is `Ordered` only if `Point` is. An impl for
+  a type parameter (`impl[T] Shape for T`) is an error: there are no
+  blanket impls. So is an impl for one instance (`impl Shape for
+  Pair[u8]`): with one impl per trait and named type, it would be the only
+  one for all of `Pair`.
+- **Coherence** (question 5, as recommended). An impl is in the trait's
+  package or the type's. The built-in traits and the primitive types
+  belong to the standard library. A second impl of a trait for a type is an
+  error. `impl Eq` is an error, as equality is derived (question 4, as
+  recommended), and so are `impl Copy` (automatic) and impls of `Integer`,
+  `Unsigned` and `Signed` (sealed).
+- **`impl Ordered`.** A struct or an enum implements the built-in `Ordered`
+  with `fn cmp(self, other: Self) -> Ordering`. It may also give `lt`, `le`,
+  `gt` and `ge` (`-> bool`); the others are `cmp`'s result compared with
+  `.less` or `.greater`. Then `slices.sort`, `math.min` and the rest work
+  on it. `<` still doesn't (question 3). The type must be `Eq`.
+- **Calls.** `p.area()` finds the type's own method first, then the
+  methods its impls give (theirs, or the traits' defaults). The doc's "one
+  namespace" isn't an error at the impl: a clash between the type's method
+  and an impl's is resolved for the type's, and `io.File` has both its own
+  `write` and `Writer`'s. When two impls give the method, the call is an
+  error, and `Shape.area(p)` (or `io.Writer.write(&f, s)`) calls through
+  the trait, with `self` as the first argument, passed as it's declared.
+  An associated function is called on the type: `Rect.unit()`, or
+  `T.unit()` in a generic body. On a type parameter, the built-in
+  `Ordered`'s methods come first, then those of the other bounds; two of
+  which giving a method is an error too.
+- **Generic bodies** are checked once against the traits, as before: a
+  trait's method on `T` has the trait's signature with `Self` as `T`. A user
+  trait gives no operator (`a < b` on `T: Shape` is an error).
+- **Associated items.** `E.Rune` in generic code is a type parameter that
+  stands for each instance's type; `E.MAX_LEN` is a value, like a value
+  parameter: a term for the checker, and an array's length in
+  `[E.MAX_LEN]u8`. On a type, `Utf8.Rune` and `Utf8.MAX_LEN` are what its
+  impl gives. An associated type can't be the error type in `throws` yet.
+- **Dispatch** is static. A trait's method called on a type parameter, or
+  through the trait, is a call of the trait's function with `Self` as its
+  first type argument. `src/mono.rs` makes it a call of the method of
+  `Self`'s impl once `Self` is known, or of an instance of the trait's
+  default; the compile-time evaluator does the same, so a constant can call
+  generic code bounded by a trait. An impl's method's symbol names its
+  trait after the method, since the type may have a method of the same
+  name: `main.Point.cmp<Ordered>`, `std/io.File.write_bytes<std/io.Writer>`;
+  a default method has the trait's name and `Self`:
+  `std/io.Writer[std/buf.StackBuf[4]].write`. The check that instances end
+  follows calls through traits.
+- **std.** `io.Writer` (`write_bytes` required, `write` a default), which
+  `io.File` and `buf.StackBuf[N]` implement, the latter in `std/io`, the
+  trait's package; `std/encoding` with `Encoding` as above (`decode`
+  returns `?Decoded[Rune]`, a struct, since there are no tuples),
+  implemented by `Utf8` and `Ascii`, and `count[E]`. An encoding is an enum
+  of one variant, a type that's never a value: structs without fields
+  aren't supported yet ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
+- **Not yet:** generic traits, trait methods with generic parameters of
+  their own, `uses` in traits, `Format` (M7e), `dyn Trait`, and declaring
+  the built-in traits in Lode.
+
 ### M7d: compile-time evaluation and target selection
 
 - The evaluator with budgets, constants of any storable type computed by
@@ -1060,10 +1166,10 @@ others keep the recommended answer unless the user changes them.
 4. **Equality is derived only:** `Eq` is never written by hand, stays
    automatic as today, and floats (so structs with float fields) aren't
    `Eq`. This closes types.md's "opt-in or automatic" question as automatic.
-   *Recommended, pending.*
+   *Recommended, pending; followed in M7c (`impl Eq` is an error).*
 5. **Coherence:** impls live in the trait's or the type's package, one per
    trait and type, no blanket impls ([Coherence](#coherence)).
-   *Recommended, pending.*
+   *Recommended, pending; implemented in M7c.*
 6. **Per-target code uses package-scope `if comptime`**, not file-name
    suffixes ([What M7 needs](#what-m7-needs)). *Decided; implemented in
    M7d.*

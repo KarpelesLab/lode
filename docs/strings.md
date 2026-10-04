@@ -29,12 +29,16 @@ An `Encoding` is a trait that the standard library implements for `utf8`,
 
 ```
 trait Encoding {
-	type Rune
+	type Rune: Copy + Eq
+	const MAX_LEN: usize                         // the longest rune, in bytes
 	fn decode(bytes: []u8) -> ?(Rune, usize)     // next rune and its length
-	fn encode(r: Rune, set out: [4]u8) -> usize  // Open: max rune length per encoding
+	fn encode(r: Rune, set out: [MAX_LEN]u8) -> usize
 	fn validate(bytes: []u8) -> bool
 }
 ```
+
+The associated constant `MAX_LEN` settles the longest rune of each
+encoding ([generics.md](generics.md#traits)).
 
 User code can define its own encodings (legacy code pages, game ROM charsets and
 so on) with no compiler support.
@@ -110,6 +114,11 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   function's result, or a local that only ever holds those, as in
   `fn Day.name(self) -> str { ... return "Mon" ... }`
   ([memory.md](memory.md#views))
+
+- `std/encoding` has the `Encoding` trait, implemented by `Utf8` and
+  `Ascii`, as a library over bytes: `decode` returns a `Decoded[Rune]`
+  struct, as there are no tuples
+  ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
 
 Not yet: returning a `str` that borrows from a parameter (it needs the view
 rules of [memory.md](memory.md#views)), comparing strings, slicing a `str`

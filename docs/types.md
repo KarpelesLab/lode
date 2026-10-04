@@ -442,7 +442,10 @@ that can change, and it counts for exclusivity like an `&` argument.
   it on the value.
 - A method is a function with `self` as its first parameter. Its linker
   symbol is `<package path>.<T>.<name>` (`std/io.File.write`).
-- No extension methods and no traits yet (M7).
+- The methods of an `impl` are methods of the type too, also in the
+  trait's package ([Generics and traits](#in-the-compiler-today-5)). A call
+  finds the type's own methods first.
+- No extension methods.
 
 ## Operators
 
@@ -470,8 +473,8 @@ high, the only exception we'd consider is a numeric trait with algebraic laws
 
 ## Generics and traits
 
-**Status:** Proposed; generic functions over the built-in traits, generic
-structs and enums, value parameters and generic methods are implemented
+**Status:** Proposed; generic functions, generic structs and enums, value
+parameters, generic methods, traits and `impl` blocks are implemented
 (see [In the compiler today](#in-the-compiler-today-5)). The detailed
 proposal for M7 is in [generics.md](generics.md).
 
@@ -498,18 +501,21 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
   ([backend.md](backend.md)).
 - Dynamic dispatch is explicit: `dyn Trait` (Open: exact form).
 - Traits are implemented in explicit `impl Trait for T { ... }` blocks
-  (Decided, [generics.md](generics.md#decisions)). Coherence: the
-  recommendation is in [generics.md](generics.md#coherence).
+  (Decided, [generics.md](generics.md#decisions)). Coherence: an `impl` is
+  in the trait's package or the type's, one per trait and type
+  ([generics.md](generics.md#coherence)).
 
 ### In the compiler today
 
-**Status:** Implemented subset (M7a and M7b; syntax in
-[syntax.md](syntax.md#generic-functions) and
-[syntax.md](syntax.md#generic-types-and-value-parameters))
+**Status:** Implemented subset (M7a, M7b and M7c; syntax in
+[syntax.md](syntax.md#generic-functions),
+[syntax.md](syntax.md#generic-types-and-value-parameters) and
+[syntax.md](syntax.md#traits-and-impls))
 
 - Generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, with
   bounds from the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`,
-  `Unsigned` and `Signed`, joined with `+`. A generic body is checked once,
+  `Unsigned` and `Signed` and from traits declared in Lode, joined with
+  `+`. A generic body is checked once,
   against its bounds; the errors at a call are about its arguments.
 - `Eq` gives `==` and `!=`. `Ordered` gives the methods `a.cmp(b)` (an
   `Ordering`: `less`, `equal` or `greater`, a C-style enum of `i8` -1, 0
@@ -547,10 +553,25 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
 - Each set of type arguments `main` reaches makes an instance with its
   own symbol: `std/math.max[u32]`, `std/buf.StackBuf[64].push`.
 - Facts about integer type parameters: [safety.md](safety.md#values-of-a-type-parameter).
-- The details are in [generics.md](generics.md#m7a-in-the-compiler) and
-  [generics.md](generics.md#m7b-in-the-compiler).
-- Not yet: `trait` and `impl` (so `Ordered` for structs and enums), `dyn`,
-  refinements on value parameters (`[N: usize where N > 0]`).
+- Traits: `trait Shape { fn area(self) -> u32 ... }` with required and
+  default methods, associated functions (`fn unit() -> Self`), associated
+  types (`type Rune: Copy`) and constants (`const MAX_LEN: usize`), and
+  supertraits (`trait Counter: Named`). `impl Shape for Rect { ... }` gives
+  the methods and the associated items, with the trait's signatures; a
+  generic type's impl names its parameters, and may bound them:
+  `impl[A: Ordered] Ordered for Pair[A]`. Structs and enums implement the
+  built-in `Ordered` with `cmp`. `Eq` stays derived, `Copy` automatic,
+  and the numeric traits sealed.
+- An `impl` is in the trait's package or the type's, one per trait and
+  type, never for a bare type parameter.
+- `p.area()` finds the type's own methods, then its impls'; when two
+  traits give it, `Shape.area(p)` names one. A trait's method on a type
+  parameter is dispatched statically to the impl of each instance.
+- The details are in [generics.md](generics.md#m7a-in-the-compiler),
+  [generics.md](generics.md#m7b-in-the-compiler) and
+  [generics.md](generics.md#m7c-in-the-compiler).
+- Not yet: `dyn`, generic traits, refinements on value parameters
+  (`[N: usize where N > 0]`).
 
 ## `secret` types
 

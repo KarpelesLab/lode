@@ -62,6 +62,17 @@ itself is in the other documents; this one is only about order.
   their own; recursive generic types rejected. std gains `std/buf`
   (`StackBuf[N]`, which `io.print_int` uses for its digits) and `std/vec`
   (`ArrayVec[T, N]`) ([generics.md](generics.md#m7b-in-the-compiler)).
+- **M7c: Traits and `impl` blocks** (2026-10-05). `trait` declarations
+  with required and default methods, associated functions, types and
+  constants, and supertraits; `impl Trait for Type { ... }` for structs,
+  enums and primitives, conditional ones for generic types
+  (`impl[A: Ordered] Ordered for Pair[A]`), in the trait's or the type's
+  package, one per trait and type; `impl Ordered` for structs and enums,
+  so `slices.sort` sorts them. Bounds name user traits, generic bodies
+  call their methods, and calls are dispatched statically, at run time and
+  at compile time. std gains `io.Writer`, implemented by `io.File` and
+  `buf.StackBuf[N]`, and `std/encoding` (the `Encoding` trait, `Utf8`,
+  `Ascii`) ([generics.md](generics.md#m7c-in-the-compiler)).
 - **M7d: Compile-time evaluation and target selection** (2026-10-04). A
   tree-walking evaluator runs constants' values, calls included (`const
   CRC_TABLE: [256]u32 = make_crc_table()`), with the program's semantics,
@@ -91,9 +102,9 @@ Slicing `a[i..j]` compiles only when the checker proves
   options are in [memory.md](memory.md#uninitialized-buffers): option 3's
   type, `StackBuf[N]`, exists, and stops filling once fields can be
   private.
-- **M7c and M7e: the rest of generics and traits**: user traits and
-  `impl` (M7c), and format strings with `comptime` parameters (M7e). The
-  proposal is in [generics.md](generics.md#implementation-plan).
+- **M7e: format strings**, with `comptime` parameters, packs and the
+  `Format` trait, the last step of generics. The proposal is in
+  [generics.md](generics.md#implementation-plan).
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack

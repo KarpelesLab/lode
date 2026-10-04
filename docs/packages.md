@@ -32,15 +32,20 @@ Go's vocabulary, which is proven:
   `package x`. Imports are followed transitively; a cycle is an error.
 - Other imports (anything outside `std/`) aren't supported yet.
 - Only `pub` items can be used from another package, as `pkg.name`, and
-  only `pub` methods: `pkg.Type.new()`, `value.method()`.
+  only `pub` methods: `pkg.Type.new()`, `value.method()`. A `pub trait` is
+  used as `pkg.Trait` in a bound or an `impl`; an `impl`'s methods are as
+  visible as its trait.
 - Linker symbols are `<import path>.<name>` (`std/io.print`), and
   `<import path>.<Type>.<name>` for a method (`std/io.File.write`); the
   program's own package uses its name (`main.main`). An instance of a
   generic function adds its type arguments: `std/math.max[u32]`; a method
   of a generic type has the type's after the type's name:
-  `std/buf.StackBuf[64].push`.
-- So far there are six packages: `std/os`, `std/io`, `std/math`,
-  `std/slices`, `std/buf` and `std/vec`.
+  `std/buf.StackBuf[64].push`. A method of an `impl` names its trait after
+  it: `std/io.File.write_bytes<std/io.Writer>`; a trait's default method
+  has the trait's name and the type:
+  `std/io.Writer[std/buf.StackBuf[16]].write`.
+- So far there are seven packages: `std/os`, `std/io`, `std/math`,
+  `std/slices`, `std/buf`, `std/vec` and `std/encoding`.
 - `std/os` is the Linux system calls, for x86-64 and AArch64 (see
   [Per-target code](#per-target-code)):
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
@@ -91,6 +96,15 @@ Go's vocabulary, which is proven:
     `write(s)` is `write_bytes(s.bytes())`.
   - `File.write_buf[N: usize](self, b: buf.StackBuf[N]) throws(os.Error)`
     writes the bytes written in a `StackBuf`, the same way.
+  - `Writer`, a trait for what bytes are written to:
+    `write_bytes(inout self, b: []u8) throws(os.Error)`, required, and
+    `write(inout self, s: str) throws(os.Error)`, a default that calls it.
+    `File` implements it with its own `write_bytes`, and so does
+    `buf.StackBuf[N]`, which throws `os.Error.no_space` when it's full,
+    after writing what fits. Generic code takes any of them:
+    `fn greet[W: io.Writer](inout w: W) throws(os.Error)`. A `File`'s own
+    `write` comes first in `f.write(s)`; `io.Writer.write(&f, s)` calls the
+    trait's.
   - `print(s: str)` and `eprint(s: str)` write a string to standard output
     and standard error.
   - `print_int[T: Integer](n: T)` writes an integer of any type in decimal
@@ -106,7 +120,8 @@ Go's vocabulary, which is proven:
     they're for output that isn't worth failing over.
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
-    (the integers and `bool`). Their parameters are `sink`, so they need no
+    (the integers, `bool`, and the structs and enums with an
+    `impl Ordered`). Their parameters are `sink`, so they need no
     `Copy`.
   - `abs(x)` for any integer type. It saturates: `abs` of a signed type's
     smallest value is its largest.
@@ -143,6 +158,20 @@ Go's vocabulary, which is proven:
 - Every access in `std/buf` and `std/vec` is proven. Without refinements,
   each method checks the bound it relies on (`end <= N`), since the
   fields are visible and could have been changed.
+- `std/encoding`, character encodings over bytes, beside the built-in
+  `str` ([strings.md](strings.md)):
+  - `Encoding`, a trait with an associated type `Rune` (`Copy + Eq`), an
+    associated constant `MAX_LEN: usize`, and the associated functions
+    `decode(bytes: []u8) -> ?Decoded[Rune]` (the first rune and its length
+    in bytes), `encode(r: Rune, set out: [MAX_LEN]u8) -> usize` and
+    `validate(bytes: []u8) -> bool` (a default).
+  - `Decoded[R]`, a rune and its length: `rune: R`, `len: usize`.
+  - `Utf8` (`Rune` is `u32`, `MAX_LEN` 4; overlong forms, surrogates and
+    values above U+10FFFF are invalid) and `Ascii` (`u8`, 1). An encoding
+    is a type, never a value: `encoding.Utf8.decode(b)`. They're enums of
+    one variant, since structs without fields aren't supported yet.
+  - `count[E: Encoding](bytes: []u8) -> ?usize`, the number of runes, or
+    `none` if `bytes` isn't valid in `E`.
 
 ## Per-target code
 

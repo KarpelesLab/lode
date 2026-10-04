@@ -77,6 +77,13 @@ What works:
   size arrays, with `a[i]` proven once for every `N`; methods of generic
   types, `fn Pair[A, B].swap(self)`, which may add bounds or have their
   own parameters ([docs/generics.md](docs/generics.md#m7b-in-the-compiler))
+- traits: `trait Shape { fn area(self) -> u32 ... }` with default methods,
+  associated functions, types and constants, and supertraits;
+  `impl Shape for Rect { ... }`, and conditional impls for generic types
+  (`impl[A: Ordered] Ordered for Pair[A]`), in the trait's or the type's
+  package; `impl Ordered` for structs and enums, so `slices.sort` sorts
+  them; bounds on user traits (`[W: io.Writer]`), dispatched statically
+  ([docs/generics.md](docs/generics.md#m7c-in-the-compiler))
 - compile-time evaluation: a constant's value can call functions
   (`const CRC_TABLE: [256]u32 = make_crc_table()`), with the same
   semantics as at run time, and be a struct, an enum or an optional; an
@@ -91,7 +98,8 @@ What works:
 - packages: `import "std/..."`, `pub`, `pkg.name`; `std/math` (`min`,
   `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
-  (bytes) and `std/vec.ArrayVec[T, N]`
+  (bytes) and `std/vec.ArrayVec[T, N]`; `io.Writer`, implemented by files
+  and buffers; `std/encoding` (UTF-8 and ASCII over bytes)
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic
 - output: `io.print` for strings, `io.print_int` for integers of any type

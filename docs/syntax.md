@@ -567,6 +567,98 @@ fn main() {
 - `Name[u8, bool].new(...)` calls an associated function with the type's
   arguments; `Name.new(...)` infers them.
 
+## Traits and impls
+
+**Status:** Proposed; implemented in the compiler (M7c, semantics in
+[types.md](types.md#in-the-compiler-today-5) and
+[generics.md](generics.md#m7c-in-the-compiler))
+
+```
+import "std/io"
+import "std/os"
+
+pub trait Shape: Copy {
+	type Unit: Copy
+	const SIDES: u8
+
+	fn area(self) -> u32                    // required
+	fn unit() -> Self                       // an associated function
+
+	fn double(self) -> u32 {                // a default method
+		return self.area() *| 2
+	}
+}
+
+struct Rect {
+	w: u32
+	h: u32
+}
+
+impl Shape for Rect {
+	type Unit = u32
+	const SIDES: u8 = 4
+
+	fn area(self) -> u32 {
+		return self.w *| self.h
+	}
+
+	fn unit() -> Rect {
+		return Rect{w: 1, h: 1}
+	}
+}
+
+struct Pair[A] {
+	first: A
+	second: A
+}
+
+impl[A: Ordered] Ordered for Pair[A] {
+	fn cmp(self, other: Self) -> Ordering {
+		return self.first.cmp(other.first)
+	}
+}
+
+fn total[S: Shape](xs: []S) -> u32 {
+	var sum: u32 = 0
+	for i in 0..xs.len {
+		sum = sum +| xs[i].area()
+	}
+	return sum
+}
+
+fn greet[W: io.Writer](inout w: W) throws(os.Error) {
+	try w.write("hello\n")
+}
+
+fn main() {
+	let r = Rect.unit()
+	let n = r.double() +| Shape.area(r) +| u32(Rect.SIDES)
+	var f = io.stdout()
+	greet(&f) catch _ {}
+}
+```
+
+- `trait Name: Super + Other { ... }` holds one item per line: `fn`
+  declarations, with a body for a default method or without one for a
+  required method; `type Name: Bounds`; `const NAME: T`. A method's `self`
+  has no type, as in `fn T.name`; a method in a trait or an `impl` is
+  written `fn name(...)`, without its type. Items have no `pub`: they're as
+  visible as the trait. `pub trait` makes the trait usable from other
+  packages.
+- `impl Trait for Type { ... }` gives the methods (each with a body),
+  `type Name = T` and `const NAME: T = value`. An `impl` has no `pub`.
+- `impl[A: Bound, N: usize] Trait for Name[A, N]` declares the parameters
+  of an impl for a generic type, one per parameter of the type, in order.
+  `impl[` has no space.
+- A bound names a trait of the package or of an imported one:
+  `[W: io.Writer]`, `impl io.Writer for Counter`.
+- `Self` is the implementing type. In a trait, its associated items can be
+  named alone (`Unit`, `SIDES`) or as `Self.Unit`; in a generic body, as
+  `T.Unit` and `T.SIDES`; on a type, as `Rect.SIDES`.
+- `x.method()` and `T.function()` call a trait's methods and associated
+  functions; `Trait.method(x, ...)` calls one through its trait, with `self`
+  as the first argument (`&x` for `inout self`).
+
 ## Compile-time code
 
 **Status:** Proposed; implemented in the compiler (M7d, semantics in
