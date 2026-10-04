@@ -23,6 +23,11 @@ pub struct File {
 	fd: i32
 }
 
+/// Standard input.
+pub fn stdin() -> File {
+	return File{fd: os.STDIN}
+}
+
 /// Standard output.
 pub fn stdout() -> File {
 	return File{fd: os.STDOUT}
@@ -47,6 +52,60 @@ pub fn File.write_bytes(self, b: []u8) throws(os.Error) {
 	let n = os.write_all(self.fd, b)
 	if n < 0 {
 		throw os.error(n)
+	}
+}
+
+/// Read from the file into `buf`: returns the number of bytes read, which is
+/// 0 only at the end of the input (or if `buf` is empty), and may be fewer
+/// than `buf.len` even before the end (a pipe or a terminal gives what it
+/// has). Throws the error that stopped it. An interrupted call is retried.
+pub fn File.read(self, inout buf: []u8) throws(os.Error) -> usize {
+	loop {
+		var n: isize
+		unsafe {
+			n = os.read(self.fd, buf.ptr, buf.len)
+		}
+		if n == -os.EINTR {
+			continue
+		}
+		if n < 0 {
+			throw os.error(n)
+		}
+		// The kernel never reads more than asked.
+		if usize(n) > buf.len {
+			throw .io
+		}
+		return usize(n)
+	}
+}
+
+/// Read from the file until `buf` is full or the input ends: returns the
+/// number of bytes read, which is less than `buf.len` only at the end of the
+/// input. Throws the error that stopped it; the bytes read before it are in
+/// `buf`, but their count is lost.
+pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize {
+	var got: usize = 0
+	loop {
+		if got >= buf.len {
+			return got
+		}
+		var n: isize
+		unsafe {
+			n = os.read(self.fd, buf.ptr + got, buf.len - got)
+		}
+		if n == -os.EINTR {
+			continue
+		}
+		if n < 0 {
+			throw os.error(n)
+		}
+		if n == 0 {
+			return got
+		}
+		if usize(n) > buf.len - got {
+			throw .io
+		}
+		got = got + usize(n)
 	}
 }
 

@@ -1,0 +1,66 @@
+// stdin:   1234567\n
+// stdout: 2469134\n
+package main
+
+import "std/io"
+
+enum ParseError {
+	empty
+	bad_digit
+	overflow
+}
+
+// The decimal number in the first `n` bytes of `b`, after optional spaces
+// and up to a space or a newline.
+fn parse(b: []u8, n: usize) throws(ParseError) -> u64 {
+	if n > b.len {
+		throw .overflow
+	}
+	var i: usize = 0
+	while i < n && b[i] == ' ' {
+		i += 1
+	}
+	var v: u64 = 0
+	var digits: u32 = 0
+	while i < n {
+		let c = b[i]
+		if c == ' ' || c == '\n' {
+			break
+		}
+		if c < '0' || c > '9' {
+			throw .bad_digit
+		}
+		// At most 18 digits, which fit with room to spare. (The checker
+		// can't use `d > MAX - v` to prove that `v + d` fits.)
+		if v >= 100000000000000000 {
+			throw .overflow
+		}
+		v = v * 10 + u64(c - '0')
+		digits +%= 1
+		i += 1
+	}
+	if digits == 0 {
+		throw .empty
+	}
+	return v
+}
+
+// Read a number from standard input and print it doubled. `read_full` reads
+// until the buffer is full or the input ends.
+fn main() -> u8 {
+	var buf: [32]u8 = [0; 32]
+	let n = io.stdin().read_full(&buf) catch _ {
+		return 1
+	}
+	let v = parse(buf, n) catch _ {
+		return 2
+	}
+	// `parse` gives less than 10^18, but the checker doesn't follow a
+	// value's range out of a function.
+	if v > 0x7fffffffffffffff {
+		return 3
+	}
+	io.print_u64(v * 2)
+	io.print("\n")
+	return 0
+}

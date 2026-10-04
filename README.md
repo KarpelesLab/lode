@@ -70,6 +70,9 @@ What works:
   integers (and `io.eprint...` for standard error), which ignore errors, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`
+- input: `io.stdin().read(&buf)` (the bytes it got, 0 at the end) and
+  `io.stdin().read_full(&buf)` (until `buf` is full or the input ends),
+  which throw an `os.Error`; `os.exit(code)` ends the process at once
 - `s.bytes()`, the bytes of a `str` as a read-only `[]u8`, and returning a
   `str` literal from a function (`fn Day.name(self) -> str`)
 - the proof rules from [docs/safety.md](docs/safety.md): plain
@@ -129,7 +132,8 @@ The canonical format is described in
 
 `cargo test` runs unit tests, the integration tests in `tests/`, and the
 programs in `tests/programs/`; each program declares its expected exit status,
-standard output or errors in its first comment lines.
+standard output or errors in its first comment lines, and can give its
+standard input there too (`// stdin: text`).
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on x86-64
 Linux for every push to `master` and every pull request: `cargo fmt --check`,

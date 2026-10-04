@@ -40,15 +40,37 @@ Go's vocabulary, which is proven:
 - `std/os` is the Linux x86-64 system calls:
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
     the bytes, retrying), which return a negative error number on failure.
-  - `Error`, the errors std reports, from the error numbers `write` can
-    give: `bad_fd` (`EBADF`), `broken_pipe` (`EPIPE`), `no_space`
+  - `read(fd, data: *u8, len: usize) -> isize` (one `read` system call,
+    `unsafe` like `write`): the number of bytes read, 0 at the end of the
+    input, or a negative error number.
+  - `exit(code: i32)` ends the process at once with status `code` (its low
+    8 bits). It's the `exit_group` system call, so it ends every thread, not
+    only the calling one. No `defer` or `errdefer` body runs, in the
+    function or its callers. Output isn't lost: there's no buffer, every
+    write is a system call. The language has no `never` type yet, so `exit`
+    returns `()` as far as the checker knows: a function that returns a
+    value still needs a `return` after the call, which never runs.
+  - `Error`, the errors std reports, from the error numbers `write` and
+    `read` can give: `bad_fd` (`EBADF`), `broken_pipe` (`EPIPE`), `no_space`
     (`ENOSPC`, `EDQUOT`), `io` (`EIO`, or a result the kernel never gives),
     and `other(errno)` for any other number. `error(n)` converts a failed
     call's result to an `Error`.
 - `std/io`:
   - `File`, an open file: a struct holding its file descriptor,
     `File{fd: i32}`. It doesn't close the file (there's no way to open one
-    yet). `stdout()` and `stderr()` return the standard ones.
+    yet). `stdin()`, `stdout()` and `stderr()` return the standard ones.
+  - `File.read(self, inout buf: []u8) throws(os.Error) -> usize` reads into
+    `buf` once and returns the number of bytes read: 0 only at the end of
+    the input (or for an empty `buf`), and possibly fewer than `buf.len`
+    before it, as a pipe or a terminal gives what it has. An interrupted
+    call (`EINTR`) is retried. `let n = try io.stdin().read(&buf)`.
+  - `File.read_full(self, inout buf: []u8) throws(os.Error) -> usize` reads
+    until `buf` is full or the input ends, so it returns less than
+    `buf.len` only at the end of the input. If it throws, the bytes read
+    before the error are in `buf`, but their count is lost.
+  - There's no slicing yet (`buf[0..n]`), so a program can't pass the first
+    `n` bytes of a buffer it read to `write_bytes` without a pointer and
+    `unsafe` (tests/programs/stdin_cat.lode).
   - `File.write(self, s: str) throws(os.Error)` writes all of `s`, or
     throws the error that stopped it. It's the checked way to write:
     `try io.stdout().write(s)`.

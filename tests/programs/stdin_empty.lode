@@ -1,0 +1,40 @@
+// stdout: ok\n
+package main
+
+import "std/io"
+
+// Without a `// stdin:` line, standard input is empty: every read gives 0.
+// A file descriptor that isn't open for reading throws `bad_fd`.
+fn main() -> u8 {
+	var buf: [16]u8 = [0; 16]
+	let n = io.stdin().read(&buf) catch _ {
+		return 1
+	}
+	if n != 0 {
+		return 2
+	}
+	// The end of the input stays the end.
+	let m = io.stdin().read_full(&buf) catch _ {
+		return 3
+	}
+	if m != 0 {
+		return 4
+	}
+	// Not an open file descriptor.
+	let bad = io.File{fd: 99}
+	bad.read(&buf) catch e {
+		match e {
+			bad_fd => {}
+			_ => return 5
+		}
+	}
+	// Standard output is open, but not for reading.
+	io.stdout().read_full(&buf) catch e {
+		match e {
+			bad_fd => {}
+			_ => return 6
+		}
+	}
+	io.print("ok\n")
+	return 0
+}

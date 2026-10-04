@@ -1,0 +1,39 @@
+// stdin: one\n
+// stdin: two\n
+// stdin: \n
+// stdin: four, the longest line of all\n
+// stdin: five
+// stdout: 43 bytes, 4 newlines\n
+package main
+
+import "std/io"
+
+// Count the bytes and newlines of standard input. The buffer is smaller than
+// the input, so it takes several reads, each giving at most `buf.len` bytes.
+fn main() -> u8 {
+	var buf: [7]u8 = [0; 7]
+	var bytes: u64 = 0
+	var lines: u64 = 0
+	loop {
+		let n = io.stdin().read(&buf) catch _ {
+			return 1
+		}
+		if n == 0 {
+			break
+		}
+		if n > buf.len {
+			return 2 // never: `read` returns at most `buf.len`
+		}
+		for i in 0..n {
+			if buf[i] == '\n' {
+				lines +%= 1
+			}
+		}
+		bytes +%= n
+	}
+	io.print_u64(bytes)
+	io.print(" bytes, ")
+	io.print_u64(lines)
+	io.print(" newlines\n")
+	return 0
+}

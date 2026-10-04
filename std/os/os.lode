@@ -7,7 +7,9 @@
 package os
 
 /// Linux x86-64 system call numbers.
+const SYS_READ = 0
 const SYS_WRITE = 1
+const SYS_EXIT_GROUP = 231
 
 /// Linux error numbers (a failed system call returns their negation).
 pub const EINTR: isize = 4
@@ -61,6 +63,15 @@ pub const STDIN: i32 = 0
 pub const STDOUT: i32 = 1
 pub const STDERR: i32 = 2
 
+/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of
+/// bytes read (0 at the end of the input, possibly fewer than `len`), or a
+/// negative error number.
+///
+/// The caller must ensure `data` points to `len` writable bytes.
+pub unsafe fn read(fd: i32, data: *u8, len: usize) -> isize {
+	return syscall(SYS_READ, fd, data, len)
+}
+
 /// Write the `len` bytes at `data` to `fd`, once. Returns the number of bytes
 /// written (possibly fewer than `len`), or a negative error number.
 ///
@@ -103,4 +114,21 @@ pub fn write_all(fd: i32, b: []u8) -> isize {
 		}
 	}
 	return -EIO
+}
+
+/// End the process now, with exit status `code` (the parent sees its low 8
+/// bits).
+///
+/// This is the `exit_group` system call, which ends every thread of the
+/// process, not only the calling one (`exit`). Nothing else runs: no `defer`
+/// or `errdefer` body, in this function or its callers. There's no output
+/// buffer to lose, since every write is a system call.
+///
+/// The language has no `never` type yet, so `exit` returns `()` as far as
+/// the checker knows: a function that must return a value still needs a
+/// `return` after it, which never runs.
+pub fn exit(code: i32) {
+	unsafe {
+		syscall(SYS_EXIT_GROUP, code)
+	}
 }

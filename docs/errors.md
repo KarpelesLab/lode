@@ -138,7 +138,7 @@ and `errdefer` cover the rest.
   `throw`, `try` that fails, `break` and `continue` that leaves it, in
   reverse order. `errdefer` runs only when the function leaves with an
   error, and only in a function that throws. A `return` runs them after
-  computing its value.
+  computing its value. `os.exit` ends the process without running any.
 - A `defer` body can't leave itself (`return`, `throw`, `try`, or a
   `break` or `continue` out of it), and can't assign variables declared
   outside it, or pass them `inout` or `set`. So running it changes no
