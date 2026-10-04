@@ -1,0 +1,75 @@
+/// Fixed-capacity byte buffers.
+package buf
+
+/// What a buffer's operations throw.
+pub enum Error {
+	/// There's no room left at that end.
+	full
+}
+
+/// A buffer of at most `N` bytes, written at either end: the bytes written
+/// so far are `bytes[start..end]`, and only those are read. Appending
+/// (`push`) and prepending (`push_front`) check that there's room, so
+/// every access is proven. The buffer lives where it's declared, on the
+/// stack for a local.
+///
+/// `new` still fills the storage with zeros: until fields can be private,
+/// any code could read the bytes outside the written part
+/// (docs/memory.md, "Uninitialized buffers").
+pub struct StackBuf[N: usize] {
+	bytes: [N]u8
+	start: usize
+	end: usize
+}
+
+/// An empty buffer that `push` fills from the front of its storage.
+pub fn StackBuf[N].new() -> StackBuf[N] {
+	return StackBuf{bytes: [0; N], start: 0, end: 0}
+}
+
+/// An empty buffer that `push_front` fills from the back of its storage,
+/// such as for the digits of a number, last digit first.
+pub fn StackBuf[N].new_end() -> StackBuf[N] {
+	return StackBuf{bytes: [0; N], start: N, end: N}
+}
+
+/// The number of bytes written.
+pub fn StackBuf[N].len(self) -> usize {
+	if self.start > self.end {
+		return 0
+	}
+	return self.end - self.start
+}
+
+/// Write `b` after the bytes written so far, or throw `full` when the
+/// storage's end is reached.
+pub fn StackBuf[N].push(inout self, b: u8) throws(Error) {
+	if self.end >= N {
+		throw .full
+	}
+	self.bytes[self.end] = b
+	self.end += 1
+}
+
+/// Write `b` before the bytes written so far, or throw `full` when the
+/// storage's front is reached.
+pub fn StackBuf[N].push_front(inout self, b: u8) throws(Error) {
+	let s = self.start
+	if s == 0 || s > N {
+		throw .full
+	}
+	let at = s - 1
+	self.bytes[at] = b
+	self.start = at
+}
+
+/// Byte `i` of the bytes written (0 is the first), or `none` past them.
+pub fn StackBuf[N].get(self, i: usize) -> ?u8 {
+	// `start + i`, or the largest `usize` if it's larger, which is past
+	// the end.
+	let at = self.start +| i
+	if at >= self.end || at >= N {
+		return none
+	}
+	return self.bytes[at]
+}

@@ -1,6 +1,7 @@
 /// Input and output.
 package io
 
+import "std/buf"
 import "std/os"
 
 /// Write `s` to standard output.
@@ -53,6 +54,19 @@ pub fn File.write_bytes(self, b: []u8) throws(os.Error) {
 	if n < 0 {
 		throw os.error(n)
 	}
+}
+
+/// Write the bytes written in the buffer `b` to the file, or throw the
+/// error that stopped it.
+pub fn File.write_buf[N: usize](self, b: buf.StackBuf[N]) throws(os.Error) {
+	let start = b.start
+	let end = b.end
+	// A `StackBuf` keeps `start <= end <= N`; its fields are visible, so
+	// that's checked here.
+	if start > end || end > N {
+		throw .io
+	}
+	try self.write_bytes(b.bytes[start..end])
 }
 
 /// Read from the file into `buf`: returns the number of bytes read, which is
@@ -137,29 +151,29 @@ fn magnitude(n: i64) -> u64 {
 /// Write `n` in decimal to `fd`, after a `-` if `negative`, in one
 /// `os.write_all` (errors are ignored, like `print`'s).
 ///
-/// The digits go into a buffer from the end, and element 0 is kept for the
-/// sign. 20 digits hold the largest `u64`, so the loop always ends when `v`
-/// is 0; `i <= 1` is what proves there's room (the checker doesn't count
-/// digits), and it leaves `i >= 1` for the sign. The output is the slice
-/// `buf[i..]`.
+/// The digits go into a buffer from the end, last digit first. 20 digits
+/// hold the largest `u64`, and the sign takes one more byte, so the buffer
+/// is never full; the checker doesn't count digits, so that's handled.
 fn write_decimal(fd: i32, n: u64, negative: bool) {
-	var buf: [21]u8 = [0; 21]
-	var i = buf.len - 1
+	var digits = buf.StackBuf[21].new_end()
 	var v = n
 	loop {
-		buf[i] = '0' + u8(v % 10)
+		digits.push_front('0' + u8(v % 10)) catch _ {
+			return
+		}
 		v = v / 10
 		if v == 0 {
 			break
 		}
-		if i <= 1 {
-			break
-		}
-		i = i - 1
 	}
 	if negative {
-		i = i - 1
-		buf[i] = '-'
+		digits.push_front('-') catch _ {
+			return
+		}
 	}
-	os.write_all(fd, buf[i..])
+	let start = digits.start
+	let end = digits.end
+	if start <= end && end <= digits.bytes.len {
+		os.write_all(fd, digits.bytes[start..end])
+	}
 }

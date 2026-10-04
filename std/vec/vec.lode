@@ -1,0 +1,70 @@
+/// Fixed-capacity vectors.
+package vec
+
+/// What a vector's operations throw.
+pub enum Error {
+	/// The vector holds `N` elements already.
+	full
+}
+
+/// A list of at most `N` elements of type `T`, stored in place (on the
+/// stack for a local): no allocation. The first `count` slots hold the
+/// elements, the others are `none`.
+///
+/// The elements must be `Copy` for now: an empty slot is a `none` copied
+/// into each, and a `T` that isn't `Copy` can't be moved out of a slot
+/// (docs/generics.md, `Copy` and moves).
+pub struct ArrayVec[T: Copy, N: usize] {
+	slots: [N]?T
+	count: usize
+}
+
+/// An empty vector.
+pub fn ArrayVec[T, N].new() -> ArrayVec[T, N] {
+	return ArrayVec{slots: [none; N], count: 0}
+}
+
+/// The number of elements.
+pub fn ArrayVec[T, N].len(self) -> usize {
+	return self.count
+}
+
+/// Add `v` at the end, or throw `full` if there are `N` elements already.
+pub fn ArrayVec[T, N].push(inout self, v: T) throws(Error) {
+	if self.count >= N {
+		throw .full
+	}
+	self.slots[self.count] = v
+	self.count += 1
+}
+
+/// Remove the last element and return it, or `none` if there's none.
+pub fn ArrayVec[T, N].pop(inout self) -> ?T {
+	let n = self.count
+	if n == 0 || n > N {
+		return none
+	}
+	let last = n - 1
+	let v = self.slots[last]
+	self.slots[last] = none
+	self.count = last
+	return v
+}
+
+/// Element `i` (0 is the first), or `none` past the last.
+pub fn ArrayVec[T, N].get(self, i: usize) -> ?T {
+	if i >= self.count || i >= N {
+		return none
+	}
+	return self.slots[i]
+}
+
+/// Replace element `i` with `v`; `false` (and no change) if there's no
+/// element `i`.
+pub fn ArrayVec[T, N].put(inout self, i: usize, v: T) -> bool {
+	if i >= self.count || i >= N {
+		return false
+	}
+	self.slots[i] = v
+	return true
+}
