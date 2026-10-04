@@ -1,0 +1,246 @@
+// stdout: 3 4 30 40 1 2\n
+// stdout: 45 100 10 true\n
+// stdout: 7 9 7 7 false\n
+// stdout: 24 21 16 9\n
+// stdout: true false true\n
+// stdout: 10 20 true 99 3\n
+// stdout: 55 6 165\n
+// stdout: 8 1 3\n
+package main
+
+import "std/io"
+
+// Struct locals used only field by field are split into one slot per
+// scalar (src/lower.rs, `split_locals`). Each function here mixes such
+// uses with the ones that keep a local in memory.
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+struct Rect {
+	min: Point
+	max: Point
+}
+
+struct Counter {
+	total: u32
+	steps: u32
+	seen: bool
+}
+
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+fn space() {
+	io.print(" ")
+}
+
+fn print_bool(b: bool) {
+	if b {
+		io.print("true")
+	} else {
+		io.print("false")
+	}
+}
+
+fn make(x: i32, y: i32) -> Point {
+	return Point{x: x, y: y}
+}
+
+fn area(r: Rect) -> i32 {
+	return (r.max.x -% r.min.x) *% (r.max.y -% r.min.y)
+}
+
+fn bump(inout n: i32) {
+	n = n +% 1
+}
+
+fn grow(inout r: Rect) {
+	r.max.x = r.max.x +% 1
+}
+
+// Nested fields read and written, a nested struct assigned whole, and
+// fields swapped through a literal that reads the local itself.
+fn nested() {
+	var r = Rect{min: Point{x: 1, y: 2}, max: Point{x: 3, y: 4}}
+	io.print_int(r.max.x)
+	space()
+	io.print_int(r.max.y)
+	space()
+	r.max = Point{x: r.max.x *% 10, y: r.max.y *% 10}
+	io.print_int(r.max.x)
+	space()
+	io.print_int(r.max.y)
+	space()
+	r.min = Point{x: r.min.y, y: r.min.x}
+	r.min = Point{x: r.min.y, y: r.min.x}
+	io.print_int(r.min.x)
+	space()
+	io.print_int(r.min.y)
+	io.print("\n")
+}
+
+// Fields updated in loops, with `continue` and `break`, and a struct
+// declared in the loop body.
+fn loops() {
+	var c = Counter{total: 0, steps: 0, seen: false}
+	for i in 0..10 {
+		let step = Point{x: i32(i), y: i32(i) *% 2}
+		if step.x <= 0 {
+			continue
+		}
+		c.total = c.total +% u32(step.x)
+		c.steps +%= 1
+		if step.y == 18 {
+			c.seen = true
+		}
+	}
+	var p = Point{x: 0, y: 0}
+	while p.x < 100 {
+		p.y = p.y +% p.x
+		p.x = p.x +% 10
+		if p.y >= 90 {
+			break
+		}
+	}
+	io.print_int(c.total)
+	space()
+	io.print_int(p.y)
+	space()
+	io.print_int(c.steps +% 1)
+	space()
+	print_bool(c.seen)
+	io.print("\n")
+}
+
+// A struct passed to a function after its fields were updated (so it
+// stays in memory), next to one that's only copied and compared.
+fn passed() {
+	var a = Point{x: 3, y: 9}
+	a.x = a.x +% 4
+	let b = Point{x: a.y, y: a.x}
+	let r = Rect{min: b, max: a}
+	io.print_int(r.max.x)
+	space()
+	io.print_int(r.min.x)
+	space()
+	var s = Rect{min: Point{x: 0, y: 0}, max: Point{x: 1, y: 1}}
+	s.max.x = 3
+	s.max.y = 7
+	grow(&s)
+	io.print_int(area(s) -% 21)
+	space()
+	io.print_int(s.max.y)
+	space()
+	print_bool(a == b)
+	io.print("\n")
+}
+
+// Structs assigned from calls, into a local and into a field, and one
+// whose scalar field is passed `inout`.
+fn from_calls() {
+	var p = make(10, 20)
+	p = make(p.y, p.x)
+	var r = Rect{min: make(1, 2), max: p}
+	r.min = make(r.min.y, r.max.y)
+	bump(&p.x)
+	bump(&p.x)
+	io.print_int(r.min.x +% p.x)
+	space()
+	io.print_int(r.max.x +% 1)
+	space()
+	io.print_int(r.min.y +% 6)
+	space()
+	io.print_int(r.max.y -% 1)
+	io.print("\n")
+}
+
+// Equality between split locals, with a literal, and with a struct in
+// memory.
+fn equality() {
+	let a = Rect{min: Point{x: 1, y: 2}, max: Point{x: 3, y: 4}}
+	var b = a
+	let same = a == b
+	b.max.y = 5
+	let in_memory = make(1, 2)
+	print_bool(same && a.min == in_memory)
+	space()
+	print_bool(a == b)
+	space()
+	print_bool(b != a && b.max != (Point{x: 3, y: 4}))
+	io.print("\n")
+}
+
+// Struct locals in generic functions, split in each instance.
+fn swapped[A: Copy, B: Copy](p: Pair[A, B]) -> Pair[B, A] {
+	var out = Pair{first: p.second, second: p.first}
+	let again = Pair{first: out.second, second: out.first}
+	out.first = again.second
+	return out
+}
+
+fn sum_firsts[T: Integer](a: T, b: T) -> T {
+	var acc = Pair{first: a, second: b}
+	acc.first = acc.first +% acc.second
+	let copy = acc
+	return copy.first
+}
+
+fn generics() {
+	let p = Pair{first: u32(10), second: true}
+	let q = swapped(p)
+	let r = swapped(Pair{first: u8(3), second: u16(99)})
+	io.print_int(q.second)
+	space()
+	io.print_int(sum_firsts(u64(12), u64(8)))
+	space()
+	print_bool(q.first)
+	space()
+	io.print_int(r.first)
+	space()
+	io.print_int(r.second)
+	io.print("\n")
+}
+
+// A struct in a `defer`, and a struct returned from a loop.
+fn fib_pair(n: u32) -> Pair[u64, u64] {
+	var f = Pair{first: u64(0), second: u64(1)}
+	for i in 0..n {
+		let next = f.first +% f.second
+		f.first = f.second
+		f.second = next
+	}
+	return f
+}
+
+fn deferred() {
+	var p = Point{x: 1, y: 2}
+	defer io.print("\n")
+	defer io.print_int(p.x *% 3)
+	p.x = 55
+	io.print_int(p.x)
+	space()
+	io.print_int(p.y *% 3)
+	space()
+}
+
+fn main() {
+	nested()
+	loops()
+	passed()
+	from_calls()
+	equality()
+	generics()
+	deferred()
+	let f = fib_pair(6)
+	io.print_int(f.first)
+	space()
+	io.print_int(f.second -% f.first -% 4)
+	space()
+	io.print_int(fib_pair(4).first)
+	io.print("\n")
+}

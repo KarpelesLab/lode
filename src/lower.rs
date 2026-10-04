@@ -88,6 +88,17 @@
 //! let` or a `let ... else` on a call stores its value in. The packed form
 //! of a value is unique, so `==` compares two packed values as integers.
 //!
+//! A struct local is split into one slot per scalar field (recursively
+//! through nested structs), each promoted by mem2reg on its own, when it's
+//! only used field by field ([`split_locals`] has the exact rule): `p.x`
+//! reads a slot, `p.x = v` writes one, `let p = e` and `p = e` write them
+//! all (from a literal field by field, or from a value in memory scalar by
+//! scalar), `==` compares them pairwise, and a copy into memory (`return
+//! p`, a field of a literal) stores each one. A local passed to a call,
+//! read whole any other way, or whose address is taken (`&p`) stays in
+//! memory: copying it into a temporary for such a use costs more than the
+//! split saves. `&p.x` of a scalar field is that field's slot.
+//!
 //! A local that a loop body declares, and that nothing outside the body
 //! names, is dead at the end of each iteration: poison is stored in its
 //! slots there ([`iteration_locals`]), so mem2reg doesn't carry its value
@@ -305,6 +316,9 @@ enum Slot {
     /// An `i64` slot holding a value in packed form (see
     /// [`packed_locals`]), of this type.
     Packed(ValueId, Ty),
+    /// A struct split into one slot per scalar ([`split_locals`]): the
+    /// index of its slots in [`FnLower::splits`].
+    Split(usize),
 }
 
 /// Lower a checked program to an IR module named `name`.
@@ -413,6 +427,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             string_lens: &program.strings,
             tables: &table_globals,
             slots: Vec::new(),
+            splits: Vec::new(),
             addrs: HashMap::new(),
             loops: Vec::new(),
             names: Vec::new(),
@@ -493,6 +508,9 @@ struct FnLower<'a> {
     /// The global of each array constant.
     tables: &'a [GlobalId],
     slots: Vec<Slot>,
+    /// The slots of each split local ([`Slot::Split`]): one per scalar,
+    /// in the order of [`leaf_tys`], with its type.
+    splits: Vec<Vec<(ValueId, Ty)>>,
     /// The addresses [`byte_offset`](Self::byte_offset) made, by block,
     /// base and offset.
     addrs: HashMap<(BlockId, ValueId, u64), ValueId>,
@@ -708,6 +726,215 @@ fn uses_in_place(place: &TExpr, packed: &mut [bool]) {
     }
 }
 
+/// The most scalars a split local has ([`split_locals`]).
+const SPLIT_LIMIT: usize = 16;
+
+/// The scalars a value of type `ty` is split into, in order: a `bool`, an
+/// integer or a pointer is itself, `()` is none, and a struct is its
+/// fields' scalars in declaration order. `None` for any other type, or a
+/// struct with an array, an enum, an optional, a result or a view in it.
+fn leaf_tys(ty: Ty) -> Option<Vec<Ty>> {
+    fn add(ty: Ty, out: &mut Vec<Ty>) -> bool {
+        match ty {
+            Ty::Bool | Ty::Int(_) | Ty::Ptr(_) => {
+                out.push(ty);
+                true
+            }
+            Ty::Unit => true,
+            _ => match ty.as_struct() {
+                Some(def) => def.fields.iter().all(|f| add(f.ty, out)),
+                None => false,
+            },
+        }
+    }
+    let mut out = Vec::new();
+    add(ty, &mut out).then_some(out)
+}
+
+/// The number of scalars of a type [`leaf_tys`] splits.
+fn leaf_count(ty: Ty) -> usize {
+    leaf_tys(ty).expect("a type that splits").len()
+}
+
+/// The local `e` is, or is a field of through field accesses only (`p`,
+/// `p.min.x`).
+fn field_root(e: &TExpr) -> Option<LocalId> {
+    match &e.kind {
+        TExprKind::Local(l) => Some(*l),
+        TExprKind::Field(base, _) => field_root(base),
+        _ => None,
+    }
+}
+
+/// Which locals of `f` are split into one slot per scalar ([`leaf_tys`]),
+/// each of which LF's mem2reg promotes to a register: the locals of a
+/// struct type with at most [`SPLIT_LIMIT`] scalars, all of them `bool`s,
+/// integers, pointers or structs of them, that aren't parameters and are
+/// only used field by field:
+/// - `p.x`, `p.min.x`: reads the slot of a scalar field;
+/// - `p.x = v`, `p.min = q`, `p.x += 1`: writes the slots of a field;
+/// - `let p = e`, `var p = e`, `p = e`: writes every slot, from a struct
+///   literal (field by field), another split local, or any other value
+///   in memory (a call's result, an element, a field of a parameter),
+///   read scalar by scalar;
+/// - `p == q`, `p != q`: compares scalar by scalar;
+/// - `p` or `p.min` copied into memory, scalar by scalar: `return p`,
+///   `throw p`, `q = p` for a `q` in memory, `ps[i] = p`, a field of a
+///   struct literal, an element of an array literal or a payload of a
+///   variant that's stored or compared;
+/// - `&p.x` of a scalar field (an `inout` or `set` argument): the address
+///   of that field's own slot, which then stays in memory alone.
+///
+/// Any other use keeps the local in memory: `p` or `p.min` as a call
+/// argument (it's passed by address) or read whole anywhere else, `&p`
+/// or `&p.min`, and a `catch` binding. Copying the struct into a
+/// temporary for such a use costs more code than its slots save (measured
+/// on tests/programs: about 1 KB more over all programs).
+fn split_locals(f: &Func) -> Vec<bool> {
+    let mut memory = vec![false; f.locals.len()];
+    for &p in &f.params {
+        memory[p] = true;
+    }
+    split_in_stmts(&f.body, &mut memory);
+    f.locals
+        .iter()
+        .enumerate()
+        .map(|(l, local)| {
+            !memory[l]
+                && local.convention.is_none()
+                && local.ty.as_struct().is_some()
+                && leaf_tys(local.ty).is_some_and(|t| t.len() <= SPLIT_LIMIT)
+        })
+        .collect()
+}
+
+/// Set `memory` for the locals `stmts` use other than as [`split_locals`]
+/// allows.
+fn split_in_stmts(stmts: &[TStmt], memory: &mut [bool]) {
+    for s in stmts {
+        match s {
+            TStmt::Init(_, e) | TStmt::Assign(_, e) | TStmt::Throw(e) | TStmt::Return(Some(e)) => {
+                split_copied(e, memory)
+            }
+            TStmt::Store(place, e) => {
+                if field_root(place).is_none() {
+                    split_place(place, memory);
+                }
+                split_copied(e, memory);
+            }
+            TStmt::Return(None) | TStmt::Break | TStmt::Continue => {}
+            TStmt::Expr(e) => split_in_expr(e, memory),
+            TStmt::If(c, then, otherwise) => {
+                split_in_expr(c, memory);
+                split_in_stmts(then, memory);
+                split_in_stmts(otherwise, memory);
+            }
+            TStmt::While(c, body) => {
+                split_in_expr(c, memory);
+                split_in_stmts(body, memory);
+            }
+            TStmt::For {
+                start, end, body, ..
+            } => {
+                split_in_expr(start, memory);
+                split_in_expr(end, memory);
+                split_in_stmts(body, memory);
+            }
+            TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
+                split_in_stmts(body, memory)
+            }
+            TStmt::Match { value, arms } => {
+                split_in_expr(value, memory);
+                for arm in arms {
+                    split_in_stmts(&arm.body, memory);
+                }
+            }
+        }
+    }
+}
+
+/// [`split_in_stmts`] for a value that's copied scalar by scalar: into a
+/// local or into memory, or compared by `==`.
+fn split_copied(e: &TExpr, memory: &mut [bool]) {
+    match &e.kind {
+        _ if field_root(e).is_some() => {}
+        TExprKind::StructLit(fields) => {
+            for (_, v) in fields {
+                split_copied(v, memory);
+            }
+        }
+        TExprKind::ArrayLit(items) | TExprKind::Variant(_, items) => {
+            for v in items {
+                split_copied(v, memory);
+            }
+        }
+        _ => split_in_expr(e, memory),
+    }
+}
+
+/// [`split_in_stmts`] for an expression whose value is read.
+fn split_in_expr(e: &TExpr, memory: &mut [bool]) {
+    match &e.kind {
+        // Read whole.
+        TExprKind::Local(l) => memory[*l] = true,
+        TExprKind::Field(..) if field_root(e).is_some() => {
+            if e.ty.in_memory() {
+                memory[field_root(e).expect("a field of a local")] = true;
+            }
+        }
+        TExprKind::Binary(TBinOp::Cmp(CmpOp::Eq | CmpOp::Ne), l, r) if l.ty.in_memory() => {
+            split_copied(l, memory);
+            split_copied(r, memory);
+        }
+        TExprKind::Ref(place) => match field_root(place) {
+            Some(_) if !place.ty.in_memory() => {}
+            _ => split_place(place, memory),
+        },
+        TExprKind::Catch {
+            call,
+            binding,
+            handler,
+        } => {
+            if let Some(b) = binding {
+                memory[*b] = true;
+            }
+            split_in_expr(call, memory);
+            match handler {
+                Handler::Value(v) => split_in_expr(v, memory),
+                Handler::Block(body) => split_in_stmts(body, memory),
+            }
+        }
+        _ => {
+            for sub in crate::sema::subexprs(e) {
+                split_in_expr(sub, memory);
+            }
+        }
+    }
+}
+
+/// [`split_in_stmts`] for a place that's written other than through its
+/// fields, or whose address is taken: the local it's part of stays in
+/// memory.
+fn split_place(place: &TExpr, memory: &mut [bool]) {
+    match &place.kind {
+        TExprKind::Local(l) => memory[*l] = true,
+        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) | TExprKind::ToSlice(base) => {
+            split_place(base, memory)
+        }
+        TExprKind::Index(base, index) => {
+            split_place(base, memory);
+            split_in_expr(index, memory);
+        }
+        TExprKind::Slice(base, start, end) => {
+            split_place(base, memory);
+            for b in [start, end].into_iter().flatten() {
+                split_in_expr(b, memory);
+            }
+        }
+        _ => split_in_expr(place, memory),
+    }
+}
+
 /// The locals a loop body `body` doesn't carry from one iteration to the
 /// next: those it declares (with `let`, `var` or `for`), named nowhere
 /// else in the function (`names` counts every name in it). The checker
@@ -834,6 +1061,7 @@ impl FnLower<'_> {
             });
         }
         let packed = packed_locals(f);
+        let split = split_locals(f);
         self.names = vec![0; f.locals.len()];
         count_names(&f.body, &mut self.names, &mut Vec::new());
         for (local, param) in f.locals.iter().zip(&params) {
@@ -859,6 +1087,15 @@ impl FnLower<'_> {
             }
             let slot = match local.ty {
                 ty if packed[self.slots.len()] => Slot::Packed(self.b.alloca(self.t.i64), ty),
+                ty if split[self.slots.len()] => {
+                    let leaves = leaf_tys(ty)
+                        .expect("a type that splits")
+                        .into_iter()
+                        .map(|t| (self.b.alloca(self.t.of(t)), t))
+                        .collect();
+                    self.splits.push(leaves);
+                    Slot::Split(self.splits.len() - 1)
+                }
                 Ty::Str | Ty::Slice(_) => Slot::View {
                     ptr: self.b.alloca(self.t.ptr),
                     len: self.b.alloca(self.t.i64),
@@ -927,6 +1164,7 @@ impl FnLower<'_> {
                 Val::View(p, n)
             }
             Slot::Mem(ptr) => Val::Mem(ptr),
+            Slot::Split(_) => unreachable!("a split local read whole"),
             // Only when it's read whole, which `packed_locals` rules out:
             // unpacked into a temporary.
             Slot::Packed(slot, ty) => {
@@ -975,6 +1213,10 @@ impl FnLower<'_> {
             Slot::One { slot, ty, align } => vec![(slot, ty, align)],
             Slot::Packed(slot, _) => vec![(slot, self.t.i64, 8)],
             Slot::View { ptr, len } => vec![(ptr, self.t.ptr, 8), (len, self.t.i64, 8)],
+            Slot::Split(k) => self.splits[k]
+                .iter()
+                .map(|&(slot, t)| (slot, self.t.of(t), align_of(t)))
+                .collect(),
             Slot::Mem(_) => Vec::new(),
         };
         for (slot, ty, align) in slots {
@@ -1229,6 +1471,10 @@ impl FnLower<'_> {
                 // A new local can't appear in its own initializer, so a
                 // literal is written straight into its storage.
                 Slot::Mem(dst) => self.fill(dst, e),
+                Slot::Split(k) => {
+                    let vals = self.leaf_values(e);
+                    self.store_leaves(k, 0, &vals);
+                }
                 Slot::Packed(slot, _) => {
                     let p = self.pack(e);
                     self.b.store(self.t.i64, slot, p, 8);
@@ -1240,6 +1486,10 @@ impl FnLower<'_> {
             },
             TStmt::Assign(local, e) => match self.slots[*local] {
                 Slot::Mem(dst) => self.assign_into(dst, e),
+                Slot::Split(k) => {
+                    let vals = self.leaf_values(e);
+                    self.store_leaves(k, 0, &vals);
+                }
                 Slot::Packed(slot, _) => {
                     let p = self.pack(e);
                     self.b.store(self.t.i64, slot, p, 8);
@@ -1250,6 +1500,11 @@ impl FnLower<'_> {
                 }
             },
             TStmt::Store(place, e) => {
+                if let Some((k, start)) = self.split_path(place) {
+                    let vals = self.leaf_values(e);
+                    self.store_leaves(k, start, &vals);
+                    return;
+                }
                 let dst = self.address(place);
                 self.assign_into(dst, e);
             }
@@ -1469,6 +1724,16 @@ impl FnLower<'_> {
                 let p = self.packed_local(base).expect("a packed local");
                 return self.packed_field(p, base.ty, *v, *k);
             }
+            TExprKind::Field(..) if self.split_path(e).is_some() => {
+                // A scalar field: `split_locals` keeps a local whose struct
+                // fields are read whole in memory.
+                let (k, start) = self.split_path(e).expect("a split local");
+                return match self.load_leaves(k, start, e.ty)[..] {
+                    [] => Val::Unit,
+                    [v] => Val::One(v),
+                    _ => unreachable!("a struct field of a split local read whole"),
+                };
+            }
             TExprKind::Index(..) | TExprKind::Field(..) | TExprKind::Payload(..) => {
                 let addr = self.address(e);
                 return self.read(addr, e.ty);
@@ -1477,6 +1742,11 @@ impl FnLower<'_> {
             // The address of the place: as for any value in memory, of a
             // scalar's storage, or a view of an array.
             TExprKind::Ref(place) => {
+                // A scalar field of a split local: its own slot.
+                if let Some((k, start)) = self.split_path(place) {
+                    debug_assert!(!place.ty.in_memory(), "a split local's address");
+                    return Val::One(self.splits[k][start].0);
+                }
                 if place.ty.in_memory() || place.ty.is_view() {
                     return self.expr(place);
                 }
@@ -1571,20 +1841,28 @@ impl FnLower<'_> {
             TExprKind::Binary(TBinOp::Cmp(op @ (CmpOp::Eq | CmpOp::Ne)), lhs, rhs)
                 if lhs.ty.in_memory() =>
             {
+                // A split local is compared scalar by scalar, without going
+                // through memory.
+                let split = self.split_path(lhs).is_some() || self.split_path(rhs).is_some();
                 // The packed form of a value is unique (the bits above the
                 // active variant's fields are 0), so two values are equal
                 // when their packed forms are.
-                let eq =
-                    if returns_packed(lhs.ty) && self.packs_cheaply(lhs) && self.packs_cheaply(rhs)
-                    {
-                        let l = self.pack(lhs);
-                        let r = self.pack(rhs);
-                        self.b.icmp(IntPred::Eq, l, r)
-                    } else {
-                        let l = self.place(lhs);
-                        let r = self.place(rhs);
-                        self.equal(l, r, lhs.ty)
-                    };
+                let eq = if split {
+                    let l = self.leaf_values(lhs);
+                    let r = self.leaf_values(rhs);
+                    self.leaves_equal(&l, &r)
+                } else if returns_packed(lhs.ty)
+                    && self.packs_cheaply(lhs)
+                    && self.packs_cheaply(rhs)
+                {
+                    let l = self.pack(lhs);
+                    let r = self.pack(rhs);
+                    self.b.icmp(IntPred::Eq, l, r)
+                } else {
+                    let l = self.place(lhs);
+                    let r = self.place(rhs);
+                    self.equal(l, r, lhs.ty)
+                };
                 if *op == CmpOp::Eq {
                     eq
                 } else {
@@ -2306,6 +2584,131 @@ impl FnLower<'_> {
         self.struct_field(base, ir_ty, i)
     }
 
+    /// The split local and the index of its first scalar, if `e` is a
+    /// split local or a field of one ([`split_locals`]). Its scalars are
+    /// the next [`leaf_count`]`(e.ty)` ones.
+    fn split_path(&self, e: &TExpr) -> Option<(usize, usize)> {
+        match &e.kind {
+            TExprKind::Local(l) => match self.slots[*l] {
+                Slot::Split(k) => Some((k, 0)),
+                _ => None,
+            },
+            TExprKind::Field(base, i) => {
+                let (k, start) = self.split_path(base)?;
+                let def = base.ty.as_struct().expect("a struct");
+                let before: usize = def.fields[..*i as usize]
+                    .iter()
+                    .map(|f| leaf_count(f.ty))
+                    .sum();
+                Some((k, start + before))
+            }
+            _ => None,
+        }
+    }
+
+    /// The scalars of split local `k` from `start` on that make up a value
+    /// of type `ty`.
+    fn load_leaves(&mut self, k: usize, start: usize, ty: Ty) -> Vec<ValueId> {
+        (start..start + leaf_count(ty))
+            .map(|j| {
+                let (slot, t) = self.splits[k][j];
+                let ir_ty = self.t.of(t);
+                self.b.load(ir_ty, slot, align_of(t))
+            })
+            .collect()
+    }
+
+    /// Store `vals` in the slots of split local `k` from `start` on.
+    fn store_leaves(&mut self, k: usize, start: usize, vals: &[ValueId]) {
+        for (j, &v) in vals.iter().enumerate() {
+            let (slot, t) = self.splits[k][start + j];
+            let ir_ty = self.t.of(t);
+            self.b.store(ir_ty, slot, v, align_of(t));
+        }
+    }
+
+    /// The scalars of `e`, of a type [`leaf_tys`] splits, in its order. A
+    /// struct literal is evaluated field by field (in source order), a
+    /// split local is read from its slots, and any other value from
+    /// memory. Every scalar is read before any is stored, so `p = Point{x:
+    /// p.y, y: p.x}` is fine.
+    fn leaf_values(&mut self, e: &TExpr) -> Vec<ValueId> {
+        if let Some((k, start)) = self.split_path(e) {
+            return self.load_leaves(k, start, e.ty);
+        }
+        match &e.kind {
+            TExprKind::StructLit(fields) => {
+                let def = e.ty.as_struct().expect("a struct");
+                let mut each = vec![Vec::new(); def.fields.len()];
+                for (i, value) in fields {
+                    each[*i as usize] = self.leaf_values(value);
+                }
+                each.concat()
+            }
+            _ if e.ty == Ty::Unit => {
+                self.expr(e);
+                Vec::new()
+            }
+            _ if !e.ty.in_memory() => vec![self.expr(e).one()],
+            _ => {
+                let addr = self.place(e);
+                let mut vals = Vec::new();
+                self.read_leaves(addr, e.ty, &mut vals);
+                vals
+            }
+        }
+    }
+
+    /// Append the scalars of the value of type `ty` at `addr` to `out`.
+    fn read_leaves(&mut self, addr: ValueId, ty: Ty, out: &mut Vec<ValueId>) {
+        match ty.as_struct() {
+            Some(def) => {
+                for (i, f) in def.fields.iter().enumerate() {
+                    let at = self.field_at(addr, ty, i as u32);
+                    self.read_leaves(at, f.ty, out);
+                }
+            }
+            None if ty == Ty::Unit => {}
+            None => out.push(self.read(addr, ty).one()),
+        }
+    }
+
+    /// Store the scalars `vals` of a value of type `ty` at `addr`.
+    fn write_leaves(&mut self, addr: ValueId, ty: Ty, vals: &mut impl Iterator<Item = ValueId>) {
+        match ty.as_struct() {
+            Some(def) => {
+                for (i, f) in def.fields.iter().enumerate() {
+                    let at = self.field_at(addr, ty, i as u32);
+                    self.write_leaves(at, f.ty, vals);
+                }
+            }
+            None if ty == Ty::Unit => {}
+            None => {
+                let v = vals.next().expect("a scalar for each");
+                self.write(addr, Val::One(v), ty);
+            }
+        }
+    }
+
+    /// Copy `e`, a split local or a field of one, to `dst`.
+    fn write_split(&mut self, dst: ValueId, e: &TExpr) {
+        let vals = self.leaf_values(e);
+        self.write_leaves(dst, e.ty, &mut vals.into_iter());
+    }
+
+    /// Whether every scalar in `a` equals the one at the same place in `b`.
+    fn leaves_equal(&mut self, a: &[ValueId], b: &[ValueId]) -> ValueId {
+        let mut eq = None;
+        for (&x, &y) in a.iter().zip(b) {
+            let same = self.b.icmp(IntPred::Eq, x, y);
+            eq = Some(match eq {
+                Some(acc) => self.b.bin(IrOp::And, acc, same, Flags::NONE),
+                None => same,
+            });
+        }
+        eq.unwrap_or_else(|| self.b.const_bool(true))
+    }
+
     /// The address of the element or field an [`TExprKind::Index`] or a
     /// [`TExprKind::Field`] names.
     fn address(&mut self, e: &TExpr) -> ValueId {
@@ -2535,6 +2938,7 @@ impl FnLower<'_> {
                     this.write(d, v, elem);
                 });
             }
+            _ if self.split_path(e).is_some() => self.write_split(dst, e),
             _ => {
                 let src = self.place(e);
                 self.copy(dst, src, e.ty);
@@ -2559,6 +2963,10 @@ impl FnLower<'_> {
         if !e.ty.in_memory() {
             let v = self.expr(e);
             self.write(dst, v, e.ty);
+            return;
+        }
+        if self.split_path(e).is_some() {
+            self.write_split(dst, e);
             return;
         }
         let src = self.place(e);
