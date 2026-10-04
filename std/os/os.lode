@@ -88,30 +88,29 @@ pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
 /// (inlining one costs 140 bytes today), each check a plain `if` (an `||`
 /// costs a merge block), and both `-EIO` cases share one exit.
 pub fn write_all(fd: i32, b: []u8) -> isize {
-	unsafe {
-		var p = b.ptr
-		var left = b.len
-		loop {
-			if left == 0 {
-				return 0
-			}
-			let n = syscall(SYS_WRITE, fd, p, left)
-			if n == -EINTR {
-				continue
-			}
-			if n < 0 {
-				return n
-			}
-			// The kernel never reports writing nothing, or more than asked.
-			if n == 0 {
-				break
-			}
-			if usize(n) > left {
-				break
-			}
-			left = left - usize(n)
-			p = p + usize(n)
+	var rest = b
+	loop {
+		if rest.len == 0 {
+			return 0
 		}
+		var n: isize
+		unsafe {
+			n = syscall(SYS_WRITE, fd, rest.ptr, rest.len)
+		}
+		if n == -EINTR {
+			continue
+		}
+		if n < 0 {
+			return n
+		}
+		// The kernel never reports writing nothing, or more than asked.
+		if n == 0 {
+			break
+		}
+		if usize(n) > rest.len {
+			break
+		}
+		rest = rest[usize(n)..]
 	}
 	return -EIO
 }

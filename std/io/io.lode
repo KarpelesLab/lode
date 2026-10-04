@@ -89,23 +89,14 @@ pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize {
 		if got >= buf.len {
 			return got
 		}
-		var n: isize
-		unsafe {
-			n = os.read(self.fd, buf.ptr + got, buf.len - got)
-		}
-		if n == -os.EINTR {
-			continue
-		}
-		if n < 0 {
-			throw os.error(n)
-		}
+		let n = try self.read(&buf[got..])
 		if n == 0 {
 			return got
 		}
-		if usize(n) > buf.len - got {
+		if n > buf.len - got {
 			throw .io
 		}
-		got = got + usize(n)
+		got = got + n
 	}
 }
 
@@ -143,14 +134,14 @@ fn magnitude(n: i64) -> u64 {
 	return u64(n)
 }
 
-/// Write `n` in decimal to `fd`, after a `-` if `negative`, in one `write`.
+/// Write `n` in decimal to `fd`, after a `-` if `negative`, in one
+/// `os.write_all` (errors are ignored, like `print`'s).
 ///
 /// The digits go into a buffer from the end, and element 0 is kept for the
 /// sign. 20 digits hold the largest `u64`, so the loop always ends when `v`
 /// is 0; `i <= 1` is what proves there's room (the checker doesn't count
-/// digits), and it leaves `i >= 1` for the sign. The output is at most 21
-/// bytes, which the kernel writes whole (and Lode installs no signal
-/// handlers, so there's no `EINTR`), so one `os.write` is enough.
+/// digits), and it leaves `i >= 1` for the sign. The output is the slice
+/// `buf[i..]`.
 fn write_decimal(fd: i32, n: u64, negative: bool) {
 	var buf: [21]u8 = [0; 21]
 	var i = buf.len - 1
@@ -170,7 +161,5 @@ fn write_decimal(fd: i32, n: u64, negative: bool) {
 		i = i - 1
 		buf[i] = '-'
 	}
-	unsafe {
-		os.write(fd, buf.ptr + i, buf.len - i)
-	}
+	os.write_all(fd, buf[i..])
 }

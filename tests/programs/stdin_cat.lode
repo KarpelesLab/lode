@@ -5,35 +5,6 @@
 package main
 
 import "std/io"
-import "std/os"
-
-// Write the first `n` bytes of `b`. There's no slicing (`b[0..n]`) yet, so
-// this goes through a pointer, after checking `n`.
-fn write_prefix(b: []u8, n: usize) throws(os.Error) {
-	if n > b.len {
-		throw .io
-	}
-	var done: usize = 0
-	while done < n {
-		var w: isize
-		unsafe {
-			w = os.write(os.STDOUT, b.ptr + done, n - done)
-		}
-		if w == -os.EINTR {
-			continue
-		}
-		if w < 0 {
-			throw os.error(w)
-		}
-		if w == 0 {
-			throw .io
-		}
-		if usize(w) > n - done {
-			throw .io
-		}
-		done = done + usize(w)
-	}
-}
 
 // `cat`: standard input to standard output, a buffer at a time.
 fn main() -> u8 {
@@ -45,7 +16,12 @@ fn main() -> u8 {
 		if n == 0 {
 			return 0
 		}
-		write_prefix(buf, n) catch _ {
+		// `read` never returns more than `buf.len`, but the checker doesn't
+		// know what a call returns yet.
+		if n > buf.len {
+			return 3
+		}
+		io.stdout().write_bytes(buf[..n]) catch _ {
 			return 2
 		}
 	}
