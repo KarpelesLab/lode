@@ -5,13 +5,13 @@ import "std/os"
 
 // `os.write_all`'s exits: an error number, nothing to write, and success.
 fn main() -> u8 {
-	if os.write_all(-1, "x") != -9 {
+	if os.write_all(-1, "x".bytes()) != -9 {
 		return 1 // EBADF
 	}
-	if os.write_all(os.STDOUT, "") != 0 {
+	if os.write_all(os.STDOUT, "".bytes()) != 0 {
 		return 2
 	}
-	if os.write_all(os.STDOUT, "ok\n") != 0 {
+	if os.write_all(os.STDOUT, "ok\n".bytes()) != 0 {
 		return 3
 	}
 	return 0

@@ -69,16 +69,17 @@ pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
 	return syscall(SYS_WRITE, fd, data, len)
 }
 
-/// Write all of `s` to `fd`, retrying after partial writes and interrupted
-/// calls. Returns 0, or the negative error number of the first failure.
+/// Write all of the bytes `b` to `fd` (a `str` gives them with `s.bytes()`),
+/// retrying after partial writes and interrupted calls. Returns 0, or the
+/// negative error number of the first failure.
 ///
 /// The loop is written for size: one `syscall` instead of a call to `write`
 /// (inlining one costs 140 bytes today), each check a plain `if` (an `||`
 /// costs a merge block), and both `-EIO` cases share one exit.
-pub fn write_all(fd: i32, s: str) -> isize {
+pub fn write_all(fd: i32, b: []u8) -> isize {
 	unsafe {
-		var p = s.ptr
-		var left = s.len
+		var p = b.ptr
+		var left = b.len
 		loop {
 			if left == 0 {
 				return 0

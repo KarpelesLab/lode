@@ -1,0 +1,53 @@
+// stdout: 3 5 olleh\n
+// stdout: HELLO\n
+package main
+
+import "std/io"
+
+// `s.bytes()` is a `[]u8` view of a string's bytes, with its length.
+fn count(s: str, c: u8) -> u32 {
+	var n: u32 = 0
+	for b in s.bytes() {
+		if b == c {
+			n +%= 1
+		}
+	}
+	return n
+}
+
+fn first(b: []u8) -> u8 {
+	if b.len == 0 {
+		return 0
+	}
+	return b[0]
+}
+
+fn main() {
+	let s = "hello, world"
+	let b = s.bytes()
+	io.print_u64(count(s, 'l'))
+	io.print(" ")
+	io.print_u64(b.len - 7)
+	io.print(" ")
+	// Reversed into a buffer, then written as raw bytes.
+	var out: [5]u8 = [0; 5]
+	for i in 0..out.len {
+		out[i] = b[4 - i] // proven: `b.len` is `s.len`, 12
+	}
+	io.stdout().write_bytes(out) catch _ {}
+	io.print("\n")
+	var upper: [5]u8 = [0; 5]
+	for i in 0..5 {
+		let c = s.bytes()[i]
+		if c >= 'a' && c <= 'z' {
+			upper[i] = c - 32
+		} else {
+			upper[i] = c
+		}
+	}
+	if first(s.bytes()) != 'h' {
+		return
+	}
+	io.stdout().write_bytes(upper) catch _ {}
+	io.stdout().write("\n") catch _ {}
+}

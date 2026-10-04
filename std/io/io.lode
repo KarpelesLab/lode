@@ -9,12 +9,12 @@ import "std/os"
 /// failing over (and a closed pipe already ends the process through SIGPIPE).
 /// To handle errors, use `stdout().write(s)`.
 pub fn print(s: str) {
-	os.write_all(os.STDOUT, s)
+	os.write_all(os.STDOUT, s.bytes())
 }
 
 /// Write `s` to standard error, ignoring errors like `print`.
 pub fn eprint(s: str) {
-	os.write_all(os.STDERR, s)
+	os.write_all(os.STDERR, s.bytes())
 }
 
 /// An open file, by its file descriptor. It doesn't close the file: the
@@ -37,7 +37,14 @@ pub fn stderr() -> File {
 ///
 /// This is the checked way to write: `try io.stdout().write(s)`.
 pub fn File.write(self, s: str) throws(os.Error) {
-	let n = os.write_all(self.fd, s)
+	try self.write_bytes(s.bytes())
+}
+
+/// Write all of the bytes `b` to the file, or throw the error that stopped
+/// it: raw bytes, such as a buffer a program filled, with no encoding
+/// claim.
+pub fn File.write_bytes(self, b: []u8) throws(os.Error) {
+	let n = os.write_all(self.fd, b)
 	if n < 0 {
 		throw os.error(n)
 	}

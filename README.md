@@ -68,7 +68,9 @@ What works:
   array or slice), the `syscall` intrinsic
 - output: `io.print` for strings, `io.print_u64` and `io.print_i64` for
   integers (and `io.eprint...` for standard error), which ignore errors, and
-  `io.stdout().write(s)`, which throws an `os.Error`
+  `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
+  which throw an `os.Error`
+- `s.bytes()`, the bytes of a `str` as a read-only `[]u8`
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe. The checker follows value ranges and relations between variables,
