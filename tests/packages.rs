@@ -75,19 +75,31 @@ pub fn Shape.radius(self) -> u8 {
 }
 ";
 
-/// A standard library root holding only `std/geo`, unique to `name`.
-fn std_root(name: &str) -> PathBuf {
+/// A standard library root holding `std/geo` and the packages `more`
+/// (name and source), unique to `name`.
+fn std_root(name: &str, more: &[(&str, &str)]) -> PathBuf {
     let root = std::env::temp_dir().join(format!("lode-packages-{}-{name}", std::process::id()));
-    let dir = root.join("geo");
-    std::fs::create_dir_all(&dir).expect("create the package directory");
-    std::fs::write(dir.join("geo.lode"), GEO).expect("write the package");
+    for (pkg, src) in std::iter::once(("geo", GEO)).chain(more.iter().copied()) {
+        let dir = root.join(pkg);
+        std::fs::create_dir_all(&dir).expect("create the package directory");
+        std::fs::write(dir.join(format!("{pkg}.lode")), src).expect("write the package");
+    }
     root
 }
 
 /// Load and check `main` against the test library: the program, or the
 /// error messages.
 fn check(name: &str, main: &str) -> Result<lode::sema::Program, Vec<String>> {
-    let root_dir = std_root(name);
+    check_with(name, main, &[])
+}
+
+/// [`check`], with the packages `more` in the library too.
+fn check_with(
+    name: &str,
+    main: &str,
+    more: &[(&str, &str)],
+) -> Result<lode::sema::Program, Vec<String>> {
+    let root_dir = std_root(name, more);
     let mut files = SourceMap::new();
     let root = files.add(SourceFile::new(format!("{name}.lode"), main.to_owned()));
     let (packages, mut diags) = lode::load::load(&mut files, root, &root_dir);
@@ -270,6 +282,86 @@ fn main() -> i32 {
         "the methods of `geo.Point` can only be declared in package `std/geo`, which declares it",
         "`geo.Point.hidden` is private to package `std/geo`",
         "`geo.Point.secret` is private to package `std/geo`",
+    ];
+    assert_eq!(errors, expected);
+}
+
+const SHAPES: &str = "\
+package shapes
+
+import \"std/geo\"
+
+/// A trait of this package, implemented here for another package's type.
+pub trait Area {
+	fn area(self) -> i32
+
+	fn double(self) -> i32 {
+		return self.area() *| 2
+	}
+}
+
+trait Secret {
+	fn s(self)
+}
+
+impl Area for geo.Point {
+	fn area(self) -> i32 {
+		return self.x *| self.y
+	}
+}
+
+pub fn total[T: Area](a: T, b: T) -> i32 {
+	return a.area() +| b.area()
+}
+";
+
+#[test]
+fn traits_across_packages() {
+    let main = "\
+package main
+
+import \"std/geo\"
+import \"std/shapes\"
+
+struct Square {
+	side: i32
+}
+
+// The type's package implements another package's trait.
+impl shapes.Area for Square {
+	fn area(self) -> i32 {
+		return self.side *| self.side
+	}
+}
+
+fn sum[T: shapes.Area](x: T) -> i32 {
+	return x.double()
+}
+
+fn main() -> i32 {
+	let p = geo.Point.new(2, 3)
+	let s = Square{side: 2}
+	return p.area() +| sum(s) +| shapes.total(s, s) +| shapes.Area.area(p)
+}
+";
+    let program = check_with("traits", main, &[("shapes", SHAPES)]).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "traits"), 6 + 8 + 8 + 6);
+    }
+    let errors = check_with(
+        "traits-coherence",
+        "package main\n\nimport \"std/geo\"\nimport \"std/shapes\"\n\n\
+         impl shapes.Area for geo.Shape {\n\tfn area(self) -> i32 {\n\t\treturn 0\n\t}\n}\n\n\
+         fn f[T: shapes.Secret](x: T) {\n}\n\n\
+         impl shapes.Area for geo.Point {\n\tfn area(self) -> i32 {\n\t\treturn 0\n\t}\n}\n\n\
+         fn main() {\n}\n",
+        &[("shapes", SHAPES)],
+    )
+    .expect_err("fails to check");
+    let expected = [
+        "`impl shapes.Area for geo.Shape` must be in the package of `shapes.Area` (`std/shapes`) or of `geo.Shape` (`std/geo`)",
+        "`impl shapes.Area for geo.Point` must be in the package of `shapes.Area` (`std/shapes`) or of `geo.Point` (`std/geo`)",
+        "`Secret` is private to package `std/shapes`",
     ];
     assert_eq!(errors, expected);
 }

@@ -786,6 +786,22 @@ mod tests {
     }
 
     #[test]
+    fn traits_and_impls() {
+        assert_eq!(
+            fmt(
+                "pub trait Shape:Eq+geo.Named{\n type Unit :Copy\nconst MAX:usize\n\
+                 fn area( self )->u32\n\n\n fn name(self)->str{ return \"s\" }\n}\n\
+                 impl [ A:Ordered ] Shape for Pair[ A ] {\ntype Unit=u8\n\
+                 fn area(self)->u32{\nreturn 1\n}\n}\n"
+            ),
+            "pub trait Shape: Eq + geo.Named {\n\ttype Unit: Copy\n\tconst MAX: usize\n\
+             \tfn area(self) -> u32\n\n\tfn name(self) -> str {\n\t\treturn \"s\"\n\t}\n}\n\
+             impl[A: Ordered] Shape for Pair[A] {\n\ttype Unit = u8\n\
+             \tfn area(self) -> u32 {\n\t\treturn 1\n\t}\n}\n"
+        );
+    }
+
+    #[test]
     fn errors_and_variants() {
         assert_eq!(
             fmt(

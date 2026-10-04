@@ -538,13 +538,12 @@ impl Parser {
             return self.error(
                 self.span(),
                 format!(
-                    "a method in {} is declared without its type: `fn {}(self, ...)`",
+                    "a method in {} is declared without its type: `fn name(self, ...)`",
                     if member == Member::Trait {
                         "a trait"
                     } else {
                         "an `impl`"
                     },
-                    name.name
                 ),
             );
         }
@@ -674,52 +673,35 @@ impl Parser {
             Vec::new()
         };
         self.expect_p(P::LBrace)?;
-        let mut items = Vec::new();
-        loop {
-            self.skip_newlines();
-            if self.at_p(P::RBrace) {
-                break;
-            }
-            let istart = self.span();
-            if self.at_kw(Kw::Pub) {
-                return self.error(
-                    self.span(),
-                    "the items of a trait are as visible as the trait: they're not marked `pub`",
-                );
-            }
-            let item = match self.peek() {
+        let (items, end) = self.member_items("a trait", |p, istart| {
+            Ok(match p.peek() {
                 Tok::Kw(Kw::Fn) => {
-                    let (decl, default) = self.fn_decl_in(false, false, istart, Member::Trait)?;
+                    let (decl, default) = p.fn_decl_in(false, false, istart, Member::Trait)?;
                     TraitItem::Method {
                         decl: Box::new(decl),
                         default,
                     }
                 }
                 Tok::Kw(Kw::Type) => {
-                    self.bump();
-                    let name = self.ident("an associated type name")?;
-                    let bounds = if self.eat_p(P::Colon) {
-                        self.bounds()?
+                    p.bump();
+                    let name = p.ident("an associated type name")?;
+                    let bounds = if p.eat_p(P::Colon) {
+                        p.bounds()?
                     } else {
                         Vec::new()
                     };
                     TraitItem::Type { name, bounds }
                 }
                 Tok::Kw(Kw::Const) => {
-                    self.bump();
-                    let name = self.ident("an associated constant name")?;
-                    self.expect_p(P::Colon)?;
-                    let ty = self.type_expr()?;
+                    p.bump();
+                    let name = p.ident("an associated constant name")?;
+                    p.expect_p(P::Colon)?;
+                    let ty = p.type_expr()?;
                     TraitItem::Const { name, ty }
                 }
-                _ => return self.expected("`fn`, `type`, `const` or `}`"),
-            };
-            items.push(item);
-            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
-                return self.expected("a new line after the item");
-            }
-        }
-        let end = self.bump().span;
+                _ => return p.expected("`fn`, `type`, `const` or `}`"),
+            })
+        })?;
         Ok(TraitDecl {
             is_pub,
             name,
@@ -744,40 +726,23 @@ impl Parser {
         }
         let ty = self.type_expr()?;
         self.expect_p(P::LBrace)?;
-        let mut items = Vec::new();
-        loop {
-            self.skip_newlines();
-            if self.at_p(P::RBrace) {
-                break;
-            }
-            let istart = self.span();
-            if self.at_kw(Kw::Pub) {
-                return self.error(
-                    self.span(),
-                    "the items of an `impl` are as visible as the trait: they're not marked `pub`",
-                );
-            }
-            let item = match self.peek() {
+        let (items, end) = self.member_items("an `impl`", |p, istart| {
+            Ok(match p.peek() {
                 Tok::Kw(Kw::Fn) => {
-                    let (decl, _) = self.fn_decl_in(false, false, istart, Member::Impl)?;
+                    let (decl, _) = p.fn_decl_in(false, false, istart, Member::Impl)?;
                     ImplItem::Method(decl)
                 }
                 Tok::Kw(Kw::Type) => {
-                    self.bump();
-                    let name = self.ident("an associated type name")?;
-                    self.expect_p(P::Eq)?;
-                    let ty = self.type_expr()?;
+                    p.bump();
+                    let name = p.ident("an associated type name")?;
+                    p.expect_p(P::Eq)?;
+                    let ty = p.type_expr()?;
                     ImplItem::Type { name, ty }
                 }
-                Tok::Kw(Kw::Const) => ImplItem::Const(self.const_decl(false, istart)?),
-                _ => return self.expected("`fn`, `type`, `const` or `}`"),
-            };
-            items.push(item);
-            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
-                return self.expected("a new line after the item");
-            }
-        }
-        let end = self.bump().span;
+                Tok::Kw(Kw::Const) => ImplItem::Const(p.const_decl(false, istart)?),
+                _ => return p.expected("`fn`, `type`, `const` or `}`"),
+            })
+        })?;
         Ok(ImplDecl {
             generics,
             trait_,
@@ -785,6 +750,78 @@ impl Parser {
             items,
             span: start.to(end),
         })
+    }
+
+    /// The items of a trait or an `impl` (`what`), after its `{`, each
+    /// parsed by `one` (given where it starts), one per line, and the span
+    /// of the closing `}`. An item in error is skipped to the end of its
+    /// line, so the others are still parsed.
+    fn member_items<T>(
+        &mut self,
+        what: &str,
+        mut one: impl FnMut(&mut Parser, Span) -> PResult<T>,
+    ) -> PResult<(Vec<T>, Span)> {
+        let mut items = Vec::new();
+        let mut ok = true;
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBrace) {
+                break;
+            }
+            if *self.peek() == Tok::Eof {
+                return self.expected("`}`");
+            }
+            let istart = self.span();
+            let item = if self.at_kw(Kw::Pub) {
+                self.error(
+                    istart,
+                    format!(
+                        "the items of {what} are as visible as the trait: they're not marked `pub`"
+                    ),
+                )
+            } else {
+                one(self, istart)
+            };
+            match item {
+                Ok(item) if matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) => {
+                    items.push(item);
+                }
+                Ok(_) => {
+                    let _: PResult<()> = self.expected("a new line after the item");
+                    ok = false;
+                    self.sync_member();
+                }
+                Err(Failed) => {
+                    ok = false;
+                    self.sync_member();
+                }
+            }
+        }
+        let end = self.bump().span;
+        if !ok {
+            return Err(Failed);
+        }
+        Ok((items, end))
+    }
+
+    /// Skip to the start of the next item of a trait or an `impl`, or to
+    /// its closing `}`.
+    fn sync_member(&mut self) {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                Tok::Eof => return,
+                Tok::P(P::RBrace) if depth == 0 => return,
+                Tok::P(P::LBrace | P::LParen | P::LBracket) => depth += 1,
+                Tok::P(P::RBrace | P::RParen | P::RBracket) => depth -= 1,
+                Tok::Newline if depth == 0 => {
+                    self.bump();
+                    return;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
     }
 
     /// A trait in a bound: `Ordered` or `io.Writer`.
@@ -2321,6 +2358,59 @@ mod tests {
             &fields[1].value.kind,
             ExprKind::StructLit(TypeExpr::Generic(_, a, _), _) if matches!(a[..], [TypeArg::Expr(_)])
         ));
+    }
+
+    #[test]
+    fn traits_and_impls() {
+        let file = parse_ok(
+            "pub trait Shape: Eq + geo.Named {\n\ttype Unit: Copy\n\tconst MAX: usize\n\
+             \tfn area(self) -> u32\n\tfn zero() -> Self\n\n\tfn name(self) -> str {\n\
+             \t\treturn \"s\"\n\t}\n}\n\
+             impl[A: Ordered, N] Shape for Pair[A, N] {\n\ttype Unit = u8\n\
+             \tconst MAX: usize = 4\n\tfn area(self) -> u32 {\n\t\treturn 1\n\t}\n}\n\
+             fn f[T: io.Writer + Shape](w: T) {\n}\n",
+        );
+        let Item::Trait(t) = &file.items[0] else {
+            panic!()
+        };
+        assert!(t.is_pub && t.supers.len() == 2 && t.supers[1].pkg.is_some());
+        let kinds: Vec<&str> = t
+            .items
+            .iter()
+            .map(|i| match i {
+                TraitItem::Type { .. } => "type",
+                TraitItem::Const { .. } => "const",
+                TraitItem::Method { default: false, .. } => "fn",
+                TraitItem::Method { default: true, .. } => "default",
+            })
+            .collect();
+        assert_eq!(kinds, ["type", "const", "fn", "fn", "default"]);
+        let TraitItem::Method { decl, .. } = &t.items[2] else {
+            panic!()
+        };
+        assert!(decl.params[0].is_self() && decl.owner.is_none());
+        let Item::Impl(i) = &file.items[1] else {
+            panic!()
+        };
+        assert_eq!((i.generics.len(), i.items.len()), (2, 3));
+        assert_eq!(i.trait_.text(), "Shape");
+        assert!(matches!(&i.ty, TypeExpr::Generic(..)));
+        let Item::Fn(f) = &file.items[2] else {
+            panic!()
+        };
+        let bounds: Vec<String> = f.generics[0].bounds.iter().map(Bound::text).collect();
+        assert_eq!(bounds, ["io.Writer", "Shape"]);
+
+        let errs = parse_errors(
+            "trait T {\n\tfn Point.f(self)\n}\npub impl T for P {\n}\nimpl T P {\n}\n\
+             trait U[X] {\n}\nimpl T for P {\n\tfn f(self)\n}\n",
+        );
+        assert_eq!(errs.len(), 5, "{errs:?}");
+        assert!(errs[0].contains("without its type"));
+        assert!(errs[1].contains("is not marked `pub`"));
+        assert!(errs[2].contains("`for`"));
+        assert!(errs[3].contains("generic traits"));
+        assert!(errs[4].contains("expected `{`"));
     }
 
     #[test]
