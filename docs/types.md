@@ -99,8 +99,10 @@ semantics.
   and slices of other types (`str`, pointers, slices) are not supported yet.
 - An array is a value. `let b = a` copies the elements, and changing `a`
   afterwards doesn't change `b`. Array locals live on the stack.
-- A slice is a read-only view, a pointer and a length, like `str`. Assigning
-  through a slice (`xs[i] = v`) needs `inout`, which isn't there yet.
+- A slice is a view, a pointer and a length, like `str`. It's read-only,
+  except an `inout` slice parameter, whose elements the function can assign
+  (`xs[i] = v`): the caller passes `&a` for a `var` array `a`
+  ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)).
 - An array converts to a slice of all its elements where a slice is
   expected: in a call argument, or in a `let`/`var` with a slice type. A slice
   kept in a local may only view a `let` array (or part of one), so it never
@@ -151,9 +153,12 @@ let p = Point{x: 1, y: 2}
 - A struct is a value, like an array. `let q = p` and `q = p` copy it, and
   changing `p` afterwards doesn't change `q`. Fields of a `var` struct can be
   assigned, also nested and with `op=`: `r.min.x = 1`, `ps[i].y += 2`.
-- Structs and arrays are passed and returned by value. A parameter is
-  read-only, so the callee reads the caller's value in place, without a copy
-  ([memory.md](memory.md#in-the-compiler-today)).
+- Structs and arrays are passed and returned by value. A default parameter
+  is read-only, so the callee reads the caller's value in place, without a
+  copy ([memory.md](memory.md#in-the-compiler-today)). An `inout` one
+  changes it in place: `mirror(&p)`, `mirror(&ps[i])`.
+- Structs have methods ([Methods](#methods)): `p.length()`, `p.scale(2)`,
+  `Point.origin()`.
 - `a == b` and `a != b` work on two structs of the same type: they compare
   every field, recursively. Every field type supported today has `==`, so
   every struct does. Equality is automatic for now; whether it should be
@@ -233,9 +238,11 @@ match tok {
 - In memory, an enum is its tag (a `u8`, or a C-style enum's integer type)
   followed by an area that fits the largest payload, aligned for it. A
   variant without payload uses only the tag. The layout is not a promise.
+- Methods work on enums, C-style ones too, as on structs
+  ([Methods](#methods)).
 - Not yet: generic enums, `match` as an expression, `match` on integers,
-  patterns that nest (`some(circle(c, r))`) or list several variants
-  (`a | b`), and methods.
+  and patterns that nest (`some(circle(c, r))`) or list several variants
+  (`a | b`).
 
 ### Optional
 
@@ -303,7 +310,8 @@ in signatures.
 
 ## Methods
 
-**Status:** Decided that types have methods. The syntax is Proposed.
+**Status:** Decided that types have methods. The syntax is Proposed;
+implemented in the compiler (see [In the compiler today](#in-the-compiler-today-4)).
 
 ```
 struct Point {
@@ -341,10 +349,39 @@ let o = Point.origin()
 - Trait implementations are the exception: `impl Ordered for Point { ... }`
   can also live in the package that defines the trait.
 
-**Open:** memory.md marks mutable arguments with `&` at the call site. Should
-`p.scale(2)` also need a marker (`(&p).scale(2)` is ugly; maybe `p&.scale(2)`
-or nothing, because `inout self` is visible in the declaration)? Leaning
-toward no marker on the receiver.
+**Decided:** no marker on the receiver. memory.md marks mutable arguments
+with `&` at the call site, but `p.scale(2)` needs none: `inout self` is
+visible in the declaration, and `(&p).scale(2)` or `p&.scale(2)` would be
+noise on the most common kind of call. The receiver must still be a place
+that can change, and it counts for exclusivity like an `&` argument.
+
+### In the compiler today
+
+**Status:** Implemented (syntax in [syntax.md](syntax.md#methods-and-parameter-conventions))
+
+- `fn T.name(self, ...)`, `fn T.name(inout self, ...)` and
+  `fn T.name(sink self, ...)` declare a method of the struct or enum `T`;
+  `fn T.name(...)` without `self` an associated function. `self` comes
+  first and has no type: it's a `T`. It can't be `set`.
+- `p.name(...)` calls a method; `T.name(...)` an associated function, and
+  `pkg.T.name(...)` one of another package's type. Calls chain:
+  `a.b().c()`. A method that throws is called with `try` or `catch` like
+  any function: `try io.stdout().write(s)`.
+- The receiver of a method that takes `inout self` must be a place that can
+  change, like the argument of an `&`: a `var`, a parameter the function
+  may change, or a field or an element of one (`ps[i].scale(2)`), but not a
+  `let` or a temporary. A default `self` can be any value, a temporary too.
+- Methods are declared only in the package that declares `T`. A method
+  can't have the name of one of the type's fields or variants (so `T.dot`
+  is always a variant and `p.x` always a field), or of another method:
+  each is an error at the declaration.
+- `pub fn T.name` makes it usable from other packages. Without `pub`, it's
+  private to its package, like a function.
+- Calling a method on the type (`Point.length(p)`) is not supported; call
+  it on the value.
+- A method is a function with `self` as its first parameter. Its linker
+  symbol is `<package path>.<T>.<name>` (`std/io.File.write`).
+- No extension methods and no traits yet (M7).
 
 ## Operators
 

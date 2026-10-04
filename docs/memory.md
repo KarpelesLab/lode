@@ -11,7 +11,8 @@
 
 ## Chosen direction: mutable value semantics
 
-**Status:** Proposed
+**Status:** Proposed; parameter conventions implemented (see
+[In the compiler today](#parameter-conventions-in-the-compiler-today))
 
 This is the model of [Hylo](https://hylo-lang.org) (formerly Val) and, partly,
 Swift. The core idea:
@@ -47,6 +48,82 @@ where it happens, which is good for readability.
 granted for, so the compiler never needs to track how long a reference lives
 across functions. Exclusivity is checked locally: in one call, an argument
 passed `inout` cannot overlap any other argument.
+
+### Parameter conventions in the compiler today
+
+**Status:** Implemented. `&` is provisional: the syntax is still Open.
+
+```
+fn split(v: u32, set hi: u32, set lo: u32) {
+	hi = v / 10
+	lo = v % 10
+}
+
+fn sort(inout xs: []u32) { ... }       // assigns xs[i]
+
+var hi: u32                            // assigned by the call
+var lo: u32
+split(42, &hi, &lo)
+var a: [4]u32 = [3, 1, 4, 1]
+sort(&a)                               // a viewed as a slice it can change
+```
+
+- **Default** (`x: T`): read-only for the call. A value in memory is passed
+  as the address of the caller's value.
+- **`inout x: T`**: the callee reads and writes the caller's place. The
+  argument is `&place`: a `var`, a parameter the function may change
+  (`inout`, `sink`, `set`), or a field or an element of one (`&p.x`,
+  `&a[i]`). An element's index is evaluated once, before the call. The place
+  must have exactly the type `T`: there's no widening.
+- **`inout xs: []T`**: a slice whose elements can be assigned (`xs[i] = v`).
+  The argument is `&a` for a `var` array `a` (or a row, `&grid[i]`), or `&xs`
+  for another `inout` slice. The slice itself can't be assigned, so its
+  length doesn't change. It can't be copied into a local either, since the
+  copy would see the elements change. `for x in xs` over it reads each
+  element when it gets to it. A `str` can't be `inout`.
+- **`sink x: T`**: the value moves in. Every type today is plain data that's
+  copied, so `sink` is a copy the callee may change, and the caller's
+  variable is unchanged. It matters once types own resources: then the
+  caller's variable is moved from, and the callee destroys the value.
+- **`set x: T`**: the callee assigns `x`, whole, on every path that returns,
+  and can't read it before. A `throw` doesn't need to assign it. The
+  argument is `&x`, and `x` may be a `var` declared without a value
+  (`var x: T`). After the call `x` is assigned, but only if the call
+  succeeded: in a `catch` block and in a `match` arm for `err`, it's as
+  before the call. A view can't be `set`.
+- A `var` declared without a value must be assigned on every path before
+  it's read. `let` always needs a value.
+- `&` on a default or `sink` argument is an error, and so is an `inout` or
+  `set` argument without `&`. `&` is only allowed in a call's arguments.
+
+**Exclusivity.** In one expression (the expression of a statement, or a
+condition), a place passed `inout` or `set`, with `&` or as the receiver of
+a method that takes `inout self`, can't overlap anything else the
+expression uses. Two places overlap when they're parts of the same variable,
+unless at some step they go to different fields, or to elements at
+different constant indexes:
+
+| Expression | |
+| --- | --- |
+| `swap(&p.x, &p.y)`, `swap(&a[0], &a[1])` | Allowed: different fields, different constant indexes |
+| `swap(&a[i], &a[j])` | Error, even where `i != j` is known |
+| `swap(&x, &x)`, `add(&x, x)`, `p.scale(p.x)` | Error |
+| `fill(&a, a.len)` | Allowed: a length is never changed through `&` |
+
+The rule covers the whole expression, not only the call's arguments: an
+argument in memory or a view is passed as an address into the caller's
+storage, and what the checker knows about a variable read earlier in the
+expression would be stale after the call changes it. It's stricter than
+Swift's, which allows `add(&x, x)`; write `let k = x` first.
+
+### In the checker
+
+After a call, the checker forgets what it knew about each place passed
+`inout` or `set`: a variable, or a struct field and the fields in it. Array
+and slice elements have no facts, and a slice's length doesn't change. In a
+loop, a variable passed with `&`, or a method's receiver, counts as assigned
+([safety.md](safety.md#facts-through-loops)). In the callee, `inout`, `sink`
+and `set` parameters are variables whose facts start from their type.
 
 ### Owning pointers are values
 
@@ -172,9 +249,12 @@ This rule also lets scoped threads use views without copying
   by assignment and into array elements and fields. A `match` binds copies
   of the payload fields. Nothing owns resources yet, so nothing
   moves.
-- A parameter uses the default convention: read-only for the duration of the
-  call. Nothing can change the argument during the call, so an array or a
-  struct is passed as the address of the caller's value, without a copy.
+- A default parameter is read-only for the duration of the call. Nothing can
+  change the argument during the call, so an array or a struct is passed as
+  the address of the caller's value, without a copy. An `inout` or `set`
+  parameter is the caller's place itself (a scalar too: the callee loads
+  and stores through its address), and a `sink` one in memory is copied on
+  entry, since the callee may change it.
 - A function returning an array or a struct writes the result straight into
   storage the caller provides: the new variable in `let p = make()`, or else
   a temporary. So `p = swap(p)` can't overwrite `p` while `swap` still reads

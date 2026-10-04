@@ -117,10 +117,10 @@ fn main() {
 | Function | `fn name(a: T, b: U) -> R { ... }` |
 | Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
 | Generic parameters | `fn max[T: Ordered](a: T, b: T) -> T` |
-| Parameter conventions | `inout x: T`, `sink x: T` ([memory.md](memory.md)) |
+| Parameter conventions | `inout x: T`, `sink x: T`, `set x: T`, passed `f(&x)` (see below) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
 | Visibility | `pub` (default is package-private) |
-| Method | `fn Point.length(self) -> f32`, called as `p.length()` ([types.md](types.md#methods)) |
+| Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
 | Refinement | `i: usize where i < buf.len` ([safety.md](safety.md#refinements-in-types)) |
 | Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
 | Compile-time | `comptime`, `if comptime cond { ... }` |
@@ -363,7 +363,66 @@ fn main() -> u32 {
   `??`: `opt ?? throw .missing`.
 - `defer` and `errdefer` take a block, or one statement on the same line.
 
-## Open questions
+## Methods and parameter conventions
+
+**Status:** Proposed; implemented in the compiler (semantics in
+[memory.md](memory.md#parameter-conventions-in-the-compiler-today) and
+[types.md](types.md#in-the-compiler-today-4))
+
+```
+struct Point {
+	x: u32
+	y: u32
+}
+
+fn Point.origin() -> Point {
+	return Point{x: 0, y: 0}
+}
+
+fn Point.sum(self) -> u32 {
+	return self.x +% self.y
+}
+
+fn Point.scale(inout self, k: u32) {
+	self.x = self.x *% k
+	self.y = self.y *% k
+}
+
+fn swap(inout a: u32, inout b: u32) {
+	let t = a
+	a = b
+	b = t
+}
+
+fn split(v: u32, set hi: u32, set lo: u32) {
+	hi = v / 10
+	lo = v % 10
+}
+
+fn main() -> u32 {
+	var p = Point.origin()
+	p.x = 2
+	p.scale(3)
+	swap(&p.x, &p.y)
+	var hi: u32
+	var lo: u32
+	split(42, &hi, &lo)
+	return p.sum() +% hi +% lo
+}
+```
+
+- A parameter is `name: T`, or with a convention first: `inout name: T`,
+  `sink name: T`, `set name: T`.
+- `&place` passes an argument to an `inout` or `set` parameter: `&x`,
+  `&p.x`, `&a[i]`. It's only allowed there. The `&` is provisional
+  ([memory.md](memory.md#chosen-direction-mutable-value-semantics)).
+- `fn Type.name(...)` declares a method or an associated function of
+  `Type`. A method's first parameter is `self`, `inout self` or
+  `sink self`, without a type.
+- `value.name(...)` calls a method, with no marker on the receiver, even
+  for `inout self`. `Type.name(...)` calls an associated function, and
+  `pkg.Type.name(...)` one of another package.
+- `var name: T` without a value declares a variable to assign later.
 
 - `match` arms: a block or a single statement now. Should an arm also be a
   single expression, once `match` can be an expression?
@@ -372,3 +431,7 @@ fn main() -> u32 {
   expression in `match` arms and blocks used as expressions.
 - Generic brackets: `[T]` (Go) avoids the `<>` parsing ambiguity. Leaning `[T]`,
   with indexing told apart by context.
+- The `&` that marks an `inout` or `set` argument: `&x` is familiar from C
+  and Rust, but there it takes an address, which Lode code never does. A
+  keyword (`f(inout x)`, as in C#'s `ref x`) would read better and say which
+  convention it is.

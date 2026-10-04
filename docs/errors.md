@@ -141,7 +141,8 @@ and `errdefer` cover the rest.
   computing its value.
 - A `defer` body can't leave itself (`return`, `throw`, `try`, or a
   `break` or `continue` out of it), and can't assign variables declared
-  outside it. So running it changes no facts. It's checked where it's
+  outside it, or pass them `inout` or `set`. So running it changes no
+  facts. It's checked where it's
   written, with the facts there about the variables nothing after it
   assigns ([safety.md](safety.md#the-fact-language)).
 - `main` can't throw: it handles its errors and returns an exit status.

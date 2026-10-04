@@ -31,9 +31,11 @@ Go's vocabulary, which is proven:
   directory of the compiler's source tree. Each file must declare
   `package x`. Imports are followed transitively; a cycle is an error.
 - Other imports (anything outside `std/`) aren't supported yet.
-- Only `pub` items can be used from another package, as `pkg.name`.
-- Linker symbols are `<import path>.<name>` (`std/io.print`); the program's
-  own package uses its name (`main.main`).
+- Only `pub` items can be used from another package, as `pkg.name`, and
+  only `pub` methods: `pkg.Type.new()`, `value.method()`.
+- Linker symbols are `<import path>.<name>` (`std/io.print`), and
+  `<import path>.<Type>.<name>` for a method (`std/io.File.write`); the
+  program's own package uses its name (`main.main`).
 - So far there are two packages, `std/os` and `std/io`.
 - `std/os` is the Linux x86-64 system calls:
   - `write` (one `write` system call) and `write_all` (all of a string,
@@ -44,10 +46,12 @@ Go's vocabulary, which is proven:
     and `other(errno)` for any other number. `error(n)` converts a failed
     call's result to an `Error`.
 - `std/io`:
-  - `write(fd: i32, s: str) throws(os.Error)` writes all of `s` to `fd`
-    (like `os.STDOUT`), or throws the error that stopped it. It's the
-    checked way to write. Once types have methods (M6), it will be
-    `io.stdout().write(s)`.
+  - `File`, an open file: a struct holding its file descriptor,
+    `File{fd: i32}`. It doesn't close the file (there's no way to open one
+    yet). `stdout()` and `stderr()` return the standard ones.
+  - `File.write(self, s: str) throws(os.Error)` writes all of `s`, or
+    throws the error that stopped it. It's the checked way to write:
+    `try io.stdout().write(s)`.
   - `print(s: str)` and `eprint(s: str)` write a string to standard output
     and standard error.
   - `print_u64(n: u64)` and `print_i64(n: i64)` write an integer in decimal
@@ -55,7 +59,7 @@ Go's vocabulary, which is proven:
     Smaller integer types convert implicitly. Each call makes one `write`
     system call. They're a stopgap until `print("{}", n)`
     ([comptime.md](comptime.md#format-strings)).
-  - `print` and the others but `write` ignore output errors: they're for
+  - `print` and the others but `File.write` ignore output errors: they're for
     output that isn't worth failing over.
 
 ## Imports

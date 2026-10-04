@@ -32,6 +32,16 @@ itself is in the other documents; this one is only about order.
   write, throwing an `os.Error`. Not yet: inferred error sets, conversion
   between error sets, error return traces
   ([errors.md](errors.md#in-the-compiler-today)).
+- **M6: Methods and parameter conventions** (2026-10-04). `inout`, `sink`
+  and `set` parameters, passed with `&x` (or `&p.x`, `&a[i]`), with the
+  exclusivity rule checked per expression; `inout` slices whose elements
+  the callee assigns (an in-place sort); `var x: T` assigned later, with
+  definite assignment. Methods (`fn T.name(self)`, `inout self`,
+  `sink self`) and associated functions (`T.new()`) on structs and enums,
+  declared in the type's package. `io.write(fd, s)` became
+  `io.stdout().write(s)`, a method of `io.File`
+  ([memory.md](memory.md#parameter-conventions-in-the-compiler-today),
+  [types.md](types.md#methods)).
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
@@ -46,8 +56,6 @@ loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
   (`[0; 21]`), even when only the part that's written is ever read. The
   options are in [memory.md](memory.md#uninitialized-buffers); the choice is
   open.
-- **M6: Methods and parameter conventions.** `fn T.name(self)`, `inout`,
-  `sink`. `io.write(os.STDOUT, s)` becomes `io.stdout().write(s)`.
 - **M7: Generics and traits** (and `comptime`, which they're built on).
 
 Later, in no fixed order yet: refinements in signatures, the allocator

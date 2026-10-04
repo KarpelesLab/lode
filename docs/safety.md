@@ -129,10 +129,12 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. A `match` on a call that throws is the same, with the arms `ok` and `err`. |
-| `try f()`, `throw` | The error leaves the function, so it adds nothing to the facts after. A call changes no local, so after `try`, the facts from before it hold. `throw` always leaves, like `return`. |
+| A call `f(&x)`, `p.scale(2)` | A call changes only the places passed `inout` or `set` (with `&`, or as the receiver of a method that takes `inout self`): what was known about each (a variable, or a struct field and the fields in it) is forgotten. A slice's length doesn't change, and elements have no facts. A variable passed `set` is assigned, with nothing known ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)). |
+| `try f()`, `throw` | The error leaves the function, so it adds nothing to the facts after. After `try`, the facts are those after the call. `throw` always leaves, like `return`. |
 | `f() catch e { ... }`, `f() catch v` | The block (or the value `v`) starts with the facts after the call. After, the block's facts are joined with the call's, as after an `if` without `else`; a block that always leaves adds nothing. A `break` or `continue` in it is a loop exit like any other. |
-| `defer`, `errdefer` | The body is checked where it's written, knowing the facts there about the variables nothing after it in the block assigns. It can't assign variables declared outside it, so running it changes no facts. |
-| `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`) |
+| `defer`, `errdefer` | The body is checked where it's written, knowing the facts there about the variables nothing after it in the block assigns. It can't assign variables declared outside it (or pass them `inout` or `set`), so running it changes no facts. |
+| `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`). After, what `b` may change is forgotten. |
+| `a ?? b` | After, what holds whether `b` ran or not: the facts before `b` joined with those after it |
 | A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` narrows only when `k` is at an end of `x`'s range. |
 | The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
 | `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
@@ -162,7 +164,10 @@ prove that a loop dividing by 10 runs at most 20 times).
 At the head of a loop, the facts before it, `E`, still hold about everything
 the loop doesn't assign. The variables it assigns (`A`: every variable
 assigned anywhere in the body, including in nested loops; for `a[i] = v` and
-`p.x = v`, `a` and `p`) can change on each iteration, so for them the head
+`p.x = v`, `a` and `p`; a variable passed with `&`, and the receiver of every
+method call, since the method may take `inout self`; but not an `inout`
+slice, of which only the elements change) can change on each iteration, so
+for them the head
 keeps only facts that every iteration keeps. Those are found by checking the
 body from a few candidate heads, in a fixed order, and taking the first that
 **holds**: each of its facts about `A` holds again at every **back-edge** (a
