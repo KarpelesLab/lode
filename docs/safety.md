@@ -111,13 +111,20 @@ The checker tracks facts about **terms**. A term is an integer local, the
 length of a view local (`xs.len` of a slice or `str` parameter or local), or
 an integer field of a struct local, reached through fields only (`p.x`,
 `r.min.y`, but not `ps[i].x`). An
-expression can be a term plus a constant: `i`, `i + 1`, `xs.len - 1`. There
-are three kinds of fact:
+expression can be a term plus a constant: `i`, `i + 1`, `xs.len - 1`. More
+generally, it can be a **form**: a constant plus at most two terms, each
+times a constant other than 0: `9 - d`, `a + b`, `10 * v + d`. There are
+four kinds of fact:
 
 - **Ranges:** a term lies in `lo..=hi`.
 - **Holes:** a term is not `k`, for a constant `k` inside its range
   (`b != 0` for a signed `b`).
 - **Relations:** for two terms, `a - b <= c`.
+- **Sums:** for two terms, `p*a + q*b <= c`, with constants `p` and `q`
+  other than 1 and -1 (that's a relation, either way round): `a + b <= c`,
+  `-a - b <= c` (`a + b >= -c`), `10*v + d <= c`. They're kept divided by
+  the largest number that divides both `p` and `q` (`2*a + 2*b <= 5` is
+  `a + b <= 2`). See [Sums](#sums).
 
 All are decidable and cheap, and the rules for how they flow are fixed:
 
@@ -133,9 +140,9 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | `T[i]` of an array constant `T` | Between the smallest and the largest of the elements `i` can pick (of all the elements, past 4096 of them): with `const DAYS: [12]u8 = [31, 28, ...]`, `DAYS[m]` is `28..=31`, and `DAYS[1]` is 28. Other elements have no facts |
 | A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
-| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A value known to be at most a term plus a constant (from `/` or `>>`, above) is related to it that way. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. A slice `s = a[i..j]` has the range of `j - i` as its length, and when `j` is a term plus a constant (`a.len` for `a[i..]`), the relations `j - i.hi <= s.len <= j - i.lo`; so with a constant `i`, `s.len == j - i`. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
+| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A form of one other term is related to it by a sum, both ways: `let x = 250 - b` gives `x + b <= 250` and `x + b >= 250`. A value known to be at most a term plus a constant (from `/` or `>>`, above) is related to it that way. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. A slice `s = a[i..j]` has the range of `j - i` as its length, and when `j` is a term plus a constant (`a.len` for `a[i..]`), the relations `j - i.hi <= s.len <= j - i.lo`; so with a constant `i`, `s.len == j - i`. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations, sums and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`; `p*i + q*b <= c` becomes `p*i + q*b <= c + p*k` for `i += k`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
-| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`, a call to a `never` function), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, each relation one branch knows directly that the other gives too (at the weaker bound; see below for what a point gives), and holes at values neither branch's facts allow. |
+| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`, a call to a `never` function), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, each relation or sum one branch knows directly that the other gives too (at the weaker bound; see below for what a point gives), and holes at values neither branch's facts allow. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. In a `match` on an integer that is a term (plus a constant), an arm also knows the value is between the smallest and the largest of its pattern's values, and that no earlier arm matched it: a value or a range at an end of what's left narrows the range, a single value inside it is a hole (`0 => ...` then `_ => ...`: in `_`, `k != 0`). After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. A `match` on a call that throws is the same, with the arms `ok` and `err`. |
 | A call `f(&x)`, `p.scale(2)` | A call changes only the places passed `inout` or `set` (with `&`, or as the receiver of a method that takes `inout self`): what was known about each (a variable, or a struct field and the fields in it) is forgotten. A slice's length doesn't change, and elements have no facts. A variable passed `set` is assigned, with nothing known ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)). |
 | `try f()`, `throw` | The error leaves the function, so it adds nothing to the facts after. After `try`, the facts are those after the call. `throw` always leaves, like `return`. |
@@ -144,13 +151,13 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | `defer`, `errdefer` | The body is checked where it's written, knowing the facts there about the variables nothing after it in the block assigns. It can't assign variables declared outside it (or pass them `inout` or `set`), so running it changes no facts. |
 | `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`). After, what `b` may change is forgotten. |
 | `a ?? b` | After, what holds whether `b` ran or not: the facts before `b` joined with those after it |
-| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` (and `x == k` being false), with `k` a single value: when `k` is at an end of `x`'s range, the range narrows past it; when it's inside, a hole at `k`. A range that narrows to a hole's value moves past it too. |
+| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. More generally, when both sides are forms and `x - y` has at most two terms, `x - y <= c` gives a relation or a sum for two terms, and a range for one (`10 - d >= 3` gives `d <= 7`); a side can also be a quotient (see [Sums](#sums)). `x != k` (and `x == k` being false), with `k` a single value: when `k` is at an end of `x`'s range, the range narrows past it; when it's inside, a hole at `k`. A range that narrows to a hole's value moves past it too. |
 | The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
 | `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
 | `loop` | After the loop, the facts at its `break`s, joined. Without a `break`, the code after it can't be reached. |
 | `for i in a..b` | In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. After the loop, the head facts, with `i` past the end: in `b.lo..=b.hi` (`..=max(a.hi, b.hi)` unless `a.hi <= b.lo` or a relation gives `a <= b`), and when `b` is a term the body doesn't assign, `b <= i`, and `i <= b` in the same case; joined with the facts at each `break`. (`i` itself can't be used after the loop, but relations go through it.) |
 | `for x in xs` | The same as `for` over `0..xs.len` with a hidden index, which proves the hidden `xs[index]` that gives `x` |
-| `x - y` | A known relation bounds the result: `y <= x` proves it doesn't go below zero |
+| `x + y`, `x - y`, `x * k` | A proven `+` or `-` of two forms, or `*` of a form by a constant, is a form if it has at most two terms. A form of two terms is bounded by a relation or a sum that matches it (see [Sums](#sums)), besides its operands' ranges: `y <= x` proves `x - y` doesn't go below zero, and `a + b <= MAX` proves `a + b` |
 | Reading a term | Its range, narrowed by each of its relations and the other term's range (or its type's): `a - b <= c` gives `a <= b.hi + c` and `b >= a.lo - c`. One step: the other term's range isn't narrowed in turn. So `n <= i` and `i < xs.len` give `n` below the largest `isize`. |
 
 A relation can also come from two known relations through one other term:
@@ -160,6 +167,70 @@ easy to predict. Where facts are compared or joined (after an `if`, at a
 loop's head), what a point **gives** for `a - b` is the tightest of a
 relation, a chain of two through one other term, and, when it knows ranges
 for both, `a.hi - b.lo`.
+
+#### Sums
+
+The rules for forms and sums, exactly:
+
+- **Forms.** A literal or a constant is a form (a constant). So is a term
+  plus a constant, and a lossless conversion of a form. `x + y` and `x - y`
+  of two forms, and `x * k` or `k * x` of a form and a single value `k`,
+  are forms when the operation is proven (not `+%` or `+|`) and the result
+  has at most two terms (terms whose coefficients add up to 0 drop out:
+  `(a + b) - a` is `b`). Nothing else is a form.
+- **Quotients.** `F / m` of a form `F` with at least one term that can't be
+  negative (its range starts at 0 or more), by a single value `m >= 1`, is a
+  quotient: it rounds toward zero, which for `F >= 0` is down. A quotient is
+  only used in a comparison.
+- **From a comparison.** `x <= y + c` (from `<`, `<=`, `>`, `>=`, `==`, true
+  or false, as for relations) gives, when both sides are forms, the facts of
+  the form `x - y <= c`: nothing if it has no term, a range for one term
+  (`m*t <= c'` gives `t <= c'/m` rounded down for `m > 0`, `t >= c'/m`
+  rounded up for `m < 0`), a relation or a sum for two, and nothing for
+  more. When `y` is a quotient `F / m`, it gives `m*x - F <= m*c` (because
+  `x - c <= F / m` rounded down means `m*(x - c) <= F`), and when `x` is
+  one, `F - m*y <= m*c + m - 1`. Each is then the facts of that form, as
+  above.
+- **Using sums.** For a form `p*a + q*b + k` of two terms, the largest
+  number `g` dividing `p` and `q` is taken out: a relation (for `p/g`,
+  `q/g` being 1 and -1, directly or through one other term, as above) or a
+  sum known directly for `(p/g)*a + (q/g)*b` bounds it above by `g*c + k`,
+  and one for `(-p/g)*a + (-q/g)*b` bounds it below by `k - g*c`. These
+  bounds narrow the range computed from the operands' ranges, before the
+  operation is checked. A sum isn't chained through a relation: `x == a`
+  and `a + b <= c` don't give `x + b <= c`.
+- **Flow.** Sums are forgotten, shifted, joined and kept at a loop's head
+  like relations, where what a point gives for a sum is the tightest of a
+  sum it knows directly and, when it knows ranges for both terms, the
+  largest value of `p*a + q*b` they allow. At a loop's head, no sum is made
+  before the search (only relations are, between the variables the loop
+  assigns). Reading a term doesn't narrow its range by its sums.
+
+So both of these are proven:
+
+```
+fn add(a: u32, b: u32) -> ?u32 {
+	if a > 4294967295 - b {                  // false: a + b <= MAX
+		return none
+	}
+	return a + b
+}
+
+fn add_digit(v: u64, d: u64) -> ?u64 {
+	if d > 9 {
+		return none
+	}
+	if v > (18446744073709551615 - d) / 10 { // false: 10*v + d <= MAX
+		return none
+	}
+	return v * 10 + d                        // v * 10 by ranges, + d by the sum
+}
+```
+
+The second also works in two steps: `if v > MAX / 10` bounds `v * 10` by
+ranges, and with `let t = v * 10`, `if t > MAX - d` gives `t + d <= MAX`.
+Both guards must be about the same variables as the sum that's checked: a
+guard on `a + c`, or on a copy of `a`, doesn't prove `a + b`.
 
 `a / b` and `a % b` are proven when `b` can't be 0 (its range doesn't
 contain 0, or 0 is a hole in it) and, for a signed type, when `a` can't be
@@ -309,7 +380,9 @@ range are separate facts):
 
 Either way, a relation no tighter than what the types of its terms give
 (`c` at least `a`'s type's largest value minus `b`'s type's smallest) is no
-fact, as a range as wide as its type is none.
+fact, as a range as wide as its type is none. A sum is weakened like a
+relation, with what a back-edge gives for it (a term with no known range
+having its type's), and is no fact when its types give as much.
 
 The **thresholds** of a term of `A` are the constants it's compared with in
 the body: each comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) between the

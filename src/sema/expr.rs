@@ -7,7 +7,7 @@ use crate::diag::Diagnostic;
 use crate::source::Span;
 use crate::types::{IntTy, Primitive, Range, Trait, Ty, primitive};
 
-use super::facts::{self, CondFacts, Env, Linear, Side, Term};
+use super::facts::{self, CondFacts, Env, Form, Linear, Side, Term};
 use super::generic::{GenericEdge, Inference, ORDERED_METHODS, num, param_help, show_range};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
@@ -27,6 +27,13 @@ pub(super) struct Checked {
     pub(super) upper: Option<Linear>,
     /// For a slice `base[start..end]`, what's known about its length.
     pub(super) len: Option<SliceLen>,
+    /// For integers, the value as a form of at most two terms, like
+    /// `9 - d` or `10 * v + d`, when it isn't exactly a term plus a
+    /// constant (see [`Checked::form`]).
+    pub(super) form: Option<Form>,
+    /// For integers, the value as `F / m` (rounded down) of a form `F` that
+    /// can't be negative and a constant `m >= 1`, like `(MAX - d) / 10`.
+    pub(super) quot: Option<(Form, i128)>,
 }
 
 /// What the checker knows about the length of a slice `base[start..end]`,
@@ -51,7 +58,32 @@ impl Checked {
             facts: None,
             upper: None,
             len: None,
+            form: None,
+            quot: None,
         }
+    }
+
+    /// The value as a form: its term plus a constant, a constant if its
+    /// range is a single value, or the form it was computed as.
+    pub(super) fn form(&self) -> Option<Form> {
+        if let Some(t) = self.term {
+            return Some(Form::of(t));
+        }
+        match self.range {
+            Some(r) if r.lo == r.hi => Some(Form::constant(r.lo)),
+            _ => self.form,
+        }
+    }
+
+    /// The same value converted to `ty`, in `range`: it's still the term,
+    /// form or quotient this one is, and below the same `upper` bound.
+    pub(super) fn converted(self, ty: Ty, range: Option<Range>) -> Checked {
+        let mut out = Checked::new(TExprKind::Convert(Box::new(self.expr)), ty, range);
+        out.term = self.term;
+        out.upper = self.upper;
+        out.form = self.form;
+        out.quot = self.quot;
+        out
     }
 
     pub(super) fn ty(&self) -> Ty {
@@ -68,6 +100,8 @@ impl Checked {
     fn side(&self) -> Side {
         Side {
             term: self.term,
+            form: self.form(),
+            quot: self.quot,
             range: self.int_range(),
             full: type_range(self.expr.ty).unwrap_or(Range::exact(0)),
         }
@@ -548,11 +582,8 @@ impl Checker<'_> {
         {
             // The value keeps its range: with none known, its own type's,
             // not the wider target's.
-            let (range, term, upper) = (Some(c.int_range()), c.term, c.upper);
-            let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), target, range);
-            out.term = term;
-            out.upper = upper;
-            return Some(out);
+            let range = Some(c.int_range());
+            return Some(c.converted(target, range));
         }
         // An array where a slice of its element type is expected: a view of
         // the whole array.
@@ -2400,6 +2431,15 @@ impl Checker<'_> {
             },
             _ => None,
         };
+        // The result as a form of at most two terms (`a + b`, `10 * v + d`,
+        // `9 - d`), for `+`, `-` and `*` by a constant that are proven.
+        let form = match (op, l.form(), r.form()) {
+            (BinOp::Add, Some(x), Some(y)) => x.plus(y),
+            (BinOp::Sub, Some(x), Some(y)) => x.minus(y),
+            (BinOp::Mul, Some(x), _) if exact(b).is_some() => exact(b).and_then(|k| x.scale(k)),
+            (BinOp::Mul, _, Some(y)) if exact(a).is_some() => exact(a).and_then(|k| y.scale(k)),
+            _ => None,
+        };
 
         let (top, range) = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
@@ -2408,14 +2448,16 @@ impl Checker<'_> {
                     BinOp::Sub => a.checked_sub(b),
                     _ => a.checked_mul(b),
                 };
-                // `x - y` of two terms: a known relation between them bounds
-                // the difference (e.g. `y <= x` gives `x - y >= 0`).
-                if op == BinOp::Sub
-                    && let (Some(x), Some(y), Some(res)) = (l.term, r.term, result)
-                {
-                    let lo = cx.env.diff_bound(y, x).map_or(res.lo, |c| res.lo.max(-c));
-                    let hi = cx.env.diff_bound(x, y).map_or(res.hi, |c| res.hi.min(c));
-                    result = Some(Range { lo, hi });
+                // A form of two terms: a relation or a sum between them
+                // bounds it (`y <= x` gives `x - y >= 0`, `a + b <= c`
+                // gives `a + b <= c`).
+                if let (Some(f), Some(res)) = (form, result) {
+                    let (lo, hi) = cx.env.form_bounds(f);
+                    let lo = lo.map_or(res.lo, |lo| res.lo.max(lo));
+                    let hi = hi.map_or(res.hi, |hi| res.hi.min(hi));
+                    if lo <= hi {
+                        result = Some(Range { lo, hi });
+                    }
                 }
                 // For a type parameter, each end of the result also fits
                 // when it's past an operand, which is a value of the type:
@@ -2574,10 +2616,25 @@ impl Checker<'_> {
         } else {
             None
         };
+        // `F / m` of a form that can't be negative, by a constant `m >= 1`:
+        // rounded down, which comparisons can use.
+        let quot = match (op, l.form(), exact(b)) {
+            (BinOp::Div, Some(f), Some(m)) if m >= 1 && a.lo >= 0 && f.term_count() > 0 => {
+                Some((f, m))
+            }
+            _ => None,
+        };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
         let mut out = Checked::new(kind, t, Some(range));
         out.term = linear;
         out.upper = upper;
+        if matches!(
+            top,
+            TBinOp::Add(Mode::Proven) | TBinOp::Sub(Mode::Proven) | TBinOp::Mul(Mode::Proven)
+        ) {
+            out.form = form;
+        }
+        out.quot = quot;
         Some(out)
     }
 
@@ -3442,9 +3499,8 @@ impl Checker<'_> {
         if from == Ty::Int(to) {
             return Some(c);
         }
-        let term = c.term;
-        let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), Ty::Int(to), Some(r));
-        out.term = term;
+        let mut out = c.converted(Ty::Int(to), Some(r));
+        out.upper = None;
         Some(out)
     }
 }

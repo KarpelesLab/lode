@@ -1,0 +1,115 @@
+// stdout: 7 none 4294967295 none\n
+// stdout: 123 none 18446744073709551615 none\n
+// stdout: 250 none 200 none 25 900 250\n
+package main
+
+import "std/io"
+
+// `a > MAX - b` being false gives the sum fact `a + b <= MAX`, which
+// proves `a + b`.
+fn add(a: u32, b: u32) -> ?u32 {
+	if a > 4294967295 - b {
+		return none
+	}
+	return a + b
+}
+
+// `v > (MAX - d) / 10` being false gives `10 * v + d <= MAX`: the quotient
+// rounds down, and `MAX - d` can't be negative.
+fn add_digit(v: u64, d: u64) -> ?u64 {
+	if d > 9 {
+		return none
+	}
+	if v > (18446744073709551615 - d) / 10 {
+		return none
+	}
+	return v * 10 + d
+}
+
+// The same, in two steps: `v > 25` (`MAX / 10`) bounds `v * 10`, which is then a
+// term: `t > MAX - d` gives `t + d <= MAX`.
+fn add_digit_steps(v: u8, d: u8) -> ?u8 {
+	if v > 25 {
+		return none
+	}
+	let t = v * 10
+	if t > 255 - d {
+		return none
+	}
+	return t + d
+}
+
+// A sum fact joins like a relation: both branches give `x + b <= 250`,
+// the first from `x = 250 - b`.
+fn joined(a: u8, b: u8) -> u8 {
+	if b > 9 {
+		return 0
+	}
+	var x = a
+	if x > 250 - b {
+		x = 250 - b
+	}
+	return x + b
+}
+
+// In a loop: `total + x <= 1000` is checked for each element before it's
+// added.
+fn capped_sum(xs: []u16) -> u16 {
+	var total: u16 = 0
+	for x in xs {
+		if x > 1000 || total > 1000 - x {
+			break
+		}
+		total += x
+	}
+	return total
+}
+
+// In a generic function: `a + b <= 200` fits every unsigned type, though
+// the ranges alone (`a, b <= 200`) don't fit in `u8`.
+fn add_small[T: Unsigned](a: T, b: T) -> ?T {
+	if b > 200 || a > 200 - b {
+		return none
+	}
+	return a + b
+}
+
+fn show[T: Integer](v: ?T) {
+	match v {
+		none => io.print("none")
+		some(x) => io.print_int(x)
+	}
+}
+
+fn main() {
+	show(add(3, 4))
+	io.print(" ")
+	show(add(4294967295, 1))
+	io.print(" ")
+	show(add(4294967290, 5))
+	io.print(" ")
+	show(add(4000000000, 300000000))
+	io.print("\n")
+	show(add_digit(12, 3))
+	io.print(" ")
+	show(add_digit(12, 10))
+	io.print(" ")
+	show(add_digit(1844674407370955161, 5))
+	io.print(" ")
+	show(add_digit(1844674407370955161, 6))
+	io.print("\n")
+	show(add_digit_steps(25, 0))
+	io.print(" ")
+	show(add_digit_steps(25, 6))
+	io.print(" ")
+	show(add_small[u8](150, 50))
+	io.print(" ")
+	show(add_small[u64](150, 51))
+	io.print(" ")
+	io.print_int(joined(20, 5))
+	io.print(" ")
+	io.print_int(capped_sum([400, 500, 200, 7]))
+	io.print(" ")
+	io.print_int(joined(250, 3))
+	io.print("\n")
+}

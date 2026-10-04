@@ -31,14 +31,13 @@ fn parse_u32(s: []u8) -> ParseResult {
 		if c < '0' || c > '9' {
 			return ParseResult.err(ParseError.invalid_digit(i))
 		}
-		let d = c - '0'
-		// WORKAROUND: natural `if n > (MAX - d) / 10 { overflow }; n = n * 10 + d`
-		// isn't provable; go through u64 instead.
-		let w = u64(n) * 10 + d
-		if w > 4294967295 {
+		let d = u32(c - '0')
+		// FIXED: this guard used to go through u64. Now `n <= (MAX - d) / 10`
+		// gives `10 * n + d <= MAX`, which proves the next line.
+		if n > (4294967295 - d) / 10 {
 			return ParseResult.err(ParseError.overflow)
 		}
-		n = u32(w)
+		n = n * 10 + d
 	}
 	return ParseResult.ok(n)
 }

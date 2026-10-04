@@ -546,9 +546,8 @@ impl Checker<'_> {
             self.diags.push(d);
             return None;
         }
-        let term = c.term;
-        let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), ty, Some(r));
-        out.term = term;
+        let mut out = c.converted(ty, Some(r));
+        out.upper = None;
         Some(out)
     }
 

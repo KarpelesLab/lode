@@ -2150,6 +2150,19 @@ impl<'a> Checker<'a> {
                 .apply(&equal(Term::Local(local), src.term, src.offset));
             cx.env.copy_holes(src.term, Term::Local(local), src.offset);
         }
+        // A form of one other term, as in `let x = 9 - d` or `t = 10 * v`:
+        // `x - F <= 0` and `F - x <= 0`, a relation or a sum.
+        if value.term.is_none()
+            && let Some(f) = value.form
+            && f.term_count() == 1
+            && f.terms().all(|(t, _)| t.local() != local)
+        {
+            let x = facts::Form::of(Linear::of(Term::Local(local)));
+            let full = term_full_by(|l| cx.locals[l].ty, Term::Local(local));
+            for d in [x.minus(f), f.minus(x)].into_iter().flatten() {
+                cx.env.apply(&d.le(0, full));
+            }
+        }
         // At most another term plus a constant, as in `let mid = xs.len / 2`.
         if let Some(up) = value.upper
             && up.term != Term::Local(local)

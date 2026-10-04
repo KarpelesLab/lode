@@ -1,0 +1,87 @@
+// error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this multiplication does not overflow `u64`
+// error: cannot prove that this addition does not overflow `u64`
+// error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this addition does not overflow `u32`
+package main
+
+// The guard leaves room for `a + b + 1`, not for `a + b + 2`.
+fn too_close(a: u32, b: u32) -> ?u32 {
+	if a >= 4294967295 - b {
+		return none
+	}
+	let ok = a + b + 1
+	return a + b + 2
+}
+
+// The guard is the wrong way around.
+fn backwards(a: u32, b: u32) -> ?u32 {
+	if a < 4294967295 - b {
+		return none
+	}
+	return a + b
+}
+
+// The guard is about `a + c`, not `a + b`.
+fn other_term(a: u32, b: u32, c: u32) -> ?u32 {
+	if a > 4294967295 - c {
+		return none
+	}
+	return a + b
+}
+
+// `x` grows after the guard: the fact moves with it. After the first
+// `x += 1`, `x + b <= MAX`; after the second, `x + b <= MAX + 1`.
+fn grows(a: u32, b: u32) -> ?u32 {
+	var x = a
+	if b < 2 || x >= 4294967295 - b {
+		return none
+	}
+	x += 1
+	let ok = x + b
+	x += 1
+	return x + b
+}
+
+// A sum fact isn't chained through a relation: `x == a` and `a + b <= MAX`
+// don't give `x + b <= MAX`.
+fn copied(a: u32, b: u32) -> ?u32 {
+	if a > 4294967295 - b {
+		return none
+	}
+	let x = a
+	return x + b
+}
+
+// Dividing by 9 bounds `10 * v` too loosely.
+fn loose_digit(v: u64, d: u64) -> ?u64 {
+	if d > 9 {
+		return none
+	}
+	if v > (18446744073709551615 - d) / 9 {
+		return none
+	}
+	return v * 10 + d
+}
+
+// `v <= (MAX - 9) / 10` and any `d`: the guard doesn't involve `d`, so
+// only ranges apply.
+fn unrelated_digit(v: u64, d: u64) -> ?u64 {
+	if v > 1844674407370955160 {
+		return none
+	}
+	return v * 10 + d
+}
+
+// Assigning `b` forgets the sum fact.
+fn reassigned(a: u32, b0: u32, b1: u32) -> ?u32 {
+	var b = b0
+	if a > 4294967295 - b {
+		return none
+	}
+	b = b1
+	return a + b
+}

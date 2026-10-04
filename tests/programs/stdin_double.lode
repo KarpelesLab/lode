@@ -30,12 +30,13 @@ fn parse(b: []u8, n: usize) throws(ParseError) -> u64 {
 		if c < '0' || c > '9' {
 			throw .bad_digit
 		}
-		// At most 18 digits, which fit with room to spare. (The checker
-		// can't use `d > MAX - v` to prove that `v + d` fits.)
-		if v >= 100000000000000000 {
+		// `v <= (MAX - d) / 10` gives `10 * v + d <= MAX`, which proves
+		// the next line.
+		let d = u64(c - '0')
+		if v > (18446744073709551615 - d) / 10 {
 			throw .overflow
 		}
-		v = v * 10 + u64(c - '0')
+		v = v * 10 + d
 		digits +%= 1
 		i += 1
 	}
@@ -55,8 +56,7 @@ fn main() -> u8 {
 	let v = parse(buf, n) catch _ {
 		return 2
 	}
-	// `parse` gives less than 10^18, but the checker doesn't follow a
-	// value's range out of a function.
+	// Only up to half the largest `u64` can be doubled.
 	if v > 0x7fffffffffffffff {
 		return 3
 	}

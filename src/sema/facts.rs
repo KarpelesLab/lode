@@ -1,10 +1,12 @@
 //! The facts the proof checker knows at a point in a function.
 //!
-//! Three kinds of fact, all decidable and cheap (docs/safety.md):
+//! Four kinds of fact, all decidable and cheap (docs/safety.md):
 //!
 //! - **ranges**: a term's value lies in `lo..=hi`;
 //! - **holes**: a term isn't some value inside its range (`b != 0`);
-//! - **relations**: for two terms `a` and `b`, `a - b <= c`.
+//! - **relations**: for two terms `a` and `b`, `a - b <= c`;
+//! - **sums**: for two terms, `p*a + q*b <= c`, with other coefficients
+//!   than a relation's (`a + b <= c`, `10*v + d <= c`).
 //!
 //! A [`Term`] is an integer local, the length of a view local (a slice or a
 //! `str`), so `i < xs.len` relates `i` to the length of `xs`, or an integer
@@ -23,8 +25,9 @@ use std::collections::{BTreeSet, HashMap};
 use super::tree::{CmpOp, LocalId};
 use crate::types::Range;
 
-/// Something the checker knows facts about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Something the checker knows facts about. The order only puts the two
+/// terms of a sum in a fixed order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Term {
     /// The value of an integer local.
     Local(LocalId),
@@ -76,12 +79,187 @@ struct Rel {
     c: i128,
 }
 
+/// A value the checker can relate to at most two terms: a constant plus
+/// each term times a coefficient other than 0, like `9 - d`, `a + b` or
+/// `10 * v + d`. A term plus a constant ([`Linear`]) is one too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Form {
+    terms: [Option<(Term, i128)>; 2],
+    pub k: i128,
+}
+
+impl Form {
+    pub fn constant(k: i128) -> Form {
+        Form {
+            terms: [None, None],
+            k,
+        }
+    }
+
+    pub fn of(x: Linear) -> Form {
+        Form {
+            terms: [Some((x.term, 1)), None],
+            k: x.offset,
+        }
+    }
+
+    /// Its terms, with their coefficients.
+    pub fn terms(&self) -> impl Iterator<Item = (Term, i128)> + '_ {
+        self.terms.iter().flatten().copied()
+    }
+
+    /// The number of terms.
+    pub fn term_count(&self) -> usize {
+        self.terms().count()
+    }
+
+    /// `self + other`, if it has at most two terms and fits.
+    pub fn plus(self, other: Form) -> Option<Form> {
+        let mut out = Form::constant(self.k.checked_add(other.k)?);
+        let mut n = 0;
+        for (t, m) in self.terms().chain(other.terms()) {
+            if let Some(slot) = out.terms[..n].iter_mut().flatten().find(|s| s.0 == t) {
+                slot.1 = slot.1.checked_add(m)?;
+                continue;
+            }
+            if n == 2 {
+                // A third term: perhaps one of the first two cancels out.
+                out = out.compact();
+                n = out.term_count();
+                if n == 2 {
+                    return None;
+                }
+            }
+            out.terms[n] = Some((t, m));
+            n += 1;
+        }
+        Some(out.compact())
+    }
+
+    /// Without the terms whose coefficient is 0.
+    fn compact(self) -> Form {
+        let mut out = Form::constant(self.k);
+        let mut n = 0;
+        for (t, m) in self.terms() {
+            if m != 0 {
+                out.terms[n] = Some((t, m));
+                n += 1;
+            }
+        }
+        out
+    }
+
+    /// `self * m`, if it fits.
+    pub fn scale(self, m: i128) -> Option<Form> {
+        let mut out = Form::constant(self.k.checked_mul(m)?);
+        for (slot, term) in out.terms.iter_mut().zip(self.terms) {
+            *slot = match term {
+                Some((t, c)) => Some((t, c.checked_mul(m)?)),
+                None => None,
+            };
+        }
+        Some(out.compact())
+    }
+
+    /// `self - other`, if it has at most two terms and fits.
+    pub fn minus(self, other: Form) -> Option<Form> {
+        self.plus(other.scale(-1)?)
+    }
+
+    /// The facts from `self <= c`: for one term, a range; for two, a
+    /// relation (coefficients 1 and -1, in either order) or a sum. Both
+    /// sides of a sum are divided by the largest number that divides both
+    /// coefficients (`2*a + 2*b <= 5` is `a + b <= 2`). `full` is the
+    /// type's range, for a range.
+    pub fn le(self, c: i128, full: Range) -> Vec<Fact> {
+        let Some(c) = c.checked_sub(self.k) else {
+            return Vec::new();
+        };
+        match self.terms {
+            [Some((t, m)), None] | [None, Some((t, m))] => {
+                // m * t <= c
+                let bound = if m > 0 {
+                    Range {
+                        lo: ANY.lo,
+                        hi: c.div_euclid(m),
+                    }
+                } else {
+                    // t >= c / m, rounded up.
+                    Range {
+                        lo: -(c.div_euclid(-m)),
+                        hi: ANY.hi,
+                    }
+                };
+                vec![Fact::Narrow {
+                    term: t,
+                    bound,
+                    full,
+                }]
+            }
+            [Some((a, p)), Some((b, q))] => vec![sum_fact(a, p, b, q, c)],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The greatest common divisor of two numbers other than 0, positive.
+fn gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    i128::try_from(a).unwrap_or(1)
+}
+
+/// `p*a + q*b <= c`, divided by the gcd of `p` and `q`, with the terms in
+/// order: a relation if the coefficients are 1 and -1, a sum otherwise.
+fn sum_fact(a: Term, p: i128, b: Term, q: i128, c: i128) -> Fact {
+    let g = gcd(p, q);
+    let (p, q, c) = (p / g, q / g, c.div_euclid(g));
+    match (p, q) {
+        (1, -1) => Fact::Rel { a, b, c },
+        (-1, 1) => Fact::Rel { a: b, b: a, c },
+        _ if a <= b => Fact::Sum { a, p, b, q, c },
+        _ => Fact::Sum {
+            a: b,
+            p: q,
+            b: a,
+            q: p,
+            c,
+        },
+    }
+}
+
+/// `p*a + q*b <= c` for two terms, `a < b`, with coefficients whose gcd is
+/// 1, other than 1 and -1 (that's a [`Rel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Sum {
+    a: Term,
+    p: i128,
+    b: Term,
+    q: i128,
+    c: i128,
+}
+
+impl Sum {
+    fn fact(self) -> Fact {
+        Fact::Sum {
+            a: self.a,
+            p: self.p,
+            b: self.b,
+            q: self.q,
+            c: self.c,
+        }
+    }
+}
+
 /// Facts at one program point.
 #[derive(Clone, Debug, Default)]
 pub struct Env {
     /// Known ranges; a term without an entry can be anything its type allows.
     ranges: HashMap<Term, Range>,
     rels: Vec<Rel>,
+    sums: Vec<Sum>,
     /// The locals that may not be assigned yet on some path to this point
     /// (a `var` declared without a value, a `set` parameter).
     uninit: BTreeSet<LocalId>,
@@ -114,6 +292,14 @@ pub enum Fact {
     },
     /// `a - b <= c`.
     Rel { a: Term, b: Term, c: i128 },
+    /// `p*a + q*b <= c`, `a < b`, normalized as for [`Sum`].
+    Sum {
+        a: Term,
+        p: i128,
+        b: Term,
+        q: i128,
+        c: i128,
+    },
     /// `term != value`.
     Hole { term: Term, value: i128 },
 }
@@ -130,6 +316,12 @@ pub struct CondFacts {
 pub struct Side {
     /// The term (plus a constant) this side reads, if any.
     pub term: Option<Linear>,
+    /// The side as a [`Form`], if it is one (a term plus a constant, a
+    /// constant, or a sum like `9 - d`).
+    pub form: Option<Form>,
+    /// The side as `F / m` (rounded down) of a form `F` that can't be
+    /// negative, and a constant `m >= 1`.
+    pub quot: Option<(Form, i128)>,
     pub range: Range,
     /// The range of the side's type.
     pub full: Range,
@@ -165,15 +357,25 @@ fn le(x: Side, y: Side, c: i128) -> Vec<Fact> {
             full: y.full,
         });
     }
-    if let (Some(a), Some(b)) = (x.term, y.term)
-        && a.term != b.term
-    {
-        // (a + ka) - (b + kb) <= c
-        facts.push(Fact::Rel {
-            a: a.term,
-            b: b.term,
-            c: c.saturating_sub(a.offset).saturating_add(b.offset),
-        });
+    // Between forms, `x - y <= c` is a form too, if it has at most two
+    // terms: a relation (`(a + ka) - (b + kb) <= c`) or a sum
+    // (`a - (k - b) <= c`). With `y = F / m` (rounded down, `F >= 0`),
+    // `x <= y + c` is `m*x - F <= m*c`; with `x = F / m`, `x <= y + c` is
+    // `F - m*y <= m*c + m - 1`. A form of one term gives a range (for a
+    // side that's a term plus a constant, the same as above).
+    let diff = match (x.form, y.form, x.quot, y.quot) {
+        (Some(fx), Some(fy), _, _) => fx.minus(fy).map(|d| (d, c)),
+        (Some(fx), None, _, Some((f, m))) => {
+            fx.scale(m).and_then(|mx| mx.minus(f)).zip(m.checked_mul(c))
+        }
+        (None, Some(fy), Some((f, m)), _) => fy
+            .scale(m)
+            .and_then(|my| f.minus(my))
+            .zip(m.checked_mul(c).and_then(|mc| mc.checked_add(m - 1))),
+        _ => None,
+    };
+    if let Some((d, c)) = diff {
+        facts.extend(d.le(c, x.full));
     }
     facts
 }
@@ -386,6 +588,74 @@ impl Env {
         if narrowed { Some(r) } else { own }
     }
 
+    /// The tightest known `c` with `p*a + q*b <= c` for a sum (`a < b`,
+    /// normalized as for [`Sum`]), directly.
+    fn sum(&self, a: Term, p: i128, b: Term, q: i128) -> Option<i128> {
+        self.sums
+            .iter()
+            .filter(|s| s.a == a && s.p == p && s.b == b && s.q == q)
+            .map(|s| s.c)
+            .min()
+    }
+
+    /// The tightest `c` with `p*a + q*b <= c` this point gives for the
+    /// two-term form `p*a + q*b` (normalized: [`sum_fact`] with `c = 0`):
+    /// from a relation (directly or through one other term) or a sum, and
+    /// from known ranges of both terms (`full` gives a term's type's range
+    /// when it has none; `None` uses only known ranges).
+    fn gives(&self, form: &Fact, full: Option<&dyn Fn(Term) -> Range>) -> Option<i128> {
+        let (a, p, b, q, known) = match *form {
+            Fact::Rel { a, b, .. } => (a, 1, b, -1, self.rel_through(a, b)),
+            Fact::Sum { a, p, b, q, .. } => (a, p, b, q, self.sum(a, p, b, q)),
+            _ => return None,
+        };
+        let range = |t: Term| self.range(t).or_else(|| full.map(|f| f(t)));
+        let end = |r: Range, m: i128| {
+            if m > 0 {
+                m.checked_mul(r.hi)
+            } else {
+                m.checked_mul(r.lo)
+            }
+        };
+        let by_ranges = match (range(a), range(b)) {
+            (Some(ra), Some(rb)) => end(ra, p)
+                .zip(end(rb, q))
+                .and_then(|(x, y)| x.checked_add(y)),
+            _ => None,
+        };
+        match (known, by_ranges) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
+    }
+
+    /// The bounds the relations and sums give on a form of two terms, as
+    /// `(lo, hi)` (for a constant, itself): `p*a + q*b + k <= c*g + k` from a relation or a sum
+    /// for `p*a + q*b` divided by `g`, the gcd of `p` and `q` (directly, or
+    /// for a relation through one other term), and the same for `-p*a -
+    /// q*b` below. Ranges aren't used: the caller has them.
+    pub fn form_bounds(&self, f: Form) -> (Option<i128>, Option<i128>) {
+        if f.term_count() == 0 {
+            return (Some(f.k), Some(f.k));
+        }
+        let [Some((a, p)), Some((b, q))] = f.terms else {
+            return (None, None);
+        };
+        let g = gcd(p, q);
+        let bound = |sign: i128| -> Option<i128> {
+            let form = sum_fact(a, sign * p, b, sign * q, 0);
+            let c = match form {
+                Fact::Rel { a, b, .. } => self.rel_through(a, b)?,
+                Fact::Sum { a, p, b, q, .. } => self.sum(a, p, b, q)?,
+                _ => return None,
+            };
+            c.checked_mul(g)
+        };
+        let hi = bound(1).and_then(|c| c.checked_add(f.k));
+        let lo = bound(-1).and_then(|c| f.k.checked_sub(c));
+        (lo, hi)
+    }
+
     /// An upper bound on `x - y` from the relations (see [`Env::rel_through`]).
     pub fn diff_bound(&self, x: Linear, y: Linear) -> Option<i128> {
         let terms = if x.term == y.term {
@@ -422,6 +692,8 @@ impl Env {
             .retain(|t, _| !matches!(t, Term::Field(l, _) if *l == local));
         self.rels
             .retain(|r| r.a.local() != local && r.b.local() != local);
+        self.sums
+            .retain(|s| s.a.local() != local && s.b.local() != local);
         self.holes.retain(|(t, _)| t.local() != local);
     }
 
@@ -432,6 +704,7 @@ impl Env {
         let hit = |t: &Term| matches!(*t, Term::Field(l, k) if l == local && fields.contains(&k));
         self.ranges.retain(|t, _| !hit(t));
         self.rels.retain(|r| !hit(&r.a) && !hit(&r.b));
+        self.sums.retain(|s| !hit(&s.a) && !hit(&s.b));
         self.holes.retain(|(t, _)| !hit(t));
     }
 
@@ -454,6 +727,24 @@ impl Env {
                 Some(Rel { c, ..*r })
             })
             .collect();
+        // p*i + q*b <= c, with i = i' - k: p*i' + q*b <= c + p*k.
+        let sums: Vec<Sum> = self
+            .sums
+            .iter()
+            .filter_map(|s| {
+                let m = if s.a == me {
+                    s.p
+                } else if s.b == me {
+                    s.q
+                } else {
+                    return None;
+                };
+                Some(Sum {
+                    c: s.c.checked_add(m.checked_mul(k)?)?,
+                    ..*s
+                })
+            })
+            .collect();
         let holes: Vec<(Term, i128)> = self
             .holes
             .iter()
@@ -462,6 +753,7 @@ impl Env {
             .collect();
         self.forget_value(local, range);
         self.rels.extend(shifted);
+        self.sums.extend(sums);
         for (term, value) in holes {
             self.apply(&[Fact::Hole { term, value }]);
         }
@@ -602,6 +894,30 @@ impl Env {
                 out.rels.push(Rel { c, ..*rel });
             }
         }
+        // A sum, as a relation: what each edge gives, a term with no known
+        // range having its type's.
+        for sum in &self.sums {
+            if !about(sum.a.local()) && !about(sum.b.local()) {
+                out.sums.push(*sum);
+                continue;
+            }
+            let form = sum.fact();
+            let by_types = Env::default().gives(&form, Some(&full));
+            let mut c = Some(sum.c);
+            for e in &live {
+                let ec = e.gives(&form, Some(&full));
+                c = match (how, c, ec) {
+                    (Loosen::Drop, Some(c), Some(ec)) if ec <= c => Some(c),
+                    (Loosen::Cover, Some(c), Some(ec)) => Some(c.max(ec)),
+                    _ => None,
+                };
+            }
+            if let Some(c) = c
+                && by_types.is_none_or(|t| c < t)
+            {
+                out.sums.push(Sum { c, ..*sum });
+            }
+        }
         // A hole can't be loosened: it's kept if every edge has it.
         for &(term, value) in &self.holes {
             if !about(term.local()) || live.iter().all(|e| e.excludes(term, value)) {
@@ -663,6 +979,8 @@ impl Env {
             && self.ranges == other.ranges
             && self.rels.len() == other.rels.len()
             && self.rels.iter().all(|r| other.rels.contains(r))
+            && self.sums.len() == other.sums.len()
+            && self.sums.iter().all(|r| other.sums.contains(r))
             && self.holes.len() == other.holes.len()
             && self.holes.iter().all(|h| other.holes.contains(h))
     }
@@ -690,6 +1008,13 @@ impl Env {
                     if self.rel(a, b).is_none_or(|old| c < old) {
                         self.rels.retain(|r| !(r.a == a && r.b == b));
                         self.rels.push(Rel { a, b, c });
+                    }
+                }
+                Fact::Sum { a, p, b, q, c } => {
+                    if self.sum(a, p, b, q).is_none_or(|old| c < old) {
+                        self.sums
+                            .retain(|s| !(s.a == a && s.p == p && s.b == b && s.q == q));
+                        self.sums.push(Sum { a, p, b, q, c });
                     }
                 }
             }
@@ -747,6 +1072,23 @@ impl Env {
                 });
             }
         }
+        // A sum either side knows, if both give it (directly or by ranges).
+        let mut sums: Vec<Sum> = Vec::new();
+        for s in a.sums.iter().chain(&b.sums) {
+            if sums
+                .iter()
+                .any(|k| k.a == s.a && k.p == s.p && k.b == s.b && k.q == s.q)
+            {
+                continue;
+            }
+            let form = s.fact();
+            if let (Some(ca), Some(cb)) = (a.gives(&form, None), b.gives(&form, None)) {
+                sums.push(Sum {
+                    c: ca.max(cb),
+                    ..*s
+                });
+            }
+        }
         // A local is assigned after the join only if it is on both paths.
         let uninit = a.uninit.union(&b.uninit).copied().collect();
         let mut holes: Vec<(Term, i128)> = Vec::new();
@@ -758,6 +1100,7 @@ impl Env {
         let mut out = Env {
             ranges,
             rels,
+            sums,
             uninit,
             holes,
             dead: false,
@@ -782,6 +1125,8 @@ mod tests {
     fn side(term: Term) -> Side {
         Side {
             term: Some(Linear::of(term)),
+            form: Some(Form::of(Linear::of(term))),
+            quot: None,
             range: U32,
             full: U32,
         }
@@ -789,9 +1134,24 @@ mod tests {
 
     /// `term + k`, for a term in `0..=u32::MAX - k`.
     fn plus(term: Term, k: i128) -> Side {
+        let lin = Linear { term, offset: k };
         Side {
-            term: Some(Linear { term, offset: k }),
+            term: Some(lin),
+            form: Some(Form::of(lin)),
+            quot: None,
             range: Range { lo: k, hi: U32.hi },
+            full: U32,
+        }
+    }
+
+    /// `k - term`, for a term in `0..=k`.
+    fn minus(k: i128, term: Term) -> Side {
+        let form = Form::constant(k).minus(Form::of(Linear::of(term)));
+        Side {
+            term: None,
+            form,
+            quot: None,
+            range: Range { lo: 0, hi: k },
             full: U32,
         }
     }
@@ -803,6 +1163,8 @@ mod tests {
     fn konst(v: i128) -> Side {
         Side {
             term: None,
+            form: Some(Form::constant(v)),
+            quot: None,
             range: Range::exact(v),
             full: U32,
         }
@@ -971,8 +1333,11 @@ mod tests {
     };
 
     fn signed(local: LocalId) -> Side {
+        let lin = Linear::of(Term::Local(local));
         Side {
-            term: Some(Linear::of(Term::Local(local))),
+            term: Some(lin),
+            form: Some(Form::of(lin)),
+            quot: None,
             range: I32,
             full: I32,
         }
@@ -1067,6 +1432,134 @@ mod tests {
         // No threshold at least E's upper end: nothing changes.
         let t = n.to_thresholds(&exact(0, 20), about, full, &ks);
         assert!(t.same(&n));
+    }
+
+    #[test]
+    fn forms() {
+        let (a, b) = (Term::Local(0), Term::Local(1));
+        let fa = Form::of(Linear::of(a));
+        let fb = Form::of(Linear::of(b));
+        // a + b - a is b; a third term doesn't fit.
+        assert_eq!(fa.plus(fb).and_then(|f| f.minus(fa)), Some(fb));
+        assert_eq!(fa.plus(fb).and_then(|f| f.plus(side_form(2))), None);
+        assert_eq!(fa.minus(fa).map(|f| f.term_count()), Some(0));
+        assert_eq!(
+            fa.scale(10)
+                .and_then(|f| f.plus(fb))
+                .map(|f| f.term_count()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn one_term_forms_narrow() {
+        // -100 < b: b >= -99. 10 - b >= 3: b <= 7. -10 * b <= -25: b >= 3.
+        let b = Term::Local(1);
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Lt, konst(-100), signed(1)).when_true);
+        assert_eq!(env.range(b).map(|r| r.lo), Some(-99));
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Ge, minus(10, b), konst(3)).when_true);
+        assert_eq!(env.range(b), Some(Range { lo: 0, hi: 7 }));
+        let mut env = Env::default();
+        let f = side_form(1).scale(-10).expect("fits");
+        env.apply(&f.le(-25, I32));
+        assert_eq!(env.range(b).map(|r| r.lo), Some(3));
+        env.apply(&f.le(25, I32));
+        assert_eq!(env.range(b).map(|r| r.lo), Some(3));
+    }
+
+    fn side_form(local: LocalId) -> Form {
+        Form::of(Linear::of(Term::Local(local)))
+    }
+
+    #[test]
+    fn sums_from_comparisons() {
+        // a > MAX - b is false: a + b <= MAX.
+        let (a, b) = (Term::Local(0), Term::Local(1));
+        let max = U32.hi;
+        let f = comparison(CmpOp::Gt, var(0), minus(max, b));
+        let mut env = Env::default();
+        env.apply(&f.when_false);
+        let sum = fa_plus_fb(a, 1, b, 1, 0);
+        assert_eq!(env.form_bounds(sum), (None, Some(max)));
+        // With a constant: a + b + 3 <= MAX + 3, and 2a + 2b <= 2 * MAX.
+        assert_eq!(env.form_bounds(fa_plus_fb(a, 1, b, 1, 3)).1, Some(max + 3));
+        assert_eq!(env.form_bounds(fa_plus_fb(a, 2, b, 2, 0)).1, Some(2 * max));
+        // a - b isn't bounded by it.
+        assert_eq!(env.form_bounds(fa_plus_fb(a, 1, b, -1, 0)), (None, None));
+        // When true, a + b >= MAX + 1.
+        let mut env = Env::default();
+        env.apply(&f.when_true);
+        assert_eq!(env.form_bounds(sum), (Some(max + 1), None));
+        // Assigning a forgets it; shifting a moves it.
+        let mut env = Env::default();
+        env.apply(&f.when_false);
+        env.shift(0, None, 2);
+        assert_eq!(env.form_bounds(sum).1, Some(max + 2));
+        env.assign(1, None);
+        assert_eq!(env.form_bounds(sum).1, None);
+    }
+
+    fn fa_plus_fb(a: Term, p: i128, b: Term, q: i128, k: i128) -> Form {
+        Form::of(Linear::of(a))
+            .scale(p)
+            .and_then(|x| x.plus(Form::of(Linear::of(b)).scale(q)?))
+            .and_then(|x| x.plus(Form::constant(k)))
+            .expect("fits")
+    }
+
+    #[test]
+    fn sums_from_quotients() {
+        // v <= (MAX - d) / 10: 10v + d <= MAX.
+        let (v, d) = (Term::Local(0), Term::Local(1));
+        let max = u64::MAX as i128;
+        let f = Form::constant(max)
+            .minus(Form::of(Linear::of(d)))
+            .expect("fits");
+        let q = Side {
+            term: None,
+            form: None,
+            quot: Some((f, 10)),
+            range: Range {
+                lo: (max - 9) / 10,
+                hi: max / 10,
+            },
+            full: Range { lo: 0, hi: max },
+        };
+        let x = Side {
+            full: Range { lo: 0, hi: max },
+            range: Range { lo: 0, hi: max },
+            ..var(0)
+        };
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Le, x, q).when_true);
+        assert_eq!(env.form_bounds(fa_plus_fb(v, 10, d, 1, 0)).1, Some(max));
+        // v > (MAX - d) / 10: 10v + d >= MAX + 1 (floor(F / 10) < v means
+        // F < 10v).
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Le, x, q).when_false);
+        assert_eq!(env.form_bounds(fa_plus_fb(v, 10, d, 1, 0)).0, Some(max + 1));
+    }
+
+    #[test]
+    fn joining_sums() {
+        let (a, b) = (Term::Local(0), Term::Local(1));
+        let sum = fa_plus_fb(a, 1, b, 1, 0);
+        let mut x = Env::default();
+        x.apply(&comparison(CmpOp::Le, var(0), minus(10, b)).when_true);
+        // The other side knows a + b <= 12 by ranges.
+        let mut y = exact(0, 5);
+        y.apply(&comparison(CmpOp::Le, var(1), konst(7)).when_true);
+        let j = Env::join(x.clone(), y);
+        assert_eq!(j.form_bounds(sum).1, Some(12));
+        // Without ranges on one side, it's gone.
+        let j = Env::join(x.clone(), Env::default());
+        assert_eq!(j.form_bounds(sum).1, None);
+        // At a loop head: kept if the back-edge gives it.
+        let about = |l: LocalId| l == 0;
+        assert!(x.holds_in(about, full, &x.clone()));
+        assert!(!x.holds_in(about, full, &Env::default()));
     }
 
     #[test]

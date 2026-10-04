@@ -91,7 +91,9 @@ What works:
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe, and so must slicing `a[i..j]`. The checker follows value ranges and
   relations between variables, struct fields and lengths through the program, narrowing on conditions, early returns and
-  `for` loops. `+% -% *% <<%` wrap and `+| -| *|` saturate. Every binary
+  `for` loops, and sums of two of them: `if a > MAX - b { return none }`
+  proves `a + b`, and `if v > (MAX - d) / 10 { ... }` proves `v * 10 + d`.
+  `+% -% *% <<%` wrap and `+| -| *|` saturate. Every binary
   operator has an assignment form with the same rules: `x += 1`, `x +%= 1`,
   `flags |= bit`.
 
