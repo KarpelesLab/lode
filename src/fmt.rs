@@ -820,6 +820,20 @@ mod tests {
     }
 
     #[test]
+    fn comptime() {
+        assert_eq!(
+            fmt(
+                "if comptime target.os==.linux{\nconst A=1\nfn f(){}\n}\nelse if comptime target.arch == .avr {\n\
+                 compile_error( \"no\" )}\n@ comptime_budget( 10 )\nconst T:[2]u8=g()\n\
+                 fn g()->[2]u8{\nif comptime A==1{return [1,2]}else{compile_error(\"x\")}\n}\n"
+            ),
+            "if comptime target.os == .linux {\n\tconst A = 1\n\tfn f() {}\n} else if comptime target.arch == .avr {\n\
+             \tcompile_error(\"no\")\n}\n@comptime_budget(10)\nconst T: [2]u8 = g()\n\
+             fn g() -> [2]u8 {\n\tif comptime A == 1 {\n\t\treturn [1, 2]\n\t} else {\n\t\tcompile_error(\"x\")\n\t}\n}\n"
+        );
+    }
+
+    #[test]
     fn comments_are_kept() {
         let src = "\
 /// Doc comment.

@@ -80,13 +80,23 @@ fn build_only(opts: &Options, command: &str) -> Result<(), String> {
     for (set, flag) in [
         (opts.emit_ir, "--emit=ir"),
         (opts.stack_usage, "--stack-usage"),
-        (opts.targets.is_some(), "--targets"),
     ] {
         if set {
             return Err(format!(
                 "`{flag}` is for `lode build`, not `lode {command}`"
             ));
         }
+    }
+    Ok(())
+}
+
+/// Reject `--targets`, which only `lode check` takes.
+fn check_only(opts: &Options) -> Result<(), String> {
+    if opts.targets.is_some() {
+        return Err(format!(
+            "`--targets` is for `lode check`: only {} can be built",
+            Target::host().name
+        ));
     }
     Ok(())
 }
@@ -246,6 +256,7 @@ fn check_targets(files: &mut SourceMap, root: FileId, targets: &[&'static Target
 
 fn build(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
+    check_only(&opts)?;
     if opts.emit_ir && opts.stack_usage {
         return Err("`--stack-usage` needs machine code, not `--emit=ir`".to_owned());
     }
@@ -277,6 +288,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
+    check_only(&opts)?;
     build_only(&opts, "run")?;
     let (mut files, root) = load(&opts.input)?;
     let build_options = lode::BuildOptions { opt: opts.opt };

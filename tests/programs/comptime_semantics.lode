@@ -1,0 +1,53 @@
+// exit: 0
+package main
+
+// The same functions, run while compiling and at run time, give the same
+// results: wrapping, saturating, shifts, division and conversions.
+const INPUTS: [6]i32 = [0, 1, -1, 2147483647, -2147483648, -12345]
+const AT_COMPILE_TIME: [6][8]u64 = table()
+
+fn mix(x: i32, k: u32) -> [8]u64 {
+	let a = x *% 3 +% 7
+	let b = x -| 100
+	let c = x <<% k
+	let d = x >> (k % 32)
+	var e: i32 = 0
+	if x != -2147483648 {
+		e = x / 7 + x % 5
+	}
+	let u = u32(k) *| 1000000
+	let w = u8(k % 256) +% 200
+	let neg = x < 0
+	var flags: u64 = 0
+	if neg {
+		flags = 1
+	}
+	return [
+		u64(u32(a & 0x7fffffff)),
+		u64(u32(b & 0x7fffffff)),
+		u64(u32(c & 0x7fffffff)),
+		u64(u32(d & 0x7fffffff)),
+		u64(u32(e & 0x7fffffff)),
+		u64(u),
+		u64(w) + u64(~w),
+		flags | u64(k) << 1,
+	]
+}
+
+fn table() -> [6][8]u64 {
+	var out: [6][8]u64 = [[0; 8]; 6]
+	for i in 0..6 {
+		out[i] = mix(INPUTS[i], u32(i) * 13)
+	}
+	return out
+}
+
+fn main() -> u8 {
+	for i in 0..6 {
+		let now = mix(INPUTS[i], u32(i) * 13)
+		if now != AT_COMPILE_TIME[i] {
+			return u8(i) + 1
+		}
+	}
+	return 0
+}

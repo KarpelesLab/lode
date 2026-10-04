@@ -1,0 +1,32 @@
+// error: a package-level `if comptime` condition can only use `target`, literals, comparisons, `&&`, `||` and `!`
+// error: `target` has no field `system`
+// error: `target.Os` has no variant `linx`
+// error: `&&` needs `bool` operands
+// error: `target` has no field `cpu`
+// help: it's evaluated before the package's names are known
+// help: its variants are `.linux`, `.none`
+package main
+
+const LEVEL = 2
+
+// Declarations are picked before names are known: only `target`, literals
+// and operators.
+if comptime LEVEL > 1 {
+	fn level() {
+	}
+}
+
+if comptime target.system == .linux {
+}
+
+if comptime target.os == .linx {
+}
+
+if comptime target.pointer_bits && true {
+}
+
+fn main() {
+	if comptime target.cpu == 1 {
+		undefined()
+	}
+}

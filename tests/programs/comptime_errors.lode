@@ -1,0 +1,105 @@
+// error: evaluating `BIG` at compile time: 100 * 3 overflows `u8`
+// error: evaluating `OUT` at compile time: the index 4 is out of bounds: the length is 4
+// error: evaluating `RATIO` at compile time: 7 is divided by zero
+// error: evaluating `NEG` at compile time: `-(-128)` doesn't fit in `i8`
+// error: evaluating `NARROW` at compile time: 256 doesn't fit in `u8`
+// error: evaluating `SPIN` at compile time: it takes more than 1000000 steps
+// error: evaluating `EXIT` at compile time: it reaches a `syscall`
+// error: the value of `SELF` depends on itself
+// error: a constant needed to declare a type or a signature can't call a function
+// error: `n` is a variable, so this condition isn't known when compiling
+// error: taken
+// error: cannot find `nope` in this scope
+// help: raise the budget with `@comptime_budget(n)` on the line before the `const`
+// help: compile-time code is hermetic: no system calls, no I/O
+package main
+
+import "std/os"
+
+// Code that only runs while compiling is checked by running it: these
+// operations aren't proven, and fail when they run.
+const BIG: u8 = half(200) * 3
+const TABLE: [4]u8 = [1, 2, 3, 4]
+const OUT: u8 = TABLE[index()]
+const RATIO: u32 = 7 / zero()
+const NEG: i8 = -minus()
+const NARROW: u8 = u8(wide())
+
+// Bounded and hermetic.
+const SPIN: u32 = spin()
+const EXIT: u32 = leave()
+
+// A value can't need itself.
+const SELF: u32 = uses_self()
+
+// Types are declared before functions are checked.
+const N: usize = index()
+
+struct Buffer {
+	bytes: [N]u8
+}
+
+fn half(x: u8) -> u8 {
+	return x / 2
+}
+
+fn index() -> usize {
+	return 4
+}
+
+fn zero() -> u32 {
+	return 0
+}
+
+fn minus() -> i8 {
+	return -128
+}
+
+fn wide() -> u32 {
+	return 256
+}
+
+fn spin() -> u32 {
+	var n: u32 = 0
+	loop {
+		n = n +% 1
+	}
+	return n
+}
+
+fn leave() -> u32 {
+	os.exit(1)
+}
+
+fn uses_self() -> u32 {
+	return SELF
+}
+
+fn main() {
+	let n: u8 = 3
+	if comptime n == 3 {
+		compile_error("not checked: the condition failed")
+	}
+	if comptime target.arch == .avr {
+		compile_error("not taken")
+	} else if comptime target.pointer_bits == 64 {
+		compile_error("taken")
+	}
+}
+
+// A function in error is reported once, though a constant runs it, and
+// though it's checked first while trying out a loop's facts.
+const EARLY: u32 = outer()
+const LATE: u32 = broken()
+
+fn outer() -> u32 {
+	var s: u32 = 0
+	for i in 0..3 {
+		s = s +% LATE
+	}
+	return s +% broken()
+}
+
+fn broken() -> u32 {
+	return nope
+}

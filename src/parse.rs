@@ -2108,6 +2108,45 @@ mod tests {
     }
 
     #[test]
+    fn comptime() {
+        let file = parse_ok(
+            "if comptime target.os == .linux {\n\tconst A = 1\n\tfn f() {\n\t}\n} else if comptime false {\n\
+             \tcompile_error(\"x\")\n}\nelse {\n\tif comptime true {\n\t}\n}\n\
+             @comptime_budget(10)\npub const B: u32 = g()\nfn h() {\n\tif comptime A == 1 {\n\t} else {\n\t}\n}\n",
+        );
+        assert_eq!(file.items.len(), 3);
+        let Item::If(i) = &file.items[0] else {
+            panic!()
+        };
+        assert_eq!(i.then.len(), 2);
+        let Some(ItemElse::If(inner)) = &i.otherwise else {
+            panic!()
+        };
+        assert!(matches!(inner.then[..], [Item::CompileError(_)]));
+        assert!(
+            matches!(&inner.otherwise, Some(ItemElse::Items(items)) if matches!(items[..], [Item::If(_)]))
+        );
+        let Item::Const(c) = &file.items[1] else {
+            panic!()
+        };
+        assert!(c.is_pub && c.budget.is_some());
+        let Item::Fn(h) = &file.items[2] else {
+            panic!()
+        };
+        assert!(matches!(&h.body.stmts[0], Stmt::If(i) if i.comptime && i.otherwise.is_some()));
+
+        let errs = parse_errors(
+            "if target.os == .linux {\n}\n@inline(1)\nconst A = 1\nfn f() {\n\tif comptime let x = y {\n\t}\n}\n\
+             @comptime_budget(1)\nfn g() {\n}\n",
+        );
+        assert_eq!(errs.len(), 4, "{errs:?}");
+        assert!(errs[0].contains("only be in an `if comptime`"));
+        assert!(errs[1].contains("unknown attribute `@inline`"));
+        assert!(errs[2].contains("can't bind a value"));
+        assert!(errs[3].contains("applies to a `const`"));
+    }
+
+    #[test]
     fn reports_and_recovers() {
         let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntrait S {}\n");
         assert_eq!(errs.len(), 3, "{errs:?}");

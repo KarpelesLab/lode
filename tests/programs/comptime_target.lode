@@ -1,0 +1,49 @@
+// stdout: linux x86_64 64 little\n
+package main
+
+import "std/io"
+
+// Per-target declarations: the branch the target takes is compiled, the
+// others only parse. They may use names that don't exist here.
+if comptime target.os == .linux && target.pointer_bits == 64 {
+	const WORD_BYTES: usize = 8
+
+	fn os_name() -> str {
+		return "linux"
+	}
+} else if comptime target.arch == .avr {
+	const WORD_BYTES: usize = avr.word_bytes()
+} else {
+	compile_error("this program needs a 64-bit Linux")
+}
+
+const IS_X86: bool = target.arch == .x86_64
+
+fn arch_name() -> str {
+	if comptime target.arch == .x86_64 {
+		return "x86_64"
+	} else if comptime target.arch == .aarch64 {
+		return "aarch64"
+	} else {
+		compile_error("arch_name: unknown architecture")
+	}
+}
+
+fn main() -> u8 {
+	io.print(os_name())
+	io.print(" ")
+	io.print(arch_name())
+	io.print(" ")
+	// `target` is an ordinary value too, and `if` checks both branches.
+	io.print_int(target.pointer_bits)
+	if target.endian == .little {
+		io.print(" little\n")
+	} else {
+		io.print(" big\n")
+	}
+	if comptime WORD_BYTES * 8 != 64 || !IS_X86 {
+		this_is_not_checked()
+		return 1
+	}
+	return 0
+}

@@ -1,0 +1,12 @@
+// error: this program only runs on AVR
+package main
+
+// A package that can't be compiled for the target says so, and nothing
+// else is checked: what follows would only give errors that follow from it.
+if comptime target.arch != .avr {
+	compile_error("this program only runs on AVR")
+}
+
+fn main() {
+	blink_forever()
+}
