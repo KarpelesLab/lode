@@ -147,15 +147,16 @@ elements have no facts, and there's no induction beyond the loop condition.
 Example, from the standard library's `os.write_all`:
 
 ```
-let n = write(fd, p, left)     // n: isize, any value
+let n = syscall(SYS_WRITE, fd, p, left)  // n: isize, any value
+...
 if n < 0 {
-	return n                   // leaves: below, n >= 0
+	return n                             // leaves: below, n >= 0
 }
-let done = usize(n)            // proven: 0 <= n
-if done == 0 || done > left {
-	return -EIO                // leaves: below, done <= left
+...
+if usize(n) > left {                     // proven: 0 <= n
+	break                                // leaves: below, usize(n) <= left
 }
-left = left - done             // proven by the relation done - left <= 0
+left = left - usize(n)                   // proven by that relation
 ```
 
 ### Refinements in types

@@ -28,26 +28,35 @@ pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
 
 /// Write all of `s` to `fd`, retrying after partial writes and interrupted
 /// calls. Returns 0, or the negative error number of the first failure.
+///
+/// The loop is written for size: one `syscall` instead of a call to `write`
+/// (inlining one costs 140 bytes today), each check a plain `if` (an `||`
+/// costs a merge block), and both `-EIO` cases share one exit.
 pub fn write_all(fd: i32, s: str) -> isize {
 	unsafe {
 		var p = s.ptr
 		var left = s.len
-		while left > 0 {
-			let n = write(fd, p, left)
+		loop {
+			if left == 0 {
+				return 0
+			}
+			let n = syscall(SYS_WRITE, fd, p, left)
+			if n == -EINTR {
+				continue
+			}
 			if n < 0 {
-				if n == -EINTR {
-					continue
-				}
 				return n
 			}
-			let done = usize(n)
-			if done == 0 || done > left {
-				// The kernel never reports writing nothing, or more than asked.
-				return -EIO
+			// The kernel never reports writing nothing, or more than asked.
+			if n == 0 {
+				break
 			}
-			left = left - done
-			p = p + done
+			if usize(n) > left {
+				break
+			}
+			left = left - usize(n)
+			p = p + usize(n)
 		}
 	}
-	return 0
+	return -EIO
 }
