@@ -258,6 +258,7 @@ struct Mark {
     consts: Vec<ConstState>,
     strs: StrOrigins,
     moved: HashSet<LocalId>,
+    generic_calls: usize,
 }
 
 impl FnCx {
@@ -3355,6 +3356,7 @@ impl<'a> Checker<'a> {
             consts: self.consts.iter().map(|c| c.state).collect(),
             strs: cx.strs.clone(),
             moved: cx.moved.clone(),
+            generic_calls: self.generic_calls.len(),
         }
     }
 
@@ -3364,6 +3366,7 @@ impl<'a> Checker<'a> {
         cx.failed.retain(|&l| l < mark.locals);
         cx.strs = mark.strs.clone();
         cx.moved = mark.moved.clone();
+        self.generic_calls.truncate(mark.generic_calls);
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
             c.state = state;
         }

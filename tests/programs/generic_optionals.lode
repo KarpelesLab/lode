@@ -1,0 +1,79 @@
+// stdout: 5 9 600 4 8 ok 8\n
+package main
+
+// Type parameters in optionals, `set` parameters and functions that
+// throw: a `T` without `Copy` moves through `??`, `if let`, `match` and
+// `let ... else`.
+
+import "std/io"
+
+enum E {
+	bad
+}
+
+fn fill2[T: Copy](set out: T, v: T) {
+	out = v
+}
+
+fn check[T: Integer](x: T) throws(E) -> T {
+	if x < 0 {
+		throw .bad
+	}
+	return x
+}
+
+fn twice_checked[T: Integer](x: T) throws(E) -> T {
+	let a = try check(x)
+	return a +| a
+}
+
+fn or_else[T](sink o: ?T, sink d: T) -> T {
+	return o ?? d
+}
+
+fn unwrap_or[T](sink o: ?T, sink d: T) -> T {
+	if let v = o {
+		return v
+	}
+	return d
+}
+
+fn is_some[T](sink o: ?T) -> bool {
+	match o {
+		some(v) => return true
+		none => return false
+	}
+}
+
+fn get[T](sink o: ?T) -> T {
+	let v = o else {
+		loop {
+		}
+	}
+	return v
+}
+
+fn main() {
+	var x: u8
+	fill2(&x, 5)
+	io.print_int(x)
+	io.print(" ")
+	let v = check[i8](-1) catch 9
+	io.print_int(v)
+	io.print(" ")
+	let w: i16 = twice_checked(300) catch 0
+	io.print_int(w)
+	io.print(" ")
+	let o: ?u32 = none
+	io.print_int(or_else(o, 4))
+	io.print(" ")
+	let p: ?u32 = 8
+	io.print_int(unwrap_or(p, 4))
+	io.print(" ")
+	if is_some(p) && !is_some(o) {
+		io.print("ok")
+	}
+	io.print(" ")
+	io.print_int(get(p))
+	io.print("\n")
+}

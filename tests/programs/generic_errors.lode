@@ -106,10 +106,15 @@ fn pass_on[U](x: U) -> U {
 	return twice(x)
 }
 
-// Instances that never end.
+// Instances that never end (reported once, though a loop's body is
+// checked several times).
 fn nest[T: Copy](x: T) -> u32 {
-	let o: ?T = x
-	return nest(o)
+	var n: u32 = 0
+	while n < 3 {
+		let o: ?T = x
+		n = nest(o)
+	}
+	return n
 }
 
 fn unknown_trait[T: Sortable](x: T) {
