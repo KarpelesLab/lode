@@ -40,8 +40,11 @@ A file that doesn't lex or parse is left unchanged, with its errors.
 
 The canonical form:
 
-- Each line is indented with one tab per open `{`. A line that continues a
-  statement, or follows a `(` or `[` left open, gets one more tab.
+- Each line is indented with one tab per block level. A block's body is one
+  tab deeper than the line that starts its header (even when the header spans
+  several lines), and its `}` lines up with that line.
+- A line that continues a statement gets one more tab. Inside a `(` or `[`
+  left open, that extra tab is given once, not once per line (as in gofmt).
 - Inside a line, tokens are separated by one space, except:
   - none after `(`, `[` and `.`, and none before `)`, `]`, `,`, `:` and `.`
   - none around `..`: `0..n`
