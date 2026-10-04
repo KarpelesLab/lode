@@ -1,0 +1,175 @@
+/// Character encodings: the `Encoding` trait, and UTF-8 and ASCII as
+/// encodings of it, beside the built-in `str` (docs/strings.md). Until
+/// `Str[E]` exists, they work on bytes.
+package encoding
+
+/// A character encoding: how runes, its characters, are written as bytes.
+/// An encoding is a type that is never a value: its functions are called
+/// on it, as `Utf8.decode(b)`, or `E.decode(b)` in generic code.
+pub trait Encoding {
+	/// One character.
+	type Rune: Copy + Eq
+	/// The most bytes a rune takes.
+	const MAX_LEN: usize
+
+	/// The rune `bytes` starts with, and its length in bytes; `none` if
+	/// `bytes` is empty or doesn't start with a valid rune.
+	fn decode(bytes: []u8) -> ?Decoded[Self.Rune]
+
+	/// Write the rune `r` at the start of `out`: returns its length in
+	/// bytes. The rest of `out` is zeros.
+	fn encode(r: Rune, set out: [MAX_LEN]u8) -> usize
+
+	/// Whether all of `bytes` is valid in the encoding.
+	fn validate(bytes: []u8) -> bool {
+		return count[Self](bytes) != none
+	}
+}
+
+/// A rune and the number of bytes it took.
+pub struct Decoded[R] {
+	rune: R
+	len: usize
+}
+
+/// The number of runes in `bytes`, or `none` if it isn't valid in `E`.
+pub fn count[E: Encoding](bytes: []u8) -> ?usize {
+	var n: usize = 0
+	var i: usize = 0
+	while i < bytes.len {
+		let d = E.decode(bytes[i..]) else {
+			return none
+		}
+		// A rune takes at least one byte, and no more than are left.
+		if d.len == 0 || d.len > bytes.len - i {
+			return none
+		}
+		i = i + d.len
+		n = n +| 1
+	}
+	return n
+}
+
+/// UTF-8: a rune is a Unicode scalar value, in 1 to 4 bytes.
+pub enum Utf8 {
+	/// Its only value, never used: the encoding is the type.
+	utf8
+}
+
+impl Encoding for Utf8 {
+	type Rune = u32
+	const MAX_LEN: usize = 4
+
+	fn decode(bytes: []u8) -> ?Decoded[u32] {
+		if bytes.len == 0 {
+			return none
+		}
+		let b0 = bytes[0]
+		if b0 < 0x80 {
+			return Decoded{rune: u32(b0), len: 1}
+		}
+		// The length and the smallest second byte, which rules out
+		// overlong forms and values above U+10FFFF and surrogates.
+		var n: usize = 0
+		var lo: u8 = 0x80
+		var hi: u8 = 0xbf
+		if b0 >= 0xc2 && b0 <= 0xdf {
+			n = 2
+		} else if b0 >= 0xe0 && b0 <= 0xef {
+			n = 3
+			if b0 == 0xe0 {
+				lo = 0xa0
+			}
+			if b0 == 0xed {
+				hi = 0x9f
+			}
+		} else if b0 >= 0xf0 && b0 <= 0xf4 {
+			n = 4
+			if b0 == 0xf0 {
+				lo = 0x90
+			}
+			if b0 == 0xf4 {
+				hi = 0x8f
+			}
+		} else {
+			return none
+		}
+		if bytes.len < n {
+			return none
+		}
+		let b1 = bytes[1]
+		if b1 < lo || b1 > hi {
+			return none
+		}
+		var r = u32(b0) & (u32(0x7f) >> u32(n))
+		for i in 1..n {
+			let b = bytes[i]
+			if b < 0x80 || b > 0xbf {
+				return none
+			}
+			r = (r << 6) | u32(b & 0x3f)
+		}
+		return Decoded{rune: r, len: n}
+	}
+
+	fn encode(r: u32, set out: [4]u8) -> usize {
+		out = [0, 0, 0, 0]
+		if r < 0x80 {
+			out[0] = u8(r)
+			return 1
+		}
+		if r < 0x800 {
+			out[0] = 0xc0 | u8(r >> 6)
+			out[1] = 0x80 | u8(r & 0x3f)
+			return 2
+		}
+		if r < 0x10000 {
+			out[0] = 0xe0 | u8(r >> 12)
+			out[1] = 0x80 | u8(r >> 6 & 0x3f)
+			out[2] = 0x80 | u8(r & 0x3f)
+			return 3
+		}
+		// Above U+10FFFF, the last valid value is written.
+		var v = r
+		if v > 0x10ffff {
+			v = 0x10ffff
+		}
+		out[0] = 0xf0 | u8(v >> 18)
+		out[1] = 0x80 | u8(v >> 12 & 0x3f)
+		out[2] = 0x80 | u8(v >> 6 & 0x3f)
+		out[3] = 0x80 | u8(v & 0x3f)
+		return 4
+	}
+}
+
+/// ASCII: a rune is a byte below 128.
+pub enum Ascii {
+	/// Its only value, never used: the encoding is the type.
+	ascii
+}
+
+impl Encoding for Ascii {
+	type Rune = u8
+	const MAX_LEN: usize = 1
+
+	fn decode(bytes: []u8) -> ?Decoded[u8] {
+		if bytes.len == 0 || bytes[0] >= 0x80 {
+			return none
+		}
+		return Decoded{rune: bytes[0], len: 1}
+	}
+
+	fn encode(r: u8, set out: [1]u8) -> usize {
+		out = [r & 0x7f]
+		return 1
+	}
+
+	fn validate(bytes: []u8) -> bool {
+		for b in bytes {
+			if b >= 0x80 {
+				return false
+			}
+		}
+		return true
+	}
+}
