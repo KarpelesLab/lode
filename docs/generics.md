@@ -7,7 +7,7 @@ builds on what's already written: [types.md](types.md#generics-and-traits)
 bounded), and the proof checker of [safety.md](safety.md). Each section lists
 the options, the trade-offs and a recommendation. The decisions only the user
 can make are collected at the end, in
-[Questions for the user](#questions-for-the-user).
+[Questions for the user](#decisions).
 
 Nothing here is implemented. Every section is **Proposed** unless it says
 otherwise.
@@ -783,35 +783,37 @@ becomes urgent.
 the concurrency work; `Str[E]`; error-set unions with generic errors; code
 sharing for small targets; reflection.
 
-## Questions for the user
+## Decisions
 
-Each has a recommended answer; the reasoning is in the section linked.
+**Status:** Decided 2026-10-04 for questions 1–3 and 6 (by the user); the
+others keep the recommended answer unless the user changes them.
 
-1. **How are traits implemented?** Recommended: `impl Trait for T { ... }`
-   blocks holding the methods, callable as `p.cmp(q)`
-   ([Implementations](#implementations)). Alternative: a one-line `impl`
-   plus ordinary `fn Point.cmp` methods.
-2. **Is `T` copyable by default?** Recommended: no; copying needs
-   `T: Copy`, and `max` takes `sink` parameters
-   ([`Copy` and moves](#copy-and-moves-in-generic-code)).
-3. **Does `<` work on `T: Ordered`?** Recommended: no; only sealed numeric
-   bounds get operators, `Ordered` gives `a.lt(b)`
-   ([Operators in generic code](#operators-in-generic-code)).
-4. **Equality: derived only?** Recommended: yes; `Eq` is never written by
-   hand, stays automatic as today, and floats (so structs with float
-   fields) aren't `Eq`. This also closes types.md's "opt-in or automatic"
-   question as automatic.
-5. **Coherence:** recommended: impls in the trait's or the type's package,
-   one per trait and type, no blanket impls ([Coherence](#coherence)).
-6. **Per-target code:** recommended: package-scope `if comptime` instead of
-   file-name suffixes ([What M7 needs](#what-m7-needs)).
-7. **Code that only runs at compile time is checked by running it**
-   instead of by the prover ([Proof obligations in compile-time
-   code](#proof-obligations-in-compile-time-code)). Recommended: yes.
-8. **One `print`:** recommended: `io.print` becomes the formatted print
-   with a compile-time format, and `print(s)` of a runtime string becomes
+1. **Traits are implemented in `impl Trait for T { ... }` blocks** holding
+   the methods, callable as `p.cmp(q)` ([Implementations](#implementations)).
+   *Decided.*
+2. **`T` is not copyable by default:** copying needs `T: Copy`, and `max`
+   takes `sink` parameters
+   ([`Copy` and moves](#copy-and-moves-in-generic-code)). *Decided.*
+3. **`<` doesn't work on `T: Ordered`:** only sealed numeric bounds get
+   operators, `Ordered` gives `a.lt(b)`
+   ([Operators in generic code](#operators-in-generic-code)). *Decided.*
+4. **Equality is derived only:** `Eq` is never written by hand, stays
+   automatic as today, and floats (so structs with float fields) aren't
+   `Eq`. This closes types.md's "opt-in or automatic" question as automatic.
+   *Recommended, pending.*
+5. **Coherence:** impls live in the trait's or the type's package, one per
+   trait and type, no blanket impls ([Coherence](#coherence)).
+   *Recommended, pending.*
+6. **Per-target code uses package-scope `if comptime`**, not file-name
+   suffixes ([What M7 needs](#what-m7-needs)). *Decided.*
+7. **Code that only runs at compile time is checked by running it** instead
+   of by the prover ([Proof obligations in compile-time
+   code](#proof-obligations-in-compile-time-code)). *Recommended, pending.*
+8. **One `print`:** `io.print` becomes the formatted print with a
+   compile-time format, and `print(s)` of a runtime string becomes
    `print("{}", s)` ([Format strings](#format-strings)).
-9. **`dyn Trait` and allocation stay out of M7.** Recommended: yes; M7 ships
-   with fixed-capacity containers, and `dyn` and the allocator context come
+   *Recommended, pending.*
+9. **`dyn Trait` and allocation stay out of M7:** M7 ships with
+   fixed-capacity containers, and `dyn` and the allocator context come
    right after ([`dyn Trait`](#dyn-trait),
-   [Sequencing](#sequencing-with-the-allocator)).
+   [Sequencing](#sequencing-with-the-allocator)). *Recommended, pending.*
