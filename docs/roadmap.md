@@ -53,6 +53,15 @@ itself is in the other documents; this one is only about order.
   `std/math` (`min`, `max`, `clamp`, `abs`), `std/slices` (`sort`,
   `is_sorted`), and `io.print_int`, which replaces `print_u64` and
   `print_i64` ([generics.md](generics.md#m7a-in-the-compiler)).
+- **M7b: Generic structs and enums, value parameters, generic methods**
+  (2026-10-04). `struct Pair[A, B]` and `enum Either[L, R]`, instantiated
+  per arguments (`Pair[u8, bool]`), which literals and calls infer; value
+  parameters (`[N: usize]`) that size arrays and are terms for the
+  checker, so `[N]T` indexing is proven once for every `N`; methods that
+  name the type's parameters (`fn Pair[A, B].swap`), add bounds, or have
+  their own; recursive generic types rejected. std gains `std/buf`
+  (`StackBuf[N]`, which `io.print_int` uses for its digits) and `std/vec`
+  (`ArrayVec[T, N]`) ([generics.md](generics.md#m7b-in-the-compiler)).
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
@@ -68,11 +77,11 @@ Slicing `a[i..j]` compiles only when the checker proves
 
 - **Checker: filling buffers.** A buffer must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read. The
-  options are in [memory.md](memory.md#uninitialized-buffers); the choice is
-  open.
-- **M7b to M7e: the rest of generics and traits** (and `comptime`, which
-  they're built on): generic structs and enums with value parameters and
-  generic methods (M7b), user traits and `impl` (M7c), compile-time
+  options are in [memory.md](memory.md#uninitialized-buffers): option 3's
+  type, `StackBuf[N]`, exists, and stops filling once fields can be
+  private.
+- **M7c to M7e: the rest of generics and traits** (and `comptime`, which
+  they're built on): user traits and `impl` (M7c), compile-time
   evaluation and target selection (M7d), format strings (M7e). The
   proposal is in [generics.md](generics.md#implementation-plan).
 

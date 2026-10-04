@@ -36,9 +36,11 @@ Go's vocabulary, which is proven:
 - Linker symbols are `<import path>.<name>` (`std/io.print`), and
   `<import path>.<Type>.<name>` for a method (`std/io.File.write`); the
   program's own package uses its name (`main.main`). An instance of a
-  generic function adds its type arguments: `std/math.max[u32]`.
-- So far there are four packages: `std/os`, `std/io`, `std/math` and
-  `std/slices`.
+  generic function adds its type arguments: `std/math.max[u32]`; a method
+  of a generic type has the type's after the type's name:
+  `std/buf.StackBuf[64].push`.
+- So far there are six packages: `std/os`, `std/io`, `std/math`,
+  `std/slices`, `std/buf` and `std/vec`.
 - `std/os` is the Linux x86-64 system calls:
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
     the bytes, retrying), which return a negative error number on failure.
@@ -86,16 +88,18 @@ Go's vocabulary, which is proven:
     same way, such as a buffer the program filled:
     `io.stdout().write_bytes(buf)`.
     `write(s)` is `write_bytes(s.bytes())`.
+  - `File.write_buf[N: usize](self, b: buf.StackBuf[N]) throws(os.Error)`
+    writes the bytes written in a `StackBuf`, the same way.
   - `print(s: str)` and `eprint(s: str)` write a string to standard output
     and standard error.
   - `print_int[T: Integer](n: T)` writes an integer of any type in decimal
     to standard output, with a `-` if it's negative, and `eprint_int` to
     standard error: `io.print_int(x)`, or `io.print_int[u64](5)` for a
     literal, which doesn't tell the type. Each call makes one `write` system
-    call. They're a stopgap until `print("{}", n)`
-    ([generics.md](generics.md#format-strings)).
-  - `print` and the others but `File.write` and `File.write_bytes` ignore
-    output errors: they're for output that isn't worth failing over.
+    call, of digits built in a `buf.StackBuf[21]`. They're a stopgap until
+    `print("{}", n)` ([generics.md](generics.md#format-strings)).
+  - `print` and the others but the `File` methods ignore output errors:
+    they're for output that isn't worth failing over.
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
     (the integers and `bool`). Their parameters are `sink`, so they need no
@@ -107,6 +111,34 @@ Go's vocabulary, which is proven:
     type: a heapsort, with no allocation and a constant stack. `&a` sorts
     an array, `&a[i..j]` part of one.
   - `is_sorted(xs: []T) -> bool`.
+- `std/buf`, fixed-capacity byte buffers:
+  - `StackBuf[N: usize]`, a buffer of at most `N` bytes written at either
+    end, stored in place (on the stack for a local). The bytes written so
+    far are `bytes[start..end]`, and only those are read.
+  - `StackBuf[N].new()` makes an empty one that `push` fills from the
+    front of its storage; `StackBuf[N].new_end()` one that `push_front`
+    fills from the back, such as for digits, last first. Both still fill
+    the storage with zeros once
+    ([memory.md](memory.md#uninitialized-buffers)).
+  - `push(inout self, b: u8) throws(Error)` writes `b` after the bytes
+    written, `push_front` before them; each throws `buf.Error.full` when
+    there's no room at that end.
+  - `len(self) -> usize` and `get(self, i: usize) -> ?u8` (byte `i` of the
+    written part, `none` past it) read it; `io.File.write_buf` writes it.
+- `std/vec`, fixed-capacity vectors:
+  - `ArrayVec[T: Copy, N: usize]`, a list of at most `N` elements of type
+    `T`, stored in place: no allocation. Its slots are `[N]?T`, so it needs
+    no value to fill the empty ones with; `T` must be `Copy` to make them
+    `none`.
+  - `ArrayVec[T, N].new()`, `len(self) -> usize`,
+    `push(inout self, v: T) throws(Error)` (`vec.Error.full` when it holds
+    `N` elements), `pop(inout self) -> ?T`, `get(self, i: usize) -> ?T`, and
+    `put(inout self, i: usize, v: T) -> bool`, which replaces element `i`.
+  - `var v = vec.ArrayVec[u16, 8].new()`, or `var v: vec.ArrayVec[u16, 8] =
+    vec.ArrayVec.new()`.
+- Every access in `std/buf` and `std/vec` is proven. Without refinements,
+  each method checks the bound it relies on (`end <= N`), since the
+  fields are visible and could have been changed.
 
 ## Imports
 

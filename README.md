@@ -71,9 +71,16 @@ What works:
   the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
   `Signed`, each body checked once against its bounds; `max(a, b)` infers
   `T`, `max[u32](a, b)` writes it ([docs/generics.md](docs/generics.md#m7a-in-the-compiler))
+- generic structs and enums: `struct Pair[A, B]`, `enum Either[L, R]`,
+  used as `Pair[u8, bool]` or with their arguments inferred
+  (`Pair{first: b, second: true}`); value parameters (`[N: usize]`) that
+  size arrays, with `a[i]` proven once for every `N`; methods of generic
+  types, `fn Pair[A, B].swap(self)`, which may add bounds or have their
+  own parameters ([docs/generics.md](docs/generics.md#m7b-in-the-compiler))
 - packages: `import "std/..."`, `pub`, `pkg.name`; `std/math` (`min`,
   `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
-  element type that fits
+  element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
+  (bytes) and `std/vec.ArrayVec[T, N]`
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic
 - output: `io.print` for strings, `io.print_int` for integers of any type

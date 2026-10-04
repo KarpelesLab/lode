@@ -324,6 +324,14 @@ A conversion out of `T` is checked against `x`'s range like any other:
 `u64(x)` of an `Unsigned` is always proven, `u8(x)` needs `x <= 255`. A
 failed proof shows the whole values range as "any `T`".
 
+A **value parameter** (`N` in `[N: usize]`, M7b) is a term like an
+integer `let`: a local of its type, with that type's range, which the body
+never assigns (each instance assigns it its value first). An array of type
+`[N]T` has the length `N`: `a.len`, `for x in a` and `a[i..j]` use that
+term, so after `if i < N` (or in `for i in 0..N`), `a[i]` is proven, once,
+for every `N`. A relation through the term works as for any other:
+`if self.count >= N { return }` makes `self.items[self.count]` proven.
+
 #### Facts through loops
 
 At the head of a loop, the facts before it, `E`, still hold about everything

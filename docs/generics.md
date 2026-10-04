@@ -9,9 +9,11 @@ the options, the trade-offs and a recommendation. The decisions only the user
 can make are collected at the end, in
 [Questions for the user](#decisions).
 
-M7a, generic functions over the built-in traits, is implemented: what the
-compiler does is in [M7a in the compiler](#m7a-in-the-compiler). The rest
-is **Proposed** unless a section says otherwise.
+M7a, generic functions over the built-in traits, and M7b, generic structs
+and enums, value parameters and generic methods, are implemented: what the
+compiler does is in [M7a in the compiler](#m7a-in-the-compiler) and
+[M7b in the compiler](#m7b-in-the-compiler). The rest is **Proposed**
+unless a section says otherwise.
 
 ## Principles
 
@@ -40,7 +42,7 @@ Five rules shape the whole proposal. They follow from decisions already made.
 
 ## Generic functions
 
-**Status:** Implemented (M7a), except value parameters (M7b)
+**Status:** Implemented (M7a; value parameters in M7b)
 
 ```
 fn max[T: Ordered](sink a: T, sink b: T) -> T {
@@ -122,6 +124,8 @@ error, in the checker. The formatter's rule "no space before an index's
 
 ### Value parameters
 
+**Status:** Implemented (M7b), without refinements, which don't exist yet
+
 ```
 struct StackBuf[N: usize] {
 	bytes: [N]u8
@@ -145,7 +149,7 @@ with `N` unknown.
 
 ## Generic types
 
-**Status:** Proposed
+**Status:** Implemented (M7b); `Box` waits for the allocator
 
 ```
 struct Pair[A, B] {
@@ -171,6 +175,8 @@ let q = Pair[u8, u16]{first: 1, second: 2}
 
 ### `?T` stays built in
 
+**Status:** Decided; followed in M7b
+
 `?T` is already an enum `none | some(value: T)` in the compiler. **Options:**
 keep it built in, or define it in the standard library as `Option[T]` with
 `?T` as sugar.
@@ -184,6 +190,8 @@ gains nothing a user can see. The same goes for a call's result,
 
 ### Views as type arguments
 
+**Status:** Implemented (M7a, M7b)
+
 A type argument can't be a view (`str`, `[]T`, later `dyn Trait`). Views are
 never stored in fields ([memory.md](memory.md#views)), and a generic type
 can put `T` in a field, so allowing `Pair[str, u8]` would need a check per
@@ -194,7 +202,7 @@ functions over views take the view in the signature instead:
 
 ## Generic methods
 
-**Status:** Proposed
+**Status:** Implemented (M7b)
 
 ```
 fn Pair[A, B].swap(self) -> Pair[B, A] {
@@ -709,7 +717,8 @@ ships generics with fixed-capacity types (`StackBuf[N]`, `ArrayVec[T, N]`)
 and generic functions over slices. The allocator context comes in its own
 milestone right after, and its containers are the first big user of M7.
 `StackBuf[N]` is also option 3 for
-[uninitialized buffers](memory.md#uninitialized-buffers).
+[uninitialized buffers](memory.md#uninitialized-buffers). M7b ships
+`StackBuf[N]` and `ArrayVec[T, N]` ([M7b in the compiler](#m7b-in-the-compiler)).
 
 ### Strings
 
@@ -720,7 +729,7 @@ of `Str[utf8]` ([strings.md](strings.md)).
 
 ## Implementation plan
 
-**Status:** M7a implemented; M7b to M7e proposed
+**Status:** M7a and M7b implemented; M7c to M7e proposed
 
 Five steps, each shippable on its own with tests, std changes and docs, as
 the earlier milestones were. Sizes are rough estimates of compiler code
@@ -753,9 +762,9 @@ proposal left room:
 
 - **Declarations.** `fn name[T: A + B, U](...)` declares type parameters,
   each bounded by built-in traits joined with `+`. A bound that isn't one of
-  the six, a value parameter (`[N: usize]`), a generic method
-  (`fn Point.f[T]`), a generic `main`, and a parameter that is both
-  `Unsigned` and `Signed` are errors.
+  the six, a generic `main`, and a parameter that is both `Unsigned` and
+  `Signed` are errors. (Value parameters, `[N: usize]`, and generic
+  methods, `fn Point.f[T]`, were errors too until M7b.)
 - **The traits.** `Eq`: every type the compiler has but views. `Ordered`:
   the integers and `bool` (structs and enums wait for `impl`, M7c). `Copy`:
   every type, except a type parameter without the bound and what holds one
@@ -817,6 +826,90 @@ proposal left room:
 - About 1,000 to 1,500 lines.
 - **std gains:** `StackBuf[N]` (and with it the end of `[0; 21]` in
   `std/io`), `ArrayVec[T, N]`, `Pair` if wanted.
+
+### M7b in the compiler
+
+**Status:** Implemented (2026-10-04)
+
+What M7b does, and the choices made while implementing it where this
+proposal left room:
+
+- **Declarations.** `struct Pair[A, B: Ordered]` and `enum Either[L, R]`
+  declare generic parameters with bounds, as a function does. A value
+  parameter, `[N: usize]`, has an integer type (any of them; `bool` not
+  yet). A C-style enum can't be generic.
+- **Types.** `Pair[u8, bool]` is an instance: the declaration plus its
+  arguments, interned like other compound types. So `Pair[u8, bool]` and
+  `Pair[u8, u16]` are two types, and two spellings of one instance are the
+  same type. A value argument is an integer known when compiling (a
+  literal, a constant) or a value parameter of the same type. The
+  arguments must satisfy the declaration's bounds where the type is
+  written. In a type, a generic type's name needs its arguments: `let p:
+  Pair = ...` is an error.
+- **Inference in literals.** `Pair{first: b, second: true}`,
+  `Either.left(x)` and `Pair.new(a, b)` infer the arguments with the rule
+  of calls: from the values, in order, then from the expected type. A
+  value that takes its type from the context (an integer literal, `none`,
+  `.name`, an array literal) doesn't fix an argument. A literal of a
+  generic type written without its arguments, nested in another, waits for
+  the expected type too, and fixes them itself when that doesn't. Explicit
+  arguments are written on the type: `Pair[u8, u16]{...}`,
+  `Pair[u8, bool].new(...)`.
+- **Value parameters are terms.** In a body, `N` is an immutable local of
+  its type, which each instance assigns first; in the fact language it's a
+  term like any local ([safety.md](safety.md#values-of-a-type-parameter)).
+  `[N]T` has length `N`: `a.len`, `for x in a` and slicing use it, and
+  `a[i]` is proven by `i < N` (or `i < a.len`) once, for every `N`.
+  `[v; N]` builds one. `N` can be used as a value of its type (`x *| K`).
+  It's also inferred from an argument's array length (`total(a)` with
+  `a: [3]u32`) or the expected type. No refinements yet: `[N: usize where
+  N > 0]`, and a field `len: usize where len <= N`, wait for them.
+- **Methods.** `fn Pair[A, B].swap(self)` names every parameter of the
+  type, in order, under any names; a value parameter is written `N` (or
+  `N: usize`). The type's bounds are implied. A method can add bounds,
+  `fn Pair[A: Ordered + Copy, B].min_first`, and then exists only where
+  they hold: a call where they don't is an error at the call, "`Point`
+  doesn't implement `Ordered`, which `Pair.min_first` requires of `A`". A
+  method can have parameters of its own, `fn Pair[A, B].with_first[C]`,
+  given after its name (`p.with_first[u16](5)`) or inferred; so can a
+  method of a type that isn't generic.
+- **Calls.** A method's receiver gives the type's arguments (`p.swap()` on
+  a `Pair[u8, bool]`). An associated function takes them from the type
+  written before it (`Pair[u8, bool].new(...)`), or infers them
+  (`Pair.new(a, b)`, `let v: ArrayVec[u8, 4] = ArrayVec.new()`).
+- **Bounds in functions.** A generic function that names a bounded generic
+  type must have the bound itself: `fn f[T](s: Sorted[T])` is an error
+  when `Sorted` requires `T: Ordered`. Only a method gets its type's
+  bounds implied.
+- **Copy and moves.** A struct or an enum is `Copy` when every field of
+  the instance is: `Pair[T, U]` is `Copy` only if `T` and `U` are. Keeping
+  a field of a value that isn't `Copy` moves the whole variable out (there
+  are no partial moves yet). So `swap` with a read-only `self` needs
+  `A: Copy, B: Copy`, and `fn Pair[A, B].into_first(sink self)` needs
+  nothing.
+- **Recursive types.** A struct or an enum that holds any instance of
+  itself by value is an error, "the struct `Holder` contains itself", also
+  through another generic type's parameter (`p: Pair[u8, Holder]`), and
+  when its instances would grow without end (`struct W[T] { w:
+  ?W[Pair[T, T]] }`). What each declaration holds, by declaration and by
+  parameter, is a fixed point over the declarations, so the check ends.
+- **Instances.** `src/mono.rs` makes one function per method and set of
+  arguments `main` reaches. A symbol puts the type's arguments after its
+  name, and the method's own after the method's: `std/buf.StackBuf[64].push`,
+  `main.Pair[u8, bool].with_first[u16]`. A call in a cycle that makes
+  instances grow is an error naming the instance, "this calls
+  `Grow[Pair[T, T]].deeper`, which calls back here".
+- **`?T` stays built in**, as decided above.
+- **std.** `std/buf.StackBuf[N]`, a byte buffer written at either end;
+  `std/vec.ArrayVec[T: Copy, N]`, a vector of at most `N` elements; and
+  `io.File.write_buf`, which writes a `StackBuf`'s bytes
+  ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
+  `io.print_int` builds its digits in a `StackBuf[21]`. Every access in
+  them is proven. Without refinements, each method checks the invariant it
+  needs (`end <= N`), and without private fields, `StackBuf` still fills
+  its storage when it's made ([memory.md](memory.md#uninitialized-buffers)).
+  `ArrayVec` keeps its elements as `[N]?T`, so it needs no value to fill
+  empty slots with, and `T: Copy` to make them `none`.
 
 ### M7c: user traits
 

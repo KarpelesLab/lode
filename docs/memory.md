@@ -311,12 +311,13 @@ yet (its result would hold a view in memory).
 
 ## Uninitialized buffers
 
-**Status:** Open
+**Status:** Leaning to option 3; its type is implemented, its storage is
+still filled (see [In the compiler today](#in-the-compiler-today-1) below)
 
 Every variable is assigned before use, and an array is assigned whole, so a
 buffer that's filled piece by piece has to be filled first: `std/io`'s
-integer output starts with `var buf: [21]u8 = [0; 21]` and then only ever
-reads the part it wrote. For 21 bytes that costs nothing worth measuring; for
+integer output used to start with `var buf: [21]u8 = [0; 21]` and then only
+ever read the part it wrote. For 21 bytes that costs nothing worth measuring; for
 a 4 KiB read buffer, or a large array on a small embedded stack, it's a
 `memset` per call that the optimizer may or may not remove, and the result
 must not depend on the optimizer. The options:
@@ -351,6 +352,29 @@ must not depend on the optimizer. The options:
 
 Leaning: 3 once generics land, possibly with 2 later for code that wants
 plain arrays; 4 only inside `unsafe`, if at all.
+
+### In the compiler today
+
+**Status:** Option 3's type is implemented (M7b); its storage is still
+filled
+
+`std/buf.StackBuf[N]` is option 3's type
+([packages.md](packages.md#the-standard-library-in-the-compiler-today)):
+bytes written at the back with `push`, or at the front with `push_front`,
+only the written part is read (`get`, `len`, `io.File.write_buf`), and every
+access is proven. `io.print_int` builds its digits in one. Two things keep
+it from skipping the fill:
+
+- **Fields aren't private.** Any code can read `b.bytes[i]` outside the
+  written part, so the bytes there must have a value.
+- **No way to leave storage unwritten.** Even in `unsafe` code, every
+  variable and field is assigned before use; an `unsafe` "uninitialized"
+  value (option 4, inside `unsafe` only) doesn't exist.
+
+So `StackBuf[N].new()` fills its `N` bytes once, as `[0; N]` did. Once
+fields can be private, `new` can leave them unwritten through such an
+`unsafe` value, and the fill goes away with no change to code that uses
+`StackBuf`.
 
 ## Destruction
 

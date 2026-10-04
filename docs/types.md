@@ -118,7 +118,8 @@ semantics.
 
 ### Arrays and slices
 
-- `[N]T`: fixed-size array, a value. `N` is a compile-time `usize`.
+- `[N]T`: fixed-size array, a value. `N` is a compile-time `usize`: a
+  constant, or a value parameter of a generic declaration.
 - `[]T`: slice, a view into contiguous `T`s. How slices relate to the memory
   model is in [memory.md](memory.md#views).
 - `a.len` is always available. Indexing follows the
@@ -201,8 +202,11 @@ let p = Point{x: 1, y: 2}
 **Status:** Implemented subset (syntax in [syntax.md](syntax.md#structs))
 
 - Field types: integers, `bool`, arrays, other structs, enums and
-  optionals. Arrays and slices of structs work too. Not yet: pointer fields, field defaults, structs
-  without fields, generic structs and `@layout`.
+  optionals, and a generic struct's parameters. Arrays and slices of
+  structs work too. Not yet: pointer fields, field defaults, structs
+  without fields and `@layout`.
+- Generic structs: `struct Pair[A, B] { ... }`, used as `Pair[u8, bool]`
+  ([Generics](#in-the-compiler-today-5)).
 - A struct is a value, like an array. `let q = p` and `q = p` copy it, and
   changing `p` afterwards doesn't change `q`. Fields of a `var` struct can be
   assigned, also nested and with `op=`: `r.min.x = 1`, `ps[i].y += 2`.
@@ -296,7 +300,9 @@ match tok {
 - `add | sub => ...` handles several variants in one arm; such an arm
   binds no payload fields.
 - `match` also works on integers and `bool` ([syntax.md](syntax.md#enums-and-match)).
-- Not yet: generic enums, `match` as an expression, and patterns that nest
+- Generic enums: `enum Either[L, R] { ... }`, used as `Either[u8, bool]`
+  ([Generics](#in-the-compiler-today-5)). A C-style enum can't be generic.
+- Not yet: `match` as an expression, and patterns that nest
   (`some(circle(c, r))`).
 
 ### Optional
@@ -464,9 +470,10 @@ high, the only exception we'd consider is a numeric trait with algebraic laws
 
 ## Generics and traits
 
-**Status:** Proposed; generic functions over the built-in traits are
-implemented (see [In the compiler today](#in-the-compiler-today-5)). The
-detailed proposal for M7 is in [generics.md](generics.md).
+**Status:** Proposed; generic functions over the built-in traits, generic
+structs and enums, value parameters and generic methods are implemented
+(see [In the compiler today](#in-the-compiler-today-5)). The detailed
+proposal for M7 is in [generics.md](generics.md).
 
 Generics are compile-time parameters (see [comptime.md](comptime.md)).
 **Traits** constrain them so that a generic function is type-checked once, at
@@ -496,8 +503,9 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
 
 ### In the compiler today
 
-**Status:** Implemented subset (M7a; syntax in
-[syntax.md](syntax.md#generic-functions))
+**Status:** Implemented subset (M7a and M7b; syntax in
+[syntax.md](syntax.md#generic-functions) and
+[syntax.md](syntax.md#generic-types-and-value-parameters))
 
 - Generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, with
   bounds from the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`,
@@ -512,16 +520,37 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
   parameter or an element is an error, and a `let` or a `sink` parameter
   can't be used after its value was moved out
   ([generics.md](generics.md#copy-and-moves-in-generic-code)). Every type
-  but such a `T` is `Copy`.
+  but such a `T` is `Copy`, and the arrays, optionals, structs and enums
+  holding one. Keeping a field moves the whole variable out.
 - Type arguments are written (`max[u32](a, b)`) or inferred from the
   arguments, then from the type expected for the result. A type argument
   can't be a view.
+- Generic structs and enums: `struct Pair[A, B: Ordered]`,
+  `enum Either[L, R]`. An instance is the declaration plus its arguments:
+  `Pair[u8, bool]` and `Pair[u8, u16]` are two types. A type names its
+  arguments (`let p: Pair[u8, bool]`); a literal or a call infers them
+  like a call's type arguments (`Pair{first: b, second: true}`,
+  `Either.left(x)`, `Pair.new(a, b)`). The arguments must satisfy the
+  declaration's bounds. A struct or an enum can't hold any instance of
+  itself by value.
+- Value parameters: `[N: usize]` (any integer type) is a value known when
+  compiling. `[N]T` is an array of `N` elements, and `N` is a term for the
+  checker, so `for i in 0..N` proves `a[i]` once for every `N`
+  ([safety.md](safety.md#values-of-a-type-parameter)). The argument is a
+  constant: `StackBuf[64]`, `first_n[4](xs)`, or inferred from an array's
+  length.
+- Methods of a generic type name its parameters:
+  `fn Pair[A, B].swap(self) -> Pair[B, A]`. They have the type's bounds,
+  and can add some, `fn Pair[A: Ordered, B].min_first`, then existing
+  only for the instances where they hold. A method can have parameters of
+  its own: `fn Pair[A, B].with_first[C]`.
 - Each set of type arguments `main` reaches makes an instance with its
-  own symbol: `std/math.max[u32]`.
+  own symbol: `std/math.max[u32]`, `std/buf.StackBuf[64].push`.
 - Facts about integer type parameters: [safety.md](safety.md#values-of-a-type-parameter).
-- Not yet: generic structs and enums, value parameters (`[N: usize]`),
-  generic methods, `trait` and `impl` (so `Ordered` for structs and enums),
-  `dyn`.
+- The details are in [generics.md](generics.md#m7a-in-the-compiler) and
+  [generics.md](generics.md#m7b-in-the-compiler).
+- Not yet: `trait` and `impl` (so `Ordered` for structs and enums), `dyn`,
+  refinements on value parameters (`[N: usize where N > 0]`).
 
 ## `secret` types
 

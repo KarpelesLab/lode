@@ -496,6 +496,75 @@ fn main() {
   argument when the brackets follow the name of a generic function.
 - `T(x)` converts an integer to a type parameter with a numeric bound.
 
+## Generic types and value parameters
+
+**Status:** Proposed; implemented in the compiler (M7b, semantics in
+[types.md](types.md#in-the-compiler-today-5) and
+[generics.md](generics.md#m7b-in-the-compiler))
+
+```
+import "std/io"
+
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+enum Either[L, R] {
+	left(value: L)
+	right(value: R)
+}
+
+struct Ring[T: Copy, N: usize] {
+	items: [N]T
+	next: usize
+}
+
+fn Pair[A: Copy, B: Copy].swap(self) -> Pair[B, A] {
+	return Pair{first: self.second, second: self.first}
+}
+
+fn Ring[T, N].new(fill: T) -> Ring[T, N] {
+	return Ring{items: [fill; N], next: 0}
+}
+
+fn Ring[T, N].push(inout self, v: T) {
+	if self.next >= N {                     // `N` is a value: a term
+		return
+	}
+	self.items[self.next] = v               // proven: next < N
+	self.next = (self.next + 1) % N
+}
+
+fn main() {
+	let p = Pair{first: u8(3), second: true}  // Pair[u8, bool], inferred
+	let q = Pair[u16, u8]{first: 300, second: 7}
+	let e: Either[u8, bool] = .left(9)
+	var r = Ring[u8, 4].new(0)
+	r.push(p.swap().second)
+	io.print_int(q.first)
+}
+```
+
+- `struct Name[A, B: Bound]` and `enum Name[T]` declare generic
+  parameters, like a function's. `[N: usize]` declares a value parameter:
+  an integer known when compiling, whose type follows the colon.
+- `Name[u8, bool]` names an instance. Its arguments are types, and values
+  for value parameters: an integer literal, a constant, or a value
+  parameter (`Ring[T, N]`, `StackBuf[64]`). An item in brackets that parses
+  as a type followed by `,` or `]` is read as one, and the checker reads a
+  name as a value where a value parameter takes it.
+- `Name[u8, bool]{...}` is a literal with its arguments; `Name{...}` infers
+  them. A literal right after `if`, `while`, `for` or `match` goes in
+  parentheses, as for other structs.
+- `fn Name[A, B].method(...)` declares a method of a generic type, naming
+  every parameter of the type, in order, and adding bounds if it wants
+  them (`fn Pair[A: Ordered, B].min_first`). A value parameter is written
+  `N`, or `N: usize`. A method's own parameters follow its name:
+  `fn Pair[A, B].with_first[C](...)`, called as `p.with_first[u16](x)`.
+- `Name[u8, bool].new(...)` calls an associated function with the type's
+  arguments; `Name.new(...)` infers them.
+
 ## Open questions
 
 - `match` arms: a block or a single statement now. Should an arm also be a
