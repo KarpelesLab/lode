@@ -11,7 +11,20 @@
 // error: `for` goes over a range `a..b`, an array or a slice; found `u32`
 // error: expected `[]u16`, found `[2]u8`
 // error: `u32` cannot be indexed
+// error: cannot keep a slice of `buf`, which is mutable
+// error: cannot keep a slice of a temporary array
+// error: cannot keep a slice of `buf`, which is mutable
 package main
+
+// A kept slice would see later writes to the array.
+fn kept_views(xs: []u8) {
+	var buf: [4]u8 = [0; 4]
+	let s: []u8 = buf
+	var t: []u8 = [1, 2]
+	t = xs
+	t = buf
+	buf[0] = 1
+}
 
 fn write_through_slice(xs: []u8) {
 	xs[0] = 1

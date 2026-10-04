@@ -127,7 +127,12 @@ fn main() -> u8 {
 	if v.len != 2 || v[1] != 6 {
 		return 9
 	}
-	let s2: []u8 = [1, 1, 2, 3, 3]
+	// A slice of a row of a `let` array.
+	let row: []u8 = m[1]
+	if row.len != 3 || row[2] != 6 {
+		return 12
+	}
+	let s2: [5]u8 = [1, 1, 2, 3, 3]
 	if last_direct(s2) != 3 || equal_neighbors(s2) != 2 {
 		return 10
 	}

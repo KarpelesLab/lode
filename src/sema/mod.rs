@@ -685,6 +685,7 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
+                self.check_kept_view(cx, &value, init.span)?;
                 Self::record_value(cx, local, &value);
                 Some(TStmt::Init(local, value.expr))
             }
@@ -734,6 +735,7 @@ impl<'a> Checker<'a> {
                     }
                 };
                 let checked = self.coerce(checked, ty, value.span)?;
+                self.check_kept_view(cx, &checked, value.span)?;
                 Self::record_value(cx, local, &checked);
                 Some(TStmt::Assign(local, checked.expr))
             }
@@ -1015,6 +1017,41 @@ impl<'a> Checker<'a> {
             before.push(for_loop);
             Some(TStmt::Block(before))
         }
+    }
+
+    /// A slice stored in a local must not see its array change: the array
+    /// can't be changed while a view of it is in use (docs/memory.md, Views),
+    /// and until the compiler checks that, a slice local may only view a
+    /// `let` array (or part of one), or part of another view. A slice of a
+    /// `var` array or of a temporary can still be passed to a function.
+    fn check_kept_view(&mut self, cx: &FnCx, value: &expr::Checked, span: Span) -> Option<()> {
+        let TExprKind::ToSlice(array) = &value.expr.kind else {
+            return Some(());
+        };
+        let mut root = &**array;
+        while let TExprKind::Index(base, _) = &root.kind {
+            root = base;
+        }
+        let diag = match root.kind {
+            // Reassigning a `var` view doesn't change what it viewed.
+            TExprKind::Local(l) if !cx.locals[l].mutable || cx.locals[l].ty.is_view() => {
+                return Some(());
+            }
+            TExprKind::Local(l) => {
+                let name = &cx.locals[l].name;
+                Diagnostic::error(
+                    span,
+                    format!("cannot keep a slice of `{name}`, which is mutable"),
+                )
+                .with_help(format!(
+                    "declare it with `let`, or pass `{name}` straight to the function that takes the slice"
+                ))
+            }
+            _ => Diagnostic::error(span, "cannot keep a slice of a temporary array")
+                .with_help("store the array with `let` first"),
+        };
+        self.diags.push(diag);
+        None
     }
 
     /// `a[i] = v`, `a[i][j] op= v`: assign to an element of a `var` array.
