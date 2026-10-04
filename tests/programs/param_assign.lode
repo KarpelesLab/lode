@@ -1,8 +1,8 @@
 // error: cannot assign to `n`, which is immutable
 // error: cannot assign to a field of `p`, which is immutable
 // error: cannot assign to `k`, which is immutable
-// help: parameters are read-only; to change a copy, declare one: `var m = n`
-// help: parameters are read-only; to change a copy, declare one: `var m = p`
+// help: parameters are read-only; declare it `inout n` to change the caller's variable, or change a copy: `var m = n`
+// help: parameters are read-only; declare it `inout p` to change the caller's variable, or change a copy: `var m = p`
 // help: declare it with `var k` to make it mutable
 package main
 

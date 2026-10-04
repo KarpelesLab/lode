@@ -17,7 +17,7 @@
 //! as every iteration keeps them ([`Env::loosen`], [`Env::holds_in`]; the
 //! rule is in `super::Checker::loop_body` and docs/safety.md).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use super::tree::{CmpOp, LocalId};
 use crate::types::Range;
@@ -81,6 +81,9 @@ pub struct Env {
     /// Known ranges; a term without an entry can be anything its type allows.
     ranges: HashMap<Term, Range>,
     rels: Vec<Rel>,
+    /// The locals that may not be assigned yet on some path to this point
+    /// (a `var` declared without a value, a `set` parameter).
+    uninit: BTreeSet<LocalId>,
     /// The facts contradict each other: this point can't be reached.
     pub dead: bool,
 }
@@ -322,6 +325,12 @@ impl Env {
     /// fields are unknown. Every relation involving the local, its length or
     /// its fields is forgotten.
     pub fn assign(&mut self, local: LocalId, range: Option<Range>) {
+        self.uninit.remove(&local);
+        self.forget_value(local, range);
+    }
+
+    /// Forget every fact about `local`, and know `range` for it.
+    fn forget_value(&mut self, local: LocalId, range: Option<Range>) {
         match range {
             Some(r) => {
                 self.ranges.insert(Term::Local(local), r);
@@ -365,13 +374,27 @@ impl Env {
                 Some(Rel { c, ..*r })
             })
             .collect();
-        self.assign(local, range);
+        self.forget_value(local, range);
         self.rels.extend(shifted);
     }
 
-    /// Forget everything about `local` (at the head of a loop that assigns it).
+    /// Forget every fact about `local` (at the head of a loop that assigns
+    /// it, or after a call that may change it). Whether it's assigned yet
+    /// doesn't change.
     pub fn forget(&mut self, local: LocalId) {
-        self.assign(local, None);
+        self.forget_value(local, None);
+    }
+
+    /// `local` is declared without a value: it must be assigned before it's
+    /// read.
+    pub fn declare_uninit(&mut self, local: LocalId) {
+        self.forget_value(local, None);
+        self.uninit.insert(local);
+    }
+
+    /// Whether `local` may not be assigned yet on some path to here.
+    pub fn is_uninit(&self, local: LocalId) -> bool {
+        !self.dead && self.uninit.contains(&local)
     }
 
     /// Whether every fact of `self` about the locals `about` picks out also
@@ -408,6 +431,7 @@ impl Env {
         let mut out = Env {
             ranges: HashMap::new(),
             rels: Vec::new(),
+            uninit: self.uninit.clone(),
             dead: self.dead,
         };
         for (&term, &r) in &self.ranges {
@@ -463,6 +487,7 @@ impl Env {
     /// Whether two sets of facts are the same.
     pub fn same(&self, other: &Env) -> bool {
         self.dead == other.dead
+            && self.uninit == other.uninit
             && self.ranges == other.ranges
             && self.rels.len() == other.rels.len()
             && self.rels.iter().all(|r| other.rels.contains(r))
@@ -515,9 +540,12 @@ impl Env {
                 })
             })
             .collect();
+        // A local is assigned after the join only if it is on both paths.
+        let uninit = a.uninit.union(&b.uninit).copied().collect();
         Env {
             ranges,
             rels,
+            uninit,
             dead: false,
         }
     }

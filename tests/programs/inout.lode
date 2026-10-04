@@ -1,0 +1,175 @@
+// stdout: 1 2 3 5 8 9\n
+// exit: 42
+package main
+
+import "std/io"
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+// A scalar: the callee changes the caller's variable.
+fn bump(inout n: u32) {
+	n = n +% 1
+}
+
+fn swap(inout a: u32, inout b: u32) {
+	let t = a
+	a = b
+	b = t
+}
+
+// A struct, field by field and whole.
+fn mirror(inout p: Point) {
+	let t = p.x
+	p.x = p.y
+	p.y = t
+}
+
+fn reset(inout p: Point) {
+	p = Point{x: 0, y: 0}
+}
+
+// An array of a fixed length.
+fn fill(inout a: [4]u8, v: u8) {
+	for i in 0..a.len {
+		a[i] = v
+	}
+}
+
+// A slice: its elements can be assigned, in place.
+fn insertion_sort(inout xs: []u32) {
+	for i in 1..xs.len {
+		let v = xs[i]
+		var j = i
+		while j > 0 {
+			if xs[j - 1] <= v {
+				break
+			}
+			xs[j] = xs[j - 1]
+			j = j - 1
+		}
+		xs[j] = v
+	}
+}
+
+// Passing an `inout` slice on.
+fn sort_twice(inout xs: []u32) {
+	insertion_sort(&xs)
+	insertion_sort(&xs)
+}
+
+fn Point.shift(inout self, d: i32) {
+	self.x = self.x +% d
+}
+
+struct Line {
+	a: Point
+	b: Point
+}
+
+// A method called on the elements of an `inout` slice.
+fn shift_all(inout ps: []Point, d: i32) {
+	for i in 0..ps.len {
+		ps[i].shift(d)
+	}
+}
+
+// Recursion passes the same place on.
+fn count_down(inout n: u32, inout steps: u32) {
+	if n > 0 {
+		n = n - 1
+		steps = steps +% 1
+		count_down(&n, &steps)
+	}
+}
+
+fn print_all(xs: []u32) {
+	for i in 0..xs.len {
+		if i > 0 {
+			io.print(" ")
+		}
+		io.print_u64(xs[i])
+	}
+	io.print("\n")
+}
+
+fn main() -> u32 {
+	var n: u32 = 1
+	bump(&n)
+	bump(&n)
+	if n != 3 {
+		return 1
+	}
+
+	var a: u32 = 1
+	var b: u32 = 2
+	swap(&a, &b)
+	if a != 2 || b != 1 {
+		return 2
+	}
+
+	// Fields and elements are places too.
+	var p = Point{x: 1, y: 2}
+	mirror(&p)
+	if p.x != 2 || p.y != 1 {
+		return 3
+	}
+	var ps: [2]Point = [Point{x: 5, y: 6}, Point{x: 7, y: 8}]
+	mirror(&ps[1])
+	if ps[1].x != 8 || ps[0].x != 5 {
+		return 4
+	}
+	var q = Point{x: 3, y: 4}
+	var counts: [2]u32 = [10, 20]
+	swap(&counts[0], &counts[1])
+	if counts[0] != 20 {
+		return 5
+	}
+	// Different fields of one variable don't overlap.
+	var pair = Point{x: 9, y: 10}
+	var c: u32 = 7
+	var d: u32 = 9
+	swap(&c, &d)
+	reset(&q)
+	if q != (Point{x: 0, y: 0}) || c != 9 {
+		return 6
+	}
+
+	var bytes: [4]u8 = [0; 4]
+	fill(&bytes, 7)
+	if bytes[3] != 7 {
+		return 7
+	}
+
+	var xs: [6]u32 = [9, 3, 8, 1, 5, 2]
+	sort_twice(&xs)
+	print_all(xs)
+
+	// Rows of a 2D array are arrays, passed as slices.
+	var grid: [2][3]u32 = [[3, 2, 1], [6, 5, 4]]
+	insertion_sort(&grid[1])
+	if grid[1][0] != 4 || grid[0][0] != 3 {
+		return 8
+	}
+	// A receiver deep in a variable.
+	var line = Line{a: Point{x: 0, y: 0}, b: Point{x: 1, y: 1}}
+	line.b.shift(5)
+	shift_all(&ps, 10)
+	if line.b.x != 6 || line.a.x != 0 || ps[0].x != 15 || ps[1].x != 18 {
+		return 9
+	}
+	var left: u32 = 5
+	var steps: u32 = 0
+	count_down(&left, &steps)
+	if left != 0 || steps != 5 {
+		return 10
+	}
+	// `.len` doesn't use the elements, so it can go with `&`.
+	fill(&bytes, u8(bytes.len))
+	if bytes[0] != 4 {
+		return 11
+	}
+	return u32(pair.x) +% 33
+}

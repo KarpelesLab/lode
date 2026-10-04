@@ -1,0 +1,81 @@
+// error: the methods of `io.File` can only be declared in package `std/io`, which declares it
+// error: `Point` has a field `x`, so it can't also have a method `x`
+// error: `Shape` has a variant `dot`, so it can't also have a method `dot`
+// error: `Point.len` is defined more than once
+// error: unknown type `Nope`
+// error: `u32` is a built-in type: it can't have methods
+// error: `self` can't be `set`
+// error: `Point` has no method `area`
+// error: `y` is a field of `Point`, not a method
+// error: `Point.len` is a method: call it on a value
+// error: `Point.origin` has no `self`, so it's called on the type
+// error: `Point` has no function `make`
+// error: `Shape` has no variant or function `big`
+// error: `[2]u8` has no method `len`
+// error: `p.len` takes 0 argument(s), but 1 were given
+// error: `Point.origin` is a function; call it with `Point.origin(...)`
+// error: `len` is a method of `Point`; call it with `.len(...)`
+package main
+
+import "std/io"
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+enum Shape {
+	dot
+}
+
+fn io.File.close(self) {
+}
+
+fn Point.x(self) -> u32 {
+	return 0
+}
+
+fn Shape.dot() -> Shape {
+	return .dot
+}
+
+fn Point.len(self) -> u32 {
+	return self.x
+}
+
+fn Point.len(self) -> u32 {
+	return self.y
+}
+
+// Its type is unknown: using `self` gives no more errors.
+fn Nope.f(self) {
+	let x = self.x
+}
+
+fn u32.double(self) -> u32 {
+	return 0
+}
+
+fn Point.reset(set self) {
+}
+
+fn Point.origin() -> Point {
+	return Point{x: 0, y: 0}
+}
+
+fn calls(p: Point) {
+	let a = p.area()
+	let b = p.y()
+	let c = Point.len(p)
+	let d = p.origin()
+	let e = Point.make()
+	let f = Shape.big()
+	let bytes: [2]u8 = [1, 2]
+	let g = bytes.len()
+	let h = p.len(1)
+	let i = Point.origin
+	let j = p.len
+}
+
+fn main() {
+}

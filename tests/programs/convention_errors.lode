@@ -1,0 +1,173 @@
+// error: cannot pass `&n`: `n` is immutable
+// error: `&` needs a variable, or a field or an element of one
+// error: `bump` takes `n` as `inout`, so the argument needs `&`
+// error: `&` marks an argument passed `inout` or `set`, but `n` of `read` is read-only
+// error: `&` marks an argument passed `inout` or `set`, but `n` of `take` is passed `sink`
+// error: `a[i]` and `a[j]` are both passed `inout` or `set` in this expression, and may overlap
+// error: `x` and `x` are both passed `inout` or `set` in this expression, and may overlap
+// error: `p` is passed `inout` or `set`, so `p.x` can't be used in the same expression
+// error: `x` is passed `inout` or `set`, so `x` can't be used in the same expression
+// error: `out` is a `set` parameter, but it may not be assigned when the function returns here
+// error: `out` is a `set` parameter, but it may not be assigned when the function returns here
+// error: `out` is used before it's assigned
+// error: `v` is used before it's assigned
+// error: `m` is used before it's assigned
+// error: `k` is used before it's assigned
+// error: `&` marks a call's argument passed `inout` or `set`, and is only used there
+// error: cannot call `p.scale`, which takes `inout self`, on `p`, which is immutable
+// error: cannot call `Point.origin().scale` on a temporary: it takes `inout self`
+// error: cannot call `self.scale`, which takes `inout self`, on `self`, which is immutable
+// error: cannot pass `&xs`: `xs` is a read-only `[]u32`
+// error: cannot pass `&bytes`: `bytes` is immutable
+// error: expected `u32`, found `u8`
+// error: a `str` can't be passed `inout`: its bytes are read-only
+// error: a `set` parameter can't be a view (`[]u8`)
+// error: cannot keep a copy of `xs`, an `inout` slice
+// error: a `defer` block can't assign `k`, which is declared outside it
+// help: two elements of one array count as overlapping unless their indexes are different constants
+// help: a `set` parameter starts unassigned: the function assigns it
+// help: declare the method with `inout self` to change the value it's called on
+package main
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+fn Point.origin() -> Point {
+	return Point{x: 0, y: 0}
+}
+
+fn Point.scale(inout self, k: u32) {
+	self.x = self.x *% k
+}
+
+fn Point.double(self) {
+	self.scale(2)
+}
+
+fn bump(inout n: u32) {
+	n = n +% 1
+}
+
+fn read(n: u32) -> u32 {
+	return n
+}
+
+fn take(sink n: u32) -> u32 {
+	return n
+}
+
+fn swap(inout a: u32, inout b: u32) {
+	let t = a
+	a = b
+	b = t
+}
+
+fn add(inout a: u32, b: u32) {
+	a = a +% b
+}
+
+fn sort(inout xs: []u32) {
+}
+
+fn arguments(i: usize, j: usize) {
+	let n: u32 = 1
+	bump(&n)
+	bump(&read(1))
+	var m: u32 = 1
+	bump(m)
+	let r = read(&m)
+	let t = take(&m)
+	var a: [4]u32 = [0; 4]
+	if i < 4 && j < 4 {
+		swap(&a[i], &a[j])
+	}
+	// Different constant indexes don't overlap.
+	swap(&a[0], &a[1])
+	var x: u32 = 0
+	swap(&x, &x)
+	var p = Point{x: 1, y: 2}
+	p.scale(p.x)
+	add(&x, x)
+	let q = &x
+}
+
+// `out` isn't assigned when `c` is false.
+fn maybe(c: bool, set out: u32) {
+	if c {
+		out = 1
+	}
+}
+
+fn early(c: bool, set out: u32) {
+	if c {
+		return
+	}
+	out = 2
+}
+
+fn reads(set out: u32) {
+	let v = out
+	out = 1
+}
+
+fn unassigned(c: bool) -> u32 {
+	var v: u32
+	if c {
+		v = 1
+	}
+	return v
+}
+
+enum E {
+	bad
+}
+
+fn parse(v: i32, set out: u32) throws(E) {
+	if v < 0 {
+		throw .bad
+	}
+	out = 1
+}
+
+// When the call fails, `set` assigns nothing.
+fn failed_set() -> u32 {
+	var m: u32
+	parse(1, &m) catch _ {}
+	var k: u32
+	match parse(2, &k) {
+		ok => {}
+		err(e) => return k
+	}
+	return m
+}
+
+fn receivers() {
+	let p = Point{x: 1, y: 2}
+	p.scale(2)
+	Point.origin().scale(2)
+}
+
+fn slices(xs: []u32) {
+	sort(&xs)
+	let bytes: [2]u32 = [1, 2]
+	sort(&bytes)
+	var small: u8 = 1
+	bump(&small)
+}
+
+fn strings(inout s: str, set b: []u8) {
+}
+
+fn keep(inout xs: []u32) {
+	let ys = xs
+}
+
+fn deferred() {
+	var k: u32 = 0
+	defer bump(&k)
+}
+
+fn main() {
+}

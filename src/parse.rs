@@ -404,9 +404,20 @@ impl Parser {
 
     fn fn_decl(&mut self, is_pub: bool, is_unsafe: bool, start: Span) -> PResult<FnDecl> {
         self.bump(); // fn
-        let name = self.ident("a function name")?;
-        if self.at_p(P::Dot) {
-            return self.error(self.span(), "methods are not supported by the compiler yet");
+        let mut name = self.ident("a function name")?;
+        // `fn Type.name` (a method or an associated function), or
+        // `fn pkg.Type.name`, which the checker rejects.
+        let mut owner = None;
+        if self.eat_p(P::Dot) {
+            let member = self.ident("a method name")?;
+            if self.eat_p(P::Dot) {
+                let method = self.ident("a method name")?;
+                owner = Some(TypeExpr::Qualified(name, member));
+                name = method;
+            } else {
+                owner = Some(TypeExpr::Named(name));
+                name = member;
+            }
         }
         if self.at_p(P::LBracket) {
             return self.error(
@@ -421,7 +432,11 @@ impl Parser {
             if self.eat_p(P::RParen) {
                 break;
             }
-            params.push(self.param()?);
+            let param = self.param(owner.as_ref())?;
+            if param.is_self() && !params.is_empty() {
+                return self.error(param.name.span, "`self` must be the first parameter");
+            }
+            params.push(param);
             self.skip_newlines();
             if !self.eat_p(P::Comma) {
                 self.skip_newlines();
@@ -471,6 +486,7 @@ impl Parser {
         Ok(FnDecl {
             is_pub,
             is_unsafe,
+            owner,
             name,
             params,
             throws,
@@ -480,7 +496,9 @@ impl Parser {
         })
     }
 
-    fn param(&mut self) -> PResult<Param> {
+    /// A parameter. `owner` is the type of a method (`fn Type.name`), whose
+    /// first parameter can be `self`, written without a type.
+    fn param(&mut self, owner: Option<&TypeExpr>) -> PResult<Param> {
         let convention = if self.eat_kw(Kw::Inout) {
             Convention::Inout
         } else if self.eat_kw(Kw::Sink) {
@@ -491,6 +509,33 @@ impl Parser {
             Convention::Let
         };
         let name = self.ident("a parameter name")?;
+        if name.name == "self" {
+            let Some(owner) = owner else {
+                return self.error(
+                    name.span,
+                    "only a method has `self`: declare it as `fn Type.name(self, ...)`",
+                );
+            };
+            if self.at_p(P::Colon) {
+                return self.error(
+                    self.span(),
+                    "`self` is written without a type: it's the method's type",
+                );
+            }
+            // `self` has the owner's type; its span is `self`'s.
+            let ty = match owner {
+                TypeExpr::Named(id) => TypeExpr::Named(Ident {
+                    name: id.name.clone(),
+                    span: name.span,
+                }),
+                other => other.clone(),
+            };
+            return Ok(Param {
+                convention,
+                name,
+                ty,
+            });
+        }
         self.expect_p(P::Colon)?;
         let ty = self.type_expr()?;
         Ok(Param {
@@ -1014,6 +1059,16 @@ impl Parser {
             };
             return Ok(Expr { kind, span });
         }
+        // `&place`: an argument passed `inout` or `set`.
+        if self.at_p(P::Amp) {
+            let start = self.bump().span;
+            let operand = self.unary()?;
+            let span = start.to(operand.span);
+            return Ok(Expr {
+                kind: ExprKind::Ref(Box::new(operand)),
+                span,
+            });
+        }
         let op = match self.peek() {
             Tok::P(P::Minus) => UnOp::Neg,
             Tok::P(P::Bang) => UnOp::Not,
@@ -1471,6 +1526,58 @@ mod tests {
         assert!(errs[0].contains("before the return type"));
         assert!(errs[1].contains("name the error"));
         assert!(errs[2].contains("in parentheses"));
+    }
+
+    #[test]
+    fn methods_conventions_and_refs() {
+        let file = parse_ok(
+            "fn Point.scale(inout self, k: u32) {\n}\nfn Point.origin() -> Point {\n}\n\
+             fn geo.Point.f(self) {\n}\nfn g(set a: u8, sink b: u8) {\n\tswap(&a[i], &p.x)\n\tlet c = x & y\n}\n",
+        );
+        let Item::Fn(scale) = &file.items[0] else {
+            panic!()
+        };
+        assert!(matches!(&scale.owner, Some(TypeExpr::Named(t)) if t.name == "Point"));
+        assert_eq!(scale.name.name, "scale");
+        assert!(scale.params[0].is_self() && scale.params[0].convention == Convention::Inout);
+        assert!(matches!(&scale.params[0].ty, TypeExpr::Named(t) if t.name == "Point"));
+        let Item::Fn(origin) = &file.items[1] else {
+            panic!()
+        };
+        assert!(origin.owner.is_some() && origin.params.is_empty());
+        let Item::Fn(f) = &file.items[2] else {
+            panic!()
+        };
+        assert!(
+            matches!(&f.owner, Some(TypeExpr::Qualified(p, t)) if p.name == "geo" && t.name == "Point")
+        );
+        let Item::Fn(g) = &file.items[3] else {
+            panic!()
+        };
+        assert_eq!(g.params[0].convention, Convention::Set);
+        assert_eq!(g.params[1].convention, Convention::Sink);
+        let Stmt::Expr(Expr {
+            kind: ExprKind::Call(_, args),
+            ..
+        }) = &g.body.stmts[0]
+        else {
+            panic!()
+        };
+        assert!(args.iter().all(|a| matches!(a.kind, ExprKind::Ref(_))));
+        // `&` between operands is still a bitwise and.
+        let Stmt::Let { init: Some(c), .. } = &g.body.stmts[1] else {
+            panic!()
+        };
+        assert!(matches!(c.kind, ExprKind::Binary(BinOp::BitAnd, ..)));
+
+        let errs = parse_errors(
+            "fn length(self) -> u32 {\n}\nfn Point.typed(self: Point) {\n}\n\
+             fn Point.late(k: u32, self) {\n}\n",
+        );
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(errs[0].contains("only a method has `self`"));
+        assert!(errs[1].contains("without a type"));
+        assert!(errs[2].contains("must be the first parameter"));
     }
 
     #[test]

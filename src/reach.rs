@@ -4,7 +4,10 @@
 //! nothing calls costs nothing in the executable. Every function is still
 //! checked: an error in code nothing calls fails the build like any other.
 //!
-//! A call (`TExprKind::Call`) is the only way to refer to a function today.
+//! A call (`TExprKind::Call`) is the only way to refer to a function today;
+//! a method call is one too, with the receiver as its first argument. The
+//! walk goes through every expression, including the places passed with `&`
+//! (`TExprKind::Ref`), whose indexes can call functions.
 
 use crate::sema::{FuncId, Handler, Program, TExpr, TExprKind, TStmt, stmt_exprs, subexprs};
 

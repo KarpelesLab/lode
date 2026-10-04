@@ -10,7 +10,7 @@ pub mod tree;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, Convention, ExprKind, Stmt, TypeExpr};
+use crate::ast::{self, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
@@ -28,6 +28,7 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         sigs: Vec::new(),
         consts: Vec::new(),
         imports: HashMap::new(),
+        methods: HashMap::new(),
         strings: Vec::new(),
         string_ids: HashMap::new(),
         ptr_bits,
@@ -100,7 +101,16 @@ struct PkgInfo {
 struct Sig {
     is_pub: bool,
     is_unsafe: bool,
-    params: Vec<Ty>,
+    /// The package that declares it.
+    pkg: usize,
+    /// The name calls are shown with: `f`, or `Point.scale` for a method
+    /// or an associated function.
+    name: String,
+    /// The parameters' types, conventions and names; a method's `self`
+    /// first.
+    params: Vec<(Ty, Convention, String)>,
+    /// Whether the first parameter is `self`.
+    has_self: bool,
     ret: Ty,
     /// The error type, for a function that throws.
     throws: Option<Ty>,
@@ -140,6 +150,9 @@ struct Checker<'a> {
     consts: Vec<ConstInfo<'a>>,
     /// For each file: import name to package index.
     imports: HashMap<FileId, HashMap<String, usize>>,
+    /// The methods and associated functions of each struct and enum, by
+    /// name.
+    methods: HashMap<(Ty, String), FuncId>,
     strings: Vec<Vec<u8>>,
     string_ids: HashMap<Vec<u8>, usize>,
     ptr_bits: u32,
@@ -170,6 +183,17 @@ struct FnCx {
     /// Locals whose declaration failed to check, with an error reported:
     /// any use of them fails without another error.
     failed: HashSet<LocalId>,
+    /// The function's `set` parameters, which must be assigned when it
+    /// returns.
+    set_params: Vec<LocalId>,
+    /// The locals the last call checked assigns through `set` arguments
+    /// that weren't assigned before it: they're assigned only if the call
+    /// succeeds.
+    call_sets: Vec<LocalId>,
+    /// How deep the current expression is in the expression being checked
+    /// (0 outside of one): a whole expression is checked for exclusivity
+    /// once it's done.
+    expr_depth: u32,
     /// For each loop around the current point, innermost last: where its
     /// body has left an iteration so far.
     loops: Vec<LoopEdges>,
@@ -207,6 +231,9 @@ impl FnCx {
             loops: Vec::new(),
             params: 0,
             failed: HashSet::new(),
+            set_params: Vec::new(),
+            call_sets: Vec::new(),
+            expr_depth: 0,
         }
     }
 
@@ -240,7 +267,8 @@ fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
         | ExprKind::Field(a, _)
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
-        | ExprKind::Throw(a) => catch_blocks(a, out),
+        | ExprKind::Throw(a)
+        | ExprKind::Ref(a) => catch_blocks(a, out),
         ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
             catch_blocks(a, out);
             catch_blocks(b, out);
@@ -283,13 +311,66 @@ fn own_exprs(s: &Stmt) -> Vec<&ast::Expr> {
     }
 }
 
-/// Names assigned anywhere in `stmts` (for forgetting facts at loop heads).
+/// The variables an expression may change: those passed with `&`, and the
+/// receivers of method calls (which may take `inout self`; the method isn't
+/// known here, so every receiver counts).
+fn changed_names(e: &ast::Expr, out: &mut HashSet<String>) {
+    let root_name = |place: &ast::Expr, out: &mut HashSet<String>| {
+        if let ExprKind::Name(n) = &place_root(place).kind {
+            out.insert(n.clone());
+        }
+    };
+    match &e.kind {
+        ExprKind::Ref(place) => root_name(place, out),
+        ExprKind::Call(callee, _) => {
+            if let ExprKind::Field(base, _) = &callee.kind {
+                root_name(base, out);
+            }
+        }
+        _ => {}
+    }
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Name(_)
+        | ExprKind::None
+        | ExprKind::Dot(_) => {}
+        ExprKind::Unary(_, a)
+        | ExprKind::Field(a, _)
+        | ExprKind::Paren(a)
+        | ExprKind::Try(a)
+        | ExprKind::Throw(a)
+        | ExprKind::Ref(a) => changed_names(a, out),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
+            changed_names(a, out);
+            changed_names(b, out);
+        }
+        ExprKind::Call(callee, args) => {
+            changed_names(callee, out);
+            args.iter().for_each(|a| changed_names(a, out));
+        }
+        ExprKind::ArrayLit(items) => items.iter().for_each(|a| changed_names(a, out)),
+        ExprKind::StructLit(_, fields) => fields.iter().for_each(|f| changed_names(&f.value, out)),
+        ExprKind::Catch { value, handler, .. } => {
+            changed_names(value, out);
+            if let ast::CatchHandler::Value(v) = handler {
+                changed_names(v, out);
+            }
+        }
+    }
+}
+
+/// Names assigned anywhere in `stmts` (for forgetting facts at loop heads),
+/// including through `&` and method calls (see [`changed_names`]).
 fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         // The blocks of `catch`es in its expressions run as part of it.
         let mut blocks = Vec::new();
         for e in own_exprs(s) {
             catch_blocks(e, &mut blocks);
+            changed_names(e, out);
         }
         for b in blocks {
             assigned_names(&b.stmts, out);
@@ -341,7 +422,13 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
 fn assigned_locals(cx: &FnCx, body: &[Stmt]) -> HashSet<LocalId> {
     let mut names = HashSet::new();
     assigned_names(body, &mut names);
-    names.iter().filter_map(|n| cx.lookup(n)).collect()
+    // An `inout` slice is never assigned itself, only its elements, which
+    // have no facts: its length stays.
+    names
+        .iter()
+        .filter_map(|n| cx.lookup(n))
+        .filter(|&l| !cx.locals[l].mutable_view())
+        .collect()
 }
 
 /// The values `term` can take by its type, for the locals' types `tys`.
@@ -469,6 +556,7 @@ fn matched_local(cx: &mut FnCx, value: expr::Checked, before: &mut Vec<TStmt>) -
         name: MATCHED.to_owned(),
         ty,
         mutable: false,
+        convention: None,
     });
     cx.scopes
         .last_mut()
@@ -480,6 +568,11 @@ fn matched_local(cx: &mut FnCx, value: expr::Checked, before: &mut Vec<TStmt>) -
         kind: TExprKind::Local(id),
         ty,
     }
+}
+
+/// Whether a checked expression is the result of a call that throws.
+fn ty_is_result(c: &expr::Checked) -> bool {
+    c.ty().as_result().is_some()
 }
 
 /// Statements, wrapped in a block if there's more than one.
@@ -573,6 +666,12 @@ impl<'a> Checker<'a> {
 
                 for item in &file.items {
                     let (name, entry) = match item {
+                        // Methods and associated functions are found
+                        // through their type, once types are known.
+                        ast::Item::Fn(f) if f.owner.is_some() => {
+                            fns.push((f, pkg, file.id));
+                            continue;
+                        }
                         ast::Item::Fn(f) => {
                             fns.push((f, pkg, file.id));
                             (&f.name, Item::Func(fns.len() - 1))
@@ -630,11 +729,103 @@ impl<'a> Checker<'a> {
         for &(e, _, _, ty) in &enums {
             self.check_recursion(&e.name, "enum", ty);
         }
-        for (f, pkg, file) in fns {
+        let mut owners = Vec::new();
+        for (id, &(f, pkg, file)) in fns.iter().enumerate() {
+            let owner = f
+                .owner
+                .as_ref()
+                .and_then(|o| self.method_owner(o, &f.name, id, pkg, file));
+            owners.push(owner);
+        }
+        for ((f, pkg, file), owner) in fns.into_iter().zip(owners) {
             let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
-            let sig = self.signature(&mut cx, f);
+            let sig = self.signature(&mut cx, f, owner);
             self.sigs.push(sig);
         }
+    }
+
+    /// The type `fn Owner.name` belongs to: a struct or an enum declared in
+    /// the same package. Registers the function `id` as its method `name`,
+    /// unless that clashes with a field, a variant or another method.
+    fn method_owner(
+        &mut self,
+        owner: &TypeExpr,
+        name: &ast::Ident,
+        id: FuncId,
+        pkg: usize,
+        file: FileId,
+    ) -> Option<Ty> {
+        let ty = match owner {
+            TypeExpr::Named(t) => match self.pkgs[pkg].items.get(&t.name) {
+                Some(Item::Type(ty)) => *ty,
+                _ if primitive(&t.name, self.ptr_bits).is_some() => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            t.span,
+                            format!("`{}` is a built-in type: it can't have methods", t.name),
+                        )
+                        .with_help("methods belong to the structs and enums a package declares"),
+                    );
+                    return None;
+                }
+                Some(_) => {
+                    self.error(t.span, format!("`{}` is not a type", t.name));
+                    return None;
+                }
+                None => {
+                    self.error(t.span, format!("unknown type `{}`", t.name));
+                    return None;
+                }
+            },
+            TypeExpr::Qualified(p, t) => {
+                let path = self
+                    .imports
+                    .get(&file)
+                    .and_then(|m| m.get(&p.name))
+                    .map(|&k| self.pkgs[k].path.clone());
+                let whose = match path {
+                    Some(path) => format!("package `{path}`"),
+                    None => format!("package `{}`", p.name),
+                };
+                self.diags.push(
+                    Diagnostic::error(
+                        owner.span(),
+                        format!(
+                            "the methods of `{}.{}` can only be declared in {whose}, which declares it",
+                            p.name, t.name
+                        ),
+                    )
+                    .with_help(
+                        "every method of a type is declared next to the type (docs/types.md, Methods)",
+                    ),
+                );
+                return None;
+            }
+            _ => unreachable!("the parser gives a name or `pkg.Name`"),
+        };
+        let n = &name.name;
+        let clash = if let Some(def) = ty.as_struct() {
+            def.field(n).map(|_| "a field")
+        } else {
+            ty.as_enum()
+                .and_then(|def| def.variant(n).map(|_| "a variant"))
+        };
+        if let Some(what) = clash {
+            self.diags.push(
+                Diagnostic::error(
+                    name.span,
+                    format!("`{ty}` has {what} `{n}`, so it can't also have a method `{n}`"),
+                )
+                .with_help("give the method another name"),
+            );
+            return Some(ty);
+        }
+        if self.methods.contains_key(&(ty, n.clone())) {
+            self.error(name.span, format!("`{ty}.{n}` is defined more than once"));
+            return Some(ty);
+        }
+        self.methods.insert((ty, n.clone()), id);
+        Some(ty)
     }
 
     /// The fields of a struct declaration. A field whose type is in error
@@ -1046,17 +1237,31 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn signature(&mut self, cx: &mut FnCx, f: &ast::FnDecl) -> Sig {
+    /// The signature of `f`, whose owner type is `owner` for a method or an
+    /// associated function (`None` if it's in error).
+    fn signature(&mut self, cx: &mut FnCx, f: &ast::FnDecl, owner: Option<Ty>) -> Sig {
         let mut params = Vec::new();
+        let has_self = f.params.first().is_some_and(ast::Param::is_self);
         for p in &f.params {
-            if p.convention != Convention::Let {
-                self.error(
-                    p.name.span,
-                    "`inout`, `sink` and `set` parameters are not supported by the compiler yet",
-                );
-            }
-            let ty = self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit);
-            params.push(ty);
+            let ty = if p.is_self() {
+                if p.convention == Convention::Set {
+                    self.diags.push(
+                        Diagnostic::error(p.name.span, "`self` can't be `set`").with_help(
+                            "a method is called on a value that exists; use `inout self` to change it",
+                        ),
+                    );
+                }
+                owner.unwrap_or(Ty::Unit)
+            } else {
+                self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit)
+            };
+            self.check_convention(p, ty);
+            // A `set self` is reported, and checked as `self`.
+            let convention = match p.convention {
+                Convention::Set if p.is_self() => Convention::Let,
+                c => c,
+            };
+            params.push((ty, convention, p.name.name.clone()));
         }
         let ret = match &f.ret {
             Some(t) => match self.resolve_type(cx, t) {
@@ -1078,14 +1283,36 @@ impl<'a> Checker<'a> {
             None => Ty::Unit,
         };
         let throws = f.throws.as_ref().and_then(|t| self.error_type(cx, t));
+        let name = match &f.owner {
+            Some(TypeExpr::Named(t)) => format!("{}.{}", t.name, f.name.name),
+            Some(TypeExpr::Qualified(p, t)) => format!("{}.{}.{}", p.name, t.name, f.name.name),
+            _ => f.name.name.clone(),
+        };
         Sig {
             is_pub: f.is_pub,
             is_unsafe: f.is_unsafe,
+            pkg: cx.pkg,
+            name,
             params,
+            has_self,
             ret,
             throws,
             span: f.name.span,
         }
+    }
+
+    /// Report a convention that a parameter of type `ty` can't have.
+    fn check_convention(&mut self, p: &ast::Param, ty: Ty) {
+        let why = match (p.convention, ty) {
+            (Convention::Inout, Ty::Str) => {
+                "a `str` can't be passed `inout`: its bytes are read-only".to_owned()
+            }
+            (Convention::Set, ty) if ty.is_view() => {
+                format!("a `set` parameter can't be a view (`{ty}`)")
+            }
+            _ => return,
+        };
+        self.error(p.name.span, why);
     }
 
     /// The error type of a `throws` clause: an enum.
@@ -1225,14 +1452,30 @@ impl<'a> Checker<'a> {
         cx.throws = throws;
         let mut params = Vec::new();
         let param_tys = self.sigs[id].params.clone();
-        for (p, &ty) in f.params.iter().zip(&param_tys) {
+        for (p, (ty, convention, _)) in f.params.iter().zip(param_tys) {
             if cx.scopes[0].contains_key(&p.name.name) {
                 self.error(
                     p.name.span,
                     format!("parameter `{}` is declared twice", p.name.name),
                 );
             }
-            params.push(self.declare(&mut cx, &p.name.name, ty, false));
+            // The callee may change an `inout`, `sink` or `set` parameter;
+            // an `inout` slice's elements, not the slice itself.
+            let mutable = match convention {
+                Convention::Let => false,
+                Convention::Inout => !ty.is_view(),
+                Convention::Sink | Convention::Set => true,
+            };
+            let local = Self::declare_local(&mut cx, &p.name.name, ty, mutable, Some(convention));
+            // `self` of a type in error: uses of it fail without more errors.
+            if p.is_self() && ty == Ty::Unit {
+                cx.failed.insert(local);
+            }
+            if convention == Convention::Set && !ty.is_view() {
+                cx.env.declare_uninit(local);
+                cx.set_params.push(local);
+            }
+            params.push(local);
         }
         cx.params = params.len();
         let body = self.block(&mut cx, &f.body.stmts);
@@ -1246,10 +1489,18 @@ impl<'a> Checker<'a> {
                     f.name.name
                 ),
             );
+        } else if !terminates(&body) {
+            // At the closing `}`.
+            let end = Span {
+                start: f.body.span.end.saturating_sub(1),
+                ..f.body.span
+            };
+            self.check_set_params(&cx, end);
         }
+        let name = self.sigs[id].name.clone();
         Func {
-            name: f.name.name.clone(),
-            symbol: format!("{}.{}", self.pkgs[pkg].path, f.name.name),
+            symbol: format!("{}.{name}", self.pkgs[pkg].path),
+            name,
             params,
             ret,
             throws,
@@ -1260,20 +1511,54 @@ impl<'a> Checker<'a> {
     }
 
     /// The help for assigning to the immutable `local`, named `name`.
-    fn immutable_help(cx: &FnCx, local: LocalId, name: &str) -> String {
-        if local < cx.params {
-            format!("parameters are read-only; to change a copy, declare one: `var m = {name}`")
+    pub(super) fn immutable_help(cx: &FnCx, local: LocalId, name: &str) -> String {
+        if name == "self" && local == 0 {
+            "declare the method with `inout self` to change the value it's called on".to_owned()
+        } else if local < cx.params {
+            format!(
+                "parameters are read-only; declare it `inout {name}` to change the caller's variable, or change a copy: `var m = {name}`"
+            )
         } else {
             format!("declare it with `var {name}` to make it mutable")
         }
     }
 
+    /// Report the `set` parameters that may not be assigned when the
+    /// function returns at `span`.
+    fn check_set_params(&mut self, cx: &FnCx, span: Span) {
+        for &p in &cx.set_params {
+            if cx.env.is_uninit(p) {
+                let name = &cx.locals[p].name;
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{name}` is a `set` parameter, but it may not be assigned when the function returns here"),
+                    )
+                    .with_help(format!(
+                        "assign `{name}` on every path that returns; a `throw` doesn't need to"
+                    )),
+                );
+            }
+        }
+    }
+
     fn declare(&mut self, cx: &mut FnCx, name: &str, ty: Ty, mutable: bool) -> LocalId {
+        Self::declare_local(cx, name, ty, mutable, None)
+    }
+
+    fn declare_local(
+        cx: &mut FnCx,
+        name: &str,
+        ty: Ty,
+        mutable: bool,
+        convention: Option<Convention>,
+    ) -> LocalId {
         let id = cx.locals.len();
         cx.locals.push(Local {
             name: name.to_owned(),
             ty,
             mutable,
+            convention,
         });
         cx.scopes
             .last_mut()
@@ -1504,12 +1789,30 @@ impl<'a> Checker<'a> {
                     None => None,
                 };
                 let Some(init) = init else {
-                    let what = if *mutable {
-                        "`var` without an initial value is"
-                    } else {
-                        "`let` needs an initial value; it"
+                    // `var x: T`: assigned later, before it's read.
+                    if !*mutable {
+                        self.diags.push(
+                            Diagnostic::error(*span, "`let` needs a value")
+                                .with_help("declare it with `var` to assign it later"),
+                        );
+                        return None;
+                    }
+                    let Some(ty) = annotated else {
+                        self.diags.push(
+                            Diagnostic::error(*span, "a `var` without a value needs a type")
+                                .with_help(format!("e.g. `var {}: u32`", name.name)),
+                        );
+                        return None;
                     };
-                    self.error(*span, format!("{what} not supported by the compiler yet"));
+                    if cx.scopes.last().expect("scope").contains_key(&name.name) {
+                        self.error(
+                            name.span,
+                            format!("`{}` is already declared in this block", name.name),
+                        );
+                        return None;
+                    }
+                    let local = self.declare(cx, &name.name, ty, true);
+                    cx.env.declare_uninit(local);
                     return None;
                 };
                 if cx.scopes.last().expect("scope").contains_key(&name.name) {
@@ -1620,8 +1923,10 @@ impl<'a> Checker<'a> {
                     binding,
                     handler,
                 } => Some(TStmt::Expr(
-                    self.catch(cx, value, binding.as_ref(), handler, false)?
-                        .expr,
+                    self.whole(cx, e.span, |ck, cx| {
+                        ck.catch(cx, value, binding.as_ref(), handler, false)
+                    })?
+                    .expr,
                 )),
                 _ => {
                     self.error(e.span, "this expression has no effect");
@@ -1643,24 +1948,28 @@ impl<'a> Checker<'a> {
             }),
             // Only reached for a `defer` outside a block's statements.
             Stmt::Defer { body, on_error, .. } => self.defer(cx, body, *on_error, &[]),
-            Stmt::Return { value, span } => Some(TStmt::Return(match (value, cx.ret) {
-                (None, Ty::Unit) => None,
-                (None, ret) => {
-                    self.error(
-                        *span,
-                        format!("this function must return a value of type `{ret}`"),
-                    );
-                    None
-                }
-                (Some(v), Ty::Unit) => {
-                    self.error(v.span, "this function doesn't return a value");
-                    None
-                }
-                (Some(v), ret) => self
-                    .expr(cx, v, Some(ret))
-                    .and_then(|checked| self.coerce(checked, ret, v.span))
-                    .map(|c| c.expr),
-            })),
+            Stmt::Return { value, span } => {
+                let value = match (value, cx.ret) {
+                    (None, Ty::Unit) => None,
+                    (None, ret) => {
+                        self.error(
+                            *span,
+                            format!("this function must return a value of type `{ret}`"),
+                        );
+                        None
+                    }
+                    (Some(v), Ty::Unit) => {
+                        self.error(v.span, "this function doesn't return a value");
+                        None
+                    }
+                    (Some(v), ret) => self
+                        .expr(cx, v, Some(ret))
+                        .and_then(|checked| self.coerce(checked, ret, v.span))
+                        .map(|c| c.expr),
+                };
+                self.check_set_params(cx, *span);
+                Some(TStmt::Return(value))
+            }
             Stmt::If(i) => Some(self.if_stmt(cx, i)),
             Stmt::While { cond, body, .. } => {
                 let ((cond, facts, body), head, exits) =
@@ -1755,8 +2064,15 @@ impl<'a> Checker<'a> {
     ) -> Option<TStmt> {
         // A call that throws gives its result, to match `ok` and `err`.
         let checked = match &value.kind {
-            ExprKind::Call(callee, args) => self.call(cx, callee, args, value.span, true)?,
+            ExprKind::Call(callee, args) => self.whole(cx, value.span, |ck, cx| {
+                ck.call(cx, callee, args, value.span, true)
+            })?,
             _ => self.expr(cx, value, None)?,
+        };
+        // When a call fails, the variables it was to assign (`set`) aren't.
+        let sets = match (&value.kind, ty_is_result(&checked)) {
+            (ExprKind::Call(..), true) => std::mem::take(&mut cx.call_sets),
+            _ => Vec::new(),
         };
         let ty = checked.ty();
         let Some(def) = ty.sum() else {
@@ -1855,6 +2171,12 @@ impl<'a> Checker<'a> {
                         }
                     }
                 },
+            }
+            // The `err` arm of a call's result (variant 1).
+            if variants.contains(&1) {
+                for &l in &sets {
+                    cx.env.declare_uninit(l);
+                }
             }
             cx.scopes.push(HashMap::new());
             let mut body = Vec::new();
@@ -2317,7 +2639,10 @@ impl<'a> Checker<'a> {
             cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
             // A bound that's a term the body doesn't assign keeps its value for
             // the whole loop, so the index can be related to it.
-            let unassigned = |cx: &FnCx, t: Term| !assigned.contains(&cx.locals[t.local()].name);
+            let unassigned = |cx: &FnCx, t: Term| {
+                let local = &cx.locals[t.local()];
+                local.mutable_view() || !assigned.contains(&local.name)
+            };
             let mut loop_facts = Vec::new();
             if let Some(e) = end.term
                 && unassigned(cx, e.term)
@@ -2408,6 +2733,22 @@ impl<'a> Checker<'a> {
     /// `let` array (or part of one), or part of another view. A slice of a
     /// `var` array or of a temporary can still be passed to a function.
     fn check_kept_view(&mut self, cx: &FnCx, value: &expr::Checked, span: Span) -> Option<()> {
+        // A copy of an `inout` slice would see its elements change.
+        if let TExprKind::Local(l) = value.expr.kind
+            && cx.locals[l].mutable_view()
+        {
+            let name = &cx.locals[l].name;
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("cannot keep a copy of `{name}`, an `inout` slice"),
+                )
+                .with_help(format!(
+                    "its elements can change; use `{name}` itself, or pass it to the function that takes the slice"
+                )),
+            );
+            return None;
+        }
         let TExprKind::ToSlice(array) = &value.expr.kind else {
             return Some(());
         };
@@ -2417,7 +2758,10 @@ impl<'a> Checker<'a> {
         }
         let diag = match root.kind {
             // Reassigning a `var` view doesn't change what it viewed.
-            TExprKind::Local(l) if !cx.locals[l].mutable || cx.locals[l].ty.is_view() => {
+            TExprKind::Local(l)
+                if !cx.locals[l].mutable_view()
+                    && (!cx.locals[l].mutable || cx.locals[l].ty.is_view()) =>
+            {
                 return Some(());
             }
             TExprKind::Local(l) => {
@@ -2464,13 +2808,15 @@ impl<'a> Checker<'a> {
         }
         self.check_defer_assign(cx, local, name, target.span)?;
         let root_ty = cx.locals[local].ty;
-        if root_ty.is_view() {
+        if root_ty.is_view() && !cx.locals[local].mutable_view() {
             self.diags.push(
                 Diagnostic::error(
                     target.span,
-                    format!("cannot assign through `{name}`, which is a `{root_ty}`"),
+                    format!("cannot assign through `{name}`, which is a read-only `{root_ty}`"),
                 )
-                .with_help("slices are read-only views for now"),
+                .with_help(
+                    "only the elements of an `inout` slice parameter can be assigned (`inout xs: []u8`)",
+                ),
             );
             return None;
         }

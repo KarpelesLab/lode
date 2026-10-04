@@ -72,6 +72,7 @@ fn callee_name(callee: &ast::Expr) -> String {
     match &callee.kind {
         ExprKind::Name(n) => n.clone(),
         ExprKind::Field(base, member) => format!("{}.{}", callee_name(base), member.name),
+        ExprKind::Call(callee, _) => format!("{}()", callee_name(callee)),
         _ => "this function".to_owned(),
     }
 }
@@ -134,6 +135,174 @@ pub(super) fn flat_size(ty: Ty) -> u32 {
     match ty.as_struct() {
         Some(def) => def.fields.iter().map(|f| flat_size(f.ty)).sum(),
         None => 1,
+    }
+}
+
+/// What changes a place, for messages: a `&` argument passed `inout` or
+/// `set`, or the receiver of a method that takes `inout self` (its name).
+#[derive(Clone, Copy)]
+pub(super) enum Changer<'a> {
+    Ref,
+    Receiver(&'a str),
+}
+
+/// One step from a variable to a part of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    Field(u32),
+    /// An element, at a constant index if known.
+    Index(Option<i128>),
+    /// A payload field (of a hidden local).
+    Payload,
+}
+
+/// A use of (part of) a variable in an expression: whether it changes it
+/// (passed `inout` or `set`), and the place, for messages.
+struct Access<'e> {
+    local: LocalId,
+    path: Vec<Step>,
+    write: bool,
+    place: &'e TExpr,
+}
+
+/// The variable and the steps a place like `a[i].x` is made of, if `e` is
+/// a place.
+fn place_path(e: &TExpr) -> Option<(LocalId, Vec<Step>)> {
+    let (base, step) = match &e.kind {
+        TExprKind::Local(l) => return Some((*l, Vec::new())),
+        TExprKind::Field(base, i) => (base, Step::Field(*i)),
+        TExprKind::Index(base, index) => {
+            let mut k = &**index;
+            while let TExprKind::Convert(inner) = &k.kind {
+                k = inner;
+            }
+            let at = match k.kind {
+                TExprKind::Int(v) => Some(v),
+                _ => None,
+            };
+            (base, Step::Index(at))
+        }
+        TExprKind::Payload(base, ..) => (base, Step::Payload),
+        _ => return None,
+    };
+    let (local, mut path) = place_path(base)?;
+    path.push(step);
+    Some((local, path))
+}
+
+/// Whether two accesses may reach the same memory: the same variable, and
+/// neither goes to a different field or a different constant index than the
+/// other at some step.
+fn overlap(a: &Access<'_>, b: &Access<'_>) -> bool {
+    a.local == b.local
+        && a.path.iter().zip(&b.path).all(|pair| match pair {
+            (Step::Field(x), Step::Field(y)) => x == y,
+            (Step::Index(Some(x)), Step::Index(Some(y))) => x == y,
+            _ => true,
+        })
+}
+
+/// The accesses to variables in `e`, in evaluation order. `a.len` doesn't
+/// access `a`'s contents: an array's length is constant, and a slice's
+/// doesn't change through `&` (only its elements can).
+fn accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
+    match &e.kind {
+        TExprKind::Ref(inner) => {
+            let place = match &inner.kind {
+                TExprKind::ToSlice(array) => &**array,
+                _ => &**inner,
+            };
+            index_accesses(place, out);
+            if let Some((local, path)) = place_path(place) {
+                out.push(Access {
+                    local,
+                    path,
+                    write: true,
+                    place,
+                });
+            }
+        }
+        TExprKind::ArrayLen(inner) | TExprKind::ViewLen(inner) if place_path(inner).is_some() => {
+            index_accesses(inner, out);
+        }
+        _ => match place_path(e) {
+            Some((local, path)) => {
+                index_accesses(e, out);
+                out.push(Access {
+                    local,
+                    path,
+                    write: false,
+                    place: e,
+                });
+            }
+            None => {
+                for sub in subexprs(e) {
+                    accesses(sub, out);
+                }
+            }
+        },
+    }
+}
+
+/// The accesses in the indexes of the place `e`.
+fn index_accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
+    match &e.kind {
+        TExprKind::Index(base, index) => {
+            index_accesses(base, out);
+            accesses(index, out);
+        }
+        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) => index_accesses(base, out),
+        _ => {}
+    }
+}
+
+/// How a place is written in messages: `p.x`, `a[i]`, `a[2]`, `a[...]`.
+pub(super) fn place_text(cx: &FnCx, e: &TExpr) -> Option<String> {
+    Some(match &e.kind {
+        TExprKind::Local(l) => cx.locals[*l].name.clone(),
+        TExprKind::Field(base, i) => {
+            let def = base.ty.as_struct()?;
+            format!("{}.{}", place_text(cx, base)?, def.fields[*i as usize].name)
+        }
+        TExprKind::Index(base, index) => {
+            let mut k = &**index;
+            while let TExprKind::Convert(inner) = &k.kind {
+                k = inner;
+            }
+            let at = match &k.kind {
+                TExprKind::Int(v) => v.to_string(),
+                TExprKind::Local(l) if !cx.locals[*l].name.starts_with('$') => {
+                    cx.locals[*l].name.clone()
+                }
+                _ => "...".to_owned(),
+            };
+            format!("{}[{at}]", place_text(cx, base)?)
+        }
+        TExprKind::ToSlice(inner) => return place_text(cx, inner),
+        _ => return None,
+    })
+}
+
+/// Forget the facts about a place a call may have changed. Array and
+/// slice elements have no facts, and a slice's length doesn't change.
+pub(super) fn forget_place(cx: &mut FnCx, place: &TExpr) {
+    match &place.kind {
+        TExprKind::Local(l) if !cx.locals[*l].ty.is_view() => cx.env.forget(*l),
+        TExprKind::Field(..) => {
+            if let Some(Term::Field(l, off)) = place_term(place) {
+                cx.env.forget_fields(l, off..off + flat_size(place.ty));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Forget the facts about every place `e` passes `inout` or `set`.
+pub(super) fn forget_changed(cx: &mut FnCx, e: &TExpr) {
+    let mut found = Vec::new();
+    accesses(e, &mut found);
+    for a in found.iter().filter(|a| a.write) {
+        forget_place(cx, a.place);
     }
 }
 
@@ -248,6 +417,81 @@ impl Checker<'_> {
         e: &ast::Expr,
         expected: Option<Ty>,
     ) -> Option<Checked> {
+        self.whole(cx, e.span, |ck, cx| ck.expr_inner(cx, e, expected))
+    }
+
+    /// Check an expression with `check`. If it's a whole expression (not
+    /// part of one being checked), check it for exclusivity once it's done.
+    pub(super) fn whole(
+        &mut self,
+        cx: &mut FnCx,
+        span: Span,
+        check: impl FnOnce(&mut Self, &mut FnCx) -> Option<Checked>,
+    ) -> Option<Checked> {
+        cx.expr_depth += 1;
+        let out = check(self, cx);
+        cx.expr_depth -= 1;
+        if cx.expr_depth == 0
+            && let Some(c) = &out
+        {
+            self.check_exclusive(cx, &c.expr, span);
+        }
+        out
+    }
+
+    /// Exclusivity (docs/memory.md): a place passed `inout` or `set` in an
+    /// expression (with `&`, or as the receiver of a method that takes
+    /// `inout self`) can't overlap anything else the expression uses.
+    fn check_exclusive(&mut self, cx: &FnCx, e: &TExpr, span: Span) {
+        let mut found = Vec::new();
+        accesses(e, &mut found);
+        let text = |a: &Access<'_>| {
+            place_text(cx, a.place).unwrap_or_else(|| cx.locals[a.local].name.clone())
+        };
+        for (i, w) in found.iter().enumerate() {
+            if !w.write {
+                continue;
+            }
+            let Some(other) = found
+                .iter()
+                .enumerate()
+                .find(|&(j, o)| j != i && !(o.write && j < i) && overlap(w, o))
+                .map(|(_, o)| o)
+            else {
+                continue;
+            };
+            let (wt, ot) = (text(w), text(other));
+            let msg = if other.write {
+                format!(
+                    "`{wt}` and `{ot}` are both passed `inout` or `set` in this expression, and may overlap"
+                )
+            } else {
+                format!(
+                    "`{wt}` is passed `inout` or `set`, so `{ot}` can't be used in the same expression"
+                )
+            };
+            let mut d = Diagnostic::error(span, msg).with_help(
+                "a place passed `inout` or `set` (with `&`, or to a method that takes `inout self`) needs exclusive access: nothing else in the expression may use it",
+            );
+            let unknown_index = w.path.iter().zip(&other.path).any(|pair| {
+                matches!(pair, (Step::Index(a), Step::Index(b)) if a.is_none() || b.is_none())
+            });
+            if unknown_index {
+                d = d.with_help(
+                    "two elements of one array count as overlapping unless their indexes are different constants",
+                );
+            }
+            self.diags.push(d);
+            return;
+        }
+    }
+
+    fn expr_inner(
+        &mut self,
+        cx: &mut FnCx,
+        e: &ast::Expr,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
         if let Some(v) = self.untyped_int(cx, e) {
             return self.literal(v, e.span, expected.map(under_optionals));
         }
@@ -281,6 +525,16 @@ impl Checker<'_> {
                 binding,
                 handler,
             } => self.catch(cx, value, binding.as_ref(), handler, true),
+            ExprKind::Ref(_) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        e.span,
+                        "`&` marks a call's argument passed `inout` or `set`, and is only used there",
+                    )
+                    .with_help("to copy a value, use it without `&`"),
+                );
+                None
+            }
             ExprKind::Throw(_) => {
                 self.diags.push(
                     Diagnostic::error(e.span, "`throw` is a statement").with_help(
@@ -534,6 +788,10 @@ impl Checker<'_> {
         let c = self.throwing_call(cx, value, "catch")?;
         let (ty, err) = c.ty().as_result().expect("a result");
         let entry = cx.env.clone();
+        // When the call fails, the variables it was to assign (`set`) aren't.
+        for l in std::mem::take(&mut cx.call_sets) {
+            cx.env.declare_uninit(l);
+        }
         let (local, handler) = match handler {
             ast::CatchHandler::Value(v) => {
                 let d = self.expr(cx, v, Some(ty));
@@ -548,7 +806,10 @@ impl Checker<'_> {
                     cx.env.assign(id, None);
                     id
                 });
+                // The block's statements are expressions of their own.
+                let depth = std::mem::replace(&mut cx.expr_depth, 0);
                 let body = self.block(cx, &b.stmts);
+                cx.expr_depth = depth;
                 cx.scopes.pop();
                 let leaves = diverges(&body);
                 if used && ty != Ty::Unit && !leaves {
@@ -919,6 +1180,18 @@ impl Checker<'_> {
             if cx.failed.contains(&local) {
                 return None;
             }
+            if cx.env.is_uninit(local) {
+                let help = if cx.set_params.contains(&local) {
+                    "a `set` parameter starts unassigned: the function assigns it"
+                } else {
+                    "assign it on every path that leads here"
+                };
+                self.diags.push(
+                    Diagnostic::error(span, format!("`{name}` is used before it's assigned"))
+                        .with_help(help),
+                );
+                return None;
+            }
             let ty = cx.locals[local].ty;
             let term = Term::Local(local);
             let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(term));
@@ -1020,7 +1293,18 @@ impl Checker<'_> {
         span: Span,
     ) -> Option<Checked> {
         if let Some(ty) = self.type_path(cx, base) {
-            return self.enum_variant(cx, ty?, member, None, span);
+            let ty = ty?;
+            if self.methods.contains_key(&(ty, member.name.clone())) {
+                self.error(
+                    span,
+                    format!(
+                        "`{ty}.{}` is a function; call it with `{ty}.{}(...)`",
+                        member.name, member.name
+                    ),
+                );
+                return None;
+            }
+            return self.enum_variant(cx, ty, member, None, span);
         }
         if let ExprKind::Name(pkg_name) = &base.kind
             && let Some(pkg) = self.imported(cx, pkg_name)
@@ -1043,6 +1327,13 @@ impl Checker<'_> {
                     usize_ty,
                     Some(Range::exact(n)),
                 ))
+            }
+            (ty, name) if self.methods.contains_key(&(ty, name.to_owned())) => {
+                self.error(
+                    span,
+                    format!("`{name}` is a method of `{ty}`; call it with `.{name}(...)`"),
+                );
+                None
             }
             (Ty::Struct(_), name) => {
                 let def = b.ty().as_struct().expect("a struct");
@@ -1306,6 +1597,10 @@ impl Checker<'_> {
                     .expr(cx, rhs, Some(Ty::Bool))
                     .and_then(|r| self.coerce(r, Ty::Bool, rhs.span));
                 cx.env = saved;
+                // What the right side changes, it may have changed.
+                if let Some(r) = &r {
+                    forget_changed(cx, &r.expr);
+                }
                 let (l, r) = (l?, r?);
                 let rf = r.facts.map(|f| *f).unwrap_or_default();
                 let (le, re) = (Box::new(l.expr), Box::new(r.expr));
@@ -1380,6 +1675,9 @@ impl Checker<'_> {
             return None;
         };
         // `opt ?? throw value` leaves the function when `opt` is `none`.
+        // The right side runs only then: after it, what's known is what
+        // holds whether it ran or not.
+        let before = cx.env.clone();
         let r = match &rhs.kind {
             ExprKind::Throw(value) => TExpr {
                 kind: TExprKind::Throw(Box::new(self.throw(cx, value, rhs.span)?)),
@@ -1390,6 +1688,7 @@ impl Checker<'_> {
                 self.coerce(r, inner, rhs.span)?.expr
             }
         };
+        cx.env = Env::join(before, std::mem::take(&mut cx.env));
         Some(Checked::new(
             TExprKind::Coalesce(Box::new(l.expr), Box::new(r)),
             inner,
@@ -1647,9 +1946,11 @@ impl Checker<'_> {
         Some(Checked::new(kind, Ty::Int(t), Some(range)))
     }
 
-    /// A call. The result of a call to a function that throws must be
-    /// `handled` (by `try`, `catch` or `match`, which then get a value of
-    /// its result type); otherwise it's an error.
+    /// A call: of a function, a method (`p.scale(2)`), or an associated
+    /// function (`Point.origin()`), or else a variant with a payload, a
+    /// conversion or `syscall`. The result of a call to a function that
+    /// throws must be `handled` (by `try`, `catch` or `match`, which then
+    /// get a value of its result type); otherwise it's an error.
     pub(super) fn call(
         &mut self,
         cx: &mut FnCx,
@@ -1658,17 +1959,57 @@ impl Checker<'_> {
         span: Span,
         handled: bool,
     ) -> Option<Checked> {
-        if let ExprKind::Field(base, member) = &callee.kind
-            && let Some(ty) = self.type_path(cx, base)
-        {
-            return self.enum_variant(cx, ty?, member, Some(args), span);
-        }
-        if let ExprKind::Field(base, _) = &callee.kind
+        // The receiver of a method call, with its span.
+        let mut receiver: Option<(Checked, Span)> = None;
+        let type_of = match &callee.kind {
+            ExprKind::Field(base, _) => self.type_path(cx, base),
+            _ => None,
+        };
+        if type_of.is_none()
+            && let ExprKind::Field(base, _) = &callee.kind
             && self.unknown_receiver(cx, base)
         {
             return None;
         }
-        let target = match &callee.kind {
+        let (id, name) = match &callee.kind {
+            ExprKind::Field(_, member) if type_of.is_some() => {
+                // `T.name(...)`: a variant, or an associated function.
+                let ty = type_of.expect("checked")?;
+                if ty
+                    .as_enum()
+                    .is_some_and(|def| def.variant(&member.name).is_some())
+                {
+                    return self.enum_variant(cx, ty, member, Some(args), span);
+                }
+                let name = format!("{ty}.{}", member.name);
+                match self.find_method(cx, ty, member)? {
+                    Some(id) if self.sigs[id].has_self => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                callee.span,
+                                format!("`{name}` is a method: call it on a value"),
+                            )
+                            .with_help(format!(
+                                "as in `x.{}(...)`, with `x` a `{ty}`",
+                                member.name
+                            )),
+                        );
+                        return None;
+                    }
+                    Some(id) => (id, name),
+                    None => {
+                        let what = match ty.as_enum() {
+                            Some(_) => "variant or function",
+                            None => "function",
+                        };
+                        self.error(
+                            member.span,
+                            format!("`{ty}` has no {what} `{}`", member.name),
+                        );
+                        return None;
+                    }
+                }
+            }
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
                 if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
                     (id, name.clone())
@@ -1710,16 +2051,44 @@ impl Checker<'_> {
                     }
                 }
             }
-            ExprKind::Field(..) => {
-                self.error(callee.span, "methods are not supported by the compiler yet");
-                return None;
+            // `value.name(...)`: a method of the value's type.
+            ExprKind::Field(base, member) => {
+                let recv = self.expr(cx, base, None)?;
+                let ty = recv.ty();
+                let id = match self.find_method(cx, ty, member)? {
+                    Some(id) => id,
+                    None => {
+                        let msg = match ty.as_struct() {
+                            Some(def) if def.field(&member.name).is_some() => {
+                                format!("`{}` is a field of `{ty}`, not a method", member.name)
+                            }
+                            _ => format!("`{ty}` has no method `{}`", member.name),
+                        };
+                        self.error(member.span, msg);
+                        return None;
+                    }
+                };
+                if !self.sigs[id].has_self {
+                    self.diags.push(
+                        Diagnostic::error(
+                            member.span,
+                            format!(
+                                "`{ty}.{}` has no `self`, so it's called on the type",
+                                member.name
+                            ),
+                        )
+                        .with_help(format!("call it as `{ty}.{}(...)`", member.name)),
+                    );
+                    return None;
+                }
+                receiver = Some((recv, base.span));
+                (id, callee_name(callee))
             }
             _ => {
                 self.error(callee.span, "only named functions can be called");
                 return None;
             }
         };
-        let (id, name) = target;
         if self.sigs[id].is_unsafe {
             self.require_unsafe(
                 cx,
@@ -1744,29 +2113,260 @@ impl Checker<'_> {
                 );
             }
         }
-        if args.len() != params.len() {
+        let skip = usize::from(receiver.is_some());
+        if args.len() + skip != params.len() {
             self.error(
                 span,
                 format!(
                     "`{name}` takes {} argument(s), but {} were given",
-                    params.len(),
+                    params.len() - skip,
                     args.len()
                 ),
             );
             return None;
         }
         let mut targs = Vec::new();
+        // The places passed `inout` or `set`, which the call may change.
+        let mut changed = Vec::new();
         let mut ok = true;
-        for (arg, &pty) in args.iter().zip(&params) {
-            match self
-                .expr(cx, arg, Some(pty))
-                .and_then(|c| self.coerce(c, pty, arg.span))
-            {
-                Some(c) => targs.push(c.expr),
+        if let Some((recv, rspan)) = receiver {
+            let e = match params[0].1 {
+                Convention::Inout => {
+                    let place = self.mutable_place(cx, recv.expr, rspan, Changer::Receiver(&name));
+                    match place {
+                        Some(p) => {
+                            changed.push((p.clone(), Convention::Inout));
+                            Some(TExpr {
+                                ty: p.ty,
+                                kind: TExprKind::Ref(Box::new(p)),
+                            })
+                        }
+                        None => None,
+                    }
+                }
+                _ => Some(recv.expr),
+            };
+            match e {
+                Some(e) => targs.push(e),
                 None => ok = false,
             }
         }
+        for (arg, (pty, conv, pname)) in args.iter().zip(&params[skip..]) {
+            let (pty, conv) = (*pty, *conv);
+            let e = match (&arg.kind, conv) {
+                (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
+                    let place = self.ref_arg(cx, inner, pty, conv, arg.span);
+                    place.map(|p| {
+                        changed.push((p.clone(), conv));
+                        TExpr {
+                            kind: TExprKind::Ref(Box::new(p)),
+                            ty: pty,
+                        }
+                    })
+                }
+                (ExprKind::Ref(_), _) => {
+                    let how = match conv {
+                        Convention::Sink => "passed `sink`, which moves a value in",
+                        _ => "read-only",
+                    };
+                    self.diags.push(
+                        Diagnostic::error(
+                            arg.span,
+                            format!(
+                                "`&` marks an argument passed `inout` or `set`, but `{pname}` of `{name}` is {how}"
+                            ),
+                        )
+                        .with_help("remove the `&`"),
+                    );
+                    None
+                }
+                (_, Convention::Inout | Convention::Set) => {
+                    let kw = if conv == Convention::Inout {
+                        "inout"
+                    } else {
+                        "set"
+                    };
+                    self.diags.push(
+                        Diagnostic::error(
+                            arg.span,
+                            format!("`{name}` takes `{pname}` as `{kw}`, so the argument needs `&`"),
+                        )
+                        .with_help(
+                            "pass a variable (or a field or an element of one) with `&`, as in `&x`: the call may change it",
+                        ),
+                    );
+                    None
+                }
+                _ => self
+                    .expr(cx, arg, Some(pty))
+                    .and_then(|c| self.coerce(c, pty, arg.span))
+                    .map(|c| c.expr),
+            };
+            match e {
+                Some(e) => targs.push(e),
+                None => ok = false,
+            }
+        }
+        // What the call may have changed: facts about it are forgotten, and
+        // a variable passed `set` is assigned (if the call succeeds).
+        let mut sets = Vec::new();
+        for (place, conv) in &changed {
+            match place.kind {
+                TExprKind::Local(l) if *conv == Convention::Set => {
+                    if cx.env.is_uninit(l) {
+                        sets.push(l);
+                    }
+                    cx.env.assign(l, None);
+                }
+                _ => forget_place(cx, place),
+            }
+        }
+        cx.call_sets = sets;
         ok.then(|| Checked::new(TExprKind::Call(id, targs), ret, None))
+    }
+
+    /// The method or associated function `member` of the type `ty`:
+    /// `Some(None)` if there's none, `None` if it's private to another
+    /// package (reported).
+    fn find_method(&mut self, cx: &FnCx, ty: Ty, member: &ast::Ident) -> Option<Option<FuncId>> {
+        let Some(&id) = self.methods.get(&(ty, member.name.clone())) else {
+            return Some(None);
+        };
+        let sig = &self.sigs[id];
+        if sig.pkg != cx.pkg && !sig.is_pub {
+            let path = self.pkgs[sig.pkg].path.clone();
+            self.error(
+                member.span,
+                format!("`{ty}.{}` is private to package `{path}`", member.name),
+            );
+            return None;
+        }
+        Some(Some(id))
+    }
+
+    /// The place `&inner` passes to a parameter of type `pty` passed `conv`
+    /// (`inout` or `set`): a variable, or a field or an element of one,
+    /// that can be changed, of exactly the parameter's type, or an array
+    /// for an `inout` slice (a view of it whose elements can be changed).
+    fn ref_arg(
+        &mut self,
+        cx: &mut FnCx,
+        inner: &ast::Expr,
+        pty: Ty,
+        conv: Convention,
+        span: Span,
+    ) -> Option<TExpr> {
+        // A variable passed `set` may be unassigned: it's written, not read.
+        let bare = match &inner.kind {
+            ExprKind::Name(n) if conv == Convention::Set => cx.lookup(n),
+            _ => None,
+        };
+        let place = match bare {
+            Some(l) => TExpr {
+                kind: TExprKind::Local(l),
+                ty: cx.locals[l].ty,
+            },
+            None => self.expr(cx, inner, Some(pty))?.expr,
+        };
+        let changer = Changer::Ref;
+        if place.ty == pty {
+            return self.mutable_place(cx, place, span, changer);
+        }
+        if let (Some((elem, _)), Some(want)) = (place.ty.as_array(), pty.as_slice())
+            && elem == want
+        {
+            let array = self.mutable_place(cx, place, span, changer)?;
+            return Some(TExpr {
+                kind: TExprKind::ToSlice(Box::new(array)),
+                ty: pty,
+            });
+        }
+        self.diags.push(
+            Diagnostic::error(span, format!("expected `{pty}`, found `{}`", place.ty))
+                .with_help(
+                    "a place passed `inout` or `set` must have exactly the parameter's type (or be an array, for a slice)",
+                ),
+        );
+        None
+    }
+
+    /// Check that `place` can be changed by `changer`: a `var` (or a
+    /// parameter the function may change), or a field or an element of one,
+    /// or an element of an `inout` slice. Returns it.
+    fn mutable_place(
+        &mut self,
+        cx: &FnCx,
+        place: TExpr,
+        span: Span,
+        changer: Changer<'_>,
+    ) -> Option<TExpr> {
+        let mut root = &place;
+        let local = loop {
+            match &root.kind {
+                TExprKind::Field(base, _) | TExprKind::Index(base, _) => root = base,
+                TExprKind::Local(l) => break *l,
+                _ => {
+                    let diag = match changer {
+                        Changer::Ref => Diagnostic::error(
+                            span,
+                            "`&` needs a variable, or a field or an element of one",
+                        )
+                        .with_help("this is a temporary value: store it in a `var` first"),
+                        Changer::Receiver(method) => Diagnostic::error(
+                            span,
+                            format!("cannot call `{method}` on a temporary: it takes `inout self`"),
+                        )
+                        .with_help("store the value in a `var` first"),
+                    };
+                    self.diags.push(diag);
+                    return None;
+                }
+            }
+        };
+        let l = &cx.locals[local];
+        let name = l.name.clone();
+        let changes = match changer {
+            Changer::Ref => format!(
+                "cannot pass `&{}`",
+                place_text(cx, &place).unwrap_or_else(|| name.clone())
+            ),
+            Changer::Receiver(method) => {
+                format!("cannot call `{method}`, which takes `inout self`,")
+            }
+        };
+        if l.ty.is_view() {
+            if !l.mutable_view() {
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        match changer {
+                            Changer::Ref => format!("{changes}: `{name}` is a read-only `{}`", l.ty),
+                            Changer::Receiver(_) => format!(
+                                "{changes} on an element of `{name}`, a read-only `{}`",
+                                l.ty
+                            ),
+                        },
+                    )
+                    .with_help(
+                        "only the elements of an `inout` slice parameter can be changed (`inout xs: []u8`)",
+                    ),
+                );
+                return None;
+            }
+        } else if !l.mutable {
+            let help = Self::immutable_help(cx, local, &name);
+            let msg = match changer {
+                Changer::Ref => format!("{changes}: `{name}` is immutable"),
+                Changer::Receiver(_) => {
+                    format!("{changes} on `{name}`, which is immutable")
+                }
+            };
+            self.diags
+                .push(Diagnostic::error(span, msg).with_help(help));
+            return None;
+        }
+        self.check_defer_assign(cx, local, &name, span)?;
+        Some(place)
     }
 
     /// `syscall(nr, args...)`: the raw operating-system call (unsafe).

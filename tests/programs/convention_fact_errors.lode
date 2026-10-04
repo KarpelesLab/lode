@@ -1,0 +1,79 @@
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+package main
+
+struct Point {
+	x: usize
+	y: usize
+}
+
+fn Point.grow(inout self) {
+	self.x = 100
+}
+
+fn set_big(inout i: usize) {
+	i = 100
+}
+
+fn is_big(inout i: usize) -> bool {
+	i = 100
+	return true
+}
+
+fn assign(set i: usize) {
+	i = 100
+}
+
+fn after_call(a: [4]u8) -> u8 {
+	var i: usize = 0
+	set_big(&i)
+	return a[i]
+}
+
+// At the loop's head, `i` isn't 0 any more after the first iteration.
+fn in_loop(a: [4]u8) -> u8 {
+	var i: usize = 0
+	var sum: u8 = 0
+	for _ in 0..3 {
+		sum = sum +% a[i]
+		set_big(&i)
+	}
+	return sum
+}
+
+fn fields(a: [4]u8) -> u8 {
+	var p = Point{x: 1, y: 2}
+	// Only `p.y` changes: `p.x` is still 1.
+	set_big(&p.y)
+	let ok = a[p.x]
+	set_big(&p.x)
+	return a[p.x]
+}
+
+fn receiver(a: [4]u8) -> u8 {
+	var p = Point{x: 1, y: 2}
+	p.grow()
+	return a[p.x]
+}
+
+// The right side of `&&` may run: what it changes is forgotten.
+fn conditions(a: [4]u8, c: bool) -> u8 {
+	var i: usize = 0
+	if c && is_big(&i) {
+	}
+	return a[i]
+}
+
+// A `set` argument has no facts after the call.
+fn set_arg(a: [4]u8) -> u8 {
+	var i: usize = 0
+	assign(&i)
+	return a[i]
+}
+
+fn main() {
+}

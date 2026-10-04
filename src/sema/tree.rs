@@ -5,6 +5,7 @@
 //! never needs a run-time check. That includes indexing: every
 //! [`TExprKind::Index`] is proven to be in bounds.
 
+pub use crate::ast::Convention;
 use crate::source::Span;
 use crate::types::Ty;
 
@@ -54,7 +55,26 @@ impl Func {
 pub struct Local {
     pub name: String,
     pub ty: Ty,
+    /// Whether it can be assigned: a `var`, or an `inout`, `sink` or `set`
+    /// parameter (but not an `inout` slice, whose elements are what can
+    /// be assigned).
     pub mutable: bool,
+    /// For a parameter, how it's passed (docs/memory.md).
+    pub convention: Option<Convention>,
+}
+
+impl Local {
+    /// Whether this is a slice whose elements can be assigned: an `inout`
+    /// slice parameter.
+    pub fn mutable_view(&self) -> bool {
+        self.ty.is_view() && self.convention == Some(Convention::Inout)
+    }
+
+    /// Whether the parameter is passed as the address of the caller's
+    /// place, which the callee reads and writes in place.
+    pub fn by_ref(&self) -> bool {
+        matches!(self.convention, Some(Convention::Inout | Convention::Set))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +216,12 @@ pub enum TExprKind {
     /// `throw value`, as the default of `??`: leave the function with an
     /// error. It has no value of its own.
     Throw(Box<TExpr>),
+    /// `&place`, a call argument passed `inout` or `set`: the address of
+    /// a place of a `var` (or of a parameter the callee may change), which
+    /// is a [`TExprKind::Local`], [`TExprKind::Field`] or
+    /// [`TExprKind::Index`], or a [`TExprKind::ToSlice`] of one for an
+    /// `inout` slice. Of the place's type.
+    Ref(Box<TExpr>),
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -304,7 +330,8 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::EnumValue(inner)
         | TExprKind::EnumFrom(inner)
         | TExprKind::Try(inner)
-        | TExprKind::Throw(inner) => vec![inner],
+        | TExprKind::Throw(inner)
+        | TExprKind::Ref(inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],

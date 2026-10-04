@@ -34,12 +34,21 @@
 //! (`match`, copies, `==`, `??`) tests the tag and branches; only the active
 //! variant's payload is ever read.
 //!
-//! Calls pass a value in memory as a pointer to it. Parameters are read-only
-//! for the duration of the call (docs/memory.md), and nothing can change the
-//! argument while the callee runs, so the pointer is to the caller's own
-//! value, not to a copy. A function returning a value in memory takes a
-//! pointer to the caller's storage for the result as its first IR parameter
-//! and returns nothing. The caller passes fresh storage: a new local's slot
+//! Calls pass a value in memory as a pointer to it. A default parameter is
+//! read-only for the duration of the call (docs/memory.md), and nothing can
+//! change the argument while the callee runs, so the pointer is to the
+//! caller's own value, not to a copy. An `inout` or `set` parameter is the
+//! caller's place itself: a value in memory is passed the same way, and a
+//! scalar as the address of the caller's variable, field or element, which
+//! the callee loads and stores through (its slot is that address). An
+//! `inout` slice is passed like any slice: the callee writes its elements
+//! through its pointer. A `sink` parameter in memory is copied into the
+//! callee's own storage on entry, since the callee may change it. A method
+//! is an ordinary function with its receiver as the first parameter, named
+//! `<package path>.<Type>.<name>`.
+//!
+//! A function returning a value in memory takes a pointer to the caller's
+//! storage for the result as its first IR parameter and returns nothing. The caller passes fresh storage: a new local's slot
 //! for `let x = f()`, otherwise a temporary that's then copied, so the
 //! callee never writes to something it can also read through a parameter.
 //!
@@ -66,7 +75,9 @@ use latticefoundry::ir::{
 use latticefoundry::support::StrInterner;
 
 use crate::reach::Reach;
-use crate::sema::{CmpOp, Func, Handler, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
+use crate::sema::{
+    CmpOp, Convention, Func, Handler, Local, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp,
+};
 use crate::types::{IntTy, Ty};
 
 /// The IR layout of an enum or an optional (see the module docs).
@@ -149,8 +160,21 @@ impl Types {
         } else {
             self.of(result)
         };
-        params.extend(f.params.iter().flat_map(|&p| self.parts(f.locals[p].ty)));
+        params.extend(
+            f.params
+                .iter()
+                .flat_map(|&p| self.param_parts(&f.locals[p])),
+        );
         (params, ret)
+    }
+
+    /// The IR parameters of a parameter: its value's parts, or the address
+    /// of the caller's place for a scalar passed `inout` or `set`.
+    fn param_parts(&self, local: &Local) -> Vec<TypeId> {
+        if local.by_ref() && !local.ty.in_memory() && !local.ty.is_view() {
+            return vec![self.ptr];
+        }
+        self.parts(local.ty)
     }
 
     fn int(&self, t: IntTy) -> TypeId {
@@ -444,10 +468,25 @@ impl FnLower<'_> {
             });
         }
         for (local, param) in f.locals.iter().zip(&params) {
-            // A parameter in memory is the caller's value, read in place.
-            if let Some(Val::Mem(p)) = *param {
-                self.slots.push(Slot::Mem(p));
-                continue;
+            match *param {
+                // A parameter in memory is the caller's value, read (or for
+                // `inout` and `set`, written) in place. A `sink` one is the
+                // callee's own copy.
+                Some(Val::Mem(p)) if local.convention != Some(Convention::Sink) => {
+                    self.slots.push(Slot::Mem(p));
+                    continue;
+                }
+                // A scalar passed `inout` or `set`: the caller's place.
+                Some(Val::One(p)) if local.by_ref() => {
+                    let ty = self.t.of(local.ty);
+                    self.slots.push(Slot::One {
+                        slot: p,
+                        ty,
+                        align: align_of(local.ty),
+                    });
+                    continue;
+                }
+                _ => {}
             }
             let slot = match local.ty {
                 Ty::Str | Ty::Slice(_) => Slot::View {
@@ -470,9 +509,12 @@ impl FnLower<'_> {
             self.slots.push(slot);
         }
         for (local, param) in params.into_iter().enumerate() {
-            match param {
-                Some(Val::Mem(_)) | None => {}
-                Some(val) => self.store(local, val),
+            let info = &f.locals[local];
+            match (param, self.slots[local]) {
+                (Some(Val::Mem(src)), Slot::Mem(dst)) if dst != src => self.copy(dst, src, info.ty),
+                (Some(Val::Mem(_)), _) | (None, _) => {}
+                (Some(Val::One(_)), _) if info.by_ref() => {}
+                (Some(val), _) => self.store(local, val),
             }
         }
         self.stmts(&f.body);
@@ -930,6 +972,20 @@ impl FnLower<'_> {
                 return self.read(addr, e.ty);
             }
             TExprKind::Coalesce(opt, default) => return self.coalesce(opt, default, e.ty),
+            // The address of the place: as for any value in memory, of a
+            // scalar's storage, or a view of an array.
+            TExprKind::Ref(place) => {
+                if place.ty.in_memory() || place.ty.is_view() {
+                    return self.expr(place);
+                }
+                match place.kind {
+                    TExprKind::Local(l) => match self.slots[l] {
+                        Slot::One { slot, .. } => slot,
+                        other => unreachable!("a scalar in {other:?}"),
+                    },
+                    _ => self.address(place),
+                }
+            }
             TExprKind::Try(call) => return self.try_call(call),
             TExprKind::Catch {
                 call,

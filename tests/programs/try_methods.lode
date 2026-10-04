@@ -1,0 +1,21 @@
+// stdout: hello\nworld\n
+package main
+
+import "std/io"
+import "std/os"
+
+// `try` on a method of another package's type.
+fn greet(out: io.File) throws(os.Error) {
+	try out.write("hello\n")
+	try io.stdout().write("world\n")
+}
+
+fn main() -> u8 {
+	greet(io.stdout()) catch _ {
+		return 1
+	}
+	io.stderr().write("") catch _ {
+		return 2
+	}
+	return 0
+}

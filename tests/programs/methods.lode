@@ -1,0 +1,151 @@
+// stdout: 25 7 3\n
+package main
+
+import "std/io"
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+// An associated function: no `self`.
+fn Point.origin() -> Point {
+	return Point{x: 0, y: 0}
+}
+
+fn Point.new(x: u32, y: u32) -> Point {
+	return Point{x: x, y: y}
+}
+
+// `self` is read-only.
+fn Point.norm2(self) -> u32 {
+	return self.x *% self.x +% self.y *% self.y
+}
+
+fn Point.sum(self) -> u32 {
+	return self.x +% self.y
+}
+
+// `inout self` changes the value the method is called on.
+fn Point.scale(inout self, k: u32) {
+	self.x = self.x *% k
+	self.y = self.y *% k
+}
+
+// A method returning a value, for chained calls.
+fn Point.swapped(self) -> Point {
+	return Point{x: self.y, y: self.x}
+}
+
+// `sink self` takes the value: here, a copy the method may change.
+fn Point.moved(sink self, dx: u32) -> Point {
+	self.x = self.x +% dx
+	return self
+}
+
+// Methods on an enum.
+enum Shape {
+	square(side: u32)
+	rect(w: u32, h: u32)
+	dot
+}
+
+fn Shape.area(self) -> u32 {
+	match self {
+		square(s) => return s *% s
+		rect(w, h) => return w *% h
+		dot => return 0
+	}
+}
+
+fn Shape.grow(inout self) {
+	match self {
+		square(s) => self = .square(s +% 1)
+		rect(w, h) => self = .rect(w +% 1, h +% 1)
+		dot => self = .square(1)
+	}
+}
+
+// And on a C-style enum.
+enum Level: u8 {
+	low = 1
+	high = 9
+}
+
+fn Level.next(self) -> Level {
+	match self {
+		low => return .high
+		high => return .low
+	}
+}
+
+enum ParseError {
+	empty
+}
+
+struct Parser {
+	pos: u32
+	len: u32
+}
+
+// A method that throws.
+fn Parser.advance(inout self) throws(ParseError) {
+	if self.pos >= self.len {
+		throw .empty
+	}
+	self.pos = self.pos + 1
+}
+
+fn Parser.skip(inout self, n: u32) throws(ParseError) {
+	for _ in 0..n {
+		try self.advance()
+	}
+}
+
+fn main() -> u32 {
+	let p = Point.new(3, 4)
+	io.print_u64(p.norm2())
+	io.print(" ")
+
+	var q = Point.origin()
+	q.x = 1
+	q.y = 2
+	q.scale(2)
+	if q.x != 2 || q.y != 4 {
+		return 1
+	}
+	// Chained calls: `swapped` returns a value, `sum` reads it.
+	io.print_u64(p.swapped().moved(0).sum())
+	io.print(" ")
+	let r = q.moved(10)
+	if r.x != 12 || q.x != 2 {
+		return 2
+	}
+
+	var s = Shape.rect(2, 3)
+	s.grow()
+	if s.area() != 12 {
+		return 3
+	}
+	var d: Shape = .dot
+	d.grow()
+	if d != Shape.square(1) {
+		return 4
+	}
+	if Level.low.next() != Level.high {
+		return 5
+	}
+
+	var parser = Parser{pos: 0, len: 3}
+	parser.skip(2) catch _ {
+		return 6
+	}
+	parser.skip(5) catch e {
+		match e {
+			empty => {}
+		}
+	}
+	io.print_u64(parser.pos)
+	io.print("\n")
+	return 0
+}

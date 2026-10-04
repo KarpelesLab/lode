@@ -1,5 +1,5 @@
-//! Structs across packages, with a package of the test's own as the
-//! standard library (the standard library has no structs to use yet).
+//! Structs, enums and methods across packages, with a package of the
+//! test's own as the standard library.
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,33 @@ enum Hidden {
 
 pub fn unit() -> Shape {
 	return Shape.circle(origin(), 1)
+}
+
+pub fn Point.new(x: i32, y: i32) -> Point {
+	return Point{x: x, y: y}
+}
+
+pub fn Point.sum(self) -> i32 {
+	return self.x +% self.y
+}
+
+pub fn Point.flip(inout self) {
+	self.x = 0 -% self.x
+}
+
+fn Point.secret(self) -> i32 {
+	return 0
+}
+
+fn Point.hidden() -> Point {
+	return origin()
+}
+
+pub fn Shape.radius(self) -> u8 {
+	match self {
+		circle(_, r) => return r
+		dot => return 0
+	}
 }
 ";
 
@@ -200,6 +227,38 @@ fn main() {
         "expected `Point`, found `geo.Point`",
         "package `std/geo` has no `Nope`",
         "`geo.origin` is not a type",
+    ];
+    assert_eq!(errors, expected);
+}
+
+#[test]
+fn methods_of_another_packages_types() {
+    let main = "\
+package main
+
+import \"std/geo\"
+
+fn main() -> i32 {
+	var p = geo.Point.new(3, 4)
+	p.flip()
+	let s = geo.Shape.circle(p, 5)
+	return p.sum() +% i32(s.radius()) +% i32(geo.unit().radius())
+}
+";
+    let program = check("methods", main).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "methods"), 7);
+    }
+    let errors = check(
+        "private-methods",
+        "package main\n\nimport \"std/geo\"\n\nfn geo.Point.mine(self) {\n}\n\n\
+         fn main() -> i32 {\n\tlet p = geo.origin()\n\tlet q = geo.Point.hidden()\n\treturn p.secret()\n}\n",
+    )
+    .expect_err("fails to check");
+    let expected = [
+        "the methods of `geo.Point` can only be declared in package `std/geo`, which declares it",
+        "`geo.Point.hidden` is private to package `std/geo`",
+        "`geo.Point.secret` is private to package `std/geo`",
     ];
     assert_eq!(errors, expected);
 }

@@ -73,7 +73,12 @@ pub struct FnDecl {
     pub is_pub: bool,
     /// `unsafe fn`: callers must be in an `unsafe` context.
     pub is_unsafe: bool,
+    /// For a method or an associated function, `fn Type.name(...)`: the
+    /// type it belongs to (`Type`, or `pkg.Type`, which is an error).
+    pub owner: Option<TypeExpr>,
     pub name: Ident,
+    /// The parameters. A method's first is `self`, whose type is the
+    /// owner's.
     pub params: Vec<Param>,
     /// `throws(E)`, or `throws` alone (an inferred error set).
     pub throws: Option<Throws>,
@@ -116,6 +121,13 @@ pub struct Param {
     pub convention: Convention,
     pub name: Ident,
     pub ty: TypeExpr,
+}
+
+impl Param {
+    /// Whether this is a method's `self` (its type is the method's owner).
+    pub fn is_self(&self) -> bool {
+        self.name.name == "self"
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +333,9 @@ pub enum ExprKind {
     },
     /// `throw value` in an expression: only after `??`.
     Throw(Box<Expr>),
+    /// `&place`: an argument passed `inout` or `set` (only in a call's
+    /// arguments).
+    Ref(Box<Expr>),
 }
 
 /// What a `catch` does with an error.

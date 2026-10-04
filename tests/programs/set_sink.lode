@@ -1,0 +1,102 @@
+// exit: 0
+package main
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+enum Error {
+	negative
+}
+
+// `set`: the function assigns the caller's variable, which may be
+// unassigned before the call.
+fn split(v: u32, set hi: u32, set lo: u32) {
+	hi = v / 10
+	lo = v % 10
+}
+
+fn origin(set p: Point) {
+	p = Point{x: 0, y: 0}
+}
+
+// Assigned on every path that returns; a `throw` doesn't need to.
+fn parse(v: i32, set out: u32) throws(Error) {
+	if v < 0 {
+		throw .negative
+	}
+	out = u32(v)
+}
+
+// `sink`: the value moves in. For plain data, that's a copy the function
+// may change; the caller's variable is unchanged.
+fn total(sink p: Point) -> u32 {
+	p.x = p.x +% p.y
+	return p.x
+}
+
+fn count(sink n: u32) -> u32 {
+	var steps: u32 = 0
+	while n > 0 {
+		n = n / 2
+		steps = steps +% 1
+	}
+	return steps
+}
+
+fn main() -> u32 {
+	var hi: u32
+	var lo: u32
+	split(42, &hi, &lo)
+	if hi != 4 || lo != 2 {
+		return 1
+	}
+	// The checker knows nothing about a variable after `set`.
+	var p: Point
+	origin(&p)
+	if p.x != 0 {
+		return 2
+	}
+
+	var n: u32
+	parse(7, &n) catch _ {
+		return 3
+	}
+	if n != 7 {
+		return 4
+	}
+	var m: u32
+	parse(-1, &m) catch _ {
+		// `m` isn't assigned here.
+		m = 99
+	}
+	if m != 99 {
+		return 5
+	}
+	var k: u32 = 5
+	match parse(8, &k) {
+		ok => {}
+		err(e) => return 6
+	}
+	if k != 8 {
+		return 7
+	}
+
+	// A `var` assigned on every path before it's read.
+	var v: u32
+	if hi > 3 {
+		v = 1
+	} else {
+		v = 2
+	}
+
+	let q = Point{x: 1, y: 2}
+	if total(q) != 3 || q.x != 1 {
+		return 8
+	}
+	if count(8) != 4 {
+		return 9
+	}
+	return v - 1
+}

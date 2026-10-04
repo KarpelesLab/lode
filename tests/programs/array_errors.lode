@@ -1,4 +1,4 @@
-// error: cannot assign through `xs`, which is a `[]u8`
+// error: cannot assign through `xs`, which is a read-only `[]u8`
 // error: cannot assign to an element of `a`, which is immutable
 // error: expected `[3]u8`, found an array of 2 element(s)
 // error: expected `[2]u8`, found an array of 3 element(s)

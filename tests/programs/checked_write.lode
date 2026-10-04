@@ -1,24 +1,28 @@
-// stdout: written\n
+// stdout: written\nto a variable\n
 package main
 
 import "std/io"
-import "std/os"
 
-// `io.write` reports what stopped it, as an `os.Error`.
+// `File.write` reports what stopped it, as an `os.Error`.
 fn main() -> u8 {
-	io.write(os.STDOUT, "written\n") catch _ {
+	io.stdout().write("written\n") catch _ {
 		return 1
 	}
 	// Nothing to write is a success.
-	io.write(os.STDOUT, "") catch _ {
+	io.stdout().write("") catch _ {
 		return 2
 	}
+	let out = io.stdout()
+	out.write("to a variable\n") catch _ {
+		return 3
+	}
 	// Not an open file descriptor.
-	io.write(99, "lost") catch e {
+	let bad = io.File{fd: 99}
+	bad.write("lost") catch e {
 		match e {
 			bad_fd => return 0
-			_ => return 3
+			_ => return 4
 		}
 	}
-	return 4
+	return 5
 }
