@@ -124,7 +124,7 @@ fn main() {
 | Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
 | Refinement | `i: usize where i < buf.len` ([safety.md](safety.md#refinements-in-types)) |
 | Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
-| Compile-time | `comptime`, `if comptime cond { ... }` |
+| Compile-time | `comptime`, `if comptime cond { ... }`, `compile_error("...")`, `target.os` (see below) |
 | Unsafe | `unsafe fn`, `unsafe { ... }` |
 | Cleanup | `defer`, `errdefer` |
 | Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a[i..j]`, `a.len` (see below) |
@@ -166,7 +166,9 @@ fn main() -> u32 {
   type of its own (`[1, x, 2]` with `x: u32` is a `[3]u32`).
 - `[v; N]` repeats one value `N` times. `N` is a constant.
 - `const DAYS: [12]u8 = [31, 28, 31, ...]` is an array constant: a table in
-  read-only data, used like an array (`DAYS[m]`, `for d in DAYS`).
+  read-only data, used like an array (`DAYS[m]`, `for d in DAYS`). Its
+  value can also be computed by a function (see
+  [Compile-time code](#compile-time-code)).
 - `a[i]` is an element. `a[i] = v` and `a[i][j] op= v` assign to an element
   of a `var` array.
 - `a[i..j]` is a slice of an array or slice: the elements from `i` up to,
@@ -564,6 +566,45 @@ fn main() {
   `fn Pair[A, B].with_first[C](...)`, called as `p.with_first[u16](x)`.
 - `Name[u8, bool].new(...)` calls an associated function with the type's
   arguments; `Name.new(...)` infers them.
+
+## Compile-time code
+
+**Status:** Proposed; implemented in the compiler (M7d, semantics in
+[comptime.md](comptime.md) and
+[generics.md](generics.md#m7d-in-the-compiler))
+
+```
+const CRC_TABLE: [256]u32 = make_crc_table()  // run while compiling
+
+@comptime_budget(5000000)
+const PRIMES: [1000]u32 = sieve()             // more steps than the default
+
+if comptime target.os == .linux {
+	pub fn page_size() -> usize {
+		return 4096
+	}
+} else {
+	compile_error("unsupported target")
+}
+
+fn word() -> str {
+	if comptime target.pointer_bits == 64 {
+		return "64-bit"
+	} else {
+		return "narrower"
+	}
+}
+```
+
+- A typed `const` takes any expression of its type, calls included.
+- `@comptime_budget(n)` on its own line before a `const` sets how many
+  steps computing it may take.
+- `if comptime cond { ... } else ...` in a body or among declarations.
+  `else if comptime` continues the chain. The branches not taken must
+  parse, nothing more. `if comptime let` doesn't exist.
+- `compile_error("message")`: a statement, or a declaration.
+- `target` names the target being compiled for: `target.os`,
+  `target.arch`, `target.pointer_bits`, `target.endian`.
 
 ## Open questions
 

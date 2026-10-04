@@ -59,7 +59,10 @@ language can express it.
 formatter (`lode fmt`), a checker (types, and the flow-sensitive proof checker
 of [safety.md](safety.md#the-fact-language)), and lowering to LF IR of only
 the functions `main` reaches. The `lode` command builds static x86-64 Linux
-executables through LF's own linker. See the README for the supported subset.
+executables through LF's own linker. It also checks programs for AArch64
+Linux, wasm32, Cortex-M (`thumbv7m`) and AVR (`lode check --targets=...`,
+[comptime.md](comptime.md#keeping-dead-branches-from-rotting)), without
+generating code for them yet. See the README for the supported subset.
 
 ## Why it fits
 
@@ -96,7 +99,7 @@ Lode is now Lode's own work.
 | Stack probes (on by default) | `0.0.2` | Overflow reliably hits the guard page |
 | `secret` values, `declassify`, constant-time verifier | `0.0.2` | [`secret[T]`](types.md#secret-types) |
 | Context save/restore/switch with full register state, signal preemption (`lf_ctx_preempt`), opt-in yield points | `0.0.2` | [Green threads](concurrency.md#preemption) |
-| Targets: wasm32, Cortex-M (Thumb-2, soft-float, Intel HEX), AVR (separate address spaces, own linker) | `0.0.2` | Multi-target `std/os` once there's `comptime` |
+| Targets: wasm32, Cortex-M (Thumb-2, soft-float, Intel HEX), AVR (separate address spaces, own linker) | `0.0.2` | Checked for, not built yet: `lode check --targets`; `std/os` is per target (Linux only) |
 | SIMD vectors (SSE2, NEON, scalar fallback) | `0.0.2` | SIMD types |
 | PE/COFF and Mach-O objects, Win64 calling convention, raw binary / Intel HEX | `0.0.2` | Windows and macOS layers |
 | Shared libraries and position-independent code (`--shared`, `--pie`) | `0.0.2` | C-ABI libraries |

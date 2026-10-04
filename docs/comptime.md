@@ -6,7 +6,8 @@ lead, with restrictions for predictability.
 
 ## Basics
 
-**Status:** Proposed
+**Status:** Proposed; implemented for constants (M7d), without `comptime`
+parameters ([generics.md](generics.md#m7d-in-the-compiler))
 
 - A subset of the language runs at compile time: arithmetic, control flow,
   structs, enums, arrays, and calls to functions that only use those.
@@ -23,7 +24,9 @@ fn make_crc_table() -> [256]u32 { ... }         // an ordinary function
 
 ## Rules for comptime code
 
-**Status:** Proposed
+**Status:** Proposed; implemented (M7d), without `embed_file`. Integers
+are exact `i128`s within their type rather than `puremp` numbers, which
+is the same while integers are at most 64 bits
 
 - **Deterministic and hermetic.** No I/O, no clock, no environment. The only
   input from outside the program is `embed_file("path")`, which is recorded as
@@ -38,7 +41,8 @@ fn make_crc_table() -> [256]u32 { ... }         // an ordinary function
 
 ## Conditional compilation
 
-**Status:** Decided: dead branches may be invalid
+**Status:** Decided: dead branches may be invalid; implemented (M7d), with
+`target.os`, `arch`, `pointer_bits` and `endian`
 
 ```
 fn page_size() -> usize {
@@ -64,7 +68,7 @@ fn page_size() -> usize {
 
 ### Keeping dead branches from rotting
 
-**Status:** Proposed
+**Status:** Proposed; implemented (M7d): `lode check --targets=...`
 
 Zig's lazy analysis means code for other targets is never checked and quietly
 breaks. Mitigations:

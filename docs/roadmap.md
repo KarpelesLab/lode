@@ -62,6 +62,17 @@ itself is in the other documents; this one is only about order.
   their own; recursive generic types rejected. std gains `std/buf`
   (`StackBuf[N]`, which `io.print_int` uses for its digits) and `std/vec`
   (`ArrayVec[T, N]`) ([generics.md](generics.md#m7b-in-the-compiler)).
+- **M7d: Compile-time evaluation and target selection** (2026-10-04). A
+  tree-walking evaluator runs constants' values, calls included (`const
+  CRC_TABLE: [256]u32 = make_crc_table()`), with the program's semantics,
+  checking what the prover didn't prove as it runs, within step and
+  memory budgets (`@comptime_budget(n)`); functions a constant calls are
+  checked on demand. `target` describes the target, `if comptime` picks
+  declarations and statements by it, `compile_error` stops what can't be
+  compiled, and `lode check --targets=...` checks for several targets in
+  one run (x86_64-linux is built; aarch64-linux, wasm32, thumbv7m and avr
+  are checked). `std/os` is Linux-only, with the system call numbers of
+  x86-64 and AArch64 ([generics.md](generics.md#m7d-in-the-compiler)).
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
@@ -80,13 +91,12 @@ Slicing `a[i..j]` compiles only when the checker proves
   options are in [memory.md](memory.md#uninitialized-buffers): option 3's
   type, `StackBuf[N]`, exists, and stops filling once fields can be
   private.
-- **M7c to M7e: the rest of generics and traits** (and `comptime`, which
-  they're built on): user traits and `impl` (M7c), compile-time
-  evaluation and target selection (M7d), format strings (M7e). The
+- **M7c and M7e: the rest of generics and traits**: user traits and
+  `impl` (M7c), and format strings with `comptime` parameters (M7e). The
   proposal is in [generics.md](generics.md#implementation-plan).
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack
 bounds (the bound in the binary, profiles that require one; `--stack-usage`
-already reports it), green threads, other targets through `comptime`, and
-self-hosting.
+already reports it), green threads, building for the other targets
+(`lode check` already checks for them), and self-hosting.

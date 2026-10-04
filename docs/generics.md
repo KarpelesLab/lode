@@ -542,7 +542,8 @@ The checking model makes errors local:
 
 ## `comptime`
 
-**Status:** Proposed
+**Status:** Proposed; items 1 to 4 and 6 of What M7 needs implemented
+(M7d, [in the compiler](#m7d-in-the-compiler)); 5 waits for M7e
 
 [comptime.md](comptime.md) describes the mechanism. M7 needs a part of it.
 
@@ -729,7 +730,7 @@ of `Str[utf8]` ([strings.md](strings.md)).
 
 ## Implementation plan
 
-**Status:** M7a and M7b implemented; M7c to M7e proposed
+**Status:** M7a, M7b and M7d implemented; M7c and M7e proposed
 
 Five steps, each shippable on its own with tests, std changes and docs, as
 the earlier milestones were. Sizes are rough estimates of compiler code
@@ -936,6 +937,93 @@ proposal left room:
 M7d depends only on M7a and could go before M7b or M7c if multi-target work
 becomes urgent.
 
+### M7d in the compiler
+
+**Status:** Implemented (2026-10-04)
+
+What M7d does, and the choices made while implementing it where this
+proposal left room:
+
+- **Constants.** A typed constant's value is any expression of its type,
+  calls included: `const CRC_TABLE: [256]u32 = make_crc_table()`. Its type
+  is an integer, `bool`, or an array, struct, enum or optional of those
+  (instances of generic types too). An array of integers or `bool` is a
+  table in read-only data, as before, and the checker knows the range of
+  its elements. Another constant is built where it's used, so it holds at
+  most 256 scalars. Untyped constants are still integer literals.
+- **The evaluator** (`src/sema/eval.rs`) walks the typed tree, as
+  recommended. An integer is an `i128` within its type; an array, a
+  struct or an enum is a list. Arithmetic in every mode, shifts,
+  conversions, `match`, `try`, `catch`, `defer`, `inout` and `set`
+  arguments (copied in, then out), slices, and generic functions and
+  methods (with the instance's type and value arguments) behave as at
+  run time. tests/programs/comptime_semantics.lode runs the same function
+  both ways and compares.
+- **On-demand checking.** A function a constant calls is checked then,
+  before the others, and once: its errors are reported once. A function
+  with errors isn't run, and the constant fails without another error. A
+  value that needs itself, also through a function's body, is an error:
+  "the value of `X` depends on itself". When a trial check of a loop body
+  is rolled back, the functions checked during it are checked again later.
+- **Types are declared first.** A constant needed to declare a type or a
+  signature (an array length in a field or a parameter) can't call a
+  function: "a constant needed to declare a type or a signature can't
+  call a function". A computed constant can be a value argument in a
+  body: `StackBuf[SIZE].new()`.
+- **Checked by running it** (decision 7). A constant's value and an `if
+  comptime` condition only run at compile time. An operation in them the
+  prover can't prove (an overflow, an index, a slice, a division, a
+  shift, a negation, a conversion) is checked as it runs, and a failure is
+  an error at it: "evaluating `BIG` at compile time: 100 * 3 overflows
+  `u8`". The functions they call were checked and proven like any other.
+- **Bounds.** A budget of one million steps (a step is a statement, a
+  loop iteration or a call); `@comptime_budget(n)` on the line before a
+  `const` sets another. A memory budget of 16,777,216 scalars allocated
+  (arrays built, or copied to be changed). At most 1,000 nested calls.
+  Going over one is an error with the calls running, innermost first; a
+  recursion is one line, "in `depth`, 1000 calls deep". The checker runs
+  on a thread with a 256 MiB stack, which the evaluator's recursion
+  needs.
+- **Hermetic.** A raw pointer (`s.ptr`, `p + n`) or a `syscall` reached at
+  compile time is an error, with the calls that reached it. `unsafe` code
+  that only computes runs.
+- **`target`** is a value of the built-in struct `target.Target`: `os`
+  (`target.Os`: `linux`, `none`), `arch` (`target.Arch`: `x86_64`,
+  `aarch64`, `wasm32`, `arm`, `avr`), `pointer_bits` (a `u32`) and
+  `endian` (`target.Endian`: `little`, `big`). `target.os` and the others
+  are known values, with facts. A local or a declaration named `target`
+  hides it. `profile`, `abi` and CPU features wait for profiles.
+- **`if comptime` in a function** checks only the branch its condition
+  picks; the others must parse. The branch is a block of its own. The
+  condition is evaluated: constants, `target`, calls and operators, never
+  a variable ("`n` is a variable, so this condition isn't known when
+  compiling").
+- **`if comptime` at package level** picks declarations, nested `if
+  comptime` included. Its condition is evaluated before names are
+  resolved, so it uses only `target`, literals, comparisons, `&&`, `||`
+  and `!`, as recommended.
+- **`compile_error("message")`** is an error where it's compiled: a
+  statement in a body that's checked, or a declaration of a package
+  outside `if comptime` or in a branch the target takes. At package level
+  it also ends the check, since what uses the package would only give
+  errors that follow from it.
+- **Targets.** `lode targets` lists the targets: x86_64-linux, which is
+  built, and aarch64-linux, wasm32, thumbv7m (Cortex-M) and avr, which are
+  checked only, as LatticeFoundry can generate code for them
+  ([backend.md](backend.md)) but Lode doesn't use it yet. `lode check
+  --targets=x86_64-linux,aarch64-linux` (or `all`) loads and parses once
+  and checks once per target. Each message is printed once, with the
+  targets it's for unless it's all of them. `usize` has the target's
+  width (16 bits on avr), and so does the longest view.
+- **std.** `std/os` is the Linux implementation inside `if comptime
+  target.os == .linux`, with the system call numbers per architecture
+  (x86-64 and AArch64); any other target gets `compile_error("std/os:
+  unsupported target")` ([packages.md](packages.md#per-target-code)).
+  Hello world is unchanged: 655 bytes, two system calls.
+- **Not yet:** `comptime` parameters, packs, `comptime for` and `match
+  comptime` (M7e); `comptime` blocks and `comptime let`; `str` constants;
+  conditional imports; building for a target other than x86_64-linux.
+
 ### M7e: format strings
 
 - `comptime` parameters, packs, `comptime for`, `match comptime`, the
@@ -976,10 +1064,12 @@ others keep the recommended answer unless the user changes them.
    trait and type, no blanket impls ([Coherence](#coherence)).
    *Recommended, pending.*
 6. **Per-target code uses package-scope `if comptime`**, not file-name
-   suffixes ([What M7 needs](#what-m7-needs)). *Decided.*
+   suffixes ([What M7 needs](#what-m7-needs)). *Decided; implemented in
+   M7d.*
 7. **Code that only runs at compile time is checked by running it** instead
    of by the prover ([Proof obligations in compile-time
-   code](#proof-obligations-in-compile-time-code)). *Recommended, pending.*
+   code](#proof-obligations-in-compile-time-code)). *Recommended, pending;
+   implemented in M7d for constants' values and `if comptime` conditions.*
 8. **One `print`:** `io.print` becomes the formatted print with a
    compile-time format, and `print(s)` of a runtime string becomes
    `print("{}", s)` ([Format strings](#format-strings)).

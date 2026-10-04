@@ -85,6 +85,12 @@ fn first_or_zero(values: []u32) -> u32 {
 When the obligation cannot be discharged, the compiler gives an error that
 names the missing fact and lists the explicit alternatives.
 
+Code that only runs while compiling (a constant's value, an `if comptime`
+condition) never runs in the program, so it has no crash path to rule out:
+its obligations are discharged by running it, and one that fails is an
+error at the operation ([generics.md](generics.md#proof-obligations-in-compile-time-code);
+implemented in M7d). The functions it calls are proven like any other.
+
 ### The checker must be predictable
 
 **Status:** Proposed, important
@@ -135,10 +141,10 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | `a / b`, `a >> n` | For `/`, on each side of 0 of the divisor's range, the four quotients of the ranges' ends (rounded toward zero) bound the result; the two sides are joined. For `>>`, the four `a.lo >> n.lo` ... `a.hi >> n.hi` (rounded down). So `x / 10` and `x >> 4` of a `u64` are at most a tenth and a sixteenth of the largest `u64`. When `a` is a term plus a constant and can't be negative, and `b >= 1` (`n >= 0`), the result is also at most `a`; when `a >= 1` and `b >= 2` (`n >= 1`), at most `a - 1`. `let mid = xs.len / 2` gives the relation `mid <= xs.len - 1` when `xs.len >= 1` |
 | `a % b` | Smaller in size than `b` can be, with the sign of `a`: in `-m..=m`, with `m` the largest size of `b` minus 1, and 0 for an end where `a` can't have that sign. It doesn't depend on `a`'s size, so `a = (a + x) % m` has the same range at every iteration of a loop |
 | `a & b`, `a \| b`, `a ^ b` | `&`: with a non-negative operand, `0..=` its largest value (the smaller of both, if both are). `\|`, `^`: when both are non-negative, at most the smallest `2^k - 1` that's at least both largest values; `\|` is also at least the larger of both smallest values. Otherwise, the type's range |
-| `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize`. For a slice `a[i..j]` that isn't a local, the range of `j - i` (below), and with a constant `i`, `j - i` as a term plus a constant: `xs[..n].len` is `n`, `xs[1..].len` is `xs.len - 1` |
+| `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` of the target. For a slice `a[i..j]` that isn't a local, the range of `j - i` (below), and with a constant `i`, `j - i` as a term plus a constant: `xs[..n].len` is `n`, `xs[1..].len` is `xs.len - 1` |
 | `a[i..j]` | Its length is `j - i` (`j` is `a.len` when left out, `i` is 0): between `j.lo - i.hi` and `j.hi - i.lo`, narrowed by a relation between `i` and `j` (`j - i <= c` bounds it above by `c`, `i - j <= c` below by `-c`), and never below 0 |
-| `T[i]` of an array constant `T` | Between the smallest and the largest of the elements `i` can pick (of all the elements, past 4096 of them): with `const DAYS: [12]u8 = [31, 28, ...]`, `DAYS[m]` is `28..=31`, and `DAYS[1]` is 28. Other elements have no facts |
-| A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
+| `T[i]` of an array constant `T` (literal or computed by a function) | Between the smallest and the largest of the elements `i` can pick (of all the elements, past 4096 of them): with `const DAYS: [12]u8 = [31, 28, ...]`, `DAYS[m]` is `28..=31`, and `DAYS[1]` is 28. Other elements have no facts |
+| A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1. An integer field of a struct constant is its value |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
 | `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A form of one other term is related to it by a sum, both ways: `let x = 250 - b` gives `x + b <= 250` and `x + b >= 250`. A value known to be at most a term plus a constant (from `/` or `>>`, above) is related to it that way. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. A slice `s = a[i..j]` has the range of `j - i` as its length, and when `j` is a term plus a constant (`a.len` for `a[i..]`), the relations `j - i.hi <= s.len <= j - i.lo`; so with a constant `i`, `s.len == j - i`. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations, sums and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`; `p*i + q*b <= c` becomes `p*i + q*b <= c + p*k` for `i += k`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |

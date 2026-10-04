@@ -77,6 +77,17 @@ What works:
   size arrays, with `a[i]` proven once for every `N`; methods of generic
   types, `fn Pair[A, B].swap(self)`, which may add bounds or have their
   own parameters ([docs/generics.md](docs/generics.md#m7b-in-the-compiler))
+- compile-time evaluation: a constant's value can call functions
+  (`const CRC_TABLE: [256]u32 = make_crc_table()`), with the same
+  semantics as at run time, and be a struct, an enum or an optional; an
+  overflow or a bad index while computing one is an error where it
+  happens; a step budget (`@comptime_budget(n)`) bounds it
+- per-target code: `target` (`target.os == .linux`, `target.arch`,
+  `target.pointer_bits`), `if comptime` that checks only the branch the
+  target takes, in functions and among declarations, and
+  `compile_error("...")`; `lode check --targets=all` checks a program for
+  every target the compiler knows (only x86-64 Linux is built)
+  ([docs/generics.md](docs/generics.md#m7d-in-the-compiler))
 - packages: `import "std/..."`, `pub`, `pkg.name`; `std/math` (`min`,
   `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
@@ -142,6 +153,7 @@ target/debug/lode build program.lode -O2  # write ./program
 target/debug/lode build program.lode --emit=ir
 target/debug/lode build program.lode --stack-usage  # frames, worst-case stack
 target/debug/lode check program.lode
+target/debug/lode check program.lode --targets=all  # for each target (see `lode targets`)
 target/debug/lode fmt program.lode        # rewrite in canonical form
 target/debug/lode fmt --check std/        # list non-canonical .lode files, exit 1 if any
 ```
@@ -160,7 +172,8 @@ CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on x86-64
 Linux for every push to `master` and every pull request: `cargo fmt --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test`, and
 `lode fmt --check` over `std/` and `tests/programs/` (except
-`unsupported.lode`, which the parser rejects on purpose). It also builds
+`unsupported.lode`, which the parser rejects on purpose), and `lode check
+--targets=x86_64-linux,aarch64-linux` over the test programs. It also builds
 `tests/programs/hello_world.lode` at `-O2`, checks it prints `hello world` in
 exactly two system calls, and reports its size in the job summary.
 

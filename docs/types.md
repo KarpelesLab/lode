@@ -162,9 +162,9 @@ semantics.
   pointer to its first element (`*u8` for `[N]u8` and `[]u8`). An array's
   pointer points to the array itself, not to a copy.
 - An array of integers or `bool` (or of arrays of them) can be a constant:
-  `const DAYS: [12]u8 = [31, 28, ...]`. Its value is array literals and
-  `[v; n]` whose elements are known when compiling, or another array
-  constant. It lives in read-only data: `DAYS[i]` and `for d in DAYS` read
+  `const DAYS: [12]u8 = [31, 28, ...]`. Its value is any expression of
+  its type, computed while compiling, calls of functions included
+  ([generics.md](generics.md#m7d-in-the-compiler)). It lives in read-only data: `DAYS[i]` and `for d in DAYS` read
   it in place, and passing it where a slice is expected views it without a
   copy. `let a = DAYS` copies it into a variable that can change. The
   checker knows the range of its elements: `DAYS[i]` is `28..=31`

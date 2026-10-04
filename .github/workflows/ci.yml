@@ -36,6 +36,15 @@ jobs:
           cargo run --quiet -- fmt --check std
           find tests/programs -name '*.lode' ! -name unsupported.lode -print0 \
             | sort -z | xargs -0 cargo run --quiet -- fmt --check
+      - name: lode check --targets
+        # Only x86-64 Linux is built. Checking std and the programs that
+        # compile for AArch64 Linux too keeps its branches of `if comptime`
+        # from rotting (docs/comptime.md). comptime_target.lode has such a
+        # branch on purpose.
+        run: |
+          grep -l -E '^// (exit|stdout):' tests/programs/*.lode \
+            | grep -v comptime_target.lode \
+            | xargs -n1 cargo run --quiet -- check --targets=x86_64-linux,aarch64-linux
 
   hello:
     name: hello world

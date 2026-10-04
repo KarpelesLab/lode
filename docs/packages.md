@@ -41,7 +41,8 @@ Go's vocabulary, which is proven:
   `std/buf.StackBuf[64].push`.
 - So far there are six packages: `std/os`, `std/io`, `std/math`,
   `std/slices`, `std/buf` and `std/vec`.
-- `std/os` is the Linux x86-64 system calls:
+- `std/os` is the Linux system calls, for x86-64 and AArch64 (see
+  [Per-target code](#per-target-code)):
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
     the bytes, retrying), which return a negative error number on failure.
   - `read(fd, data: *u8, len: usize) -> isize` (one `read` system call,
@@ -139,6 +140,42 @@ Go's vocabulary, which is proven:
 - Every access in `std/buf` and `std/vec` is proven. Without refinements,
   each method checks the bound it relies on (`end <= N`), since the
   fields are visible and could have been changed.
+
+## Per-target code
+
+**Status:** Decided ([generics.md](generics.md#decisions), question 6);
+implemented (M7d)
+
+A package holds the code of every target. A package-level `if comptime`
+picks the declarations compiled for the target, rather than file names
+(Go's `os_linux.go`):
+
+```
+if comptime target.os == .linux {
+	if comptime target.arch == .x86_64 {
+		const SYS_WRITE = 1
+	} else if comptime target.arch == .aarch64 {
+		const SYS_WRITE = 64
+	}
+	pub fn write_all(fd: i32, b: []u8) -> isize { ... }
+} else {
+	compile_error("std/os: unsupported target")
+}
+```
+
+- Every file is parsed for every target; only the branches the target
+  takes are checked.
+- The conditions use only `target`, literals, comparisons, `&&`, `||` and
+  `!`, since they're evaluated before the package's names are known.
+- A `compile_error` reached among a package's declarations ends the check
+  there: "std/os: unsupported target" is the one error a program using
+  `std/io` gets for wasm32.
+- `std/os` is like that: Linux only, with the system call numbers of x86-64
+  and AArch64. Only x86-64 Linux can be built today; `lode check
+  --targets=aarch64-linux` checks the other.
+- `lode check --targets=all` checks a program for every target the
+  compiler knows, in one run, so the branches for other targets don't
+  rot unseen. CI checks the test programs for both Linux targets.
 
 ## Imports
 

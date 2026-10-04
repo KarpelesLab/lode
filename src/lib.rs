@@ -2,7 +2,8 @@
 //!
 //! The pipeline: [`load`] (the root file and the packages it imports, each
 //! [`lex`]ed and [`parse`]d) → [`sema`] (types, `unsafe`, and proof
-//! obligations, over all the code, generic bodies once) → [`lower`] (to
+//! obligations, over all the code, generic bodies once, for one
+//! [`target`]; constants are computed there, by its evaluator) → [`lower`] (to
 //! LatticeFoundry IR, only the code `main` reaches: the instances [`mono`]
 //! makes) → LatticeFoundry's verify, optimize, codegen and link. The design
 //! of the language is in `docs/`.
@@ -10,8 +11,9 @@
 //! This is an early compiler: it supports functions, generic functions over
 //! the built-in traits, integers, `bool`, `str`,
 //! arrays and slices, structs, enums and `match`, optionals, raw pointers in
-//! `unsafe` code, constants, local variables, arithmetic, control flow
-//! (including `for` loops) and packages. Everything else in the design is
+//! `unsafe` code, constants computed at compile time, `if comptime`,
+//! local variables, arithmetic, control flow (including `for` loops) and
+//! packages. Everything else in the design is
 //! reported as "not supported by the compiler yet".
 
 pub mod ast;
@@ -48,10 +50,6 @@ use crate::stack::StackReport;
 pub use crate::target::Target;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// The address width of the only target the backend can link for today
-/// (x86-64 Linux).
-pub const PTR_BITS: u32 = 64;
 
 /// Why compiling failed.
 #[derive(Debug)]
