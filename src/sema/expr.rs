@@ -1137,12 +1137,27 @@ impl Checker<'_> {
         };
         let term = match view.kind {
             TExprKind::Local(l) => Some(Term::Len(l)),
+            // `s.bytes()` has the length of `s`.
+            TExprKind::Bytes(ref s) => match s.kind {
+                TExprKind::Local(l) => Some(Term::Len(l)),
+                _ => None,
+            },
             _ => None,
         };
         let range = term
             .and_then(|t| super::read_range(cx, t))
             .and_then(|r| r.intersect(any_len))
             .unwrap_or(any_len);
+        // A string literal's length is known.
+        let literal = match &view.kind {
+            TExprKind::Str(id) => Some(self.strings[*id].len() as i128),
+            TExprKind::Bytes(s) => match s.kind {
+                TExprKind::Str(id) => Some(self.strings[id].len() as i128),
+                _ => None,
+            },
+            _ => None,
+        };
+        let range = literal.map_or(range, Range::exact);
         let mut c = Checked::new(
             TExprKind::ViewLen(Box::new(view)),
             self.usize_ty(),
@@ -1162,9 +1177,12 @@ impl Checker<'_> {
         let elem = match b.ty() {
             Ty::Array(_) | Ty::Slice(_) => b.ty().elem().expect("array or slice"),
             Ty::Str => {
-                self.error(
-                    base.span,
-                    "indexing a `str` is not supported by the compiler yet",
+                self.diags.push(
+                    Diagnostic::error(
+                        base.span,
+                        "a `str` can't be indexed: a byte is not a character",
+                    )
+                    .with_help("index its bytes: `s.bytes()[i]`"),
                 );
                 return None;
             }
@@ -1490,6 +1508,13 @@ impl Checker<'_> {
                 );
                 c.term = term.map(Linear::of);
                 Some(c)
+            }
+            (Ty::Str, "bytes") => {
+                self.error(
+                    span,
+                    "`bytes` is a method of `str`; call it with `.bytes()`",
+                );
+                None
             }
             (Ty::Str, "ptr") => {
                 self.require_unsafe(cx, span, "taking a string's raw pointer");
@@ -2222,6 +2247,9 @@ impl Checker<'_> {
             ExprKind::Field(base, member) => {
                 let recv = self.expr(cx, base, None)?;
                 let ty = recv.ty();
+                if ty == Ty::Str && member.name == "bytes" {
+                    return self.str_bytes(recv, args, span);
+                }
                 let id = match self.find_method(cx, ty, member)? {
                     Some(id) => id,
                     None => {
@@ -2390,6 +2418,22 @@ impl Checker<'_> {
         }
         cx.call_sets = sets;
         ok.then(|| Checked::new(TExprKind::Call(id, targs), ret, None))
+    }
+
+    /// `s.bytes()`: the bytes of the `str` `s`, a `[]u8` view of the same
+    /// storage. It's a projection of `s`, not a new value: like any view,
+    /// it can be kept in a local and passed on, but not stored or returned.
+    fn str_bytes(&mut self, s: Checked, args: &[ast::Expr], span: Span) -> Option<Checked> {
+        if !args.is_empty() {
+            self.error(span, "`bytes()` takes no arguments");
+            return None;
+        }
+        let u8_ty = Ty::slice(Ty::Int(IntTy::new(false, 8)));
+        Some(Checked::new(
+            TExprKind::Bytes(Box::new(s.expr)),
+            u8_ty,
+            None,
+        ))
     }
 
     /// The method or associated function `member` of the type `ty`:

@@ -1925,7 +1925,7 @@ impl<'a> Checker<'a> {
     }
 
     /// A local was given a new value: record what's known about it.
-    fn record_value(cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
+    fn record_value(&self, cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
         match value.term {
             // `i = i + k`: what was known about `i` shifts by `k`.
             Some(src) if src.term == Term::Local(local) => {
@@ -1953,7 +1953,21 @@ impl<'a> Checker<'a> {
             cx.env.copy_holes(src.term, Term::Local(local), src.offset);
         }
         if cx.locals[local].ty.is_view() {
-            match &value.expr.kind {
+            // `s.bytes()` views the same bytes as `s`.
+            let viewed = match &value.expr.kind {
+                TExprKind::Bytes(s) => &s.kind,
+                kind => kind,
+            };
+            match viewed {
+                // A string literal has its length.
+                TExprKind::Str(id) => {
+                    let n = self.strings[*id].len() as i128;
+                    cx.env.apply(&[facts::Fact::Narrow {
+                        term: Term::Len(local),
+                        bound: Range::exact(n),
+                        full: Range { lo: n, hi: n },
+                    }]);
+                }
                 // A copy of another view has its length.
                 TExprKind::Local(src) if *src != local => {
                     cx.env.apply(&equal(Term::Len(local), Term::Len(*src), 0));
@@ -2081,7 +2095,7 @@ impl<'a> Checker<'a> {
                 }
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
                 self.check_kept_view(cx, &value, init.span)?;
-                Self::record_value(cx, local, &value);
+                self.record_value(cx, local, &value);
                 Some(TStmt::Init(local, value.expr))
             }
             Stmt::Assign {
@@ -2151,7 +2165,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 self.check_kept_view(cx, &checked, value.span)?;
-                Self::record_value(cx, local, &checked);
+                self.record_value(cx, local, &checked);
                 Some(TStmt::Assign(local, checked.expr))
             }
             Stmt::Expr(e) => match &e.kind {
@@ -2463,7 +2477,7 @@ impl<'a> Checker<'a> {
                         fty,
                         None,
                     );
-                    Self::record_value(cx, local, &value);
+                    self.record_value(cx, local, &value);
                     body.push(TStmt::Init(local, value.expr));
                 }
             }
@@ -2897,7 +2911,7 @@ impl<'a> Checker<'a> {
             inner,
             None,
         );
-        Self::record_value(cx, local, &value);
+        self.record_value(cx, local, &value);
         before.push(TStmt::Match {
             value: matched,
             arms: vec![
@@ -3143,7 +3157,7 @@ impl<'a> Checker<'a> {
                     (_, TExprKind::Table(_)) => (xs.clone(), seq.expr),
                     _ => {
                         let hidden = self.declare(cx, SEQ, seq.ty(), false);
-                        Self::record_value(cx, hidden, &seq);
+                        self.record_value(cx, hidden, &seq);
                         let ty = seq.ty();
                         before.push(TStmt::Init(hidden, seq.expr));
                         let name = ast::Expr {
@@ -3253,7 +3267,7 @@ impl<'a> Checker<'a> {
                 };
                 let x = ck.declare(cx, &var.name, *elem, false);
                 if let Some(value) = value {
-                    Self::record_value(cx, x, &value);
+                    ck.record_value(cx, x, &value);
                     stmts.push(TStmt::Init(x, value.expr));
                 }
             }
@@ -3444,7 +3458,7 @@ impl<'a> Checker<'a> {
                     let checked = self.expr(cx, index, Some(usize_ty))?;
                     let name = format!("$index{}", before.len());
                     let hidden = self.declare(cx, &name, checked.ty(), false);
-                    Self::record_value(cx, hidden, &checked);
+                    self.record_value(cx, hidden, &checked);
                     before.push(TStmt::Init(hidden, checked.expr));
                     **index = ast::Expr {
                         kind: ExprKind::Name(name),

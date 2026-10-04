@@ -230,6 +230,13 @@ owns a copy or holds [handles](#shared-and-back-pointer-structures-belong-to-the
 This rule also lets scoped threads use views without copying
 ([concurrency.md](concurrency.md#structured-concurrency)).
 
+**In the compiler today:** views are parameters and locals, never fields,
+and functions don't return them yet. A few built-in projections make a view
+of another one: an array where a slice is expected, and `s.bytes()`, the
+`[]u8` of a `str`. A projection views what its receiver views, so it obeys
+the same rules as the receiver: kept in a local, passed to a function, never
+stored.
+
 ## Copies
 
 **Status:** Proposed

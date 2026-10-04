@@ -1,0 +1,26 @@
+// error: `bytes` is a method of `str`; call it with `.bytes()`
+// error: `bytes()` takes no arguments
+// error: cannot assign through `b`, which is a read-only `[]u8`
+// error: a struct field can't be a view (`[]u8`)
+// error: a `str` can't be indexed: a byte is not a character
+// help: index its bytes: `s.bytes()[i]`
+// error: cannot prove that this index is less than the length
+package main
+
+struct Holder {
+	b: []u8
+}
+
+// The bytes of a `str` are read-only, and a view: they can't be stored.
+fn f(s: str) -> u8 {
+	let n = s.bytes
+	let m = s.bytes(1)
+	let b = s.bytes()
+	b[0] = 1
+	let c = s[0]
+	return b[0]
+}
+
+fn main() -> u8 {
+	return f("x")
+}

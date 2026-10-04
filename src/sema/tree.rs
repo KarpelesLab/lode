@@ -197,6 +197,9 @@ pub enum TExprKind {
     /// `s.ptr` of a `str` or a slice (unsafe). For an array, `a.ptr` is this
     /// over a [`TExprKind::ToSlice`] of it.
     StrPtr(Box<TExpr>),
+    /// `s.bytes()`: the bytes of a `str`, as a `[]u8` view of the same
+    /// storage (read-only, like every slice that isn't `inout`).
+    Bytes(Box<TExpr>),
     /// `p + n`: a pointer moved forward by `n` elements (unsafe).
     PtrAdd(Box<TExpr>, Box<TExpr>),
     /// The `syscall(nr, args...)` intrinsic (unsafe). Integer operands are
@@ -345,6 +348,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::ArrayRepeat(inner, _)
         | TExprKind::ToSlice(inner)
         | TExprKind::StrPtr(inner)
+        | TExprKind::Bytes(inner)
         | TExprKind::Payload(inner, ..)
         | TExprKind::EnumValue(inner)
         | TExprKind::EnumFrom(inner)

@@ -997,6 +997,8 @@ impl FnLower<'_> {
                 Val::View(_, n) => n,
                 other => unreachable!("`len` of {other:?}"),
             },
+            // The same pointer and length.
+            TExprKind::Bytes(s) => return self.expr(s),
             TExprKind::StrPtr(s) => match self.expr(s) {
                 Val::View(p, _) => p,
                 other => unreachable!("`ptr` of {other:?}"),

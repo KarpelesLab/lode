@@ -91,6 +91,14 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
 - `str` locals and parameters (passed as two values: pointer and length)
 - `s.len` (a `usize`; the checker knows it's at most the largest `isize`)
 - `s.ptr` (a `*u8`), only in `unsafe` code
+- `s.bytes()`: the bytes of `s` as a `[]u8`, a view of the same storage with
+  the same length (the checker knows `s.bytes().len` is `s.len`, and a
+  literal's length). It's read-only, like every slice that isn't `inout`.
+  Byte indexing goes through it: `s.bytes()[i]`; `s[i]` is an error.
+  It's a built-in projection of its receiver, not a function returning a
+  view: like any view, it can be kept in a local and passed to functions,
+  but not stored in a struct field or returned
+  ([memory.md](memory.md#views)).
 
 Not yet: returning a `str` (it needs the view rules of
 [memory.md](memory.md#views)), comparing or slicing strings, rune iteration,
