@@ -1,0 +1,158 @@
+// stdout: 021\n
+// stdout: rd nd\n
+// stdout: aED abD\n
+// stdout: 0123\n
+// stdout: yes\n
+// stdout: i;;;\n
+// stdout: vLLF\n
+// stdout: hC\n
+// stdout: .7\n
+// stdout: [w]\n
+package main
+
+import "std/io"
+
+enum E {
+	bad
+}
+
+// In reverse order, at the end of the block.
+fn order() {
+	defer io.print("1")
+	defer {
+		io.print("2")
+	}
+	io.print("0")
+}
+
+// Before each `return`, after its value is computed.
+fn early(x: bool) -> u32 {
+	defer io.print("d")
+	if x {
+		io.print("r")
+		return 1
+	}
+	io.print("n")
+	return 2
+}
+
+fn fails(fail: bool) throws(E) -> u32 {
+	if fail {
+		throw .bad
+	}
+	return 5
+}
+
+// `errdefer` only when leaving with an error, here from a `try`.
+fn with_errdefer(fail: bool) throws(E) -> u32 {
+	defer io.print("D")
+	errdefer io.print("E")
+	io.print("a")
+	let v = try fails(fail)
+	io.print("b")
+	return v
+}
+
+// Each block runs its own, when it ends.
+fn nested() {
+	defer io.print("3")
+	if true {
+		defer io.print("1")
+		io.print("0")
+	}
+	io.print("2")
+}
+
+// An `errdefer` whose block has ended doesn't run.
+fn scoped_errdefer() throws(E) {
+	if true {
+		errdefer io.print("no")
+	}
+	errdefer io.print("yes")
+	throw .bad
+}
+
+// A loop body's run at each `continue` and `break`.
+fn loops() {
+	for i in 0..3 {
+		defer io.print(";")
+		if i == 1 {
+			continue
+		}
+		if i == 2 {
+			break
+		}
+		io.print("i")
+	}
+}
+
+// A `try` in a loop runs the loop body's and the function's.
+fn loop_try() throws(E) {
+	defer io.print("F")
+	for i in 0..3 {
+		defer io.print("L")
+		let v = try fails(i == 1)
+		io.print("v")
+	}
+}
+
+// A `return` in a `catch` block runs them too.
+fn catch_return() -> u32 {
+	defer io.print("C")
+	let v = fails(true) catch e {
+		io.print("h")
+		return 0
+	}
+	return v
+}
+
+// The facts at a `defer` hold when it runs, for the variables assigned
+// nowhere after it.
+fn defer_facts(xs: []u8, i: usize) {
+	if i < xs.len {
+		defer io.print_u64(xs[i]) // proven: i < xs.len
+		io.print(".")
+	}
+}
+
+// A `defer` with a loop of its own.
+fn defer_loop() {
+	defer {
+		for c in 1..3 {
+			if c == 2 {
+				break
+			}
+			io.print("]")
+		}
+	}
+	io.print("[w")
+}
+
+fn main() {
+	order()
+	io.print("\n")
+	early(true)
+	io.print(" ")
+	early(false)
+	io.print("\n")
+	with_errdefer(true) catch _ {}
+	io.print(" ")
+	with_errdefer(false) catch _ {}
+	io.print("\n")
+	nested()
+	io.print("\n")
+	scoped_errdefer() catch _ {}
+	io.print("\n")
+	loops()
+	io.print("\n")
+	loop_try() catch _ {}
+	io.print("\n")
+	catch_return()
+	io.print("\n")
+	let xs: [2]u8 = [5, 7]
+	defer_facts(xs, 1)
+	defer_facts(xs, 2)
+	io.print("\n")
+	defer_loop()
+	io.print("\n")
+}

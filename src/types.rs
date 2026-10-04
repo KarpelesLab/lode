@@ -83,6 +83,12 @@ pub enum Ty {
     /// An optional `?T`: a [`Compound::Optional`] in the interner. It works
     /// like an enum with two variants, `none` and `some(value: T)`.
     Optional(CompoundId),
+    /// The result of calling a function that throws, `throws(E) -> T`: a
+    /// [`Compound::Result`] in the interner. It works like an enum with two
+    /// variants, `ok(value: T)` (`ok` when `T` is `()`) and `err(error: E)`.
+    /// Only the checker's hidden locals and temporaries hold one: the
+    /// program handles a call's result right away (`try`, `catch`, `match`).
+    Result(CompoundId),
 }
 
 impl Ty {
@@ -152,12 +158,28 @@ impl Ty {
         }
     }
 
+    /// The result type `throws(err) -> ok`.
+    pub fn result(ok: Ty, err: Ty) -> Ty {
+        Ty::Result(intern(Compound::Result { ok, err }))
+    }
+
+    /// The value and error types of a result type.
+    pub fn as_result(self) -> Option<(Ty, Ty)> {
+        match self {
+            Ty::Result(id) => match compound(id) {
+                Compound::Result { ok, err } => Some((ok, err)),
+                _ => unreachable!("a result id names another type"),
+            },
+            _ => None,
+        }
+    }
+
     /// Whether values of this type live in memory, as places (arrays,
-    /// structs, enums and optionals), rather than in registers.
+    /// structs, enums, optionals and results), rather than in registers.
     pub fn in_memory(self) -> bool {
         matches!(
             self,
-            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_)
+            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) | Ty::Result(_)
         )
     }
 
@@ -172,12 +194,43 @@ impl Ty {
         }
     }
 
-    /// The variants of an enum or an optional, which share their layout and
-    /// their operations. An optional `?T` is `none` (tag 0) or
-    /// `some(value: T)` (tag 1).
+    /// The variants of an enum, an optional or a result, which share their
+    /// layout and their operations. An optional `?T` is `none` (tag 0) or
+    /// `some(value: T)` (tag 1). A result is `ok(value: T)` (tag 0; `ok`
+    /// without payload when `T` is `()`) or `err(error: E)` (tag 1).
     pub fn sum(self) -> Option<Arc<EnumDef>> {
         if let Some(def) = self.as_enum() {
             return Some(def);
+        }
+        if let Some((ok, err)) = self.as_result() {
+            let field = |name: &str, ty| Field {
+                name: name.to_owned(),
+                ty,
+            };
+            let ok_fields = if ok == Ty::Unit {
+                Vec::new()
+            } else {
+                vec![field("value", ok)]
+            };
+            return Some(Arc::new(EnumDef {
+                name: self.to_string(),
+                pkg: usize::MAX,
+                is_pub: true,
+                tag: IntTy::new(false, 8),
+                explicit: false,
+                variants: vec![
+                    Variant {
+                        name: "ok".to_owned(),
+                        fields: ok_fields,
+                        value: 0,
+                    },
+                    Variant {
+                        name: "err".to_owned(),
+                        fields: vec![field("error", err)],
+                        value: 1,
+                    },
+                ],
+            }));
         }
         let inner = self.as_optional()?;
         Some(Arc::new(EnumDef {
@@ -380,6 +433,11 @@ pub enum Compound {
     Optional {
         inner: Ty,
     },
+    /// `throws(err) -> ok`.
+    Result {
+        ok: Ty,
+        err: Ty,
+    },
 }
 
 /// The interner's tables. Entries are only ever appended, so an id stays
@@ -433,15 +491,20 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
-            Ty::Array(id) | Ty::Slice(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Optional(id) => {
-                match compound(*id) {
-                    Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
-                    Compound::Slice { elem } => write!(f, "[]{elem}"),
-                    Compound::Struct { def } => f.write_str(&struct_def(def).name),
-                    Compound::Enum { def } => f.write_str(&enum_def(def).name),
-                    Compound::Optional { inner } => write!(f, "?{inner}"),
-                }
-            }
+            Ty::Array(id)
+            | Ty::Slice(id)
+            | Ty::Struct(id)
+            | Ty::Enum(id)
+            | Ty::Optional(id)
+            | Ty::Result(id) => match compound(*id) {
+                Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
+                Compound::Slice { elem } => write!(f, "[]{elem}"),
+                Compound::Struct { def } => f.write_str(&struct_def(def).name),
+                Compound::Enum { def } => f.write_str(&enum_def(def).name),
+                Compound::Optional { inner } => write!(f, "?{inner}"),
+                Compound::Result { ok: Ty::Unit, err } => write!(f, "throws({err})"),
+                Compound::Result { ok, err } => write!(f, "throws({err}) -> {ok}"),
+            },
         }
     }
 }

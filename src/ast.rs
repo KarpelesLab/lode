@@ -75,8 +75,18 @@ pub struct FnDecl {
     pub is_unsafe: bool,
     pub name: Ident,
     pub params: Vec<Param>,
+    /// `throws(E)`, or `throws` alone (an inferred error set).
+    pub throws: Option<Throws>,
     pub ret: Option<TypeExpr>,
     pub body: Block,
+    pub span: Span,
+}
+
+/// The `throws` clause of a function: `throws(E)` names the error type,
+/// `throws` alone asks for it to be inferred.
+#[derive(Debug)]
+pub struct Throws {
+    pub ty: Option<TypeExpr>,
     pub span: Span,
 }
 
@@ -140,13 +150,13 @@ impl TypeExpr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Stmt {
     /// `let x: T = e` (`mutable: false`) or `var x: T = e` (`mutable: true`).
     /// With `otherwise`, `let x = opt else { ... }`: `e` is an optional, and
@@ -198,17 +208,30 @@ pub enum Stmt {
         arms: Vec<Arm>,
         span: Span,
     },
+    /// `throw value`: leave the function with the error `value`.
+    Throw {
+        value: Expr,
+        span: Span,
+    },
+    /// `defer { ... }` (or `defer` and one statement): run the block when
+    /// leaving the enclosing block. With `on_error` (`errdefer`), only when
+    /// leaving the function with an error.
+    Defer {
+        body: Block,
+        on_error: bool,
+        span: Span,
+    },
 }
 
 /// `pattern => body` in a `match`. A body written as a single statement is
 /// a block of that statement.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Arm {
     pub pattern: Pattern,
     pub body: Block,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Pattern {
     /// `_`: every variant not matched by an earlier arm.
     Wildcard(Span),
@@ -230,7 +253,7 @@ impl Pattern {
 }
 
 /// What a `for` loop goes over.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ForIter {
     /// `a..b`: the integers from `a` up to, but not including, `b`.
     Range(Expr, Expr),
@@ -238,7 +261,7 @@ pub enum ForIter {
     Each(Expr),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct IfStmt {
     /// `if let name = cond`: `cond` is an optional, and the `then` block
     /// runs with its value bound to `name` when it's not `none`.
@@ -249,7 +272,7 @@ pub struct IfStmt {
     pub span: Span,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Else {
     If(Box<IfStmt>),
     Block(Block),
@@ -283,6 +306,30 @@ pub enum ExprKind {
     StructLit(TypeExpr, Vec<FieldInit>),
     /// `none`: the empty optional.
     None,
+    /// `.name`: a variant of the enum the context expects (`.name(a, b)`
+    /// is a call of it).
+    Dot(Ident),
+    /// `try call`: the call's value, or its error passed on to the caller.
+    Try(Box<Expr>),
+    /// `call catch e { ... }`, `call catch _ { ... }` or `call catch value`.
+    Catch {
+        value: Box<Expr>,
+        /// The name the error is bound to in the block (`None` for `_`, and
+        /// for a fallback value).
+        binding: Option<Ident>,
+        handler: CatchHandler,
+    },
+    /// `throw value` in an expression: only after `??`.
+    Throw(Box<Expr>),
+}
+
+/// What a `catch` does with an error.
+#[derive(Clone, Debug)]
+pub enum CatchHandler {
+    /// `catch e { ... }`: run a block.
+    Block(Block),
+    /// `catch value`: use a fallback value.
+    Value(Box<Expr>),
 }
 
 /// `name: value` in a struct literal.

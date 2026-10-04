@@ -1,0 +1,129 @@
+// error: `parse` can throw, and its error must be handled
+// error: `try` can only be used in a function that throws
+// error: `try` can't pass on an error of type `ParseError` from a function that throws `IoError`
+// error: expected `IoError`, found `ParseError`
+// error: `throw` can only be used in a function that throws
+// error: this `catch` block must leave, since the call's value (a `u32`) is used
+// error: `plain` doesn't throw, so it needs no `try`
+// error: `catch` needs a call to a function that throws
+// error: inferred error sets (`throws` without a type) are not supported by the compiler yet
+// error: an error type must be an enum, found `u32`
+// error: `main` can't throw
+// error: `errdefer` can only be used in a function that throws
+// error: `return` can't leave a `defer` block
+// error: `try` can't leave a `defer` block
+// error: a `defer` block can't assign `n`, which is declared outside it
+// error: `break` or `continue` can't leave a `defer` block
+// error: cannot tell which enum `.empty` is a variant of
+// error: `throw` is a statement
+// error: cannot prove that this index is less than the length
+// error: `f` can reach the end of its body without returning a value
+package main
+
+enum ParseError {
+	empty
+	bad
+}
+
+enum IoError {
+	closed
+}
+
+fn parse() throws(ParseError) -> u32 {
+	return 1
+}
+
+fn write() throws(IoError) {
+}
+
+fn plain() -> u32 {
+	return 1
+}
+
+// Unhandled: the error would be dropped.
+fn unhandled() -> u32 {
+	return parse()
+}
+
+fn try_without_throws() -> u32 {
+	return try parse()
+}
+
+// A different error type: no conversion.
+fn wrong_type() throws(IoError) -> u32 {
+	let n = try parse()
+	throw ParseError.bad
+}
+
+fn throw_without_throws() {
+	throw ParseError.empty
+}
+
+// The value is needed, so the block must leave.
+fn falls_through() -> u32 {
+	let n = parse() catch e {
+		plain()
+	}
+	return n
+}
+
+fn needless() throws(ParseError) -> u32 {
+	let a = try plain()
+	let b = 1 catch 0
+	return 0
+}
+
+fn inferred() throws -> u32 {
+	return 0
+}
+
+fn not_an_enum() throws(u32) {
+}
+
+fn main() throws(ParseError) {
+}
+
+fn no_errdefer() {
+	errdefer plain()
+}
+
+fn leaving_defer() throws(ParseError) -> u32 {
+	var n: u32 = 0
+	defer {
+		return 1
+	}
+	defer try write()
+	defer n = 1
+	loop {
+		defer break
+	}
+	return n
+}
+
+fn no_context() {
+	let x = .empty
+}
+
+fn throw_expression() throws(ParseError) -> u32 {
+	return 1 + throw .empty
+}
+
+// The facts after a `catch` block that doesn't leave are joined with the
+// call's.
+fn joined() -> u8 {
+	let table: [6]u8 = [10, 11, 12, 13, 14, 15]
+	var k: usize = 0
+	write() catch _ {
+		k = 9
+	}
+	return table[k]
+}
+
+// A `loop` left by a `break` in a `catch` block can end.
+fn f() -> u32 {
+	loop {
+		write() catch _ {
+			break
+		}
+	}
+}

@@ -192,7 +192,10 @@ fn restructure(items: Vec<Item<'_>>) -> Result<Vec<Item<'_>>, String> {
                     | Kw::Struct
                     | Kw::Enum
                     | Kw::Trait
-                    | Kw::Impl,
+                    | Kw::Impl
+                    | Kw::Catch
+                    | Kw::Defer
+                    | Kw::Errdefer,
                 ) => headers.push(stack.len()),
                 Tok::P(P::RBrace | P::RParen | P::RBracket) => {
                     headers.retain(|&d| d < stack.len());
@@ -389,7 +392,9 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
                     }
                 });
                 let unary = match &t.tok {
-                    // `??` in a type, as in `??u8`, is two prefix `?`.
+                    // `??` in a type, as in `??u8`, is two prefix `?`, and
+                    // a `.` that doesn't follow an operand starts a
+                    // variant: `throw .empty`.
                     Tok::P(
                         P::Minus
                         | P::Bang
@@ -401,6 +406,7 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
                     ) => prev
                         .as_ref()
                         .is_none_or(|p| !p.operand_end || (p.prefix_close && t.glued)),
+                    Tok::P(P::Dot) => prev.as_ref().is_none_or(|p| !p.operand_end),
                     _ => false,
                 };
                 if let Some(p) = &prev
@@ -508,23 +514,15 @@ fn space_before(prev: &Prev, cur: &TokInfo<'_>, cur_unary: bool) -> bool {
         return false;
     }
     match &cur.tok {
-        Tok::P(
-            P::Comma
-            | P::Semi
-            | P::RParen
-            | P::RBracket
-            | P::RBrace
-            | P::Dot
-            | P::DotDot
-            | P::Colon,
-        ) => {
+        Tok::P(P::Comma | P::Semi | P::RParen | P::RBracket | P::RBrace | P::DotDot | P::Colon) => {
             return false;
         }
+        Tok::P(P::Dot) if !cur_unary => return false,
         Tok::P(P::Question) if !cur_unary => return false,
         Tok::P(P::LParen) => {
             return !matches!(
                 prev.tok,
-                Tok::Ident(_) | Tok::Kw(Kw::Fn) | Tok::P(P::RParen | P::RBracket)
+                Tok::Ident(_) | Tok::Kw(Kw::Fn | Kw::Throws) | Tok::P(P::RParen | P::RBracket)
             );
         }
         Tok::P(P::LBracket) => {
@@ -720,6 +718,20 @@ mod tests {
         assert_eq!(
             fmt("fn f(o: ?? u8, p: [2]?u8) -> u8 {\n\treturn o??p[0]?? 1\n}\n"),
             "fn f(o: ??u8, p: [2]?u8) -> u8 {\n\treturn o ?? p[0] ?? 1\n}\n"
+        );
+    }
+
+    #[test]
+    fn errors_and_variants() {
+        assert_eq!(
+            fmt(
+                "fn f() throws ( E ) -> u32 {\n\tlet x = try g( )\n\tlet y = g() catch e{\n\
+                 return 0\n}\n\tthrow . bad\n\tdefer{h()}\n\tg() catch _ {}\n\
+                 \tlet s: S = .a(1,.b)\n\tlet n = [1, 2].len\n\treturn o ?? throw .c\n}\n"
+            ),
+            "fn f() throws(E) -> u32 {\n\tlet x = try g()\n\tlet y = g() catch e {\n\
+             \t\treturn 0\n\t}\n\tthrow .bad\n\tdefer {\n\t\th()\n\t}\n\tg() catch _ {}\n\
+             \tlet s: S = .a(1, .b)\n\tlet n = [1, 2].len\n\treturn o ?? throw .c\n}\n"
         );
     }
 

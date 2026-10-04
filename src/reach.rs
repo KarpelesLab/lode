@@ -6,7 +6,7 @@
 //!
 //! A call (`TExprKind::Call`) is the only way to refer to a function today.
 
-use crate::sema::{FuncId, Program, TExpr, TExprKind, TStmt};
+use crate::sema::{FuncId, Handler, Program, TExpr, TExprKind, TStmt, stmt_exprs, subexprs};
 
 /// The functions reachable from a root.
 #[derive(Debug)]
@@ -71,95 +71,47 @@ struct Uses {
 
 impl Uses {
     fn stmt(&mut self, s: &TStmt) {
-        match s {
-            TStmt::Init(_, e) | TStmt::Assign(_, e) | TStmt::Expr(e) => self.expr(e),
-            TStmt::Store(place, e) => {
-                self.expr(place);
-                self.expr(e);
-            }
-            TStmt::Return(e) => {
-                if let Some(e) = e {
-                    self.expr(e);
-                }
-            }
-            TStmt::If(cond, then, otherwise) => {
-                self.expr(cond);
-                for s in then.iter().chain(otherwise) {
-                    self.stmt(s);
-                }
-            }
-            TStmt::While(cond, body) => {
-                self.expr(cond);
-                for s in body {
-                    self.stmt(s);
-                }
-            }
-            TStmt::For {
-                start, end, body, ..
-            } => {
-                self.expr(start);
-                self.expr(end);
-                for s in body {
-                    self.stmt(s);
-                }
-            }
-            TStmt::Loop(body) | TStmt::Block(body) => {
-                for s in body {
-                    self.stmt(s);
-                }
-            }
-            TStmt::Match { value, arms } => {
-                self.expr(value);
-                for s in arms.iter().flat_map(|a| &a.body) {
-                    self.stmt(s);
-                }
-            }
-            TStmt::Break | TStmt::Continue => {}
+        for e in stmt_exprs(s) {
+            self.expr(e);
+        }
+        let nested: Vec<&[TStmt]> = match s {
+            TStmt::If(_, then, otherwise) => vec![then, otherwise],
+            TStmt::While(_, body)
+            | TStmt::For { body, .. }
+            | TStmt::Loop(body)
+            | TStmt::Block(body)
+            | TStmt::Defer { body, .. } => vec![body],
+            TStmt::Match { arms, .. } => arms.iter().map(|a| &a.body[..]).collect(),
+            TStmt::Init(..)
+            | TStmt::Assign(..)
+            | TStmt::Store(..)
+            | TStmt::Expr(_)
+            | TStmt::Return(_)
+            | TStmt::Throw(_)
+            | TStmt::Break
+            | TStmt::Continue => Vec::new(),
+        };
+        for s in nested.into_iter().flatten() {
+            self.stmt(s);
         }
     }
 
     fn expr(&mut self, e: &TExpr) {
         match &e.kind {
-            TExprKind::Call(f, args) => {
-                self.calls.push(*f);
-                for a in args {
-                    self.expr(a);
-                }
-            }
-            TExprKind::ArrayLit(items)
-            | TExprKind::Syscall(items)
-            | TExprKind::Variant(_, items) => {
-                for a in items {
-                    self.expr(a);
-                }
-            }
-            TExprKind::Binary(_, l, r)
-            | TExprKind::And(l, r)
-            | TExprKind::Or(l, r)
-            | TExprKind::Index(l, r)
-            | TExprKind::PtrAdd(l, r)
-            | TExprKind::Coalesce(l, r) => {
-                self.expr(l);
-                self.expr(r);
-            }
-            TExprKind::StructLit(fields) => {
-                for (_, v) in fields {
-                    self.expr(v);
-                }
-            }
-            TExprKind::Unary(_, inner)
-            | TExprKind::Field(inner, _)
-            | TExprKind::Convert(inner)
-            | TExprKind::ViewLen(inner)
-            | TExprKind::ArrayLen(inner)
-            | TExprKind::ArrayRepeat(inner, _)
-            | TExprKind::ToSlice(inner)
-            | TExprKind::StrPtr(inner)
-            | TExprKind::Payload(inner, ..)
-            | TExprKind::EnumValue(inner)
-            | TExprKind::EnumFrom(inner) => self.expr(inner),
+            TExprKind::Call(f, _) => self.calls.push(*f),
             TExprKind::Str(id) => self.strings.push(*id),
-            TExprKind::Int(_) | TExprKind::Bool(_) | TExprKind::Local(_) => {}
+            TExprKind::Catch {
+                handler: Handler::Block(body),
+                ..
+            } => {
+                for s in body {
+                    self.stmt(s);
+                }
+            }
+            _ => {}
+        }
+        for sub in subexprs(e) {
+            self.expr(sub);
         }
     }
 }

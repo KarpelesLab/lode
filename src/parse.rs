@@ -429,12 +429,34 @@ impl Parser {
                 break;
             }
         }
+        let throws = if self.at_kw(Kw::Throws) {
+            let start = self.bump().span;
+            let ty = if self.eat_p(P::LParen) {
+                let ty = self.type_expr()?;
+                self.expect_p(P::RParen)?;
+                Some(ty)
+            } else {
+                None
+            };
+            Some(Throws {
+                ty,
+                span: start.to(self.prev_span()),
+            })
+        } else {
+            None
+        };
         let ret = if self.eat_p(P::Arrow) {
             Some(self.type_expr()?)
         } else {
             None
         };
-        for kw in [Kw::Throws, Kw::Uses, Kw::Where] {
+        if self.at_kw(Kw::Throws) {
+            return self.error(
+                self.span(),
+                "`throws` comes before the return type: `fn f() throws(E) -> T`",
+            );
+        }
+        for kw in [Kw::Uses, Kw::Where] {
             if self.at_kw(kw) {
                 return self.error(
                     self.span(),
@@ -451,6 +473,7 @@ impl Parser {
             is_unsafe,
             name,
             params,
+            throws,
             ret,
             span: start.to(body.span),
             body,
@@ -653,11 +676,27 @@ impl Parser {
                 })
             }
             Tok::Kw(Kw::Match) => self.match_stmt(),
-            Tok::Kw(kw @ (Kw::Defer | Kw::Errdefer | Kw::Throw | Kw::Scope | Kw::Comptime)) => self
-                .error(
-                    self.span(),
-                    format!("`{}` is not supported by the compiler yet", kw.as_str()),
-                ),
+            Tok::Kw(Kw::Throw) => {
+                self.bump();
+                let value = self.expr()?;
+                Ok(Stmt::Throw {
+                    span: start.to(value.span),
+                    value,
+                })
+            }
+            Tok::Kw(kw @ (Kw::Defer | Kw::Errdefer)) => {
+                self.bump();
+                let body = self.block_or_stmt()?;
+                Ok(Stmt::Defer {
+                    span: start.to(body.span),
+                    body,
+                    on_error: kw == Kw::Errdefer,
+                })
+            }
+            Tok::Kw(kw @ (Kw::Scope | Kw::Comptime)) => self.error(
+                self.span(),
+                format!("`{}` is not supported by the compiler yet", kw.as_str()),
+            ),
             _ => {
                 let target = self.expr()?;
                 let op = match self.peek() {
@@ -719,17 +758,22 @@ impl Parser {
     fn arm(&mut self) -> PResult<Arm> {
         let pattern = self.pattern()?;
         self.expect_p(P::FatArrow)?;
-        let body = if self.at_p(P::LBrace) {
-            self.block()?
-        } else {
-            let start = self.span();
-            let stmt = self.stmt()?;
-            Block {
-                stmts: vec![stmt],
-                span: start.to(self.prev_span()),
-            }
-        };
+        let body = self.block_or_stmt()?;
         Ok(Arm { pattern, body })
+    }
+
+    /// A block, or a single statement on the same line (a `match` arm, a
+    /// `defer`), as a block of that statement.
+    fn block_or_stmt(&mut self) -> PResult<Block> {
+        if self.at_p(P::LBrace) {
+            return self.block();
+        }
+        let start = self.span();
+        let stmt = self.stmt()?;
+        Ok(Block {
+            stmts: vec![stmt],
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn pattern(&mut self) -> PResult<Pattern> {
@@ -866,7 +910,15 @@ impl Parser {
 
     fn binary(&mut self, min_prec: u8) -> PResult<Expr> {
         let mut lhs = self.unary()?;
-        while let Some((op, prec)) = binop_info(self.peek()) {
+        loop {
+            // `catch` binds like `??`.
+            if self.at_kw(Kw::Catch) && COALESCE >= min_prec {
+                lhs = self.catch(lhs)?;
+                continue;
+            }
+            let Some((op, prec)) = binop_info(self.peek()) else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -890,7 +942,64 @@ impl Parser {
         Ok(lhs)
     }
 
+    /// `value catch name { ... }`, `value catch _ { ... }` or
+    /// `value catch fallback`.
+    fn catch(&mut self, value: Expr) -> PResult<Expr> {
+        self.bump(); // catch
+        let (binding, handler) = match self.peek().clone() {
+            // As after `if`, a `{` after a name starts a block.
+            Tok::Ident(name)
+                if *self.peek_at(1) == Tok::P(P::LBrace)
+                    && matches!(self.peek_at(2), Tok::Ident(_))
+                    && *self.peek_at(3) == Tok::P(P::Colon) =>
+            {
+                return self.error(
+                    self.span(),
+                    format!(
+                        "a struct literal after `catch` goes in parentheses: `catch ({name}{{...}})`"
+                    ),
+                );
+            }
+            Tok::Ident(name) if *self.peek_at(1) == Tok::P(P::LBrace) => {
+                let id = self.ident("a name for the error")?;
+                // Struct literals are allowed in the block, even in a header.
+                let saved = std::mem::replace(&mut self.no_struct_lit, false);
+                let block = self.block();
+                self.no_struct_lit = saved;
+                let binding = (name != "_").then_some(id);
+                (binding, CatchHandler::Block(block?))
+            }
+            Tok::P(P::LBrace) => {
+                return self.error(
+                    self.span(),
+                    "name the error before the block (`catch e {`), or ignore it with `catch _ {`",
+                );
+            }
+            _ => (None, CatchHandler::Value(Box::new(self.binary(COALESCE)?))),
+        };
+        Ok(Expr {
+            span: value.span.to(self.prev_span()),
+            kind: ExprKind::Catch {
+                value: Box::new(value),
+                binding,
+                handler,
+            },
+        })
+    }
+
     fn unary(&mut self) -> PResult<Expr> {
+        // `try call`, and `throw value` after `??`.
+        if let Tok::Kw(kw @ (Kw::Try | Kw::Throw)) = *self.peek() {
+            let start = self.bump().span;
+            let operand = Box::new(self.unary()?);
+            let span = start.to(operand.span);
+            let kind = if kw == Kw::Try {
+                ExprKind::Try(operand)
+            } else {
+                ExprKind::Throw(operand)
+            };
+            return Ok(Expr { kind, span });
+        }
         let op = match self.peek() {
             Tok::P(P::Minus) => UnOp::Neg,
             Tok::P(P::Bang) => UnOp::Not,
@@ -994,11 +1103,14 @@ impl Parser {
             }
             Tok::P(P::LBracket) => return self.array_literal(),
             Tok::Kw(Kw::None) => ExprKind::None,
-            Tok::Kw(kw @ Kw::Try) => {
-                return self.error(
-                    span,
-                    format!("`{}` is not supported by the compiler yet", kw.as_str()),
-                );
+            // `.name`: a variant of the enum the context expects.
+            Tok::P(P::Dot) if matches!(self.peek_at(1), Tok::Ident(_)) => {
+                self.bump();
+                let name = self.ident("a variant name")?;
+                return Ok(Expr {
+                    span: span.to(name.span),
+                    kind: ExprKind::Dot(name),
+                });
             }
             _ => return self.expected("an expression"),
         };
@@ -1249,6 +1361,88 @@ mod tests {
             matches!(&rest.kind, ExprKind::Binary(BinOp::Coalesce, _, sum)
             if matches!(sum.kind, ExprKind::Binary(BinOp::Add, ..)))
         );
+    }
+
+    #[test]
+    fn errors_and_defer() {
+        let file = parse_ok(
+            "fn f(s: str) throws(E) -> u32 {\n\tdefer g()\n\terrdefer {\n\t\th()\n\t}\n\
+             \tlet a = try p(s) + 1\n\tlet b = p(s) catch e {\n\t\treturn 0\n\t}\n\
+             \tp(s) catch _ {}\n\tlet c = p(s) catch 0 == 1\n\tlet d = o ?? throw .bad(1)\n\
+             \tthrow .empty\n}\nfn g() throws {\n}\n",
+        );
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
+        assert!(matches!(&f.throws, Some(Throws { ty: Some(_), .. })));
+        let s = &f.body.stmts;
+        assert!(
+            matches!(&s[0], Stmt::Defer { on_error: false, body, .. } if body.stmts.len() == 1)
+        );
+        assert!(matches!(&s[1], Stmt::Defer { on_error: true, .. }));
+        // `try` binds to its operand: `(try p(s)) + 1`.
+        let Stmt::Let { init: Some(a), .. } = &s[2] else {
+            panic!()
+        };
+        assert!(
+            matches!(&a.kind, ExprKind::Binary(BinOp::Add, l, _) if matches!(l.kind, ExprKind::Try(_)))
+        );
+        let Stmt::Let { init: Some(b), .. } = &s[3] else {
+            panic!()
+        };
+        assert!(matches!(
+            &b.kind,
+            ExprKind::Catch {
+                binding: Some(_),
+                handler: CatchHandler::Block(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &s[4],
+            Stmt::Expr(Expr {
+                kind: ExprKind::Catch {
+                    binding: None,
+                    handler: CatchHandler::Block(_),
+                    ..
+                },
+                ..
+            })
+        ));
+        // `catch` binds like `??`: tighter than a comparison.
+        let Stmt::Let { init: Some(c), .. } = &s[5] else {
+            panic!()
+        };
+        assert!(
+            matches!(&c.kind, ExprKind::Binary(BinOp::Eq, l, _) if matches!(l.kind, ExprKind::Catch { .. }))
+        );
+        let Stmt::Let { init: Some(d), .. } = &s[6] else {
+            panic!()
+        };
+        let ExprKind::Binary(BinOp::Coalesce, _, rhs) = &d.kind else {
+            panic!("{d:?}")
+        };
+        let ExprKind::Throw(value) = &rhs.kind else {
+            panic!()
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Call(callee, _) if matches!(callee.kind, ExprKind::Dot(_)))
+        );
+        assert!(
+            matches!(&s[7], Stmt::Throw { value, .. } if matches!(value.kind, ExprKind::Dot(_)))
+        );
+        let Item::Fn(g) = &file.items[1] else {
+            panic!()
+        };
+        assert!(matches!(&g.throws, Some(Throws { ty: None, .. })));
+        let errs = parse_errors(
+            "fn f() -> u32 throws(E) {\n}\nfn g() {\n\tf() catch {\n\t}\n\
+             \tlet p = f() catch P{x: 1}\n\tlet q = f() catch (P{x: 1})\n}\n",
+        );
+        assert_eq!(errs.len(), 3, "{errs:?}");
+        assert!(errs[0].contains("before the return type"));
+        assert!(errs[1].contains("name the error"));
+        assert!(errs[2].contains("in parentheses"));
     }
 
     #[test]

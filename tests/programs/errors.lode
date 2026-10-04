@@ -1,0 +1,248 @@
+// exit: 0
+package main
+
+enum ParseError {
+	empty
+	invalid_digit(pos: usize)
+	overflow
+}
+
+enum Shape {
+	circle(r: u32)
+	square(side: u32)
+	dot
+}
+
+struct Pair {
+	a: u32
+	b: u32
+}
+
+// `throw .name` takes the variant from the error type.
+fn parse_u32(s: []u8) throws(ParseError) -> u32 {
+	if s.len == 0 {
+		throw .empty
+	}
+	var n: u32 = 0
+	for i in 0..s.len {
+		let c = s[i]
+		if c < '0' || c > '9' {
+			throw .invalid_digit(i)
+		}
+		let d = u32(c - '0') // proven: '0' <= c <= '9'
+		n = checked_add(checked_mul(n, 10) ?? throw .overflow, d) ?? throw ParseError.overflow
+	}
+	return n
+}
+
+fn checked_mul(a: u32, b: u32) -> ?u32 {
+	if b != 0 && a > 4294967295 / b {
+		return none
+	}
+	return a *% b
+}
+
+fn checked_add(a: u32, b: u32) -> ?u32 {
+	let sum = a +% b
+	if sum < a {
+		return none
+	}
+	return sum
+}
+
+// `try` passes errors on, through several calls.
+fn parse_sum(a: []u8, b: []u8) throws(ParseError) -> u32 {
+	let x = try parse_u32(a)
+	let y = try parse_u32(b)
+	return x +% y
+}
+
+fn parse_sum_twice(a: []u8, b: []u8) throws(ParseError) -> u32 {
+	return (try parse_sum(a, b)) +% (try parse_sum(b, a))
+}
+
+// A value in memory through `try`.
+fn pair(a: []u8, b: []u8) throws(ParseError) -> Pair {
+	return Pair{a: try parse_u32(a), b: try parse_u32(b)}
+}
+
+// A `try` in a condition.
+fn is_small(s: []u8) throws(ParseError) -> bool {
+	if try parse_u32(s) < 1000 {
+		return true
+	}
+	return false
+}
+
+// A function that throws and returns nothing.
+fn check_nonempty(s: []u8) throws(ParseError) {
+	if s.len == 0 {
+		throw .empty
+	}
+}
+
+fn validate(a: []u8) throws(ParseError) {
+	try check_nonempty(a)
+	try parse_u32(a)
+}
+
+// `match` on a call's result.
+fn describe(s: []u8) -> u32 {
+	match parse_u32(s) {
+		ok(v) => return v
+		err(e) => {
+			match e {
+				empty => return 1000
+				invalid_digit(pos) => return 2000 + u32(pos % 10)
+				overflow => return 3000
+			}
+		}
+	}
+}
+
+fn unit_result(s: []u8) -> u32 {
+	match check_nonempty(s) {
+		ok => return 1
+		err(_) => return 2
+	}
+}
+
+// `.name` where an enum is expected: a `let` with a type, an argument, a
+// return value, a comparison and a payload.
+fn area(s: Shape) -> u32 {
+	match s {
+		circle(r) => return 3 *% r *% r
+		square(side) => return side *% side
+		dot => return 0
+	}
+}
+
+fn biggest() -> Shape {
+	return .square(10)
+}
+
+fn shorthand() -> bool {
+	let s: Shape = .circle(2)
+	let o: ?Shape = .dot
+	let big = biggest()
+	return area(s) == 12 && area(.square(3)) == 9 && big == .square(10) && o == .dot && s != .dot
+}
+
+// The facts before a call hold after it, on its `ok` path.
+fn after_catch(xs: []u32, i: usize) -> u32 {
+	if i >= xs.len {
+		return 0
+	}
+	let digits: [1]u8 = ['7']
+	let v = parse_u32(digits) catch e {
+		return 0
+	}
+	return xs[i] +% v // proven: the call didn't change i
+}
+
+// A `catch` block that doesn't leave joins like an `if` without `else`.
+fn joined(s: []u8) -> u8 {
+	let table: [6]u8 = [10, 11, 12, 13, 14, 15]
+	var k: usize = 0
+	check_nonempty(s) catch _ {
+		k = 5
+	}
+	return table[k] // proven: k is 0 or 5
+}
+
+// `catch` blocks that leave a loop.
+fn count_numbers(words: [4][2]u8) -> u32 {
+	var n: u32 = 0
+	for w in words {
+		let v = parse_u32(w) catch e {
+			if e == .empty {
+				break
+			}
+			continue
+		}
+		n = n +% v
+	}
+	return n
+}
+
+fn main() -> u8 {
+	let a: [3]u8 = ['1', '2', '3']
+	let b: [2]u8 = ['4', 'x']
+	let empty: [0]u8 = []
+	let big: [11]u8 = ['9', '9', '9', '9', '9', '9', '9', '9', '9', '9', '9']
+
+	// A block that leaves.
+	let n = parse_u32(a) catch e {
+		return 1
+	}
+	if n != 123 {
+		return 2
+	}
+	// A fallback value, evaluated only on an error.
+	if (parse_u32(b) catch 7) != 7 || (parse_u32(a) catch 7) != 123 {
+		return 3
+	}
+	// The error, bound in the block.
+	var pos: usize = 99
+	parse_u32(b) catch e {
+		match e {
+			invalid_digit(p) => pos = p
+			empty => pos = 98
+			overflow => pos = 97
+		}
+	}
+	if pos != 1 {
+		return 4
+	}
+	// Ignored explicitly.
+	parse_u32(empty) catch _ {}
+	if describe(empty) != 1000 || describe(b) != 2001 || describe(big) != 3000 || describe(a) != 123 {
+		return 5
+	}
+	if (parse_sum(a, a) catch 0) != 246 || (parse_sum(a, b) catch 0) != 0 {
+		return 6
+	}
+	if (parse_sum_twice(a, a) catch 0) != 492 {
+		return 7
+	}
+	let p = pair(a, a) catch e {
+		return 8
+	}
+	if p.a != 123 || p.b != 123 {
+		return 9
+	}
+	var failed = false
+	pair(a, b) catch _ {
+		failed = true
+	}
+	if !failed {
+		return 10
+	}
+	let fallback = pair(a, b) catch (Pair{a: 4, b: 5})
+	if fallback.b != 5 {
+		return 16
+	}
+	if !(is_small(a) catch false) || !(is_small(big) catch true) {
+		return 17
+	}
+	if unit_result(a) != 1 || unit_result(empty) != 2 {
+		return 11
+	}
+	validate(empty) catch e {
+		if e != .empty {
+			return 12
+		}
+	}
+	if !shorthand() {
+		return 13
+	}
+	let xs: [3]u32 = [1, 2, 3]
+	if after_catch(xs, 2) != 10 || joined(a) != 10 || joined(empty) != 15 {
+		return 14
+	}
+	let words: [4][2]u8 = [['1', '0'], ['x', '1'], ['2', '0'], ['3', '0']]
+	if count_numbers(words) != 60 {
+		return 15
+	}
+	return 0
+}

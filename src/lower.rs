@@ -42,6 +42,20 @@
 //! and returns nothing. The caller passes fresh storage: a new local's slot
 //! for `let x = f()`, otherwise a temporary that's then copied, so the
 //! callee never writes to something it can also read through a parameter.
+//!
+//! A function that throws returns a result `throws(E) -> T`, which is an
+//! enum `{ ok(T), err(E) }` in memory, written through the result pointer
+//! like any value in memory. `return v` writes `ok(v)`; `throw e` writes
+//! `err(e)`. A caller's `try`, `catch` or `match` calls into a temporary
+//! (or a hidden local) and tests its tag. There is no unwinding: an error
+//! is a return value.
+//!
+//! `defer` bodies are emitted at each exit of their block, in reverse
+//! order: at its end, and at every `return`, `throw`, failing `try`,
+//! `break` and `continue` that leaves it. `errdefer` bodies only at the
+//! exits that leave the function with an error.
+
+use std::rc::Rc;
 
 use latticefoundry::Module;
 use latticefoundry::ir::builder::FunctionBuilder;
@@ -52,7 +66,7 @@ use latticefoundry::ir::{
 use latticefoundry::support::StrInterner;
 
 use crate::reach::Reach;
-use crate::sema::{CmpOp, Func, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
+use crate::sema::{CmpOp, Func, Handler, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
 use crate::types::{IntTy, Ty};
 
 /// The IR layout of an enum or an optional (see the module docs).
@@ -108,7 +122,7 @@ impl Types {
             Ty::Int(t) => self.int(t),
             Ty::Ptr(_) => self.ptr,
             Ty::Str | Ty::Slice(_) => unreachable!("a view is two values"),
-            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) => {
+            Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) | Ty::Result(_) => {
                 unreachable!("{ty} lives in memory")
             }
         }
@@ -128,11 +142,12 @@ impl Types {
     /// written through a pointer passed first (see the module docs).
     fn signature(&self, f: &Func) -> (Vec<TypeId>, TypeId) {
         let mut params = Vec::new();
-        let ret = if f.ret.in_memory() {
+        let result = f.result_ty();
+        let ret = if result.in_memory() {
             params.push(self.ptr);
             self.void
         } else {
-            self.of(f.ret)
+            self.of(result)
         };
         params.extend(f.params.iter().flat_map(|&p| self.parts(f.locals[p].ty)));
         (params, ret)
@@ -279,9 +294,12 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             string_lens: &program.strings,
             slots: Vec::new(),
             loops: Vec::new(),
+            defers: Vec::new(),
             terminated: false,
             exit_status: (direct_entry == Some(i)).then_some(f.ret),
             result: None,
+            result_ty: f.result_ty(),
+            throws: f.throws.is_some(),
         }
         .function(f);
     }
@@ -337,8 +355,12 @@ struct FnLower<'a> {
     strings: &'a [GlobalId],
     string_lens: &'a [Vec<u8>],
     slots: Vec<Slot>,
-    /// `(continue target, break target)` of each enclosing loop.
-    loops: Vec<(BlockId, BlockId)>,
+    /// `(continue target, break target, defer scopes outside it)` of each
+    /// enclosing loop.
+    loops: Vec<(BlockId, BlockId, usize)>,
+    /// For each statement list being lowered, innermost last: the `defer`
+    /// bodies registered so far, with whether each is an `errdefer`.
+    defers: Vec<Vec<(Rc<[TStmt]>, bool)>>,
     /// Whether the current block already has its terminator.
     terminated: bool,
     /// For the entry function, `main`'s return type: its returns become
@@ -346,6 +368,11 @@ struct FnLower<'a> {
     exit_status: Option<Ty>,
     /// Where to write the result, for a function returning a value in memory.
     result: Option<ValueId>,
+    /// What the function returns: its return type, or its result type if
+    /// it throws.
+    result_ty: Ty,
+    /// Whether the function throws (and returns a result).
+    throws: bool,
 }
 
 /// The most scalar copies an array copy or fill is unrolled into; longer
@@ -396,7 +423,7 @@ impl FnLower<'_> {
         // The IR parameters: the result's storage first, if it's in memory,
         // then each parameter's parts.
         let mut next = 0;
-        if f.ret.in_memory() {
+        if self.result_ty.in_memory() {
             self.result = Some(self.b.param(entry, 0));
             next = 1;
         }
@@ -451,7 +478,7 @@ impl FnLower<'_> {
         self.stmts(&f.body);
         if !self.terminated {
             if f.ret == Ty::Unit {
-                self.ret(None);
+                self.return_value(None);
             } else {
                 // The checker proved every path returns, so this block is dead.
                 self.b.unreachable();
@@ -496,7 +523,9 @@ impl FnLower<'_> {
         self.terminated = false;
     }
 
+    /// A statement list, which is a scope for `defer`.
     fn stmts(&mut self, stmts: &[TStmt]) {
+        self.defers.push(Vec::new());
         for s in stmts {
             if self.terminated {
                 // Code after a `return`/`break`: give it a fresh (unreachable) block.
@@ -504,6 +533,185 @@ impl FnLower<'_> {
                 self.start_block(dead);
             }
             self.stmt(s);
+        }
+        if !self.terminated {
+            self.run_defers(self.defers.len() - 1, false);
+        }
+        self.defers.pop();
+    }
+
+    /// Emit the `defer` bodies of the scopes from `outer` in, innermost
+    /// first and each scope's last first, for leaving them; with `error`,
+    /// the `errdefer` bodies too.
+    fn run_defers(&mut self, outer: usize, error: bool) {
+        for scope in (outer..self.defers.len()).rev() {
+            let bodies = self.defers[scope].clone();
+            for (body, on_error) in bodies.iter().rev() {
+                if *on_error && !error {
+                    continue;
+                }
+                // The body can't leave its own statements, so the defers
+                // registered while lowering it are its own.
+                let depth = self.defers.len();
+                self.stmts(body);
+                debug_assert_eq!(depth, self.defers.len());
+            }
+        }
+    }
+
+    /// `return value`: write it (as `ok(value)` in a function that throws),
+    /// run every `defer`, and return.
+    fn return_value(&mut self, value: Option<&TExpr>) {
+        let v = if self.throws {
+            let dst = self.result.expect("a result in memory");
+            if let Some(e) = value {
+                let d = self.payload_at(dst, self.result_ty, 0, 0);
+                self.fill_or_write(d, e);
+            }
+            self.store_tag(dst, self.result_ty, 0);
+            None
+        } else {
+            match (value, self.result) {
+                (Some(e), Some(dst)) => {
+                    self.fill(dst, e);
+                    None
+                }
+                (Some(e), None) => Some(self.expr(e).one()),
+                (None, _) => None,
+            }
+        };
+        self.run_defers(0, false);
+        self.ret(v);
+        self.terminated = true;
+    }
+
+    /// Leave the function with an error: `write` stores it in the payload
+    /// of `err` at the given address, then every `defer` and `errdefer`
+    /// runs.
+    fn fail(&mut self, write: impl FnOnce(&mut Self, ValueId)) {
+        let dst = self.result.expect("a result in memory");
+        let d = self.payload_at(dst, self.result_ty, 1, 0);
+        write(self, d);
+        self.store_tag(dst, self.result_ty, 1);
+        self.run_defers(0, true);
+        self.ret(None);
+        self.terminated = true;
+    }
+
+    /// `throw e`.
+    fn throw(&mut self, e: &TExpr) {
+        self.fail(|this, d| this.fill(d, e));
+    }
+
+    /// Call `call`, a call to a function that throws, into a temporary, and
+    /// branch on its result: to the returned block for `ok`, to `err_bb`
+    /// for `err`. Returns the temporary and the `ok` block.
+    fn call_result(&mut self, call: &TExpr, err_bb: BlockId) -> (ValueId, BlockId) {
+        let ir_ty = self.ir_ty(call.ty);
+        let tmp = self.b.alloca(ir_ty);
+        self.fill(tmp, call);
+        let tag = self.load_tag(tmp, call.ty);
+        let ok_bb = self.b.create_block(&[]);
+        self.branch_on_tag(tag, call.ty, &[(vec![0], ok_bb), (vec![1], err_bb)]);
+        (tmp, ok_bb)
+    }
+
+    /// The value of `ok` in the result of type `ty` at `base`, or `Unit`.
+    fn ok_value(&mut self, base: ValueId, ty: Ty) -> Val {
+        let (value, _) = ty.as_result().expect("a result");
+        if value == Ty::Unit {
+            return Val::Unit;
+        }
+        let addr = self.payload_at(base, ty, 0, 0);
+        self.read(addr, value)
+    }
+
+    /// `try call`.
+    fn try_call(&mut self, call: &TExpr) -> Val {
+        let (_, err) = call.ty.as_result().expect("a result");
+        let err_bb = self.b.create_block(&[]);
+        let (tmp, ok_bb) = self.call_result(call, err_bb);
+        self.start_block(err_bb);
+        let src = self.payload_at(tmp, call.ty, 1, 0);
+        self.fail(|this, d| this.copy(d, src, err));
+        self.start_block(ok_bb);
+        self.ok_value(tmp, call.ty)
+    }
+
+    /// `call catch ...`, of type `ty`.
+    fn catch(&mut self, call: &TExpr, binding: Option<usize>, handler: &Handler, ty: Ty) -> Val {
+        let (_, err) = call.ty.as_result().expect("a result");
+        // Where the value goes: a temporary in memory, or the join
+        // block's parameter.
+        let scalar = ty != Ty::Unit && !ty.in_memory();
+        let out = if ty.in_memory() {
+            let ir_ty = self.ir_ty(ty);
+            Some(self.b.alloca(ir_ty))
+        } else {
+            None
+        };
+        let err_bb = self.b.create_block(&[]);
+        let (tmp, ok_bb) = self.call_result(call, err_bb);
+        let join = if scalar {
+            let ir_ty = self.t.of(ty);
+            self.b.create_block(&[ir_ty])
+        } else {
+            self.b.create_block(&[])
+        };
+        let arrive = |this: &mut Self, v: Val| {
+            match (out, v) {
+                (Some(dst), Val::Mem(src)) => this.copy(dst, src, ty),
+                (None, Val::One(v)) => {
+                    this.b.br(join, &[v]);
+                    return;
+                }
+                _ => {}
+            }
+            this.b.br(join, &[]);
+        };
+
+        self.start_block(ok_bb);
+        let v = self.ok_value(tmp, call.ty);
+        arrive(self, v);
+
+        self.start_block(err_bb);
+        if let Some(local) = binding {
+            let Slot::Mem(dst) = self.slots[local] else {
+                unreachable!("an error is an enum, in memory")
+            };
+            let src = self.payload_at(tmp, call.ty, 1, 0);
+            self.copy(dst, src, err);
+        }
+        match handler {
+            Handler::Value(v) => match out {
+                Some(dst) => {
+                    self.fill(dst, v);
+                    self.b.br(join, &[]);
+                }
+                None => {
+                    let v = self.expr(v);
+                    arrive(self, v);
+                }
+            },
+            Handler::Block(body) => {
+                self.stmts(body);
+                // Only a `catch` whose value isn't used ends its block.
+                if !self.terminated {
+                    if scalar {
+                        let ir_ty = self.t.of(ty);
+                        let unused = self.b.poison(ir_ty);
+                        self.b.br(join, &[unused]);
+                    } else {
+                        self.b.br(join, &[]);
+                    }
+                }
+            }
+        }
+        self.start_block(join);
+        match out {
+            Some(dst) => Val::Mem(dst),
+            None if scalar => Val::One(self.b.param(join, 0)),
+            None => Val::Unit,
         }
     }
 
@@ -532,17 +740,11 @@ impl FnLower<'_> {
             TStmt::Expr(e) => {
                 self.expr(e);
             }
-            TStmt::Return(value) => {
-                let v = match (value, self.result) {
-                    (Some(e), Some(dst)) => {
-                        self.fill(dst, e);
-                        None
-                    }
-                    (Some(e), None) => Some(self.expr(e).one()),
-                    (None, _) => None,
-                };
-                self.ret(v);
-                self.terminated = true;
+            TStmt::Return(value) => self.return_value(value.as_ref()),
+            TStmt::Throw(e) => self.throw(e),
+            TStmt::Defer { body, on_error } => {
+                let scope = self.defers.last_mut().expect("in a statement list");
+                scope.push((Rc::from(body.clone()), *on_error));
             }
             TStmt::If(cond, then, otherwise) => {
                 let c = self.expr(cond).one();
@@ -617,8 +819,9 @@ impl FnLower<'_> {
                 self.start_block(exit);
             }
             TStmt::Break | TStmt::Continue => {
-                let (cont, brk) = *self.loops.last().expect("checked: inside a loop");
+                let (cont, brk, outer) = *self.loops.last().expect("checked: inside a loop");
                 let target = if matches!(s, TStmt::Break) { brk } else { cont };
+                self.run_defers(outer, false);
                 self.b.br(target, &[]);
                 self.terminated = true;
             }
@@ -648,7 +851,7 @@ impl FnLower<'_> {
 
     fn loop_body(&mut self, body_bb: BlockId, cont: BlockId, exit: BlockId, body: &[TStmt]) {
         self.start_block(body_bb);
-        self.loops.push((cont, exit));
+        self.loops.push((cont, exit, self.defers.len()));
         self.stmts(body);
         self.loops.pop();
         if !self.terminated {
@@ -727,6 +930,25 @@ impl FnLower<'_> {
                 return self.read(addr, e.ty);
             }
             TExprKind::Coalesce(opt, default) => return self.coalesce(opt, default, e.ty),
+            TExprKind::Try(call) => return self.try_call(call),
+            TExprKind::Catch {
+                call,
+                binding,
+                handler,
+            } => return self.catch(call, *binding, handler, e.ty),
+            // Only the default of `??`: it leaves, and the code after it,
+            // which uses its value, is unreachable.
+            TExprKind::Throw(value) => {
+                self.throw(value);
+                let dead = self.b.create_block(&[]);
+                self.start_block(dead);
+                if e.ty.in_memory() {
+                    let ir_ty = self.ir_ty(e.ty);
+                    return Val::Mem(self.b.alloca(ir_ty));
+                }
+                let ir_ty = self.t.of(e.ty);
+                self.b.poison(ir_ty)
+            }
             TExprKind::EnumValue(inner) => {
                 let base = self.place(inner);
                 self.load_tag(base, inner.ty)

@@ -1,12 +1,12 @@
 // error: `trait` declarations are not supported by the compiler yet
-// error: `throws` clauses are not supported by the compiler yet
+// error: `uses` clauses are not supported by the compiler yet
 package main
 
 trait Shape {
 	area
 }
 
-fn parse() throws -> u32 {
+fn parse() uses alloc -> u32 {
 	return 0
 }
 

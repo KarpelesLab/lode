@@ -1,11 +1,13 @@
 //! Checking expressions.
 
+use std::collections::HashMap;
+
 use crate::ast::{self, BinOp, ExprKind, UnOp};
 use crate::diag::Diagnostic;
 use crate::source::Span;
 use crate::types::{IntTy, Primitive, Range, Ty, primitive};
 
-use super::facts::{self, CondFacts, Linear, Side, Term};
+use super::facts::{self, CondFacts, Env, Linear, Side, Term};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
 
@@ -51,13 +53,26 @@ impl Checked {
     }
 }
 
-/// Whether `e` takes its type from its context: an array literal or
-/// `none`. In `xs == [1, 2, 3]` or `opt == none`, it takes the other side's.
+/// Whether `e` takes its type from its context: an array literal, `none`
+/// or a variant `.name`. In `xs == [1, 2, 3]` or `opt == none`, it takes
+/// the other side's.
 fn needs_context(e: &ast::Expr) -> bool {
     match &e.kind {
-        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) | ExprKind::None => true,
+        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) | ExprKind::None | ExprKind::Dot(_) => {
+            true
+        }
+        ExprKind::Call(callee, _) => matches!(callee.kind, ExprKind::Dot(_)),
         ExprKind::Paren(inner) => needs_context(inner),
         _ => false,
+    }
+}
+
+/// The name a call's callee is written with (`f`, `os.write`), for messages.
+fn callee_name(callee: &ast::Expr) -> String {
+    match &callee.kind {
+        ExprKind::Name(n) => n.clone(),
+        ExprKind::Field(base, member) => format!("{}.{}", callee_name(base), member.name),
+        _ => "this function".to_owned(),
     }
 }
 
@@ -253,7 +268,25 @@ impl Checker<'_> {
             ExprKind::Paren(inner) => self.expr(cx, inner, expected),
             ExprKind::Unary(op, operand) => self.unary(cx, *op, operand, e.span, expected),
             ExprKind::Binary(op, lhs, rhs) => self.binary(cx, *op, lhs, rhs, e.span, expected),
-            ExprKind::Call(callee, args) => self.call(cx, callee, args, e.span),
+            ExprKind::Call(callee, args) => match &callee.kind {
+                ExprKind::Dot(name) => self.dot_variant(name, Some(args), e.span, expected, cx),
+                _ => self.call(cx, callee, args, e.span, false),
+            },
+            ExprKind::Dot(name) => self.dot_variant(name, None, e.span, expected, cx),
+            ExprKind::Try(call) => self.try_call(cx, call, e.span),
+            ExprKind::Catch {
+                value,
+                binding,
+                handler,
+            } => self.catch(cx, value, binding.as_ref(), handler, true),
+            ExprKind::Throw(_) => {
+                self.diags.push(
+                    Diagnostic::error(e.span, "`throw` is a statement").with_help(
+                        "in an expression, it can only follow `??`: `opt ?? throw .name`",
+                    ),
+                );
+                None
+            }
             ExprKind::Field(base, member) => self.field(cx, base, member, e.span),
             ExprKind::ArrayLit(elems) => {
                 self.array_literal(cx, elems, e.span, expected.map(under_optionals))
@@ -379,6 +412,185 @@ impl Checker<'_> {
             }
         }
         ok.then(|| Checked::new(TExprKind::Variant(i as u32, values), ty, None))
+    }
+
+    /// `.name` (`args` is `None`) or `.name(a, b)`: a variant of the enum
+    /// the context expects (or of the one in the optional it expects).
+    fn dot_variant(
+        &mut self,
+        name: &ast::Ident,
+        args: Option<&[ast::Expr]>,
+        span: Span,
+        expected: Option<Ty>,
+        cx: &mut FnCx,
+    ) -> Option<Checked> {
+        match expected.map(under_optionals) {
+            Some(ty @ Ty::Enum(_)) => self.enum_variant(cx, ty, name, args, span),
+            other => {
+                let found = match other {
+                    Some(t) => format!(", and `{t}` is not an enum"),
+                    None => String::new(),
+                };
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "cannot tell which enum `.{}` is a variant of{found}",
+                            name.name
+                        ),
+                    )
+                    .with_help(format!("name the enum: `E.{}`", name.name)),
+                );
+                None
+            }
+        }
+    }
+
+    /// The call `e` (in parentheses or not) to a function that throws, for
+    /// `what` (`try` or `catch`): its result, of a result type.
+    fn throwing_call(&mut self, cx: &mut FnCx, e: &ast::Expr, what: &str) -> Option<Checked> {
+        let mut inner = e;
+        while let ExprKind::Paren(x) = &inner.kind {
+            inner = x;
+        }
+        let ExprKind::Call(callee, args) = &inner.kind else {
+            self.diags.push(
+                Diagnostic::error(
+                    e.span,
+                    format!("`{what}` needs a call to a function that throws"),
+                )
+                .with_help("only a call can fail with an error"),
+            );
+            return None;
+        };
+        let c = self.call(cx, callee, args, inner.span, true)?;
+        if c.ty().as_result().is_none() {
+            self.diags.push(
+                Diagnostic::error(
+                    e.span,
+                    format!(
+                        "`{}` doesn't throw, so it needs no `{what}`",
+                        callee_name(callee)
+                    ),
+                )
+                .with_help(
+                    "`try` and `catch` handle the errors of functions declared with `throws(E)`",
+                ),
+            );
+            return None;
+        }
+        Some(c)
+    }
+
+    /// `try call`: the call's value, or its error passed on to the caller.
+    fn try_call(&mut self, cx: &mut FnCx, call: &ast::Expr, span: Span) -> Option<Checked> {
+        self.check_not_in_defer(cx, span, "`try`")?;
+        let c = self.throwing_call(cx, call, "try")?;
+        let (value, err) = c.ty().as_result().expect("a result");
+        match cx.throws {
+            None => {
+                self.diags.push(
+                    Diagnostic::error(span, "`try` can only be used in a function that throws")
+                        .with_help(format!(
+                            "handle the error here with `catch` or `match`, or declare `throws({err})`"
+                        )),
+                );
+                return None;
+            }
+            Some(own) if own != err => {
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "`try` can't pass on an error of type `{err}` from a function that throws `{own}`"
+                        ),
+                    )
+                    .with_help(format!(
+                        "convert it: `... catch e {{ throw .name(...) }}` with a variant of `{own}`"
+                    )),
+                );
+                return None;
+            }
+            Some(_) => {}
+        }
+        Some(Checked::new(TExprKind::Try(Box::new(c.expr)), value, None))
+    }
+
+    /// `call catch e { ... }`, `call catch _ { ... }` or `call catch value`:
+    /// the call's value, or else the handler's. When the value is used
+    /// (`used`) and isn't `()`, a block must leave. The facts after it are
+    /// those of the call joined with those at the end of a block that
+    /// doesn't leave, as after an `if`.
+    pub(super) fn catch(
+        &mut self,
+        cx: &mut FnCx,
+        value: &ast::Expr,
+        binding: Option<&ast::Ident>,
+        handler: &ast::CatchHandler,
+        used: bool,
+    ) -> Option<Checked> {
+        let c = self.throwing_call(cx, value, "catch")?;
+        let (ty, err) = c.ty().as_result().expect("a result");
+        let entry = cx.env.clone();
+        let (local, handler) = match handler {
+            ast::CatchHandler::Value(v) => {
+                let d = self.expr(cx, v, Some(ty));
+                let d = self.coerce(d?, ty, v.span)?;
+                cx.env = Env::join(entry, std::mem::take(&mut cx.env));
+                (None, Handler::Value(Box::new(d.expr)))
+            }
+            ast::CatchHandler::Block(b) => {
+                cx.scopes.push(HashMap::new());
+                let local = binding.map(|name| {
+                    let id = self.declare(cx, &name.name, err, false);
+                    cx.env.assign(id, None);
+                    id
+                });
+                let body = self.block(cx, &b.stmts);
+                cx.scopes.pop();
+                let leaves = diverges(&body);
+                if used && ty != Ty::Unit && !leaves {
+                    self.diags.push(
+                        Diagnostic::error(
+                            b.span,
+                            format!(
+                                "this `catch` block must leave, since the call's value (a `{ty}`) is used"
+                            ),
+                        )
+                        .with_help("end it with `return`, `throw`, `break` or `continue`")
+                        .with_help("or give a value to use instead: `catch 0`"),
+                    );
+                    // The value is kept, so checking goes on without more
+                    // errors about it.
+                }
+                let end = std::mem::take(&mut cx.env);
+                cx.env = Checker::join_branches(vec![(entry, false), (end, leaves)]);
+                (local, Handler::Block(body))
+            }
+        };
+        Some(Checked::new(
+            TExprKind::Catch {
+                call: Box::new(c.expr),
+                binding: local,
+                handler,
+            },
+            ty,
+            None,
+        ))
+    }
+
+    /// The error `value` of `throw value`, of the function's error type.
+    pub(super) fn throw(&mut self, cx: &mut FnCx, value: &ast::Expr, span: Span) -> Option<TExpr> {
+        self.check_not_in_defer(cx, span, "`throw`")?;
+        let Some(err) = cx.throws else {
+            self.diags.push(
+                Diagnostic::error(span, "`throw` can only be used in a function that throws")
+                    .with_help("declare the error type: `fn name(...) throws(E)`"),
+            );
+            return None;
+        };
+        let c = self.expr(cx, value, Some(err))?;
+        Some(self.coerce(c, err, value.span)?.expr)
     }
 
     /// `E(x)` for a C-style enum `E`: the variant whose value is the integer
@@ -1119,10 +1331,19 @@ impl Checker<'_> {
             );
             return None;
         };
-        let r = self.expr(cx, rhs, Some(inner))?;
-        let r = self.coerce(r, inner, rhs.span)?;
+        // `opt ?? throw value` leaves the function when `opt` is `none`.
+        let r = match &rhs.kind {
+            ExprKind::Throw(value) => TExpr {
+                kind: TExprKind::Throw(Box::new(self.throw(cx, value, rhs.span)?)),
+                ty: inner,
+            },
+            _ => {
+                let r = self.expr(cx, rhs, Some(inner))?;
+                self.coerce(r, inner, rhs.span)?.expr
+            }
+        };
         Some(Checked::new(
-            TExprKind::Coalesce(Box::new(l.expr), Box::new(r.expr)),
+            TExprKind::Coalesce(Box::new(l.expr), Box::new(r)),
             inner,
             None,
         ))
@@ -1384,12 +1605,16 @@ impl Checker<'_> {
         Some(Checked::new(kind, Ty::Int(t), Some(range)))
     }
 
-    fn call(
+    /// A call. The result of a call to a function that throws must be
+    /// `handled` (by `try`, `catch` or `match`, which then get a value of
+    /// its result type); otherwise it's an error.
+    pub(super) fn call(
         &mut self,
         cx: &mut FnCx,
         callee: &ast::Expr,
         args: &[ast::Expr],
         span: Span,
+        handled: bool,
     ) -> Option<Checked> {
         if let ExprKind::Field(base, member) = &callee.kind
             && let Some(ty) = self.type_path(cx, base)
@@ -1455,7 +1680,23 @@ impl Checker<'_> {
                 &format!("calling the `unsafe fn` `{name}`"),
             );
         }
-        let (params, ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
+        let (params, mut ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
+        if let Some(err) = self.sigs[id].throws {
+            if handled {
+                ret = Ty::result(ret, err);
+            } else {
+                // Reported, then checked as if passed on, to go on checking.
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{name}` can throw, and its error must be handled"),
+                    )
+                    .with_help(format!(
+                        "pass it on with `try {name}(...)`, handle it with `catch`, or `match` on `ok` and `err`"
+                    )),
+                );
+            }
+        }
         if args.len() != params.len() {
             self.error(
                 span,

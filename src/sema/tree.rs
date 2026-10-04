@@ -30,10 +30,24 @@ pub struct Func {
     /// The linker symbol: `<package path>.<name>`, e.g. `std/io.print`.
     pub symbol: String,
     pub params: Vec<LocalId>,
+    /// The type of the value it returns (`T` in `throws(E) -> T`).
     pub ret: Ty,
+    /// The error type of a function that throws.
+    pub throws: Option<Ty>,
     pub locals: Vec<Local>,
     pub body: Vec<TStmt>,
     pub span: Span,
+}
+
+impl Func {
+    /// What a call returns: `ret`, or for a function that throws, the
+    /// result `throws(E) -> ret`, which holds the value or the error.
+    pub fn result_ty(&self) -> Ty {
+        match self.throws {
+            Some(err) => Ty::result(self.ret, err),
+            None => self.ret,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -43,7 +57,7 @@ pub struct Local {
     pub mutable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum TStmt {
     /// Initialize a local.
     Init(LocalId, TExpr),
@@ -78,11 +92,23 @@ pub enum TStmt {
         value: TExpr,
         arms: Vec<TArm>,
     },
+    /// `throw value`: leave the function with the error `value`, of the
+    /// function's error type.
+    Throw(TExpr),
+    /// `defer` (or `errdefer`, with `on_error`): `body` runs when control
+    /// leaves the enclosing statement list, in reverse order of the
+    /// `defer`s, or only when it leaves the function with an error. The
+    /// body never leaves itself: no `return`, `throw` or `try`, and its
+    /// `break` and `continue` stay in its own loops.
+    Defer {
+        body: Vec<TStmt>,
+        on_error: bool,
+    },
 }
 
 /// One arm of a [`TStmt::Match`]: the variants it handles (by index) and
 /// its body, which starts by binding the payload fields it names.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TArm {
     pub variants: Vec<u32>,
     pub body: Vec<TStmt>,
@@ -155,6 +181,31 @@ pub enum TExprKind {
     /// The C-style enum value whose value is the integer operand, as an
     /// optional of the enum: `none` if no variant has that value.
     EnumFrom(Box<TExpr>),
+    /// `try call`: the value of `call` (a [`TExprKind::Call`] of a result
+    /// type), or, if it failed, leave the function with its error (of the
+    /// same type as the function's).
+    Try(Box<TExpr>),
+    /// `call catch ...`: the value of `call` (a [`TExprKind::Call`] of a
+    /// result type), or, if it failed, the handler's. The error is stored
+    /// in `binding` first, if there's one.
+    Catch {
+        call: Box<TExpr>,
+        binding: Option<LocalId>,
+        handler: Handler,
+    },
+    /// `throw value`, as the default of `??`: leave the function with an
+    /// error. It has no value of its own.
+    Throw(Box<TExpr>),
+}
+
+/// What a [`TExprKind::Catch`] does with an error.
+#[derive(Clone, Debug)]
+pub enum Handler {
+    /// A fallback value, of the call's value type.
+    Value(Box<TExpr>),
+    /// A block. When the `catch` has a value (it's not a statement on its
+    /// own), the block always leaves.
+    Block(Vec<TStmt>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,10 +254,92 @@ pub enum CmpOp {
     Ge,
 }
 
+/// The expressions a statement evaluates itself (not those of the
+/// statements nested in it).
+pub fn stmt_exprs(s: &TStmt) -> Vec<&TExpr> {
+    match s {
+        TStmt::Init(_, e)
+        | TStmt::Assign(_, e)
+        | TStmt::Expr(e)
+        | TStmt::Throw(e)
+        | TStmt::If(e, ..)
+        | TStmt::While(e, _)
+        | TStmt::Match { value: e, .. } => vec![e],
+        TStmt::Store(place, e) => vec![place, e],
+        TStmt::Return(e) => e.iter().collect(),
+        TStmt::For { start, end, .. } => vec![start, end],
+        TStmt::Loop(_) | TStmt::Break | TStmt::Continue | TStmt::Block(_) | TStmt::Defer { .. } => {
+            Vec::new()
+        }
+    }
+}
+
+/// The subexpressions of an expression (not itself, and not those in the
+/// blocks of a `catch`).
+pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
+    match &e.kind {
+        TExprKind::Int(_) | TExprKind::Bool(_) | TExprKind::Str(_) | TExprKind::Local(_) => {
+            Vec::new()
+        }
+        TExprKind::Call(_, items)
+        | TExprKind::ArrayLit(items)
+        | TExprKind::Syscall(items)
+        | TExprKind::Variant(_, items) => items.iter().collect(),
+        TExprKind::Binary(_, l, r)
+        | TExprKind::And(l, r)
+        | TExprKind::Or(l, r)
+        | TExprKind::Index(l, r)
+        | TExprKind::PtrAdd(l, r)
+        | TExprKind::Coalesce(l, r) => vec![l, r],
+        TExprKind::StructLit(fields) => fields.iter().map(|(_, v)| v).collect(),
+        TExprKind::Unary(_, inner)
+        | TExprKind::Field(inner, _)
+        | TExprKind::Convert(inner)
+        | TExprKind::ViewLen(inner)
+        | TExprKind::ArrayLen(inner)
+        | TExprKind::ArrayRepeat(inner, _)
+        | TExprKind::ToSlice(inner)
+        | TExprKind::StrPtr(inner)
+        | TExprKind::Payload(inner, ..)
+        | TExprKind::EnumValue(inner)
+        | TExprKind::EnumFrom(inner)
+        | TExprKind::Try(inner)
+        | TExprKind::Throw(inner) => vec![inner],
+        TExprKind::Catch { call, handler, .. } => match handler {
+            Handler::Value(v) => vec![call, v],
+            Handler::Block(_) => vec![call],
+        },
+    }
+}
+
+/// The blocks of the `catch`es in an expression, at any depth.
+pub fn expr_blocks<'a>(e: &'a TExpr, out: &mut Vec<&'a [TStmt]>) {
+    if let TExprKind::Catch {
+        handler: Handler::Block(b),
+        ..
+    } = &e.kind
+    {
+        out.push(b);
+    }
+    for sub in subexprs(e) {
+        expr_blocks(sub, out);
+    }
+}
+
+/// The blocks of the `catch`es in the expressions statement `s` evaluates
+/// itself.
+fn stmt_blocks(s: &TStmt) -> Vec<&[TStmt]> {
+    let mut out = Vec::new();
+    for e in stmt_exprs(s) {
+        expr_blocks(e, &mut out);
+    }
+    out
+}
+
 /// Whether control can't fall off the end of `stmts` (for "missing return").
 pub fn terminates(stmts: &[TStmt]) -> bool {
     stmts.iter().any(|s| match s {
-        TStmt::Return(_) => true,
+        TStmt::Return(_) | TStmt::Throw(_) => true,
         TStmt::If(_, then, otherwise) => terminates(then) && terminates(otherwise),
         TStmt::Loop(body) => !breaks(body),
         TStmt::Block(body) => terminates(body),
@@ -219,7 +352,7 @@ pub fn terminates(stmts: &[TStmt]) -> bool {
 /// in `return`, `break` or `continue`, or an endless loop.
 pub fn diverges(stmts: &[TStmt]) -> bool {
     stmts.iter().any(|s| match s {
-        TStmt::Return(_) | TStmt::Break | TStmt::Continue => true,
+        TStmt::Return(_) | TStmt::Throw(_) | TStmt::Break | TStmt::Continue => true,
         TStmt::If(_, then, otherwise) => diverges(then) && diverges(otherwise),
         TStmt::Loop(body) => !breaks(body),
         TStmt::Block(body) => diverges(body),
@@ -228,13 +361,18 @@ pub fn diverges(stmts: &[TStmt]) -> bool {
     })
 }
 
-/// Whether `stmts` contain a `break` that leaves the enclosing loop.
+/// Whether `stmts` contain a `break` that leaves the enclosing loop
+/// (including one in the block of a `catch`, and in the condition or the
+/// bounds of a nested loop, which are evaluated outside of it).
 pub fn breaks(stmts: &[TStmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        TStmt::Break => true,
-        TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
-        TStmt::Block(body) => breaks(body),
-        TStmt::Match { arms, .. } => arms.iter().any(|a| breaks(&a.body)),
-        _ => false,
+    stmts.iter().any(|s| {
+        let nested = match s {
+            TStmt::Break => true,
+            TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
+            TStmt::Block(body) => breaks(body),
+            TStmt::Match { arms, .. } => arms.iter().any(|a| breaks(&a.body)),
+            _ => false,
+        };
+        nested || stmt_blocks(s).into_iter().any(breaks)
     })
 }

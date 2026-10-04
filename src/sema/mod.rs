@@ -59,8 +59,16 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
     if let Some(id) = main {
         let sig = &ck.sigs[id];
         let (no_params, ret, span) = (sig.params.is_empty(), sig.ret, sig.span);
+        let throws = sig.throws.is_some();
         if !no_params {
             ck.error(span, "`main` takes no parameters");
+        }
+        if throws {
+            ck.diags.push(
+                Diagnostic::error(span, "`main` can't throw").with_help(
+                    "handle its errors with `catch` or `match`, and return an exit status",
+                ),
+            );
         }
         if !matches!(ret, Ty::Unit | Ty::Int(_)) {
             ck.error(span, "`main` must return nothing or an integer exit status");
@@ -94,6 +102,8 @@ struct Sig {
     is_unsafe: bool,
     params: Vec<Ty>,
     ret: Ty,
+    /// The error type, for a function that throws.
+    throws: Option<Ty>,
     /// The function name's span.
     span: Span,
 }
@@ -142,7 +152,15 @@ struct FnCx {
     locals: Vec<Local>,
     scopes: Vec<HashMap<String, LocalId>>,
     ret: Ty,
+    /// The function's error type, if it throws.
+    throws: Option<Ty>,
     loop_depth: u32,
+    /// Nesting of `defer` blocks, which can't be left with `return`,
+    /// `throw` or `try`.
+    defer_depth: u32,
+    /// In a `defer` block, the first local declared in it: it can't assign
+    /// the locals before it, which are declared outside it.
+    defer_floor: LocalId,
     /// Nesting of `unsafe` blocks; an `unsafe fn` body starts at 1.
     unsafe_depth: u32,
     /// The facts known at the current point.
@@ -175,7 +193,10 @@ impl FnCx {
             locals: Vec::new(),
             scopes: vec![HashMap::new()],
             ret,
+            throws: None,
             loop_depth: 0,
+            defer_depth: 0,
+            defer_floor: 0,
             unsafe_depth: u32::from(is_unsafe),
             env: Env::default(),
             loops: Vec::new(),
@@ -198,9 +219,74 @@ const INDEX: &str = "$i";
 /// `let ... else` looks into, unless it's already a local.
 const MATCHED: &str = "$match";
 
+/// The blocks of the `catch`es in an expression, at any depth.
+fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Name(_)
+        | ExprKind::None
+        | ExprKind::Dot(_) => {}
+        ExprKind::Unary(_, a)
+        | ExprKind::Field(a, _)
+        | ExprKind::Paren(a)
+        | ExprKind::Try(a)
+        | ExprKind::Throw(a) => catch_blocks(a, out),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
+            catch_blocks(a, out);
+            catch_blocks(b, out);
+        }
+        ExprKind::Call(callee, args) => {
+            catch_blocks(callee, out);
+            args.iter().for_each(|a| catch_blocks(a, out));
+        }
+        ExprKind::ArrayLit(items) => items.iter().for_each(|a| catch_blocks(a, out)),
+        ExprKind::StructLit(_, fields) => fields.iter().for_each(|f| catch_blocks(&f.value, out)),
+        ExprKind::Catch { value, handler, .. } => {
+            catch_blocks(value, out);
+            match handler {
+                ast::CatchHandler::Block(b) => out.push(b),
+                ast::CatchHandler::Value(v) => catch_blocks(v, out),
+            }
+        }
+    }
+}
+
+/// The expressions a statement evaluates itself (not those of the
+/// statements nested in it).
+fn own_exprs(s: &Stmt) -> Vec<&ast::Expr> {
+    match s {
+        Stmt::Let { init, .. } => init.iter().collect(),
+        Stmt::Assign { target, value, .. } => vec![target, value],
+        Stmt::Expr(e) | Stmt::Throw { value: e, .. } | Stmt::Match { value: e, .. } => vec![e],
+        Stmt::Return { value, .. } => value.iter().collect(),
+        Stmt::If(i) => vec![&i.cond],
+        Stmt::While { cond, .. } => vec![cond],
+        Stmt::For { iter, .. } => match iter {
+            ast::ForIter::Range(a, b) => vec![a, b],
+            ast::ForIter::Each(xs) => vec![xs],
+        },
+        Stmt::Loop { .. }
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Unsafe(_)
+        | Stmt::Defer { .. } => Vec::new(),
+    }
+}
+
 /// Names assigned anywhere in `stmts` (for forgetting facts at loop heads).
 fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
+        // The blocks of `catch`es in its expressions run as part of it.
+        let mut blocks = Vec::new();
+        for e in own_exprs(s) {
+            catch_blocks(e, &mut blocks);
+        }
+        for b in blocks {
+            assigned_names(&b.stmts, out);
+        }
         match s {
             Stmt::Assign { target, .. } => {
                 // `a[i] = v` and `p.x = v` assign (part of) `a` and `p`.
@@ -234,7 +320,8 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             Stmt::While { body, .. }
             | Stmt::Loop { body, .. }
             | Stmt::For { body, .. }
-            | Stmt::Unsafe(body) => {
+            | Stmt::Unsafe(body)
+            | Stmt::Defer { body, .. } => {
                 assigned_names(&body.stmts, out);
             }
             _ => {}
@@ -358,7 +445,7 @@ fn storable(ty: Ty) -> Result<(), Option<()>> {
             Ok(())
         }
         Ty::Str | Ty::Slice(_) => Err(Some(())),
-        Ty::Ptr(_) | Ty::Unit => Err(None),
+        Ty::Ptr(_) | Ty::Unit | Ty::Result(_) => Err(None),
     }
 }
 
@@ -967,13 +1054,41 @@ impl<'a> Checker<'a> {
             },
             None => Ty::Unit,
         };
+        let throws = f.throws.as_ref().and_then(|t| self.error_type(cx, t));
         Sig {
             is_pub: f.is_pub,
             is_unsafe: f.is_unsafe,
             params,
             ret,
+            throws,
             span: f.name.span,
         }
+    }
+
+    /// The error type of a `throws` clause: an enum.
+    fn error_type(&mut self, cx: &mut FnCx, t: &ast::Throws) -> Option<Ty> {
+        let Some(te) = &t.ty else {
+            self.diags.push(
+                Diagnostic::error(
+                    t.span,
+                    "inferred error sets (`throws` without a type) are not supported by the compiler yet",
+                )
+                .with_help("name the error type, an enum: `throws(E)`"),
+            );
+            return None;
+        };
+        let ty = self.resolve_type(cx, te)?;
+        if ty.as_enum().is_none() {
+            self.diags.push(
+                Diagnostic::error(
+                    te.span(),
+                    format!("an error type must be an enum, found `{ty}`"),
+                )
+                .with_help("declare the errors as the variants of an enum: `enum E { ... }`"),
+            );
+            return None;
+        }
+        Some(ty)
     }
 
     /// Look up `name` in package `pkg` as seen from `cx`'s package, reporting
@@ -1082,7 +1197,9 @@ impl<'a> Checker<'a> {
 
     fn function(&mut self, f: &ast::FnDecl, id: FuncId, pkg: usize, file: FileId) -> Func {
         let (ret, is_unsafe) = (self.sigs[id].ret, self.sigs[id].is_unsafe);
+        let throws = self.sigs[id].throws;
         let mut cx = FnCx::new(pkg, file, ret, is_unsafe);
+        cx.throws = throws;
         let mut params = Vec::new();
         let param_tys = self.sigs[id].params.clone();
         for (p, &ty) in f.params.iter().zip(&param_tys) {
@@ -1109,6 +1226,7 @@ impl<'a> Checker<'a> {
             symbol: format!("{}.{}", self.pkgs[pkg].path, f.name.name),
             params,
             ret,
+            throws,
             locals: cx.locals,
             body,
             span: f.span,
@@ -1143,9 +1261,96 @@ impl<'a> Checker<'a> {
 
     fn block(&mut self, cx: &mut FnCx, stmts: &[Stmt]) -> Vec<TStmt> {
         cx.scopes.push(HashMap::new());
-        let out = stmts.iter().filter_map(|s| self.stmt(cx, s)).collect();
+        let mut out = Vec::new();
+        for (k, s) in stmts.iter().enumerate() {
+            let checked = match s {
+                Stmt::Defer { body, on_error, .. } => {
+                    self.defer(cx, body, *on_error, &stmts[k + 1..])
+                }
+                _ => self.stmt(cx, s),
+            };
+            out.extend(checked);
+        }
         cx.scopes.pop();
         out
+    }
+
+    /// `defer` or `errdefer` (`on_error`), followed by `rest` in its block.
+    /// The body runs when control leaves the block, at a point after the
+    /// `defer` statement, so it's checked with the facts known here about
+    /// the variables `rest` doesn't assign. It can't assign variables
+    /// declared outside it, so running it changes no facts.
+    fn defer(
+        &mut self,
+        cx: &mut FnCx,
+        body: &ast::Block,
+        on_error: bool,
+        rest: &[Stmt],
+    ) -> Option<TStmt> {
+        if on_error && cx.throws.is_none() {
+            self.diags.push(
+                Diagnostic::error(
+                    body.span,
+                    "`errdefer` can only be used in a function that throws",
+                )
+                .with_help("use `defer` to run it whenever the block is left"),
+            );
+            return None;
+        }
+        let mut later = HashSet::new();
+        assigned_names(rest, &mut later);
+        let saved = cx.env.clone();
+        for name in &later {
+            if let Some(local) = cx.lookup(name) {
+                cx.env.forget(local);
+            }
+        }
+        let loop_depth = std::mem::replace(&mut cx.loop_depth, 0);
+        let floor = std::mem::replace(&mut cx.defer_floor, cx.locals.len());
+        cx.defer_depth += 1;
+        let checked = self.block(cx, &body.stmts);
+        cx.defer_depth -= 1;
+        cx.defer_floor = floor;
+        cx.loop_depth = loop_depth;
+        cx.env = saved;
+        Some(TStmt::Defer {
+            body: checked,
+            on_error,
+        })
+    }
+
+    /// Report an assignment to `local` (named `name`) in a `defer` block
+    /// that declared it outside the block.
+    fn check_defer_assign(
+        &mut self,
+        cx: &FnCx,
+        local: LocalId,
+        name: &str,
+        span: Span,
+    ) -> Option<()> {
+        if cx.defer_depth == 0 || local >= cx.defer_floor {
+            return Some(());
+        }
+        self.diags.push(
+            Diagnostic::error(
+                span,
+                format!("a `defer` block can't assign `{name}`, which is declared outside it"),
+            )
+            .with_help("`defer` is for cleanup, like closing what was opened"),
+        );
+        None
+    }
+
+    /// Report a statement (`what`) that would leave a `defer` block.
+    pub(super) fn check_not_in_defer(&mut self, cx: &FnCx, span: Span, what: &str) -> Option<()> {
+        if cx.defer_depth == 0 {
+            return Some(());
+        }
+        self.diags.push(
+            Diagnostic::error(span, format!("{what} can't leave a `defer` block"))
+                .with_help("a `defer` block runs while its block is left, and must end normally"),
+        );
+        None
     }
 
     /// A local was given a new value: record what's known about it.
@@ -1319,6 +1524,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
+                self.check_defer_assign(cx, local, name, target.span)?;
                 let ty = cx.locals[local].ty;
                 let checked = match op {
                     None => self.expr(cx, value, Some(ty))?,
@@ -1339,16 +1545,39 @@ impl<'a> Checker<'a> {
                 Self::record_value(cx, local, &checked);
                 Some(TStmt::Assign(local, checked.expr))
             }
-            Stmt::Expr(e) => {
-                if !matches!(e.kind, ExprKind::Call(..)) {
-                    self.error(e.span, "this expression has no effect");
-                    return None;
+            Stmt::Expr(e) => match &e.kind {
+                ExprKind::Call(..) | ExprKind::Try(_) => {
+                    Some(TStmt::Expr(self.expr(cx, e, None)?.expr))
                 }
-                Some(TStmt::Expr(self.expr(cx, e, None)?.expr))
-            }
+                // The value is dropped, so the block may end normally.
+                ExprKind::Catch {
+                    value,
+                    binding,
+                    handler,
+                } => Some(TStmt::Expr(
+                    self.catch(cx, value, binding.as_ref(), handler, false)?
+                        .expr,
+                )),
+                _ => {
+                    self.error(e.span, "this expression has no effect");
+                    None
+                }
+            },
             // A `return` that fails to check still ends control flow, so it's kept
             // (as a bare `return`) to avoid a cascade of "missing return" errors.
             // Lowering never sees it: the program has errors.
+            Stmt::Return { span, .. } if cx.defer_depth > 0 => {
+                self.check_not_in_defer(cx, *span, "`return`");
+                None
+            }
+            // Like a `return`, a `throw` that fails to check still ends
+            // control flow; lowering never sees it.
+            Stmt::Throw { value, span } => Some(match self.throw(cx, value, *span) {
+                Some(e) => TStmt::Throw(e),
+                None => TStmt::Return(None),
+            }),
+            // Only reached for a `defer` outside a block's statements.
+            Stmt::Defer { body, on_error, .. } => self.defer(cx, body, *on_error, &[]),
             Stmt::Return { value, span } => Some(TStmt::Return(match (value, cx.ret) {
                 (None, Ty::Unit) => None,
                 (None, ret) => {
@@ -1403,6 +1632,10 @@ impl<'a> Checker<'a> {
                 out
             }
             Stmt::Break(span) | Stmt::Continue(span) => {
+                if cx.loop_depth == 0 && cx.defer_depth > 0 {
+                    self.check_not_in_defer(cx, *span, "`break` or `continue`");
+                    return None;
+                }
                 if cx.loop_depth == 0 {
                     self.error(
                         *span,
@@ -1455,7 +1688,11 @@ impl<'a> Checker<'a> {
         arms: &[ast::Arm],
         span: Span,
     ) -> Option<TStmt> {
-        let checked = self.expr(cx, value, None)?;
+        // A call that throws gives its result, to match `ok` and `err`.
+        let checked = match &value.kind {
+            ExprKind::Call(callee, args) => self.call(cx, callee, args, value.span, true)?,
+            _ => self.expr(cx, value, None)?,
+        };
         let ty = checked.ty();
         let Some(def) = ty.sum() else {
             self.error(
@@ -1621,7 +1858,7 @@ impl<'a> Checker<'a> {
             .collect();
         if rest.is_empty() {
             // On another package's enum, `_` handles variants it may add.
-            if def.pkg == cx.pkg || ty.as_optional().is_some() {
+            if def.pkg == cx.pkg || ty.as_optional().is_some() || ty.as_result().is_some() {
                 self.diags.push(Diagnostic::warning(
                     span,
                     format!("this `_` matches nothing: every variant of `{ty}` is matched above"),
@@ -2146,6 +2383,7 @@ impl<'a> Checker<'a> {
             self.error(root.span, format!("cannot find `{name}` in this scope"));
             return None;
         };
+        self.check_defer_assign(cx, local, name, target.span)?;
         let root_ty = cx.locals[local].ty;
         if root_ty.is_view() {
             self.diags.push(
