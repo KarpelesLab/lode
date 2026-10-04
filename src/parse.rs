@@ -378,7 +378,20 @@ impl Parser {
                 let span = start.to(inner.span());
                 Ok(TypeExpr::Ptr(Box::new(inner), span))
             }
-            Tok::P(P::Question | P::LBracket) => self.error(
+            Tok::P(P::LBracket) => {
+                let start = self.bump().span;
+                if self.eat_p(P::RBracket) {
+                    let elem = self.type_expr()?;
+                    let span = start.to(elem.span());
+                    return Ok(TypeExpr::Slice(Box::new(elem), span));
+                }
+                let len = self.expr()?;
+                self.expect_p(P::RBracket)?;
+                let elem = self.type_expr()?;
+                let span = start.to(elem.span());
+                Ok(TypeExpr::Array(Box::new(len), Box::new(elem), span))
+            }
+            Tok::P(P::Question) => self.error(
                 self.span(),
                 "this kind of type is not supported by the compiler yet",
             ),
@@ -477,14 +490,28 @@ impl Parser {
             }
             Tok::Kw(Kw::Break) => Ok(Stmt::Break(self.bump().span)),
             Tok::Kw(Kw::Continue) => Ok(Stmt::Continue(self.bump().span)),
+            Tok::Kw(Kw::For) => {
+                self.bump();
+                let var = self.ident("a loop variable name")?;
+                if !self.eat_kw(Kw::In) {
+                    return self.expected("`in`");
+                }
+                let first = self.expr()?;
+                let iter = if self.eat_p(P::DotDot) {
+                    ForIter::Range(first, self.expr()?)
+                } else {
+                    ForIter::Each(first)
+                };
+                let body = self.block()?;
+                Ok(Stmt::For {
+                    var,
+                    iter,
+                    span: start.to(body.span),
+                    body,
+                })
+            }
             Tok::Kw(
-                kw @ (Kw::For
-                | Kw::Match
-                | Kw::Defer
-                | Kw::Errdefer
-                | Kw::Throw
-                | Kw::Scope
-                | Kw::Comptime),
+                kw @ (Kw::Match | Kw::Defer | Kw::Errdefer | Kw::Throw | Kw::Scope | Kw::Comptime),
             ) => self.error(
                 self.span(),
                 format!("`{}` is not supported by the compiler yet", kw.as_str()),
@@ -621,6 +648,16 @@ impl Parser {
                     kind: ExprKind::Field(Box::new(e), field),
                     span,
                 };
+            } else if self.eat_p(P::LBracket) {
+                self.skip_newlines();
+                let index = self.expr()?;
+                self.skip_newlines();
+                self.expect_p(P::RBracket)?;
+                let span = e.span.to(self.prev_span());
+                e = Expr {
+                    kind: ExprKind::Index(Box::new(e), Box::new(index)),
+                    span,
+                };
             } else {
                 return Ok(e);
             }
@@ -647,6 +684,7 @@ impl Parser {
                     span: span.to(self.prev_span()),
                 });
             }
+            Tok::P(P::LBracket) => return self.array_literal(),
             Tok::Kw(kw @ (Kw::Try | Kw::None)) => {
                 return self.error(
                     span,
@@ -657,6 +695,47 @@ impl Parser {
         };
         self.bump();
         Ok(Expr { kind, span })
+    }
+
+    /// `[a, b, c]` or `[value; count]`.
+    fn array_literal(&mut self) -> PResult<Expr> {
+        let start = self.bump().span; // [
+        let mut elems = Vec::new();
+        loop {
+            self.skip_newlines_only();
+            if self.eat_p(P::RBracket) {
+                break;
+            }
+            elems.push(self.expr()?);
+            if elems.len() == 1 && self.eat_p(P::Semi) {
+                self.skip_newlines_only();
+                let count = self.expr()?;
+                self.skip_newlines_only();
+                self.expect_p(P::RBracket)?;
+                let value = elems.pop().expect("one element");
+                return Ok(Expr {
+                    kind: ExprKind::ArrayRepeat(Box::new(value), Box::new(count)),
+                    span: start.to(self.prev_span()),
+                });
+            }
+            self.skip_newlines_only();
+            if !self.eat_p(P::Comma) {
+                self.skip_newlines_only();
+                self.expect_p(P::RBracket)?;
+                break;
+            }
+        }
+        Ok(Expr {
+            kind: ExprKind::ArrayLit(elems),
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// Skip newlines but not `;` (which separates a repeat literal's parts).
+    fn skip_newlines_only(&mut self) {
+        while *self.peek() == Tok::Newline {
+            self.bump();
+        }
     }
 }
 
@@ -718,6 +797,55 @@ mod tests {
             panic!()
         };
         assert!(matches!(prod.kind, ExprKind::Binary(BinOp::Mul, ..)));
+    }
+
+    #[test]
+    fn arrays_slices_and_for() {
+        let file = parse_ok(
+            "fn f(xs: []u8, m: [][4]u8) {\n\tvar a: [N][2]u8 = [[1, 2], [3,\n\t\t4]]\n\tlet z = [0; 16]\n\ta[i][0] = xs[1]\n\tfor i in 0..xs.len {\n\t}\n\tfor x in xs {\n\t}\n}\n",
+        );
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
+        assert!(matches!(f.params[0].ty, TypeExpr::Slice(..)));
+        let TypeExpr::Slice(row, _) = &f.params[1].ty else {
+            panic!()
+        };
+        assert!(matches!(**row, TypeExpr::Array(..)));
+        let Stmt::Let {
+            ty: Some(TypeExpr::Array(_, inner, _)),
+            init: Some(init),
+            ..
+        } = &f.body.stmts[0]
+        else {
+            panic!("{:?}", f.body.stmts[0])
+        };
+        assert!(matches!(**inner, TypeExpr::Array(..)));
+        assert!(matches!(&init.kind, ExprKind::ArrayLit(rows) if rows.len() == 2));
+        let Stmt::Let { init: Some(z), .. } = &f.body.stmts[1] else {
+            panic!()
+        };
+        assert!(matches!(z.kind, ExprKind::ArrayRepeat(..)));
+        let Stmt::Assign { target, .. } = &f.body.stmts[2] else {
+            panic!()
+        };
+        assert!(
+            matches!(&target.kind, ExprKind::Index(base, _) if matches!(base.kind, ExprKind::Index(..)))
+        );
+        assert!(matches!(
+            &f.body.stmts[3],
+            Stmt::For {
+                iter: ForIter::Range(..),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &f.body.stmts[4],
+            Stmt::For {
+                iter: ForIter::Each(..),
+                ..
+            }
+        ));
     }
 
     #[test]

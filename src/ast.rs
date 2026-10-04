@@ -78,13 +78,20 @@ pub enum TypeExpr {
     Unit(Span),
     /// A raw pointer `*T`.
     Ptr(Box<TypeExpr>, Span),
+    /// A fixed-size array `[N]T`; `N` must be a constant.
+    Array(Box<Expr>, Box<TypeExpr>, Span),
+    /// A slice `[]T`.
+    Slice(Box<TypeExpr>, Span),
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
-            TypeExpr::Unit(span) | TypeExpr::Ptr(_, span) => *span,
+            TypeExpr::Unit(span)
+            | TypeExpr::Ptr(_, span)
+            | TypeExpr::Array(_, _, span)
+            | TypeExpr::Slice(_, span) => *span,
         }
     }
 }
@@ -127,10 +134,26 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// `for var in iter { ... }`
+    For {
+        var: Ident,
+        iter: ForIter,
+        body: Block,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     /// `unsafe { ... }`
     Unsafe(Block),
+}
+
+/// What a `for` loop goes over.
+#[derive(Debug)]
+pub enum ForIter {
+    /// `a..b`: the integers from `a` up to, but not including, `b`.
+    Range(Expr, Expr),
+    /// The elements of an array or slice.
+    Each(Expr),
 }
 
 #[derive(Debug)]
@@ -165,6 +188,12 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Expr>),
     Field(Box<Expr>, Ident),
     Paren(Box<Expr>),
+    /// `[a, b, c]`
+    ArrayLit(Vec<Expr>),
+    /// `[value; count]`; the count must be a constant.
+    ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// `base[index]`
+    Index(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

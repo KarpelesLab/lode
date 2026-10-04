@@ -1,6 +1,8 @@
 //! Lode types and integer value ranges.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
 
 /// A fixed-width integer type. `size` marks `usize`/`isize`, which are distinct
 /// types from the same-width `u64`/`i64` even though they share a layout.
@@ -67,6 +69,11 @@ pub enum Ty {
     Str,
     /// A raw pointer `*T` to an integer type. Only usable in `unsafe` code.
     Ptr(IntTy),
+    /// A fixed-size array `[N]T`: a [`Compound::Array`] in the interner.
+    Array(CompoundId),
+    /// A slice `[]T`, a read-only view like `str`: a [`Compound::Slice`] in
+    /// the interner.
+    Slice(CompoundId),
 }
 
 impl Ty {
@@ -76,6 +83,93 @@ impl Ty {
             _ => None,
         }
     }
+
+    /// The array type `[len]elem`.
+    pub fn array(elem: Ty, len: u64) -> Ty {
+        Ty::Array(intern(Compound::Array { elem, len }))
+    }
+
+    /// The slice type `[]elem`.
+    pub fn slice(elem: Ty) -> Ty {
+        Ty::Slice(intern(Compound::Slice { elem }))
+    }
+
+    /// The element type and length of an array type.
+    pub fn as_array(self) -> Option<(Ty, u64)> {
+        match self {
+            Ty::Array(id) => match compound(id) {
+                Compound::Array { elem, len } => Some((elem, len)),
+                Compound::Slice { .. } => unreachable!("an array id names a slice"),
+            },
+            _ => None,
+        }
+    }
+
+    /// The element type of a slice type.
+    pub fn as_slice(self) -> Option<Ty> {
+        match self {
+            Ty::Slice(id) => match compound(id) {
+                Compound::Slice { elem } => Some(elem),
+                Compound::Array { .. } => unreachable!("a slice id names an array"),
+            },
+            _ => None,
+        }
+    }
+
+    /// The element type of an array or slice.
+    pub fn elem(self) -> Option<Ty> {
+        self.as_array().map(|(elem, _)| elem).or(self.as_slice())
+    }
+
+    /// Whether values of this type are views, a pointer and a length (`str`
+    /// and slices).
+    pub fn is_view(self) -> bool {
+        matches!(self, Ty::Str | Ty::Slice(_))
+    }
+}
+
+/// The index of a compound type in the global type interner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CompoundId(u32);
+
+/// A type made of other types. Compound types are interned (hash-consed) so
+/// that [`Ty`] stays small and `Copy`: equal compound types always get the
+/// same [`CompoundId`], so comparing ids compares the types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Compound {
+    Array { elem: Ty, len: u64 },
+    Slice { elem: Ty },
+}
+
+/// The interner's tables. Entries are only ever appended, so an id stays
+/// valid for the life of the process.
+#[derive(Default)]
+struct Interner {
+    entries: Vec<Compound>,
+    ids: HashMap<Compound, CompoundId>,
+}
+
+fn interner() -> &'static Mutex<Interner> {
+    static INTERNER: OnceLock<Mutex<Interner>> = OnceLock::new();
+    INTERNER.get_or_init(Mutex::default)
+}
+
+/// The id of a compound type, adding it to the interner if it's new.
+pub fn intern(c: Compound) -> CompoundId {
+    let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&id) = tables.ids.get(&c) {
+        return id;
+    }
+    let id = CompoundId(u32::try_from(tables.entries.len()).expect("too many types"));
+    tables.entries.push(c);
+    tables.ids.insert(c, id);
+    id
+}
+
+/// The compound type an id stands for.
+pub fn compound(id: CompoundId) -> Compound {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    tables.entries[id.0 as usize]
 }
 
 impl fmt::Display for Ty {
@@ -86,6 +180,10 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
+            Ty::Array(id) | Ty::Slice(id) => match compound(*id) {
+                Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
+                Compound::Slice { elem } => write!(f, "[]{elem}"),
+            },
         }
     }
 }
@@ -235,5 +333,24 @@ mod tests {
         assert_eq!(a.checked_mul(b), Some(Range { lo: -20, hi: 30 }));
         let big = IntTy::new(false, 64).range();
         assert!(big.checked_mul(big).is_none());
+    }
+
+    #[test]
+    fn interned_types_are_shared_and_display() {
+        let u8_ = Ty::Int(IntTy::new(false, 8));
+        let a = Ty::array(u8_, 4);
+        assert_eq!(a, Ty::array(u8_, 4));
+        assert_ne!(a, Ty::array(u8_, 5));
+        assert_ne!(Ty::slice(u8_), Ty::slice(Ty::Bool));
+        let nested = Ty::array(a, 3);
+        assert_eq!(nested.as_array(), Some((a, 3)));
+        assert_eq!(nested.to_string(), "[3][4]u8");
+        assert_eq!(Ty::slice(a).to_string(), "[][4]u8");
+        assert_eq!(Ty::slice(a).as_slice(), Some(a));
+        assert_eq!(Ty::slice(a).elem(), Some(a));
+        assert!(Ty::slice(u8_).is_view() && Ty::Str.is_view() && !a.is_view());
+        let id = intern(Compound::Slice { elem: u8_ });
+        assert_eq!(Ty::Slice(id), Ty::slice(u8_));
+        assert_eq!(compound(id), Compound::Slice { elem: u8_ });
     }
 }

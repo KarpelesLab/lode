@@ -16,7 +16,7 @@ use crate::load::Package;
 use crate::source::{FileId, Span};
 use crate::types::{Primitive, Range, Ty, primitive};
 
-use facts::Env;
+use facts::{Env, Term};
 pub use tree::*;
 
 /// Check every loaded package (dependencies first, the root package last).
@@ -165,12 +165,24 @@ impl FnCx {
     }
 }
 
+/// The hidden local holding the sequence of a `for x in xs` loop. Hidden names
+/// start with `$`, so they can't clash with (or be used by) the program.
+const SEQ: &str = "$seq";
+
+/// The hidden index of a `for x in xs` loop.
+const INDEX: &str = "$i";
+
 /// Names assigned anywhere in `stmts` (for forgetting facts at loop heads).
 fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign { target, .. } => {
-                if let ExprKind::Name(n) = &target.kind {
+                // `a[i] = v` assigns (part of) `a`.
+                let mut root = target;
+                while let ExprKind::Index(base, _) = &root.kind {
+                    root = base;
+                }
+                if let ExprKind::Name(n) = &root.kind {
                     out.insert(n.clone());
                 }
             }
@@ -188,7 +200,10 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
                     };
                 }
             }
-            Stmt::While { body, .. } | Stmt::Loop { body, .. } | Stmt::Unsafe(body) => {
+            Stmt::While { body, .. }
+            | Stmt::Loop { body, .. }
+            | Stmt::For { body, .. }
+            | Stmt::Unsafe(body) => {
                 assigned_names(&body.stmts, out);
             }
             _ => {}
@@ -210,8 +225,10 @@ impl<'a> Checker<'a> {
         self.diags.push(Diagnostic::error(span, msg));
     }
 
-    /// Build the package and item tables and every file's imports.
+    /// Build the package and item tables, every file's imports, and every
+    /// function's signature.
     fn collect(&mut self, packages: &'a [Package]) {
+        let mut fns = Vec::new();
         for (pkg, package) in packages.iter().enumerate() {
             self.pkgs.push(PkgInfo {
                 path: package.path.clone(),
@@ -240,9 +257,8 @@ impl<'a> Checker<'a> {
                 for item in &file.items {
                     let (name, entry) = match item {
                         ast::Item::Fn(f) => {
-                            let sig = self.signature(f);
-                            self.sigs.push(sig);
-                            (&f.name, Item::Func(self.sigs.len() - 1))
+                            fns.push((f, pkg, file.id));
+                            (&f.name, Item::Func(fns.len() - 1))
                         }
                         ast::Item::Const(c) => {
                             self.consts.push(ConstInfo {
@@ -264,12 +280,32 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // Signatures come once every item is known: an array length in a
+        // parameter's type can name a constant declared further down.
+        for (f, pkg, file) in fns {
+            let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+            let sig = self.signature(&mut cx, f);
+            self.sigs.push(sig);
+        }
     }
 
-    fn resolve_type(&mut self, t: &TypeExpr) -> Option<Ty> {
+    /// The Lode type a type expression names. `cx` is where it appears: array
+    /// lengths are constant expressions evaluated there.
+    fn resolve_type(&mut self, cx: &mut FnCx, t: &TypeExpr) -> Option<Ty> {
         match t {
             TypeExpr::Unit(_) => Some(Ty::Unit),
-            TypeExpr::Ptr(inner, span) => match self.resolve_type(inner)? {
+            TypeExpr::Array(len, elem, _) => {
+                let elem_ty = self.resolve_type(cx, elem)?;
+                let len = self.const_count(cx, len)?;
+                self.check_elem(elem_ty, "arrays", elem.span())?;
+                Some(Ty::array(elem_ty, len))
+            }
+            TypeExpr::Slice(elem, _) => {
+                let elem_ty = self.resolve_type(cx, elem)?;
+                self.check_elem(elem_ty, "slices", elem.span())?;
+                Some(Ty::slice(elem_ty))
+            }
+            TypeExpr::Ptr(inner, span) => match self.resolve_type(cx, inner)? {
                 Ty::Int(it) => Some(Ty::Ptr(it)),
                 other => {
                     self.error(
@@ -299,7 +335,46 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn signature(&mut self, f: &ast::FnDecl) -> Sig {
+    /// Whether `elem` can be the element type of an array or slice (`what`).
+    fn check_elem(&mut self, elem: Ty, what: &str, span: Span) -> Option<()> {
+        match elem {
+            Ty::Int(_) | Ty::Bool | Ty::Array(_) => Some(()),
+            other => {
+                self.error(
+                    span,
+                    format!("{what} of `{other}` are not supported by the compiler yet"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The value of a constant count, like an array length: an untyped
+    /// integer, or a typed integer constant.
+    pub(super) fn const_count(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<u64> {
+        let v = match self.untyped_int(cx, e) {
+            Some(v) => v,
+            None => {
+                let c = self.expr(cx, e, None)?;
+                match (&c.expr.kind, c.ty()) {
+                    (TExprKind::Int(v), Ty::Int(_)) => *v,
+                    _ => {
+                        self.error(e.span, "an array length must be a constant integer");
+                        return None;
+                    }
+                }
+            }
+        };
+        match u64::try_from(v) {
+            Ok(n) if n <= i64::MAX as u64 => Some(n),
+            _ => {
+                self.error(e.span, format!("`{v}` is not a valid array length"));
+                None
+            }
+        }
+    }
+
+    fn signature(&mut self, cx: &mut FnCx, f: &ast::FnDecl) -> Sig {
         let mut params = Vec::new();
         for p in &f.params {
             if p.convention != Convention::Let {
@@ -308,16 +383,33 @@ impl<'a> Checker<'a> {
                     "`inout`, `sink` and `set` parameters are not supported by the compiler yet",
                 );
             }
-            params.push(self.resolve_type(&p.ty).unwrap_or(Ty::Unit));
+            let ty = self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit);
+            if let Some((elem, _)) = ty.as_array() {
+                // The type is kept, so the body is still checked.
+                self.diags.push(
+                    Diagnostic::error(
+                        p.ty.span(),
+                        "passing an array by value is not supported by the compiler yet",
+                    )
+                    .with_help(format!("take a slice instead: `{}: []{elem}`", p.name.name)),
+                );
+            }
+            params.push(ty);
         }
         let ret = match &f.ret {
-            Some(t) => match self.resolve_type(t) {
-                Some(Ty::Str) => {
+            Some(t) => match self.resolve_type(cx, t) {
+                Some(ty @ (Ty::Str | Ty::Slice(_) | Ty::Array(_))) => {
+                    let what = match ty {
+                        Ty::Str => "a `str`",
+                        Ty::Slice(_) => "a slice",
+                        _ => "an array",
+                    };
                     self.error(
                         t.span(),
-                        "returning a `str` is not supported by the compiler yet",
+                        format!("returning {what} is not supported by the compiler yet"),
                     );
-                    Ty::Unit
+                    // The type is kept, so the body is still checked.
+                    ty
                 }
                 Some(ty) => ty,
                 None => Ty::Unit,
@@ -401,7 +493,7 @@ impl<'a> Checker<'a> {
                 }
             },
             Some(t) => {
-                let ty = self.resolve_type(t);
+                let ty = self.resolve_type(&mut cx, t);
                 match ty {
                     Some(ty @ Ty::Int(_)) => self
                         .expr(&mut cx, &decl.value, Some(ty))
@@ -504,22 +596,46 @@ impl<'a> Checker<'a> {
     /// A local was given a new value: record what's known about it.
     fn record_value(cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
         cx.env.assign(local, value.range);
+        // a == b + k
+        let equal = |a: Term, b: Term, k: i128| {
+            [
+                facts::Fact::Rel { a, b, c: k },
+                facts::Fact::Rel { a: b, b: a, c: -k },
+            ]
+        };
         if let Some(src) = value.term
-            && src != local
+            && src.term != Term::Local(local)
         {
-            // A copy of another local: equal to it.
-            cx.env.apply(&[
-                facts::Fact::Rel {
-                    a: local,
-                    b: src,
-                    c: 0,
-                },
-                facts::Fact::Rel {
-                    a: src,
-                    b: local,
-                    c: 0,
-                },
-            ]);
+            // Another term (a local or a length) plus a constant: related to
+            // it, as in `let i = xs.len - 1`.
+            cx.env
+                .apply(&equal(Term::Local(local), src.term, src.offset));
+        }
+        if cx.locals[local].ty.is_view() {
+            match &value.expr.kind {
+                // A copy of another view has its length.
+                TExprKind::Local(src) if *src != local => {
+                    cx.env.apply(&equal(Term::Len(local), Term::Len(*src), 0));
+                    if let Some(r) = cx.env.range(Term::Len(*src)) {
+                        cx.env.apply(&[facts::Fact::Narrow {
+                            term: Term::Len(local),
+                            bound: r,
+                            full: r,
+                        }]);
+                    }
+                }
+                // A view of a whole array has the array's length.
+                TExprKind::ToSlice(array) => {
+                    let (_, n) = array.ty.as_array().expect("an array");
+                    let n = i128::from(n);
+                    cx.env.apply(&[facts::Fact::Narrow {
+                        term: Term::Len(local),
+                        bound: Range::exact(n),
+                        full: Range { lo: n, hi: n },
+                    }]);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -533,7 +649,7 @@ impl<'a> Checker<'a> {
                 span,
             } => {
                 let annotated = match ty {
-                    Some(t) => Some(self.resolve_type(t)?),
+                    Some(t) => Some(self.resolve_type(cx, t)?),
                     None => None,
                 };
                 let Some(init) = init else {
@@ -578,8 +694,14 @@ impl<'a> Checker<'a> {
                 value,
                 span,
             } => {
+                if let ExprKind::Index(..) = target.kind {
+                    return self.element_assign(cx, target, *op, value, *span);
+                }
                 let ExprKind::Name(name) = &target.kind else {
-                    self.error(target.span, "only variables can be assigned to");
+                    self.error(
+                        target.span,
+                        "only variables and their elements can be assigned to",
+                    );
                     return None;
                 };
                 let Some(local) = cx.lookup(name) else {
@@ -669,6 +791,14 @@ impl<'a> Checker<'a> {
                 cx.env = entry;
                 Some(TStmt::Loop(body))
             }
+            Stmt::For {
+                var, iter, body, ..
+            } => {
+                cx.scopes.push(HashMap::new());
+                let out = self.for_stmt(cx, var, iter, body);
+                cx.scopes.pop();
+                out
+            }
             Stmt::Break(span) | Stmt::Continue(span) => {
                 if cx.loop_depth == 0 {
                     self.error(
@@ -701,6 +831,283 @@ impl<'a> Checker<'a> {
             if let Some(local) = cx.lookup(&name) {
                 cx.env.forget(local);
             }
+        }
+    }
+
+    /// A `for` loop, in a scope of its own (for the loop variable and the
+    /// hidden locals of `for x in xs`).
+    ///
+    /// `for i in a..b` evaluates `a` and `b` once. In the body, `i` is
+    /// immutable and `a <= i < b`: its range is `a.lo..=b.hi - 1`, and when
+    /// `a` or `b` is a term the body doesn't assign, `i` is related to it.
+    ///
+    /// `for x in xs` is an index loop over `0..xs.len` with a hidden index
+    /// `$i` and `let x = xs[$i]` at the top of the body. `xs` is evaluated
+    /// once: unless it's a local the body doesn't assign, it's copied to a
+    /// hidden local `$seq` first.
+    fn for_stmt(
+        &mut self,
+        cx: &mut FnCx,
+        var: &ast::Ident,
+        iter: &ast::ForIter,
+        body: &ast::Block,
+    ) -> Option<TStmt> {
+        let mut assigned = HashSet::new();
+        assigned_names(&body.stmts, &mut assigned);
+        let usize_ty = self.usize_ty();
+        let mut before = Vec::new();
+        // The range, and for `for x in xs`, the name of the sequence.
+        let (start, end, each) = match iter {
+            ast::ForIter::Range(a, b) => {
+                // Ranges are mostly for indexing: two untyped bounds are `usize`.
+                let untyped =
+                    self.untyped_int(cx, a).is_some() && self.untyped_int(cx, b).is_some();
+                let (start, end) = self.operands(cx, a, b, untyped.then_some(usize_ty))?;
+                if start.ty().as_int().is_none() {
+                    self.error(
+                        a.span.to(b.span),
+                        format!("a range needs integers, found `{}`", start.ty()),
+                    );
+                    return None;
+                }
+                (start, end, None)
+            }
+            ast::ForIter::Each(xs) => {
+                let seq = self.expr(cx, xs, None)?;
+                let (elem, len) = match (seq.ty().as_array(), seq.ty().as_slice()) {
+                    (Some((elem, n)), _) => (elem, Some(n)),
+                    (_, Some(elem)) => (elem, None),
+                    _ => {
+                        self.error(
+                            xs.span,
+                            format!(
+                                "`for` goes over a range `a..b`, an array or a slice; found `{}`",
+                                seq.ty()
+                            ),
+                        );
+                        return None;
+                    }
+                };
+                let seq_name = match (&xs.kind, &seq.expr.kind) {
+                    (ExprKind::Name(name), TExprKind::Local(_)) if !assigned.contains(name) => {
+                        name.clone()
+                    }
+                    _ => {
+                        let hidden = self.declare(cx, SEQ, seq.ty(), false);
+                        Self::record_value(cx, hidden, &seq);
+                        before.push(TStmt::Init(hidden, seq.expr));
+                        SEQ.to_owned()
+                    }
+                };
+                let local = cx.lookup(&seq_name).expect("declared");
+                let end = match len {
+                    Some(n) => {
+                        let n = i128::from(n);
+                        expr::Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)))
+                    }
+                    None => self.view_len(
+                        cx,
+                        TExpr {
+                            kind: TExprKind::Local(local),
+                            ty: cx.locals[local].ty,
+                        },
+                    ),
+                };
+                let start = expr::Checked::new(TExprKind::Int(0), usize_ty, Some(Range::exact(0)));
+                (start, end, Some((seq_name, elem)))
+            }
+        };
+
+        self.forget_assigned(cx, &body.stmts);
+        let entry = cx.env.clone();
+
+        // What the body knows about the loop variable.
+        let ty = start.ty();
+        let index = match &each {
+            Some(_) => self.declare(cx, INDEX, ty, false),
+            None => self.declare(cx, &var.name, ty, false),
+        };
+        let (lo, hi) = (start.int_range().lo, end.int_range().hi - 1);
+        // An empty range: the body never runs, and any range will do.
+        cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
+        // A bound that's a term the body doesn't assign keeps its value for
+        // the whole loop, so the index can be related to it.
+        let unassigned = |cx: &FnCx, t: Term| {
+            let (Term::Local(l) | Term::Len(l)) = t;
+            !assigned.contains(&cx.locals[l].name)
+        };
+        let mut loop_facts = Vec::new();
+        if let Some(e) = end.term
+            && unassigned(cx, e.term)
+        {
+            // i < e + k: i - e <= k - 1
+            loop_facts.push(facts::Fact::Rel {
+                a: Term::Local(index),
+                b: e.term,
+                c: e.offset - 1,
+            });
+        }
+        if let Some(s) = start.term
+            && unassigned(cx, s.term)
+        {
+            // s + k <= i: s - i <= -k
+            loop_facts.push(facts::Fact::Rel {
+                a: s.term,
+                b: Term::Local(index),
+                c: -s.offset,
+            });
+        }
+        cx.env.apply(&loop_facts);
+
+        cx.loop_depth += 1;
+        let mut stmts = Vec::new();
+        if let Some((seq_name, elem)) = &each {
+            // let x = seq[$i]
+            let element = ast::Expr {
+                kind: ExprKind::Index(
+                    Box::new(ast::Expr {
+                        kind: ExprKind::Name(seq_name.clone()),
+                        span: var.span,
+                    }),
+                    Box::new(ast::Expr {
+                        kind: ExprKind::Name(INDEX.to_owned()),
+                        span: var.span,
+                    }),
+                ),
+                span: var.span,
+            };
+            let value = if end.range == Some(Range::exact(0)) {
+                // An empty array: the body never runs, so the element read
+                // needs no proof (there's no index that could be proven).
+                let seq = cx.lookup(seq_name).expect("declared");
+                let index = cx.lookup(INDEX).expect("declared");
+                let local = |l: LocalId, ty: Ty| TExpr {
+                    kind: TExprKind::Local(l),
+                    ty,
+                };
+                let kind = TExprKind::Index(
+                    Box::new(local(seq, cx.locals[seq].ty)),
+                    Box::new(local(index, usize_ty)),
+                );
+                Some(expr::Checked::new(kind, *elem, None))
+            } else {
+                self.expr(cx, &element, Some(*elem))
+            };
+            let x = self.declare(cx, &var.name, *elem, false);
+            if let Some(value) = value {
+                Self::record_value(cx, x, &value);
+                stmts.push(TStmt::Init(x, value.expr));
+            }
+        }
+        stmts.extend(self.block(cx, &body.stmts));
+        cx.loop_depth -= 1;
+        cx.env = entry;
+
+        let for_loop = TStmt::For {
+            var: index,
+            start: start.expr,
+            end: end.expr,
+            body: stmts,
+        };
+        if before.is_empty() {
+            Some(for_loop)
+        } else {
+            before.push(for_loop);
+            Some(TStmt::Block(before))
+        }
+    }
+
+    /// `a[i] = v`, `a[i][j] op= v`: assign to an element of a `var` array.
+    fn element_assign(
+        &mut self,
+        cx: &mut FnCx,
+        target: &ast::Expr,
+        op: Option<ast::BinOp>,
+        value: &ast::Expr,
+        span: Span,
+    ) -> Option<TStmt> {
+        let mut root = target;
+        while let ExprKind::Index(base, _) = &root.kind {
+            root = base;
+        }
+        let ExprKind::Name(name) = &root.kind else {
+            self.error(
+                root.span,
+                "only variables and their elements can be assigned to",
+            );
+            return None;
+        };
+        let Some(local) = cx.lookup(name) else {
+            self.error(root.span, format!("cannot find `{name}` in this scope"));
+            return None;
+        };
+        let root_ty = cx.locals[local].ty;
+        if root_ty.is_view() {
+            self.diags.push(
+                Diagnostic::error(
+                    target.span,
+                    format!("cannot assign through `{name}`, which is a `{root_ty}`"),
+                )
+                .with_help("slices are read-only views for now"),
+            );
+            return None;
+        }
+        if root_ty.as_array().is_some() && !cx.locals[local].mutable {
+            self.diags.push(
+                Diagnostic::error(
+                    target.span,
+                    format!("cannot assign to an element of `{name}`, which is immutable"),
+                )
+                .with_help(format!("declare it with `var {name}` to make it mutable")),
+            );
+            return None;
+        }
+
+        // For `op=`, the target is read and then written: an index that
+        // isn't a variable or a constant is evaluated once, into a hidden
+        // local.
+        let mut before = Vec::new();
+        let mut target = target.clone();
+        if op.is_some() {
+            let usize_ty = self.usize_ty();
+            let mut place = &mut target;
+            while let ExprKind::Index(base, index) = &mut place.kind {
+                let simple = matches!(index.kind, ExprKind::Name(_))
+                    || self.untyped_int(cx, index).is_some();
+                if !simple {
+                    let checked = self.expr(cx, index, Some(usize_ty))?;
+                    let name = format!("$index{}", before.len());
+                    let hidden = self.declare(cx, &name, checked.ty(), false);
+                    Self::record_value(cx, hidden, &checked);
+                    before.push(TStmt::Init(hidden, checked.expr));
+                    **index = ast::Expr {
+                        kind: ExprKind::Name(name),
+                        span: index.span,
+                    };
+                }
+                place = base;
+            }
+        }
+
+        let place = self.expr(cx, &target, None)?;
+        let ty = place.ty();
+        let checked = match op {
+            None => self.expr(cx, value, Some(ty))?,
+            Some(op) => {
+                let combined = ast::Expr {
+                    kind: ExprKind::Binary(op, Box::new(target), Box::new(value.clone())),
+                    span,
+                };
+                self.expr(cx, &combined, Some(ty))?
+            }
+        };
+        let checked = self.coerce(checked, ty, value.span)?;
+        let store = TStmt::Store(place.expr, checked.expr);
+        if before.is_empty() {
+            Some(store)
+        } else {
+            before.push(store);
+            Some(TStmt::Block(before))
         }
     }
 

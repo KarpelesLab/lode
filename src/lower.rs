@@ -5,9 +5,16 @@
 //! this pass has been proven safe by the checker, so proven arithmetic carries
 //! `nsw`/`nuw` flags and nothing here emits a run-time check.
 //!
-//! A `str` is two IR values, its pointer and its length: it's passed as two
-//! parameters and stored in two slots. String literals become read-only data
-//! symbols ([`Lowered::strings`]) that the object writer emits.
+//! A view (a `str` or a slice) is two IR values, its pointer and its length:
+//! it's passed as two parameters and stored in two slots. String literals
+//! become read-only data symbols ([`Lowered::strings`]) that the object
+//! writer emits.
+//!
+//! Arrays live in memory. An array-typed expression lowers to a pointer to
+//! its storage ([`Val::Mem`]): a local's slot, an element of another array,
+//! or a temporary slot that a literal is written into. Copying an array
+//! copies its elements, one by one or in a loop for longer arrays. Array
+//! slots and temporaries are `alloca`s, which LF gives static frame slots.
 
 use latticefoundry::Module;
 use latticefoundry::ir::builder::FunctionBuilder;
@@ -55,7 +62,8 @@ impl Types {
             Ty::Bool => self.bool,
             Ty::Int(t) => self.int(t),
             Ty::Ptr(_) => self.ptr,
-            Ty::Str => unreachable!("a str is two values"),
+            Ty::Str | Ty::Slice(_) => unreachable!("a view is two values"),
+            Ty::Array(_) => unreachable!("an array lives in memory"),
         }
     }
 
@@ -63,7 +71,7 @@ impl Types {
     fn parts(&self, ty: Ty) -> Vec<TypeId> {
         match ty {
             Ty::Unit => Vec::new(),
-            Ty::Str => vec![self.ptr, self.i64],
+            Ty::Str | Ty::Slice(_) => vec![self.ptr, self.i64],
             _ => vec![self.of(ty)],
         }
     }
@@ -83,8 +91,10 @@ impl Types {
 enum Val {
     Unit,
     One(ValueId),
-    /// A `str`: pointer and length.
-    Str(ValueId, ValueId),
+    /// A view (`str` or slice): pointer and length.
+    View(ValueId, ValueId),
+    /// An array: a pointer to its storage.
+    Mem(ValueId),
 }
 
 impl Val {
@@ -99,7 +109,8 @@ impl Val {
         match self {
             Val::Unit => Vec::new(),
             Val::One(v) => vec![v],
-            Val::Str(p, n) => vec![p, n],
+            Val::View(p, n) => vec![p, n],
+            Val::Mem(_) => unreachable!("arrays aren't passed by value"),
         }
     }
 }
@@ -112,10 +123,12 @@ enum Slot {
         ty: TypeId,
         align: u32,
     },
-    Str {
+    View {
         ptr: ValueId,
         len: ValueId,
     },
+    /// An array's storage.
+    Mem(ValueId),
 }
 
 /// Lower a checked program to an IR module named `name`. If the program has a
@@ -225,6 +238,18 @@ struct FnLower<'a> {
     terminated: bool,
 }
 
+/// The most scalar copies an array copy or fill is unrolled into; longer
+/// arrays are copied in a loop.
+const UNROLL_LIMIT: u64 = 16;
+
+/// The number of scalars in a value of type `ty`.
+fn scalars(ty: Ty) -> u64 {
+    match ty.as_array() {
+        Some((elem, n)) => n.saturating_mul(scalars(elem)),
+        None => 1,
+    }
+}
+
 fn align_of(ty: Ty) -> u32 {
     match ty {
         Ty::Int(t) => t.bits / 8,
@@ -245,10 +270,14 @@ impl FnLower<'_> {
         let entry = self.b.create_entry_block();
         for local in &f.locals {
             let slot = match local.ty {
-                Ty::Str => Slot::Str {
+                Ty::Str | Ty::Slice(_) => Slot::View {
                     ptr: self.b.alloca(self.t.ptr),
                     len: self.b.alloca(self.t.i64),
                 },
+                ty @ Ty::Array(_) => {
+                    let ir_ty = self.ir_ty(ty);
+                    Slot::Mem(self.b.alloca(ir_ty))
+                }
                 ty => {
                     let ir_ty = self.t.of(ty);
                     Slot::One {
@@ -263,8 +292,8 @@ impl FnLower<'_> {
         let mut next = 0;
         for &p in &f.params {
             let val = match f.locals[p].ty {
-                Ty::Str => {
-                    let v = Val::Str(self.b.param(entry, next), self.b.param(entry, next + 1));
+                Ty::Str | Ty::Slice(_) => {
+                    let v = Val::View(self.b.param(entry, next), self.b.param(entry, next + 1));
                     next += 2;
                     v
                 }
@@ -289,7 +318,7 @@ impl FnLower<'_> {
     fn store(&mut self, local: usize, val: Val) {
         match (self.slots[local], val) {
             (Slot::One { slot, ty, align }, Val::One(v)) => self.b.store(ty, slot, v, align),
-            (Slot::Str { ptr, len }, Val::Str(p, n)) => {
+            (Slot::View { ptr, len }, Val::View(p, n)) => {
                 self.b.store(self.t.ptr, ptr, p, 8);
                 self.b.store(self.t.i64, len, n, 8);
             }
@@ -300,11 +329,12 @@ impl FnLower<'_> {
     fn load(&mut self, local: usize) -> Val {
         match self.slots[local] {
             Slot::One { slot, ty, align } => Val::One(self.b.load(ty, slot, align)),
-            Slot::Str { ptr, len } => {
+            Slot::View { ptr, len } => {
                 let p = self.b.load(self.t.ptr, ptr, 8);
                 let n = self.b.load(self.t.i64, len, 8);
-                Val::Str(p, n)
+                Val::View(p, n)
             }
+            Slot::Mem(ptr) => Val::Mem(ptr),
         }
     }
 
@@ -326,9 +356,25 @@ impl FnLower<'_> {
 
     fn stmt(&mut self, s: &TStmt) {
         match s {
-            TStmt::Init(local, e) | TStmt::Assign(local, e) => {
-                let v = self.expr(e);
-                self.store(*local, v);
+            TStmt::Init(local, e) => match self.slots[*local] {
+                // A new local can't appear in its own initializer, so a
+                // literal is written straight into its storage.
+                Slot::Mem(dst) => self.fill(dst, e),
+                _ => {
+                    let v = self.expr(e);
+                    self.store(*local, v);
+                }
+            },
+            TStmt::Assign(local, e) => match self.slots[*local] {
+                Slot::Mem(dst) => self.assign_into(dst, e),
+                _ => {
+                    let v = self.expr(e);
+                    self.store(*local, v);
+                }
+            },
+            TStmt::Store(place, e) => {
+                let dst = self.address(place);
+                self.assign_into(dst, e);
             }
             TStmt::Expr(e) => {
                 self.expr(e);
@@ -369,6 +415,45 @@ impl FnLower<'_> {
                 let exit = self.b.create_block(&[]);
                 self.b.br(body_bb, &[]);
                 self.loop_body(body_bb, body_bb, exit, body);
+                self.start_block(exit);
+            }
+            TStmt::For {
+                var,
+                start,
+                end,
+                body,
+            } => {
+                let it = start.ty.as_int().expect("integer range");
+                let first = self.expr(start).one();
+                let end = self.expr(end).one();
+                self.store(*var, Val::One(first));
+                let header = self.b.create_block(&[]);
+                let body_bb = self.b.create_block(&[]);
+                let latch = self.b.create_block(&[]);
+                let exit = self.b.create_block(&[]);
+                self.b.br(header, &[]);
+                self.start_block(header);
+                let i = self.load(*var).one();
+                let pred = if it.signed {
+                    IntPred::Slt
+                } else {
+                    IntPred::Ult
+                };
+                let more = self.b.icmp(pred, i, end);
+                self.b.cond_br(more, body_bb, &[], exit, &[]);
+                self.loop_body(body_bb, latch, exit, body);
+                // The counter is below `end`, so adding one can't overflow.
+                self.start_block(latch);
+                let i = self.load(*var).one();
+                let one = self.b.const_i64(self.t.int(it), 1);
+                let flags = if it.signed {
+                    Flags::nsw()
+                } else {
+                    Flags::nuw()
+                };
+                let next = self.b.add(i, one, flags);
+                self.store(*var, Val::One(next));
+                self.b.br(header, &[]);
                 self.start_block(exit);
             }
             TStmt::Break | TStmt::Continue => {
@@ -420,7 +505,7 @@ impl FnLower<'_> {
                 let n = self
                     .b
                     .const_i64(self.t.i64, self.string_lens[*id].len() as i64);
-                return Val::Str(p, n);
+                return Val::View(p, n);
             }
             TExprKind::Local(local) => return self.load(*local),
             TExprKind::Call(f, args) => {
@@ -436,14 +521,35 @@ impl FnLower<'_> {
                 let ops: Vec<ValueId> = args.iter().map(|a| self.syscall_operand(a)).collect();
                 self.b.syscall(ops[0], &ops[1..])
             }
-            TExprKind::StrLen(s) => match self.expr(s) {
-                Val::Str(_, n) => n,
+            TExprKind::ViewLen(s) => match self.expr(s) {
+                Val::View(_, n) => n,
                 other => unreachable!("`len` of {other:?}"),
             },
             TExprKind::StrPtr(s) => match self.expr(s) {
-                Val::Str(p, _) => p,
+                Val::View(p, _) => p,
                 other => unreachable!("`ptr` of {other:?}"),
             },
+            TExprKind::ArrayLen(a) => {
+                self.expr(a);
+                let (_, n) = a.ty.as_array().expect("an array");
+                self.b.const_i64(self.t.i64, n as i64)
+            }
+            TExprKind::ArrayLit(_) | TExprKind::ArrayRepeat(..) => {
+                let ir_ty = self.ir_ty(e.ty);
+                let tmp = self.b.alloca(ir_ty);
+                self.fill(tmp, e);
+                return Val::Mem(tmp);
+            }
+            TExprKind::Index(..) => {
+                let addr = self.address(e);
+                return self.read(addr, e.ty);
+            }
+            TExprKind::ToSlice(a) => {
+                let p = self.place(a);
+                let (_, n) = a.ty.as_array().expect("an array");
+                let n = self.b.const_i64(self.t.i64, n as i64);
+                return Val::View(p, n);
+            }
             TExprKind::PtrAdd(p, n) => {
                 let base = self.expr(p).one();
                 let count = self.expr(n).one();
@@ -507,6 +613,156 @@ impl FnLower<'_> {
             }
         };
         Val::One(v)
+    }
+
+    /// The IR type of a value stored in memory: a scalar, or an array of them.
+    fn ir_ty(&mut self, ty: Ty) -> TypeId {
+        match ty.as_array() {
+            Some((elem, n)) => {
+                let elem = self.ir_ty(elem);
+                self.b.types_mut().array(elem, n)
+            }
+            None => self.t.of(ty),
+        }
+    }
+
+    /// The storage of an array-typed expression.
+    fn place(&mut self, e: &TExpr) -> ValueId {
+        match self.expr(e) {
+            Val::Mem(p) => p,
+            other => unreachable!("an array lowered to {other:?}"),
+        }
+    }
+
+    /// The address of the element an [`TExprKind::Index`] names.
+    fn address(&mut self, e: &TExpr) -> ValueId {
+        let TExprKind::Index(base, index) = &e.kind else {
+            unreachable!("not an element: {e:?}")
+        };
+        let base = match self.expr(base) {
+            Val::Mem(p) | Val::View(p, _) => p,
+            other => unreachable!("indexing {other:?}"),
+        };
+        let i = self.expr(index).one();
+        // The index is proven non-negative, so zero-extension is exact.
+        let from = IntTy {
+            signed: false,
+            ..index.ty.as_int().expect("integer index")
+        };
+        let i = self.resize(i, from, IntTy::new(false, 64));
+        let elem = self.ir_ty(e.ty);
+        self.b.array_elem(base, elem, i)
+    }
+
+    /// The value of type `ty` stored at `addr`.
+    fn read(&mut self, addr: ValueId, ty: Ty) -> Val {
+        if ty.as_array().is_some() {
+            return Val::Mem(addr);
+        }
+        let ir_ty = self.t.of(ty);
+        Val::One(self.b.load(ir_ty, addr, align_of(ty)))
+    }
+
+    /// Store `val`, of type `ty`, at `addr`.
+    fn write(&mut self, addr: ValueId, val: Val, ty: Ty) {
+        match val {
+            Val::Mem(src) => self.copy(addr, src, ty),
+            Val::One(v) => {
+                let ir_ty = self.t.of(ty);
+                self.b.store(ir_ty, addr, v, align_of(ty));
+            }
+            other => unreachable!("storing {other:?} in memory"),
+        }
+    }
+
+    /// The address of element `k` of the array of `elem` at `base`.
+    fn elem_at(&mut self, base: ValueId, elem: Ty, k: ValueId) -> ValueId {
+        let ir_ty = self.ir_ty(elem);
+        self.b.array_elem(base, ir_ty, k)
+    }
+
+    /// Run `body` for each `k` in `0..n` (an `i64`): unrolled when the array
+    /// is small, otherwise in a loop.
+    fn each_elem(&mut self, n: u64, elem: Ty, mut body: impl FnMut(&mut Self, ValueId)) {
+        if n.saturating_mul(scalars(elem)) <= UNROLL_LIMIT {
+            for k in 0..n {
+                let k = self.b.const_i64(self.t.i64, k as i64);
+                body(self, k);
+            }
+            return;
+        }
+        let header = self.b.create_block(&[self.t.i64]);
+        let body_bb = self.b.create_block(&[]);
+        let exit = self.b.create_block(&[]);
+        let zero = self.b.const_i64(self.t.i64, 0);
+        self.b.br(header, &[zero]);
+        self.start_block(header);
+        let k = self.b.param(header, 0);
+        let end = self.b.const_i64(self.t.i64, n as i64);
+        let more = self.b.icmp(IntPred::Ult, k, end);
+        self.b.cond_br(more, body_bb, &[], exit, &[]);
+        self.start_block(body_bb);
+        body(self, k);
+        let one = self.b.const_i64(self.t.i64, 1);
+        let next = self.b.add(k, one, Flags::nuw());
+        self.b.br(header, &[next]);
+        self.start_block(exit);
+    }
+
+    /// Copy the array of type `ty` at `src` to `dst`, element by element.
+    /// The two are the same array or don't overlap.
+    fn copy(&mut self, dst: ValueId, src: ValueId, ty: Ty) {
+        let (elem, n) = ty.as_array().expect("copying an array");
+        self.each_elem(n, elem, |this, k| {
+            let s = this.elem_at(src, elem, k);
+            let d = this.elem_at(dst, elem, k);
+            let v = this.read(s, elem);
+            this.write(d, v, elem);
+        });
+    }
+
+    /// Write the array value `e` into the (fresh) storage at `dst`. A literal
+    /// is written element by element.
+    fn fill(&mut self, dst: ValueId, e: &TExpr) {
+        let (elem, _) = e.ty.as_array().expect("filling an array");
+        match &e.kind {
+            TExprKind::ArrayLit(elems) => {
+                for (k, el) in elems.iter().enumerate() {
+                    let k = self.b.const_i64(self.t.i64, k as i64);
+                    let d = self.elem_at(dst, elem, k);
+                    if el.ty.as_array().is_some() {
+                        self.fill(d, el);
+                    } else {
+                        let v = self.expr(el);
+                        self.write(d, v, elem);
+                    }
+                }
+            }
+            TExprKind::ArrayRepeat(value, n) => {
+                let v = self.expr(value);
+                self.each_elem(*n, elem, |this, k| {
+                    let d = this.elem_at(dst, elem, k);
+                    this.write(d, v, elem);
+                });
+            }
+            _ => {
+                let src = self.place(e);
+                self.copy(dst, src, e.ty);
+            }
+        }
+    }
+
+    /// `dst = e`, for an existing value at `dst` of `e`'s type. A literal
+    /// may read `dst` (`a = [a[1], a[0]]`), so it's built in a temporary
+    /// first.
+    fn assign_into(&mut self, dst: ValueId, e: &TExpr) {
+        if e.ty.as_array().is_none() {
+            let v = self.expr(e);
+            self.write(dst, v, e.ty);
+            return;
+        }
+        let src = self.place(e);
+        self.copy(dst, src, e.ty);
     }
 
     /// Change an integer's width: sign- or zero-extend by the source's

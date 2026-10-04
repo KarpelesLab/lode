@@ -1,0 +1,58 @@
+// error: cannot assign through `xs`, which is a `[]u8`
+// error: cannot assign to an element of `a`, which is immutable
+// error: expected `[3]u8`, found an array of 2 element(s)
+// error: expected `[2]u8`, found an array of 3 element(s)
+// error: passing an array by value is not supported by the compiler yet
+// error: returning an array is not supported by the compiler yet
+// error: returning a slice is not supported by the compiler yet
+// error: arrays of `str` are not supported by the compiler yet
+// error: an array length must be a constant integer
+// error: cannot tell the element type of this array
+// error: `for` goes over a range `a..b`, an array or a slice; found `u32`
+// error: expected `[]u16`, found `[2]u8`
+// error: `u32` cannot be indexed
+package main
+
+fn write_through_slice(xs: []u8) {
+	xs[0] = 1
+}
+
+fn write_to_let() {
+	let a: [2]u8 = [1, 2]
+	a[0] = 3
+}
+
+fn wrong_lengths() {
+	let a: [3]u8 = [1, 2]
+	var b: [2]u8 = [0; 2]
+	b = [1, 2, 3]
+}
+
+fn by_value(a: [4]u8) -> u8 {
+	return a[0]
+}
+
+fn returns_array() -> [4]u8 {
+	return [0; 4]
+}
+
+fn returns_slice(xs: []u8) -> []u8 {
+	return xs
+}
+
+fn element_types(n: usize) {
+	let names: [2]str = ["a", "b"]
+	let a: [n]u8 = [0; 4]
+	let b = [1, 2, 3]
+}
+
+fn other(x: u32, wide: []u16) {
+	for i in x {
+	}
+	let bytes: [2]u8 = [1, 2]
+	other(x, bytes)
+	let y = x[0]
+}
+
+fn main() {
+}

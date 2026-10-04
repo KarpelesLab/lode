@@ -2,7 +2,8 @@
 //!
 //! Every operation in it is already known to be safe: the checker rejects
 //! arithmetic, division, shifts and conversions it can't prove, so lowering
-//! never needs a run-time check.
+//! never needs a run-time check. That includes indexing: every
+//! [`TExprKind::Index`] is proven to be in bounds.
 
 use crate::source::Span;
 use crate::types::Ty;
@@ -44,11 +45,23 @@ pub enum TStmt {
     /// Initialize a local.
     Init(LocalId, TExpr),
     Assign(LocalId, TExpr),
+    /// `place = value`, where `place` is an [`TExprKind::Index`] of a `var`
+    /// array (possibly nested).
+    Store(TExpr, TExpr),
     Expr(TExpr),
     Return(Option<TExpr>),
     If(TExpr, Vec<TStmt>, Vec<TStmt>),
     While(TExpr, Vec<TStmt>),
     Loop(Vec<TStmt>),
+    /// `for var in start..end`: `start` and `end` are evaluated once, then
+    /// the body runs with `var` set to each value from `start` up to, but not
+    /// including, `end`. `continue` moves on to the next value.
+    For {
+        var: LocalId,
+        start: TExpr,
+        end: TExpr,
+        body: Vec<TStmt>,
+    },
     Break,
     Continue,
     /// A nested block (an `unsafe` block).
@@ -77,8 +90,20 @@ pub enum TExprKind {
     Or(Box<TExpr>, Box<TExpr>),
     /// An integer conversion to `ty`, proven not to lose information.
     Convert(Box<TExpr>),
-    /// `s.len` of a `str`.
-    StrLen(Box<TExpr>),
+    /// `s.len` of a view (a `str` or a slice).
+    ViewLen(Box<TExpr>),
+    /// `a.len` of an array: the constant length of its type. The array is
+    /// still evaluated, for any calls in it.
+    ArrayLen(Box<TExpr>),
+    /// `[a, b, c]`, of type `[N]T`.
+    ArrayLit(Vec<TExpr>),
+    /// `[value; N]`; `value` is evaluated once.
+    ArrayRepeat(Box<TExpr>, u64),
+    /// `base[index]` of an array or slice, with the index proven to be in
+    /// bounds. An array-typed element is a place, like any array value.
+    Index(Box<TExpr>, Box<TExpr>),
+    /// An array viewed as a slice of all its elements.
+    ToSlice(Box<TExpr>),
     /// `s.ptr` of a `str` (unsafe).
     StrPtr(Box<TExpr>),
     /// `p + n`: a pointer moved forward by `n` elements (unsafe).

@@ -5,7 +5,7 @@ use crate::diag::Diagnostic;
 use crate::source::Span;
 use crate::types::{IntTy, Primitive, Range, Ty, primitive};
 
-use super::facts::{self, CondFacts, Side};
+use super::facts::{self, CondFacts, Linear, Side, Term};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
 
@@ -14,14 +14,15 @@ pub(super) struct Checked {
     pub(super) expr: TExpr,
     /// For integers, the range its value lies in (`None`: its type's range).
     pub(super) range: Option<Range>,
-    /// The local it reads, if it's (a lossless conversion of) a local.
-    pub(super) term: Option<LocalId>,
+    /// The term it reads, if it's (a lossless conversion of) an integer
+    /// local or a view's length.
+    pub(super) term: Option<Linear>,
     /// For conditions: the facts it gives when true and when false.
     pub(super) facts: Option<Box<CondFacts>>,
 }
 
 impl Checked {
-    fn new(kind: TExprKind, ty: Ty, range: Option<Range>) -> Checked {
+    pub(super) fn new(kind: TExprKind, ty: Ty, range: Option<Range>) -> Checked {
         Checked {
             expr: TExpr { kind, ty },
             range,
@@ -35,7 +36,7 @@ impl Checked {
     }
 
     /// The known range, or the full range of the type.
-    fn int_range(&self) -> Range {
+    pub(super) fn int_range(&self) -> Range {
         self.range
             .or_else(|| type_range(self.expr.ty))
             .unwrap_or(Range::exact(0))
@@ -127,6 +128,17 @@ impl Checker<'_> {
             out.term = term;
             return Some(out);
         }
+        // An array where a slice of its element type is expected: a view of
+        // the whole array.
+        if let (Some((from, _)), Some(to)) = (c.ty().as_array(), target.as_slice())
+            && from == to
+        {
+            return Some(Checked::new(
+                TExprKind::ToSlice(Box::new(c.expr)),
+                target,
+                None,
+            ));
+        }
         self.error(span, format!("expected `{target}`, found `{}`", c.ty()));
         None
     }
@@ -161,14 +173,237 @@ impl Checker<'_> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(cx, *op, lhs, rhs, e.span, expected),
             ExprKind::Call(callee, args) => self.call(cx, callee, args, e.span),
             ExprKind::Field(base, member) => self.field(cx, base, member, e.span),
+            ExprKind::ArrayLit(elems) => self.array_literal(cx, elems, e.span, expected),
+            ExprKind::ArrayRepeat(value, count) => {
+                self.array_repeat(cx, value, count, e.span, expected)
+            }
+            ExprKind::Index(base, index) => self.index(cx, base, index),
         }
+    }
+
+    /// The element type and length (`None` for a slice) that an array literal
+    /// is expected to have, from its context.
+    fn expected_array(expected: Option<Ty>) -> (Option<Ty>, Option<u64>) {
+        match expected {
+            Some(t) => match (t.as_array(), t.as_slice()) {
+                (Some((elem, n)), _) => (Some(elem), Some(n)),
+                (_, Some(elem)) => (Some(elem), None),
+                _ => (None, None),
+            },
+            None => (None, None),
+        }
+    }
+
+    /// Report an array literal whose length doesn't match the expected type.
+    fn check_literal_len(
+        &mut self,
+        found: u64,
+        want: Option<u64>,
+        expected: Option<Ty>,
+        span: Span,
+    ) -> Option<()> {
+        match (want, expected) {
+            (Some(n), Some(t)) if n != found => {
+                self.error(
+                    span,
+                    format!("expected `{t}`, found an array of {found} element(s)"),
+                );
+                None
+            }
+            _ => Some(()),
+        }
+    }
+
+    /// `[a, b, c]`. The element type comes from the context, or else from the
+    /// first element that has a type of its own.
+    fn array_literal(
+        &mut self,
+        cx: &mut FnCx,
+        elems: &[ast::Expr],
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        let (want_elem, want_len) = Self::expected_array(expected);
+        let n = elems.len() as u64;
+        let mut checked: Vec<Option<Checked>> = elems.iter().map(|_| None).collect();
+        let elem = match want_elem {
+            Some(t) => t,
+            None => {
+                let typed = elems.iter().position(|e| self.untyped_int(cx, e).is_none());
+                let Some(k) = typed else {
+                    self.diags.push(
+                        Diagnostic::error(span, "cannot tell the element type of this array")
+                            .with_help(format!(
+                                "give it a type from context, e.g. `let a: [{n}]u32 = ...`"
+                            )),
+                    );
+                    return None;
+                };
+                let first = self.expr(cx, &elems[k], None)?;
+                let ty = first.ty();
+                checked[k] = Some(first);
+                ty
+            }
+        };
+        self.check_elem(elem, "arrays", span)?;
+        self.check_literal_len(n, want_len, expected, span)?;
+        let mut ok = true;
+        let mut out = Vec::new();
+        for (e, done) in elems.iter().zip(checked) {
+            let c = match done {
+                Some(c) => Some(c),
+                None => self.expr(cx, e, Some(elem)),
+            };
+            match c.and_then(|c| self.coerce(c, elem, e.span)) {
+                Some(c) => out.push(c.expr),
+                None => ok = false,
+            }
+        }
+        ok.then(|| Checked::new(TExprKind::ArrayLit(out), Ty::array(elem, n), None))
+    }
+
+    /// `[value; count]`.
+    fn array_repeat(
+        &mut self,
+        cx: &mut FnCx,
+        value: &ast::Expr,
+        count: &ast::Expr,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
+        let (want_elem, want_len) = Self::expected_array(expected);
+        let n = self.const_count(cx, count);
+        let v = self.expr(cx, value, want_elem);
+        let (n, v) = (n?, v?);
+        let v = match want_elem {
+            Some(t) => self.coerce(v, t, value.span)?,
+            None => v,
+        };
+        let elem = v.ty();
+        self.check_elem(elem, "arrays", value.span)?;
+        self.check_literal_len(n, want_len, expected, span)?;
+        Some(Checked::new(
+            TExprKind::ArrayRepeat(Box::new(v.expr), n),
+            Ty::array(elem, n),
+            None,
+        ))
+    }
+
+    /// The length of a view (a slice or `str`): a term when the view is a
+    /// local, so conditions like `i < xs.len` relate to it.
+    pub(super) fn view_len(&self, cx: &FnCx, view: TExpr) -> Checked {
+        // A length is at most the largest `isize`: no object is bigger.
+        let any_len = Range {
+            lo: 0,
+            hi: i128::from(i64::MAX),
+        };
+        let term = match view.kind {
+            TExprKind::Local(l) => Some(Term::Len(l)),
+            _ => None,
+        };
+        let range = term
+            .and_then(|t| cx.env.range(t))
+            .and_then(|r| r.intersect(any_len))
+            .unwrap_or(any_len);
+        let mut c = Checked::new(
+            TExprKind::ViewLen(Box::new(view)),
+            self.usize_ty(),
+            Some(range),
+        );
+        c.term = term.map(Linear::of);
+        c
+    }
+
+    /// `base[index]`, which must be proven in bounds: `0 <= index < base.len`.
+    fn index(&mut self, cx: &mut FnCx, base: &ast::Expr, index: &ast::Expr) -> Option<Checked> {
+        let b = self.expr(cx, base, None);
+        // Untyped indexes are `usize`; any integer type is accepted.
+        let usize_ty = self.usize_ty();
+        let i = self.expr(cx, index, Some(usize_ty));
+        let (b, i) = (b?, i?);
+        let elem = match b.ty() {
+            Ty::Array(_) | Ty::Slice(_) => b.ty().elem().expect("array or slice"),
+            Ty::Str => {
+                self.error(
+                    base.span,
+                    "indexing a `str` is not supported by the compiler yet",
+                );
+                return None;
+            }
+            other => {
+                self.error(base.span, format!("`{other}` cannot be indexed"));
+                return None;
+            }
+        };
+        if i.ty().as_int().is_none() {
+            self.error(
+                index.span,
+                format!("an index must be an integer, found `{}`", i.ty()),
+            );
+            return None;
+        }
+
+        let r = i.int_range();
+        let help_check = match (&index.kind, &base.kind) {
+            (ExprKind::Name(i), ExprKind::Name(xs)) if !i.starts_with('$') => {
+                format!("check it first (`if {i} < {xs}.len`), or loop with `for`")
+            }
+            _ => "check it against `.len` first, or loop with `for`".to_owned(),
+        };
+        if r.lo < 0 {
+            self.diags.push(
+                Diagnostic::error(index.span, "cannot prove that this index is not negative")
+                    .with_help(format!("the index can be {r}"))
+                    .with_help("check it first, or use an unsigned index"),
+            );
+            return None;
+        }
+        // `the length is 4`, `the length can be 1..=10`, ...
+        let (proven, len_desc) = match b.ty().as_array() {
+            Some((_, n)) => (r.hi < i128::from(n), format!("the length is {n}")),
+            None => {
+                let len = self.view_len(cx, b.expr.clone());
+                let lr = len.int_range();
+                let by_range = r.hi < lr.lo;
+                let by_rel = match (i.term, len.term) {
+                    (Some(it), Some(lt)) => cx.env.diff_bound(it, lt).is_some_and(|c| c <= -1),
+                    _ => false,
+                };
+                let desc = if lr.lo == lr.hi {
+                    format!("the length is {lr}")
+                } else if lr.lo == 0 && lr.hi == i128::from(i64::MAX) {
+                    "nothing is known about the length".to_owned()
+                } else {
+                    format!("the length can be {lr}")
+                };
+                (by_range || by_rel, desc)
+            }
+        };
+        if !proven {
+            let what = if r.lo == r.hi { "is" } else { "can be" };
+            self.diags.push(
+                Diagnostic::error(
+                    index.span,
+                    "cannot prove that this index is less than the length",
+                )
+                .with_help(format!("the index {what} {r}, and {len_desc}"))
+                .with_help(help_check),
+            );
+            return None;
+        }
+        Some(Checked::new(
+            TExprKind::Index(Box::new(b.expr), Box::new(i.expr)),
+            elem,
+            None,
+        ))
     }
 
     fn name(&mut self, cx: &mut FnCx, name: &str, span: Span) -> Option<Checked> {
         if let Some(local) = cx.lookup(name) {
             let ty = cx.locals[local].ty;
-            let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(local));
-            c.term = type_range(ty).map(|_| local);
+            let term = Term::Local(local);
+            let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(term));
+            c.term = type_range(ty).map(|_| Linear::of(term));
             return Some(c);
         }
         if let Some(&item) = self.pkgs[cx.pkg].items.get(name) {
@@ -217,17 +452,15 @@ impl Checker<'_> {
         }
         let b = self.expr(cx, base, None)?;
         match (b.ty(), member.name.as_str()) {
-            (Ty::Str, "len") => {
-                // A length is at most the largest `isize`: no object is bigger.
-                let range = Range {
-                    lo: 0,
-                    hi: i128::from(i64::MAX),
-                };
+            (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len(cx, b.expr)),
+            (Ty::Array(_), "len") => {
+                let (_, n) = b.ty().as_array().expect("an array");
+                let n = i128::from(n);
                 let usize_ty = self.usize_ty();
                 Some(Checked::new(
-                    TExprKind::StrLen(Box::new(b.expr)),
+                    TExprKind::ArrayLen(Box::new(b.expr)),
                     usize_ty,
-                    Some(range),
+                    Some(Range::exact(n)),
                 ))
             }
             (Ty::Str, "ptr") => {
@@ -245,7 +478,7 @@ impl Checker<'_> {
         }
     }
 
-    fn usize_ty(&self) -> Ty {
+    pub(super) fn usize_ty(&self) -> Ty {
         Ty::Int(IntTy {
             signed: false,
             bits: self.ptr_bits,
@@ -366,7 +599,7 @@ impl Checker<'_> {
     /// Check two operands that must share a type. An untyped integer on one
     /// side takes the other side's type; otherwise a lossless widening is
     /// applied to the narrower side.
-    fn operands(
+    pub(super) fn operands(
         &mut self,
         cx: &mut FnCx,
         lhs: &ast::Expr,
@@ -549,6 +782,20 @@ impl Checker<'_> {
         };
         let (a, b) = (l.int_range(), r.int_range());
         let full = t.range();
+        // A proven `x + k` or `x - k` of a term `x` and a constant `k` is
+        // that term plus a constant, which the facts can relate to others.
+        let exact = |r: Range| (r.lo == r.hi).then_some(r.lo);
+        let linear = match op {
+            BinOp::Add => match (l.term, exact(b), r.term, exact(a)) {
+                (Some(x), Some(k), _, _) | (_, _, Some(x), Some(k)) => x.plus(k),
+                _ => None,
+            },
+            BinOp::Sub => match (l.term, exact(b)) {
+                (Some(x), Some(k)) => x.plus(-k),
+                _ => None,
+            },
+            _ => None,
+        };
 
         let (top, range) = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
@@ -557,13 +804,13 @@ impl Checker<'_> {
                     BinOp::Sub => a.checked_sub(b),
                     _ => a.checked_mul(b),
                 };
-                // `x - y` of two locals: a known relation between them bounds
+                // `x - y` of two terms: a known relation between them bounds
                 // the difference (e.g. `y <= x` gives `x - y >= 0`).
                 if op == BinOp::Sub
                     && let (Some(x), Some(y), Some(res)) = (l.term, r.term, result)
                 {
-                    let lo = cx.env.rel(y, x).map_or(res.lo, |c| res.lo.max(-c));
-                    let hi = cx.env.rel(x, y).map_or(res.hi, |c| res.hi.min(c));
+                    let lo = cx.env.diff_bound(y, x).map_or(res.lo, |c| res.lo.max(-c));
+                    let hi = cx.env.diff_bound(x, y).map_or(res.hi, |c| res.hi.min(c));
                     result = Some(Range { lo, hi });
                 }
                 match result {
@@ -674,7 +921,9 @@ impl Checker<'_> {
             _ => unreachable!("not an arithmetic operator"),
         };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
-        Some(Checked::new(kind, Ty::Int(t), Some(range)))
+        let mut out = Checked::new(kind, Ty::Int(t), Some(range));
+        out.term = linear;
+        Some(out)
     }
 
     fn shift(

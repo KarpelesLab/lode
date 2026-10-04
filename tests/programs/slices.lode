@@ -1,0 +1,138 @@
+// exit: 0
+package main
+
+// `i < xs.len` proves the index.
+fn first_or_zero(xs: []u32) -> u32 {
+	if xs.len > 0 {
+		return xs[0]
+	}
+	return 0
+}
+
+// The same proof from an early return.
+fn at(xs: []u32, i: usize) -> u32 {
+	if i >= xs.len {
+		return 0
+	}
+	return xs[i]
+}
+
+// A `while` loop over a slice, proven by its condition.
+fn count_zeros(xs: []u8) -> usize {
+	var n: usize = 0
+	var i: usize = 0
+	while i < xs.len {
+		if xs[i] == 0 {
+			n = n +% 1
+		}
+		i = i + 1
+	}
+	return n
+}
+
+// The last element: `xs.len - 1` is proven not to underflow, and to be an
+// index.
+fn last(xs: []u8) -> u8 {
+	if xs.len == 0 {
+		return 0
+	}
+	let i = xs.len - 1
+	return xs[i]
+}
+
+// Terms plus constants: `xs.len - 1`, and `i + 1 < xs.len` proving `xs[i + 1]`.
+fn last_direct(xs: []u8) -> u8 {
+	if xs.len > 0 {
+		return xs[xs.len - 1]
+	}
+	return 0
+}
+
+fn equal_neighbors(xs: []u8) -> u32 {
+	var n: u32 = 0
+	for i in 0..xs.len {
+		if i + 1 < xs.len && xs[i] == xs[i + 1] {
+			n = n +% 1
+		}
+	}
+	return n
+}
+
+// Any integer type can index.
+fn at_u8(xs: []u32, k: u8) -> u32 {
+	if k < xs.len {
+		return xs[k]
+	}
+	return 0
+}
+
+// A length copied into a local still bounds the index.
+fn sum_by_index(xs: []u32) -> u32 {
+	let n = xs.len
+	var total: u32 = 0
+	for i in 0..n {
+		total = total +% xs[i]
+	}
+	return total
+}
+
+// Slices of arrays: indexing gives a row, which is an array.
+fn trace(m: [][3]u8) -> u32 {
+	var t: u32 = 0
+	for i in 0..m.len {
+		let row = m[i]
+		if i < row.len {
+			t = t +% u32(row[i])
+		}
+	}
+	return t
+}
+
+fn main() -> u8 {
+	let a: [4]u32 = [10, 20, 30, 40]
+	if first_or_zero(a) != 10 {
+		return 1
+	}
+	if at(a, 3) != 40 || at(a, 4) != 0 {
+		return 2
+	}
+	// A slice local views the array; its length is the array's.
+	let s: []u32 = a
+	if s.len != 4 || s[3] != 40 {
+		return 3
+	}
+	let t = s
+	if t[2] != 30 {
+		return 4
+	}
+	let bytes: [6]u8 = [0, 1, 0, 2, 0, 9]
+	if count_zeros(bytes) != 3 || last(bytes) != 9 {
+		return 5
+	}
+	// Array literals and repeats convert to slices too.
+	if count_zeros([1, 0]) != 1 || last([0; 3]) != 0 {
+		return 6
+	}
+	if sum_by_index(a) != 100 {
+		return 7
+	}
+	let m: [3][3]u8 = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+	if trace(m) != 15 {
+		return 8
+	}
+	// A `var` slice can be pointed at another array.
+	let b: [2]u32 = [5, 6]
+	var v: []u32 = a
+	v = b
+	if v.len != 2 || v[1] != 6 {
+		return 9
+	}
+	let s2: []u8 = [1, 1, 2, 3, 3]
+	if last_direct(s2) != 3 || equal_neighbors(s2) != 2 {
+		return 10
+	}
+	if at_u8(a, 2) != 30 || at_u8(a, 200) != 0 {
+		return 11
+	}
+	return 0
+}
