@@ -7,6 +7,7 @@
 // error: cannot prove that this subtraction does not overflow `usize`
 // error: cannot prove that this subtraction does not overflow `usize`
 // error: cannot prove that this index is less than the length
+// error: cannot prove that this subtraction does not overflow `usize`
 package main
 
 // Dividing by 1 keeps the whole range.
@@ -107,6 +108,22 @@ fn off_by_one(prog: []u8) -> i64 {
 		}
 	}
 	return 0
+}
+
+fn bump(inout n: usize) {
+	n = n +% 2
+}
+
+// A counter changed through `&n` is assigned by the loop like any other:
+// after the call, nothing relates it to the index.
+fn counted_by_call(xs: []u8) -> usize {
+	var n: usize = 0
+	for x in xs {
+		if x == 0 {
+			bump(&n)
+		}
+	}
+	return xs.len - n
 }
 
 fn main() {
