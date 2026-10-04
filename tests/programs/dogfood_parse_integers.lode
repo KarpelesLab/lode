@@ -8,7 +8,6 @@
 package main
 
 import "std/io"
-import "std/os"
 
 enum ParseError {
 	empty
@@ -44,17 +43,10 @@ fn parse_u32(s: []u8) -> ParseResult {
 	return ParseResult.ok(n)
 }
 
-// WORKAROUND: no safe way to print a []u8 or to get the bytes of a str
-fn print_bytes(s: []u8) {
-	unsafe {
-		os.write(os.STDOUT, s.ptr, s.len)
-	}
-}
-
-fn report(s: []u8) {
-	print_bytes(s)
+fn report(s: str) {
+	io.print(s)
 	io.print(" -> ")
-	match parse_u32(s) {
+	match parse_u32(s.bytes()) {
 		ok(v) => io.print_u64(v)
 		err(e) => {
 			match e {
@@ -71,14 +63,12 @@ fn report(s: []u8) {
 }
 
 fn main() -> u8 {
-	// WORKAROUND: str has no .bytes(), so inputs are byte arrays
-	report(['0'])
-	report(['1', '2', '3', '4', '5'])
-	report(['4', '2', '9', '4', '9', '6', '7', '2', '9', '5'])
-	report(['4', '2', '9', '4', '9', '6', '7', '2', '9', '6'])
-	report(['9', '9', '9', '9', '9', '9', '9', '9', '9', '9', '9'])
-	report(['1', '2', 'a', '4'])
-	let none_: [0]u8 = []
-	report(none_)
+	report("0")
+	report("12345")
+	report("4294967295")
+	report("4294967296")
+	report("99999999999")
+	report("12a4")
+	report("")
 	return 0
 }

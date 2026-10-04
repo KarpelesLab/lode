@@ -52,29 +52,23 @@ fn next_token(src: []u8, pos: usize) -> Lexed {
 	while i < src.len {
 		let c = src[i]
 		match state {
-			start => {
-				if c == ' ' || c == '\t' || c == '\n' {
-					i = i + 1
-				} else if is_digit(c) {
-					state = State.in_number
-				} else if is_alpha(c) {
+			start => match c {
+				' ' | '\t' | '\n' => i = i + 1
+				'0'..='9' => state = State.in_number
+				'a'..='z' | 'A'..='Z' | '_' => {
 					state = State.in_ident
 					start = i
-				} else if c == '+' || c == '-' || c == '*' || c == '/' {
-					return Lexed{tok: Token.op(c), next: i + 1}
-				} else if c == '(' {
-					return Lexed{tok: Token.lparen, next: i + 1}
-				} else if c == ')' {
-					return Lexed{tok: Token.rparen, next: i + 1}
-				} else {
-					return Lexed{tok: Token.bad(i), next: i + 1}
 				}
+				'+' | '-' | '*' | '/' => return Lexed{tok: Token.op(c), next: i + 1}
+				'(' => return Lexed{tok: Token.lparen, next: i + 1}
+				')' => return Lexed{tok: Token.rparen, next: i + 1}
+				_ => return Lexed{tok: Token.bad(i), next: i + 1}
 			}
 			in_number => {
-				if c < '0' || c > '9' { // WORKAROUND: is_digit(c) gives no facts
-					return Lexed{tok: Token.number(value), next: i}
+				match c {
+					'0'..='9' => value = value *| 10 +| (c - '0') // proven: c >= '0'
+					_ => return Lexed{tok: Token.number(value), next: i}
 				}
-				value = value *% 10 +% (c - '0') // WORKAROUND: `*|` unsupported
 				i = i + 1
 			}
 			in_ident => {
@@ -93,13 +87,13 @@ fn next_token(src: []u8, pos: usize) -> Lexed {
 }
 
 fn main() -> u8 {
-	let src: [24]u8 = ['f', 'o', 'o', ' ', '+', ' ', '1', '2', '*', '(', 'b', 'a', 'r', '_', '9', ' ', '-', ' ', '7', ')', ' ', '$', ' ', 'x']
+	let src = "foo + 12*(bar_9 - 7) $ x".bytes()
 	var pos: usize = 0
 	var count: u32 = 0
 	loop {
 		let l = next_token(src, pos)
 		pos = l.next
-		count = count +% 1
+		count +%= 1
 		match l.tok {
 			number(v) => {
 				io.print("num ")
