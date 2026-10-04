@@ -45,7 +45,7 @@ pretend otherwise:
 | Float to int | Always defined: saturating, and NaN gives 0. No proof needed. | [types.md](types.md#floats) |
 | Use after free, double free, dangling reference | Ruled out by the memory model. | [memory.md](memory.md) |
 | Data race | Ruled out by exclusivity and `Send`-like rules. | [concurrency.md](concurrency.md) |
-| Uninitialized read | Every variable is definitely assigned before use (flow analysis, as in Go and Rust). | |
+| Uninitialized read | Every variable is definitely assigned before use (flow analysis, as in Go and Rust). | [memory.md](memory.md#uninitialized-buffers) |
 | Unhandled error | A `throws` call must be handled with `try`, `catch` or `match`. | [errors.md](errors.md) |
 | Non-exhaustive match | Compile error. | [types.md](types.md#enums-sum-types) |
 
@@ -125,14 +125,16 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
 | A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
-| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length. |
+| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. |
 | `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`) |
 | A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` narrows only when `k` is at an end of `x`'s range. |
-| `while cond` / `loop` | Before the loop, everything is forgotten about the variables the loop assigns. The body knows `cond` is true. After a `while` without `break`, `cond` is false. |
-| `for i in a..b` | Everything about the variables the loop assigns is forgotten, as for `while`. In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. |
+| The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
+| `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
+| `loop` | After the loop, the facts at its `break`s, joined. Without a `break`, the code after it can't be reached. |
+| `for i in a..b` | In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. After the loop, the head facts, joined with the facts at each `break`. |
 | `for x in xs` | The same as `for` over `0..xs.len` with a hidden index, which proves the hidden `xs[index]` that gives `x` |
 | `x - y` | A known relation bounds the result: `y <= x` proves it doesn't go below zero |
 
@@ -148,8 +150,74 @@ the length's (for an array, its constant `N`), or a relation gives
 Everything else gives no facts. In particular, facts don't cross function
 calls yet (that's what [refinements](#refinements-in-types) are for), array
 elements (and fields under them) have no facts, a copy of a struct doesn't
-keep its fields' facts, and there's no induction beyond the loop
-condition.
+keep its fields' facts, and a loop's head knows only facts of the kinds
+above that held before the loop (there's no counting: the checker can't
+prove that a loop dividing by 10 runs at most 20 times).
+
+#### Facts through loops
+
+At the head of a loop, the facts before it, `E`, still hold about everything
+the loop doesn't assign. The variables it assigns (`A`: every variable
+assigned anywhere in the body, including in nested loops; for `a[i] = v` and
+`p.x = v`, `a` and `p`) can change on each iteration, so for them the head
+keeps only facts that every iteration keeps. Those are found by checking the
+body from a few candidate heads, in a fixed order, and taking the first that
+**holds**: each of its facts about `A` holds again at every **back-edge** (a
+`continue`, and the end of the body when it can be reached). At a back-edge,
+a range end holds if the back-edge's range for the term (or its type's range,
+if none is known) is within it, and a relation `a - b <= c` holds if the
+back-edge gives `a - b <= c'` with `c' <= c` (directly or through one other
+term, as above). A back-edge that can't be reached holds everything.
+
+Two ways to weaken facts, each fact about `A` on its own (the two ends of a
+range are separate facts):
+
+- **drop** for some back-edges: forget each fact that doesn't hold at one of
+  them (a range end goes to its type's limit);
+- **cover** some back-edges: widen each range just enough to include the
+  back-edges' ranges (a term with no range has its type's), and raise each
+  relation's `c` to the largest the back-edges give (and forget it if one
+  gives none).
+
+The candidates, in order:
+
+1. `E` itself.
+2. `C`: `E` covering the back-edges of the check from `E`.
+3. `W`: `C` dropping for the back-edges of the check from `C`. If `W` doesn't
+   hold, the head is `E` with every fact about `A` forgotten, and the search
+   ends.
+4. `N`: `E` covering the back-edges of the check from `W`. If `N` doesn't
+   hold, the head is `W`.
+
+So the body is checked at most five times (a nested loop is checked that
+often for each check of the loop around it), and only the check from the
+chosen head counts: errors found from other candidates are not reported.
+Step 1 keeps what the loop doesn't change, step 2 one round of change (a
+variable set to a bounded value on some path), step 3 the bounds that only
+move one way (`i` counting down from `buf.len` keeps `i <= buf.len`), and
+step 4 bounds that come from the loop's own tests (a `while i > 1` that
+counts down leaves `i >= 1` at the head).
+
+```
+var i = buf.len                  // E: i == 21
+var v = n
+loop {
+	buf[i - 1] = digit(v)        // needs 1 <= i <= 21 at the head
+	v = v / 10
+	if v == 0 {
+		break
+	}
+	if i <= 2 {
+		break
+	}
+	i = i - 1                    // back-edge: 2 <= i <= 20
+}
+```
+
+Here `E` (`i` is 21) and `C` (20 to 21) don't hold. `W` (`i <= 21`) does,
+though `buf[i - 1]` can't be proven from it, and `N` (2 to 21, covering the
+back-edge's 2 to 20) holds too: it's the head, and proves `buf[i - 1]`. After
+the loop, both `break`s know `i >= 2`.
 
 Example, from the standard library's `os.write_all`:
 

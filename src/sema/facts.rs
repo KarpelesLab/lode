@@ -11,9 +11,11 @@
 //!
 //! Facts come from literals and constants, from assignments, from the
 //! conditions of `if` and `while` (narrowing), and from `for` loops. They flow
-//! forward through a function: past an `if` whose branch always leaves the
-//! block, both branches' facts are joined, and at the head of a loop every
-//! variable the loop assigns is forgotten.
+//! forward through a function: after an `if`, both branches' facts are joined
+//! (a branch that always leaves the block contributes nothing), and at the
+//! head of a loop, facts about the variables the loop assigns are kept as far
+//! as every iteration keeps them ([`Env::loosen`], [`Env::holds_in`]; the
+//! rule is in `super::Checker::loop_body` and docs/safety.md).
 
 use std::collections::HashMap;
 
@@ -81,6 +83,18 @@ pub struct Env {
     rels: Vec<Rel>,
     /// The facts contradict each other: this point can't be reached.
     pub dead: bool,
+}
+
+/// How [`Env::loosen`] weakens a fact that doesn't hold at a loop's
+/// back-edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Loosen {
+    /// Forget it (for a range, the end that doesn't hold).
+    Drop,
+    /// Weaken it just enough to hold at every back-edge: a range grows to
+    /// cover theirs, a relation takes the weakest bound (and is forgotten if
+    /// a back-edge doesn't know it).
+    Cover,
 }
 
 /// One fact learned from a condition.
@@ -332,9 +346,126 @@ impl Env {
         self.rels.retain(|r| !hit(&r.a) && !hit(&r.b));
     }
 
+    /// The integer local `local` was assigned its own value plus `k` (as in
+    /// `i = i - 1`), now in `range`: its relations shift by `k` instead of
+    /// being forgotten (`i - b <= c` becomes `i - b <= c + k`).
+    pub fn shift(&mut self, local: LocalId, range: Option<Range>, k: i128) {
+        let me = Term::Local(local);
+        let shifted: Vec<Rel> = self
+            .rels
+            .iter()
+            .filter_map(|r| {
+                let c = if r.a == me {
+                    r.c.checked_add(k)?
+                } else if r.b == me {
+                    r.c.checked_sub(k)?
+                } else {
+                    return None;
+                };
+                Some(Rel { c, ..*r })
+            })
+            .collect();
+        self.assign(local, range);
+        self.rels.extend(shifted);
+    }
+
     /// Forget everything about `local` (at the head of a loop that assigns it).
     pub fn forget(&mut self, local: LocalId) {
         self.assign(local, None);
+    }
+
+    /// Whether every fact of `self` about the locals `about` picks out also
+    /// holds in `other` (a range end if `other`'s range, or its type's range
+    /// `full` when `other` has none, is within it; a relation if
+    /// [`Env::rel_through`] in `other` gives the same bound or a tighter
+    /// one). Nothing needs to hold at a point no path reaches.
+    pub fn holds_in(
+        &self,
+        about: impl Fn(LocalId) -> bool,
+        full: impl Fn(Term) -> Range,
+        other: &Env,
+    ) -> bool {
+        // Loosening against no edges only normalizes (a range as wide as its
+        // type is the same as none).
+        let kept = self.loosen(&about, &full, std::slice::from_ref(other), Loosen::Drop);
+        kept.same(&self.loosen(&about, &full, &[], Loosen::Drop))
+    }
+
+    /// `self` with every fact about the locals `about` picks out weakened to
+    /// hold at each of `edges` (the facts at a loop's back-edges): either
+    /// [`Loosen::Drop`]ped when it doesn't hold at some edge, or loosened
+    /// just enough to [`Loosen::Cover`] all of them. The two ends of a range
+    /// are separate facts; a dropped end goes to the type's limit (`full`).
+    /// Other facts are kept as they are.
+    pub fn loosen(
+        &self,
+        about: impl Fn(LocalId) -> bool,
+        full: impl Fn(Term) -> Range,
+        edges: &[Env],
+        how: Loosen,
+    ) -> Env {
+        let live: Vec<&Env> = edges.iter().filter(|e| !e.dead).collect();
+        let mut out = Env {
+            ranges: HashMap::new(),
+            rels: Vec::new(),
+            dead: self.dead,
+        };
+        for (&term, &r) in &self.ranges {
+            if !about(term.local()) {
+                out.ranges.insert(term, r);
+                continue;
+            }
+            let f = full(term);
+            let (mut lo, mut hi) = (r.lo, r.hi);
+            for e in &live {
+                let er = e.range(term).unwrap_or(f);
+                match how {
+                    Loosen::Drop => {
+                        if er.lo < r.lo {
+                            lo = f.lo;
+                        }
+                        if er.hi > r.hi {
+                            hi = f.hi;
+                        }
+                    }
+                    Loosen::Cover => {
+                        lo = lo.min(er.lo);
+                        hi = hi.max(er.hi);
+                    }
+                }
+            }
+            let r = Range { lo, hi };
+            if r != f {
+                out.ranges.insert(term, r);
+            }
+        }
+        for rel in &self.rels {
+            if !about(rel.a.local()) && !about(rel.b.local()) {
+                out.rels.push(*rel);
+                continue;
+            }
+            let mut c = Some(rel.c);
+            for e in &live {
+                let ec = e.rel_through(rel.a, rel.b);
+                c = match (how, c, ec) {
+                    (Loosen::Drop, Some(c), Some(ec)) if ec <= c => Some(c),
+                    (Loosen::Cover, Some(c), Some(ec)) => Some(c.max(ec)),
+                    _ => None,
+                };
+            }
+            if let Some(c) = c {
+                out.rels.push(Rel { c, ..*rel });
+            }
+        }
+        out
+    }
+
+    /// Whether two sets of facts are the same.
+    pub fn same(&self, other: &Env) -> bool {
+        self.dead == other.dead
+            && self.ranges == other.ranges
+            && self.rels.len() == other.rels.len()
+            && self.rels.iter().all(|r| other.rels.contains(r))
     }
 
     pub fn apply(&mut self, facts: &[Fact]) {
@@ -518,6 +649,73 @@ mod tests {
         b.apply(&comparison(CmpOp::Eq, var(0), konst(7)).when_true);
         let j = Env::join(a, b);
         assert_eq!(j.range(Term::Local(0)), Some(Range { lo: 0, hi: 7 }));
+    }
+
+    #[test]
+    fn shifting_keeps_relations() {
+        // i == len(xs) (from `var i = xs.len`), then `i = i - 1`.
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Eq, var(0), side(Term::Len(1))).when_true);
+        env.shift(0, Some(Range { lo: 0, hi: 9 }), -1);
+        assert_eq!(env.rel(Term::Local(0), Term::Len(1)), Some(-1));
+        assert_eq!(env.rel(Term::Len(1), Term::Local(0)), Some(1));
+        assert_eq!(env.range(Term::Local(0)), Some(Range { lo: 0, hi: 9 }));
+    }
+
+    fn full(_: Term) -> Range {
+        U32
+    }
+
+    fn exact(local: LocalId, v: i128) -> Env {
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Eq, var(local), konst(v)).when_true);
+        env
+    }
+
+    #[test]
+    fn loosening_drops_or_covers() {
+        // Before a loop: i == 21 and j == 3; the loop assigns only i.
+        let mut entry = exact(0, 21);
+        entry.apply(&comparison(CmpOp::Eq, var(1), konst(3)).when_true);
+        let about = |l: LocalId| l == 0;
+        let edges = [exact(0, 20), Env::unreachable()];
+        let dropped = entry.loosen(about, full, &edges, Loosen::Drop);
+        assert_eq!(dropped.range(Term::Local(0)), Some(Range { lo: 0, hi: 21 }));
+        assert_eq!(dropped.range(Term::Local(1)), Some(Range::exact(3)));
+        let covered = entry.loosen(about, full, &edges, Loosen::Cover);
+        assert_eq!(
+            covered.range(Term::Local(0)),
+            Some(Range { lo: 20, hi: 21 })
+        );
+        // A range as wide as the type is no fact.
+        let wide = [exact(0, 30), exact(0, 0)];
+        let gone = entry.loosen(about, full, &wide, Loosen::Drop);
+        assert_eq!(gone.range(Term::Local(0)), None);
+        // A relation stays only if every edge knows it (here, through len).
+        let mut rel = Env::default();
+        rel.apply(&comparison(CmpOp::Le, var(0), side(Term::Len(1))).when_true);
+        let mut edge = Env::default();
+        edge.apply(&comparison(CmpOp::Lt, var(0), var(2)).when_true);
+        edge.apply(&comparison(CmpOp::Le, var(2), side(Term::Len(1))).when_true);
+        let kept = rel.loosen(about, full, std::slice::from_ref(&edge), Loosen::Drop);
+        assert_eq!(kept.rel(Term::Local(0), Term::Len(1)), Some(0));
+        let lost = rel.loosen(about, full, &[Env::default()], Loosen::Cover);
+        assert_eq!(lost.rel(Term::Local(0), Term::Len(1)), None);
+    }
+
+    #[test]
+    fn holding_at_a_back_edge() {
+        let mut head = Env::default();
+        head.apply(&comparison(CmpOp::Le, var(0), konst(21)).when_true);
+        let about = |l: LocalId| l == 0;
+        assert!(head.holds_in(about, full, &exact(0, 20)));
+        assert!(!head.holds_in(about, full, &exact(0, 22)));
+        assert!(!head.holds_in(about, full, &Env::default()));
+        assert!(head.holds_in(about, full, &Env::unreachable()));
+        // Facts about other locals don't need to hold.
+        assert!(exact(1, 5).holds_in(about, full, &Env::default()));
+        assert!(head.same(&head.clone()));
+        assert!(!head.same(&exact(0, 21)));
     }
 
     #[test]

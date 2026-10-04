@@ -147,6 +147,24 @@ struct FnCx {
     unsafe_depth: u32,
     /// The facts known at the current point.
     env: Env,
+    /// For each loop around the current point, innermost last: where its
+    /// body has left an iteration so far.
+    loops: Vec<LoopEdges>,
+}
+
+/// The facts where a loop's body leaves an iteration: at each back-edge
+/// (a `continue`, or the end of the body) and at each `break`.
+#[derive(Default)]
+struct LoopEdges {
+    next: Vec<Env>,
+    exits: Vec<Env>,
+}
+
+/// The state a trial check of a loop body rolls back.
+struct Mark {
+    diags: usize,
+    locals: usize,
+    consts: Vec<ConstState>,
 }
 
 impl FnCx {
@@ -160,6 +178,7 @@ impl FnCx {
             loop_depth: 0,
             unsafe_depth: u32::from(is_unsafe),
             env: Env::default(),
+            loops: Vec::new(),
         }
     }
 
@@ -221,6 +240,47 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             _ => {}
         }
     }
+}
+
+/// The locals assigned anywhere in `body`, as seen from before it (for the
+/// facts at a loop's head).
+fn assigned_locals(cx: &FnCx, body: &[Stmt]) -> HashSet<LocalId> {
+    let mut names = HashSet::new();
+    assigned_names(body, &mut names);
+    names.iter().filter_map(|n| cx.lookup(n)).collect()
+}
+
+/// The values `term` can take by its type, for the locals' types `tys`.
+fn term_full(tys: &[Ty], term: Term) -> Range {
+    let any = Range {
+        lo: i128::MIN,
+        hi: i128::MAX,
+    };
+    match term {
+        Term::Local(l) => type_range(tys[l]).unwrap_or(any),
+        // No object is bigger than the largest `isize` (as in `view_len`).
+        Term::Len(_) => Range {
+            lo: 0,
+            hi: i128::from(i64::MAX),
+        },
+        Term::Field(l, k) => flat_field(tys[l], k).and_then(type_range).unwrap_or(any),
+    }
+}
+
+/// The type of field number `k` of a value of type `ty`, numbered as in
+/// [`Term::Field`].
+fn flat_field(ty: Ty, mut k: u32) -> Option<Ty> {
+    let Some(def) = ty.as_struct() else {
+        return (k == 0).then_some(ty);
+    };
+    for f in &def.fields {
+        let n = expr::flat_size(f.ty);
+        if k < n {
+            return flat_field(f.ty, k);
+        }
+        k -= n;
+    }
+    None
 }
 
 /// The variable a place like `a[i].x` is part of: the expression under its
@@ -1090,7 +1150,13 @@ impl<'a> Checker<'a> {
 
     /// A local was given a new value: record what's known about it.
     fn record_value(cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
-        cx.env.assign(local, value.range);
+        match value.term {
+            // `i = i + k`: what was known about `i` shifts by `k`.
+            Some(src) if src.term == Term::Local(local) => {
+                cx.env.shift(local, value.range, src.offset);
+            }
+            _ => cx.env.assign(local, value.range),
+        }
         if let TExprKind::StructLit(_) = value.expr.kind {
             Self::record_fields(cx, local, &value.expr, 0);
         }
@@ -1303,28 +1369,29 @@ impl<'a> Checker<'a> {
             })),
             Stmt::If(i) => Some(self.if_stmt(cx, i)),
             Stmt::While { cond, body, .. } => {
-                self.forget_assigned(cx, &body.stmts);
-                let (cond, facts) = self.condition(cx, cond);
-                let entry = cx.env.clone();
-                cx.env.apply(&facts.when_true);
-                cx.loop_depth += 1;
-                let body = self.block(cx, &body.stmts);
-                cx.loop_depth -= 1;
-                // The loop ends when the condition is false, unless a `break`
-                // leaves it earlier.
-                cx.env = entry;
-                if !breaks(&body) {
-                    cx.env.apply(&facts.when_false);
-                }
+                let ((cond, facts, body), head, exits) =
+                    self.loop_body(cx, &body.stmts, |ck, cx| {
+                        let (cond, facts) = ck.condition(cx, cond);
+                        cx.env.apply(&facts.when_true);
+                        let body = ck.block(cx, &body.stmts);
+                        let reaches_end = !diverges(&body);
+                        ((cond, facts, body), reaches_end)
+                    });
+                // The loop ends at its head when the condition is false, or
+                // at a `break`.
+                let mut done = head;
+                done.apply(&facts.when_false);
+                cx.env = exits.into_iter().fold(done, Env::join);
                 Some(TStmt::While(cond.unwrap_or_else(placeholder_bool), body))
             }
             Stmt::Loop { body, .. } => {
-                self.forget_assigned(cx, &body.stmts);
-                let entry = cx.env.clone();
-                cx.loop_depth += 1;
-                let body = self.block(cx, &body.stmts);
-                cx.loop_depth -= 1;
-                cx.env = entry;
+                let (body, _, exits) = self.loop_body(cx, &body.stmts, |ck, cx| {
+                    let body = ck.block(cx, &body.stmts);
+                    let reaches_end = !diverges(&body);
+                    (body, reaches_end)
+                });
+                // Only a `break` leaves.
+                cx.env = exits.into_iter().fold(Env::unreachable(), Env::join);
                 Some(TStmt::Loop(body))
             }
             Stmt::For {
@@ -1343,9 +1410,12 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
+                let edges = cx.loops.last_mut().expect("in a loop");
                 Some(if matches!(stmt, Stmt::Break(_)) {
+                    edges.exits.push(cx.env.clone());
                     TStmt::Break
                 } else {
+                    edges.next.push(cx.env.clone());
                     TStmt::Continue
                 })
             }
@@ -1723,15 +1793,118 @@ impl<'a> Checker<'a> {
         Some(TStmt::Block(before))
     }
 
-    /// At the head of a loop: forget the facts about every variable the loop
-    /// body assigns, since they may change on each iteration.
-    fn forget_assigned(&mut self, cx: &mut FnCx, body: &[Stmt]) {
-        let mut names = HashSet::new();
-        assigned_names(body, &mut names);
-        for name in names {
-            if let Some(local) = cx.lookup(&name) {
-                cx.env.forget(local);
+    /// Check a loop's body (with `check`, which also says whether the body
+    /// can reach its end), starting from the facts at the loop's head.
+    /// Returns what `check` gave, the head facts, and the facts at each
+    /// `break`.
+    ///
+    /// The head facts are the facts before the loop, with those about the
+    /// variables the loop assigns kept only as far as every iteration keeps
+    /// them. A candidate head holds when each of its facts about those
+    /// variables holds again at every back-edge (`continue`, or the end of
+    /// the body). The body is checked from each candidate in turn, at most
+    /// five times; the first that holds is the head, and only the check from
+    /// it counts (the others are rolled back with their errors). From the
+    /// facts before the loop, `E` (docs/safety.md, "Facts through loops"):
+    ///
+    /// 1. `E` itself;
+    /// 2. `C`: `E` loosened to cover the back-edges of check 1;
+    /// 3. `W`: `C` without the facts that failed at a back-edge of check 2
+    ///    (each end of a range on its own). If `W` doesn't hold either, the
+    ///    head is `E` with everything about the variables forgotten;
+    /// 4. `N`: `E` loosened to cover the back-edges of check 3. If `N` is
+    ///    `W` or doesn't hold, the head is `W`.
+    fn loop_body<T>(
+        &mut self,
+        cx: &mut FnCx,
+        body: &[Stmt],
+        mut check: impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
+    ) -> (T, Env, Vec<Env>) {
+        use facts::Loosen::{Cover, Drop};
+        let assigned = assigned_locals(cx, body);
+        let about = |l: LocalId| assigned.contains(&l);
+        let tys: Vec<Ty> = cx.locals.iter().map(|l| l.ty).collect();
+        let full = |t: Term| term_full(&tys, t);
+        let holds = |head: &Env, edges: &LoopEdges| {
+            edges.next.iter().all(|e| head.holds_in(about, full, e))
+        };
+        let entry = cx.env.clone();
+        let mark = self.mark(cx);
+
+        // 1. E
+        let (out, edges) = self.loop_pass(cx, entry.clone(), &mut check);
+        if holds(&entry, &edges) {
+            return (out, entry, edges.exits);
+        }
+        // 2. C
+        self.rollback(cx, &mark);
+        let c = entry.loosen(about, full, &edges.next, Cover);
+        let (out, edges) = self.loop_pass(cx, c.clone(), &mut check);
+        if holds(&c, &edges) {
+            return (out, c, edges.exits);
+        }
+        // 3. W
+        self.rollback(cx, &mark);
+        let w = c.loosen(about, full, &edges.next, Drop);
+        let (out, edges) = self.loop_pass(cx, w.clone(), &mut check);
+        if !holds(&w, &edges) {
+            self.rollback(cx, &mark);
+            let mut base = entry;
+            for &local in &assigned {
+                base.forget(local);
             }
+            let (out, edges) = self.loop_pass(cx, base.clone(), &mut check);
+            return (out, base, edges.exits);
+        }
+        // 4. N
+        let n = entry.loosen(about, full, &edges.next, Cover);
+        if n.same(&w) {
+            return (out, w, edges.exits);
+        }
+        self.rollback(cx, &mark);
+        let (out, edges) = self.loop_pass(cx, n.clone(), &mut check);
+        if holds(&n, &edges) {
+            return (out, n, edges.exits);
+        }
+        self.rollback(cx, &mark);
+        let (out, edges) = self.loop_pass(cx, w.clone(), &mut check);
+        (out, w, edges.exits)
+    }
+
+    /// Check a loop's body once, from the facts `head`.
+    fn loop_pass<T>(
+        &mut self,
+        cx: &mut FnCx,
+        head: Env,
+        check: &mut impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
+    ) -> (T, LoopEdges) {
+        cx.env = head;
+        cx.loops.push(LoopEdges::default());
+        cx.loop_depth += 1;
+        let (out, reaches_end) = check(self, cx);
+        cx.loop_depth -= 1;
+        let mut edges = cx.loops.pop().expect("pushed above");
+        if reaches_end {
+            edges.next.push(std::mem::take(&mut cx.env));
+        }
+        (out, edges)
+    }
+
+    /// What a trial check of a loop body changes: errors, locals, and
+    /// constants evaluated (whose errors are reported once).
+    fn mark(&self, cx: &FnCx) -> Mark {
+        Mark {
+            diags: self.diags.len(),
+            locals: cx.locals.len(),
+            consts: self.consts.iter().map(|c| c.state).collect(),
+        }
+    }
+
+    fn rollback(&mut self, cx: &mut FnCx, mark: &Mark) {
+        self.diags.truncate(mark.diags);
+        cx.locals.truncate(mark.locals);
+        for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
+            c.state = state;
         }
     }
 
@@ -1819,87 +1992,88 @@ impl<'a> Checker<'a> {
             }
         };
 
-        self.forget_assigned(cx, &body.stmts);
-        let entry = cx.env.clone();
-
-        // What the body knows about the loop variable.
-        let ty = start.ty();
-        let index = match &each {
-            Some(_) => self.declare(cx, INDEX, ty, false),
-            None => self.declare(cx, &var.name, ty, false),
-        };
-        let (lo, hi) = (start.int_range().lo, end.int_range().hi - 1);
-        // An empty range: the body never runs, and any range will do.
-        cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
-        // A bound that's a term the body doesn't assign keeps its value for
-        // the whole loop, so the index can be related to it.
-        let unassigned = |cx: &FnCx, t: Term| !assigned.contains(&cx.locals[t.local()].name);
-        let mut loop_facts = Vec::new();
-        if let Some(e) = end.term
-            && unassigned(cx, e.term)
-        {
-            // i < e + k: i - e <= k - 1
-            loop_facts.push(facts::Fact::Rel {
-                a: Term::Local(index),
-                b: e.term,
-                c: e.offset - 1,
-            });
-        }
-        if let Some(s) = start.term
-            && unassigned(cx, s.term)
-        {
-            // s + k <= i: s - i <= -k
-            loop_facts.push(facts::Fact::Rel {
-                a: s.term,
-                b: Term::Local(index),
-                c: -s.offset,
-            });
-        }
-        cx.env.apply(&loop_facts);
-
-        cx.loop_depth += 1;
-        let mut stmts = Vec::new();
-        if let Some((seq_name, elem)) = &each {
-            // let x = seq[$i]
-            let element = ast::Expr {
-                kind: ExprKind::Index(
-                    Box::new(ast::Expr {
-                        kind: ExprKind::Name(seq_name.clone()),
-                        span: var.span,
-                    }),
-                    Box::new(ast::Expr {
-                        kind: ExprKind::Name(INDEX.to_owned()),
-                        span: var.span,
-                    }),
-                ),
-                span: var.span,
+        let ((index, stmts), head, exits) = self.loop_body(cx, &body.stmts, |ck, cx| {
+            // What the body knows about the loop variable.
+            let ty = start.ty();
+            let index = match &each {
+                Some(_) => ck.declare(cx, INDEX, ty, false),
+                None => ck.declare(cx, &var.name, ty, false),
             };
-            let value = if end.range == Some(Range::exact(0)) {
-                // An empty array: the body never runs, so the element read
-                // needs no proof (there's no index that could be proven).
-                let seq = cx.lookup(seq_name).expect("declared");
-                let index = cx.lookup(INDEX).expect("declared");
-                let local = |l: LocalId, ty: Ty| TExpr {
-                    kind: TExprKind::Local(l),
-                    ty,
-                };
-                let kind = TExprKind::Index(
-                    Box::new(local(seq, cx.locals[seq].ty)),
-                    Box::new(local(index, usize_ty)),
-                );
-                Some(expr::Checked::new(kind, *elem, None))
-            } else {
-                self.expr(cx, &element, Some(*elem))
-            };
-            let x = self.declare(cx, &var.name, *elem, false);
-            if let Some(value) = value {
-                Self::record_value(cx, x, &value);
-                stmts.push(TStmt::Init(x, value.expr));
+            let (lo, hi) = (start.int_range().lo, end.int_range().hi - 1);
+            // An empty range: the body never runs, and any range will do.
+            cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
+            // A bound that's a term the body doesn't assign keeps its value for
+            // the whole loop, so the index can be related to it.
+            let unassigned = |cx: &FnCx, t: Term| !assigned.contains(&cx.locals[t.local()].name);
+            let mut loop_facts = Vec::new();
+            if let Some(e) = end.term
+                && unassigned(cx, e.term)
+            {
+                // i < e + k: i - e <= k - 1
+                loop_facts.push(facts::Fact::Rel {
+                    a: Term::Local(index),
+                    b: e.term,
+                    c: e.offset - 1,
+                });
             }
-        }
-        stmts.extend(self.block(cx, &body.stmts));
-        cx.loop_depth -= 1;
-        cx.env = entry;
+            if let Some(s) = start.term
+                && unassigned(cx, s.term)
+            {
+                // s + k <= i: s - i <= -k
+                loop_facts.push(facts::Fact::Rel {
+                    a: s.term,
+                    b: Term::Local(index),
+                    c: -s.offset,
+                });
+            }
+            cx.env.apply(&loop_facts);
+
+            let mut stmts = Vec::new();
+            if let Some((seq_name, elem)) = &each {
+                // let x = seq[$i]
+                let element = ast::Expr {
+                    kind: ExprKind::Index(
+                        Box::new(ast::Expr {
+                            kind: ExprKind::Name(seq_name.clone()),
+                            span: var.span,
+                        }),
+                        Box::new(ast::Expr {
+                            kind: ExprKind::Name(INDEX.to_owned()),
+                            span: var.span,
+                        }),
+                    ),
+                    span: var.span,
+                };
+                let value = if end.range == Some(Range::exact(0)) {
+                    // An empty array: the body never runs, so the element read
+                    // needs no proof (there's no index that could be proven).
+                    let seq = cx.lookup(seq_name).expect("declared");
+                    let index = cx.lookup(INDEX).expect("declared");
+                    let local = |l: LocalId, ty: Ty| TExpr {
+                        kind: TExprKind::Local(l),
+                        ty,
+                    };
+                    let kind = TExprKind::Index(
+                        Box::new(local(seq, cx.locals[seq].ty)),
+                        Box::new(local(index, usize_ty)),
+                    );
+                    Some(expr::Checked::new(kind, *elem, None))
+                } else {
+                    ck.expr(cx, &element, Some(*elem))
+                };
+                let x = ck.declare(cx, &var.name, *elem, false);
+                if let Some(value) = value {
+                    Self::record_value(cx, x, &value);
+                    stmts.push(TStmt::Init(x, value.expr));
+                }
+            }
+            stmts.extend(ck.block(cx, &body.stmts));
+            let reaches_end = !diverges(&stmts);
+            ((index, stmts), reaches_end)
+        });
+        // The loop ends at its head (the head facts still hold), or at a
+        // `break`.
+        cx.env = exits.into_iter().fold(head, Env::join);
 
         let for_loop = TStmt::For {
             var: index,

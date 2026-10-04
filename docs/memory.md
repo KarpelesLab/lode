@@ -180,6 +180,49 @@ This rule also lets scoped threads use views without copying
   a temporary. So `p = swap(p)` can't overwrite `p` while `swap` still reads
   it.
 
+## Uninitialized buffers
+
+**Status:** Open
+
+Every variable is assigned before use, and an array is assigned whole, so a
+buffer that's filled piece by piece has to be filled first: `std/io`'s
+integer output starts with `var buf: [21]u8 = [0; 21]` and then only ever
+reads the part it wrote. For 21 bytes that costs nothing worth measuring; for
+a 4 KiB read buffer, or a large array on a small embedded stack, it's a
+`memset` per call that the optimizer may or may not remove, and the result
+must not depend on the optimizer. The options:
+
+1. **Keep filling** (today). Simple and obviously safe. The cost is the fill,
+   and it's paid at `-O0` and whenever dead-store elimination doesn't see
+   that every read follows a write.
+2. **Track initialized element ranges in the checker.** `var buf: [N]T =
+   undefined` (or `uninit`) starts with no initialized elements; the fact
+   language gains one fact per such array, "elements `lo..hi` are written",
+   with `lo` and `hi` terms plus constants, like the facts in
+   [safety.md](safety.md#the-fact-language). `buf[i] = v` with `i == lo - 1`
+   or `i == hi` grows the range; `buf[i]`, `buf[a..b]` and passing `buf`
+   need a proof that what's read is inside it. It flows through `if` and
+   loops with the existing rules (joins, loop heads). Costs: the checker
+   gets more complex, only contiguous growth from one end or the other is
+   understood (no scattered writes), and the rule has to be specified as
+   exactly as the others. No runtime cost and no new types.
+3. **A write-only buffer type in the standard library**, such as a
+   `StackBuf(N)` that only allows `push_front`/`push_back` and hands out a
+   slice of the part written so far. The initialized range is the type's
+   private state (a length or a start index), kept right by `unsafe` code
+   inside the type, so the checker doesn't change. Costs: it needs generics
+   and methods (M6, M7), it carries a counter at run time (often in a
+   register anyway), and code has to go through its API instead of plain
+   indexing.
+4. **Uninitialized but defined**: `undefined` gives elements an arbitrary but
+   fixed value (the backend "freezes" it), so reading one is not undefined
+   behavior. Cheapest to implement. Costs: a program can print or send
+   whatever was on the stack before (an information leak, as with
+   uninitialized buffers in C), and it hides bugs instead of rejecting them.
+
+Leaning: 3 once generics land, possibly with 2 later for code that wants
+plain arrays; 4 only inside `unsafe`, if at all.
+
 ## Destruction
 
 **Status:** Proposed

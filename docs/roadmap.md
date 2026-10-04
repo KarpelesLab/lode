@@ -28,19 +28,16 @@ itself is in the other documents; this one is only about order.
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
 reaches, and decimal integer output (`io.print_u64`, `io.print_i64`). Hello
-world is now 655 bytes, still 2 syscalls.
+world is now 655 bytes, still 2 syscalls. The checker keeps facts through
+loops: bounds every iteration keeps survive at the loop head, and after a
+loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
 
 ## Next
 
-- **Checker: facts through loops.** Writing `std/io`'s integer output hit
-  three gaps in the fact language. They push natural code into unnatural
-  shapes, so they come before more language features:
-  - facts about a variable a loop assigns are dropped entirely at the loop
-    head, even bounds every iteration keeps (`i` only counting down from
-    `buf.len`), so `while i > 0 { i = i - 1; buf[i] = ... }` doesn't compile;
-  - facts set inside a loop are lost after it;
-  - a buffer must be filled before use (`[0; 21]`), even when only the part
-    that's written is ever read.
+- **Checker: filling buffers.** A buffer must be filled before use
+  (`[0; 21]`), even when only the part that's written is ever read. The
+  options are in [memory.md](memory.md#uninitialized-buffers); the choice is
+  open.
 - **M5: Errors.** `throws`, `try`, `catch`, error sets, `defer`/`errdefer`.
   `io.stdout().write` becomes the checked way to write.
 - **M6: Methods and parameter conventions.** `fn T.name(self)`, `inout`,

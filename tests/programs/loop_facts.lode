@@ -1,0 +1,138 @@
+// exit: 0
+package main
+
+// A bound every iteration keeps survives at the loop head: `i` only counts
+// down from `buf.len`, and `i > 0` then `i - 1` gives a proven index.
+fn countdown() -> u32 {
+	var buf: [8]u8 = [0; 8]
+	var i = buf.len
+	while i > 0 {
+		i = i - 1
+		buf[i] = u8(i)
+	}
+	var total: u32 = 0
+	for b in buf {
+		total = total +| u32(b)
+	}
+	return total
+}
+
+// The same over a slice: `i = i - 1` shifts the relation `i <= xs.len`, so
+// it's kept, and `i > 0` makes `i - 1` a proven index.
+fn sum_backwards(xs: []u8) -> u32 {
+	var i = xs.len
+	var total: u32 = 0
+	while i > 0 {
+		i = i - 1
+		total = total +| u32(xs[i])
+	}
+	return total
+}
+
+// A bound that comes from the loop, not its condition: `i` starts at 0 and
+// grows by 1 only while it's below 9, so it stays in `0..=9`.
+fn fill_until_last() -> u8 {
+	var buf: [10]u8 = [0; 10]
+	var i: usize = 0
+	loop {
+		buf[i] = 1
+		if i >= 9 {
+			break
+		}
+		i = i + 1
+	}
+	// After the loop, the facts at the `break`: `i` is 9.
+	return buf[i] +| u8(i)
+}
+
+// After a `while` without `break`: the head facts and the condition being
+// false. `i` lies in `0..=5` at the head, and is 5 after the loop.
+fn count_to_five() -> u8 {
+	let buf: [6]u8 = [10, 11, 12, 13, 14, 15]
+	var i: usize = 0
+	while i < 5 {
+		i = i + 1
+	}
+	return buf[i]
+}
+
+// After a `while` with `break`: the head facts with the condition false,
+// joined with the facts at each `break`. Digits go into `buf` from the end
+// and element 0 is kept for a sign: `i` stays at least 1, so `buf[i - 1]`
+// is proven after the loop.
+fn digits(n: u64, negative: bool) -> usize {
+	var buf: [21]u8 = [0; 21]
+	var i = buf.len
+	var v = n
+	while i > 1 {
+		i = i - 1
+		buf[i] = '0' + u8(v % 10)
+		v = v / 10
+		if v == 0 {
+			break
+		}
+	}
+	if negative {
+		i = i - 1
+		buf[i] = '-'
+	}
+	return buf.len - i
+}
+
+// Nested loops: each keeps its own bounds, and the inner one starts from a
+// value related to the outer one's.
+fn triangle() -> u32 {
+	let buf: [4]u32 = [1, 2, 3, 4]
+	var total: u32 = 0
+	var i = buf.len
+	while i > 0 {
+		i = i - 1
+		var j = i
+		while j > 0 {
+			j = j - 1
+			total = total +| buf[j]
+		}
+		total = total +| buf[i]
+	}
+	return total
+}
+
+// A `for` loop keeps the bounds of the variables it assigns too, and after
+// it, the facts at its head.
+fn last_small(xs: []u8) -> u8 {
+	let buf: [16]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+	var at: usize = 0
+	for x in xs {
+		if x < 16 {
+			at = usize(x)
+		}
+	}
+	return buf[at]
+}
+
+fn main() -> u8 {
+	if countdown() != 28 {
+		return 1
+	}
+	let xs: [3]u8 = [1, 2, 3]
+	if sum_backwards(xs) != 6 {
+		return 2
+	}
+	if fill_until_last() != 10 {
+		return 3
+	}
+	if count_to_five() != 15 {
+		return 4
+	}
+	if digits(1234, false) != 4 || digits(0, true) != 2 || digits(18446744073709551615, true) != 21 {
+		return 5
+	}
+	if triangle() != 20 {
+		return 6
+	}
+	let ys: [4]u8 = [3, 200, 7, 99]
+	if last_small(ys) != 7 {
+		return 7
+	}
+	return 0
+}
