@@ -37,16 +37,19 @@ That program is 1,049 bytes and makes exactly two system calls, `write` and
 
 What works:
 
-- functions, `let`/`var`, `if`/`while`/`loop`, `break`/`continue`, `const`
+- functions, `let`/`var`, `if`/`while`/`loop`/`for`, `break`/`continue`,
+  `const`
 - integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
+- arrays (`[4]u8`, `[0; 16]`, `[[1, 2], [3, 4]]`) and read-only slices
+  (`[]u8`); an array is passed where a slice is expected
 - packages: `import "std/..."`, `pub`, `pkg.name`
 - `unsafe` blocks and functions, raw pointers (`*u8`), the `syscall`
   intrinsic
 - the proof rules from [docs/safety.md](docs/safety.md): plain
-  `+ - * / % <<` and conversions like `u8(x)` must be proven safe. The checker
-  follows value ranges and relations between variables through the program,
-  narrowing on conditions and early returns. `+% -% *% <<%` wrap and `+| -|`
-  saturate.
+  `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
+  safe. The checker follows value ranges and relations between variables and
+  lengths through the program, narrowing on conditions, early returns and
+  `for` loops. `+% -% *% <<%` wrap and `+| -|` saturate.
 
 ```
 fn clamp_to_u8(x: i32) -> u8 {
@@ -64,6 +67,16 @@ fn distance(a: u64, b: u64) -> u64 {
 		return a - b      // proven: b <= a
 	}
 	return b - a          // proven: a < b
+}
+
+fn count_rises(xs: []u32) -> u32 {
+	var n: u32 = 0
+	for i in 1..xs.len {
+		if xs[i - 1] < xs[i] {    // proven: 1 <= i < xs.len
+			n = n +% 1
+		}
+	}
+	return n
 }
 ```
 

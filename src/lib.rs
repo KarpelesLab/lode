@@ -6,8 +6,8 @@
 //! optimize, codegen and link. The design of the language is in `docs/`.
 //!
 //! This is an early compiler: it supports functions, integers, `bool`, `str`,
-//! raw pointers in `unsafe` code, constants, local variables, arithmetic,
-//! control flow and packages. Everything else in the design is reported as
+//! arrays and slices, raw pointers in `unsafe` code, constants, local
+//! variables, arithmetic, control flow (including `for` loops) and packages. Everything else in the design is reported as
 //! "not supported by the compiler yet".
 
 pub mod ast;

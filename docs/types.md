@@ -91,6 +91,27 @@ semantics.
 - `a.len` is always available. Indexing follows the
   [safety rules](safety.md#failure-sources-in-detail).
 
+#### In the compiler today
+
+**Status:** Implemented subset (syntax in [syntax.md](syntax.md#arrays-slices-and-for))
+
+- Element types: integers, `bool`, and arrays (`[4][4]u8`). Arrays and slices
+  of other types are not supported yet.
+- An array is a value. `let b = a` copies the elements, and changing `a`
+  afterwards doesn't change `b`. Array locals live on the stack.
+- A slice is a read-only view, a pointer and a length, like `str`. Assigning
+  through a slice (`xs[i] = v`) needs `inout`, which isn't there yet.
+- An array converts to a slice of all its elements where a slice is
+  expected: in a call argument, or in a `let`/`var` with a slice type. A slice
+  kept in a local may only view a `let` array (or part of one), so it never
+  sees the array change. This stands in for the [view rules](memory.md#views)
+  until they're checked.
+- Every `a[i]` must be [proven](safety.md#the-fact-language) to be in
+  bounds. The index can have any integer type.
+- Not yet: passing or returning an array by value (take a slice instead),
+  returning a slice, comparing arrays with `==`, slicing (`a[i..j]`), and
+  `a.get(i)`.
+
 ### Structs
 
 ```

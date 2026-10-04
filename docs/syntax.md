@@ -123,6 +123,53 @@ fn main() {
 | Compile-time | `comptime`, `if comptime cond { ... }` |
 | Unsafe | `unsafe fn`, `unsafe { ... }` |
 | Cleanup | `defer`, `errdefer` |
+| Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a.len` (see below) |
+| Loop over a range or elements | `for i in 0..n { ... }`, `for x in xs { ... }` |
+
+## Arrays, slices and `for`
+
+**Status:** Proposed; implemented in the compiler
+
+```
+const N = 4
+
+fn sum(xs: []u32) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+fn main() -> u32 {
+	var grid: [N][N]u8 = [[0; N]; N]
+	for i in 0..N {
+		grid[i][i] = 1
+	}
+	let primes: [4]u32 = [2, 3, 5, 7]
+	return sum(primes)
+}
+```
+
+- `[N]T` is an array of `N` elements of type `T`. `N` is a constant: an
+  integer literal or a `const`. `[N][M]T` is an array of `N` rows, each a
+  `[M]T`, so `grid[i][j]` is row `i`, column `j` (as in Go).
+- `[]T` is a slice of `T`.
+- `[a, b, c]` is an array literal. Its element type comes from the context
+  (`let a: [3]u8 = [1, 2, 3]`), or else from its first element that has a
+  type of its own (`[1, x, 2]` with `x: u32` is a `[3]u32`).
+- `[v; N]` repeats one value `N` times. `N` is a constant.
+- `a[i]` is an element. `a[i] = v` and `a[i][j] op= v` assign to an element
+  of a `var` array.
+- `a.len` is the length: a `usize`, and for an array its constant `N`.
+- `for i in a..b { ... }` runs the body for each integer from `a` up to, but
+  not including, `b`. Both bounds are evaluated once, before the loop. When
+  both are untyped (literals or untyped constants), they're `usize`, because
+  ranges are mostly for indexing.
+- `for x in xs { ... }` runs the body for each element of an array or slice.
+  `xs` is evaluated once, before the loop: if the body assigns to an array
+  `xs`, the loop still goes over the elements it had when it started.
+- The loop variable is immutable. `break` and `continue` work as in `while`.
 
 ## Open questions
 

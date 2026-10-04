@@ -106,10 +106,13 @@ So:
 
 **Status:** Proposed; implemented in the compiler (`src/sema/facts.rs`)
 
-The checker tracks two kinds of fact about integer locals:
+The checker tracks facts about **terms**. A term is an integer local, or the
+length of a view local (`xs.len` of a slice or `str` parameter or local). An
+expression can be a term plus a constant: `i`, `i + 1`, `xs.len - 1`. There
+are two kinds of fact:
 
-- **Ranges:** `x` lies in `lo..=hi`.
-- **Relations:** for two locals, `a - b <= c`.
+- **Ranges:** a term lies in `lo..=hi`.
+- **Relations:** for two terms, `a - b <= c`.
 
 Both are decidable and cheap, and the rules for how they flow are fixed:
 
@@ -117,17 +120,29 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | --- | --- |
 | A literal or constant | Its exact value |
 | An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges) |
-| `let` / `var` / assignment | The value's range; a copy of another local is equal to it. Assigning forgets every relation involving the variable. |
+| `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
+| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length. |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
 | `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`) |
-| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two locals, a relation. `x != k` narrows only when `k` is at an end of `x`'s range. |
+| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` narrows only when `k` is at an end of `x`'s range. |
 | `while cond` / `loop` | Before the loop, everything is forgotten about the variables the loop assigns. The body knows `cond` is true. After a `while` without `break`, `cond` is false. |
+| `for i in a..b` | Everything about the variables the loop assigns is forgotten, as for `while`. In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. |
+| `for x in xs` | The same as `for` over `0..xs.len` with a hidden index, which proves the hidden `xs[index]` that gives `x` |
 | `x - y` | A known relation bounds the result: `y <= x` proves it doesn't go below zero |
 
+A relation can also come from two known relations through one other term:
+`i < n` and `n == xs.len` (from `let n = xs.len`) give `i < xs.len`. Only
+one step: longer chains are not followed, which keeps the check cheap and
+easy to predict.
+
+`a[i]` is proven when `i` can't be negative and either `i`'s range is below
+the length's (for an array, its constant `N`), or a relation gives
+`i - a.len <= -1`.
+
 Everything else gives no facts. In particular, facts don't cross function
-calls yet (that's what [refinements](#refinements-in-types) are for), and
-there's no induction beyond the loop condition.
+calls yet (that's what [refinements](#refinements-in-types) are for), array
+elements have no facts, and there's no induction beyond the loop condition.
 
 Example, from the standard library's `os.write_all`:
 
