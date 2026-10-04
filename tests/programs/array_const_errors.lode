@@ -1,6 +1,4 @@
 // error: expected `[3]u8`, found an array of 2 element(s)
-// error: the elements of an array constant must be known when compiling
-// error: constants of type `[2]Point` are not supported by the compiler yet
 // error: an array constant has at most 16777216 elements
 // error: expected `[2]u8`, found `u8`
 // error: cannot assign to `TABLE`, which is a constant
@@ -11,21 +9,11 @@
 // help: change a copy: `var v = TABLE`
 package main
 
-struct Point {
-	x: u8
-}
-
 const SHORT: [3]u8 = [1, 2]
-const CALLED: [2]u8 = [1, one()]
-const POINTS: [2]Point = [Point{x: 1}, Point{x: 2}]
 const HUGE: [20000000]u8 = [0; 20000000]
 const NOT_ARRAY: [2]u8 = SQUARE
 const SQUARE: u8 = 4
 const TABLE: [4]u8 = [10, 20, 30, 40]
-
-fn one() -> u8 {
-	return 1
-}
 
 fn clear(inout xs: [4]u8) {
 	xs[0] = 0

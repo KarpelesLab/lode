@@ -1,143 +1,158 @@
-/// The operating system interface: Linux on x86-64.
+/// The operating system interface: Linux, on x86-64 and AArch64.
 ///
 /// This is the lowest layer of the standard library, the one a project can
-/// replace with its own (docs/backend.md, "Custom os/arch layers"). Other
-/// targets will get their own version of this package, selected with
-/// `if comptime target.os == ...` once the compiler has `comptime`.
+/// replace with its own (docs/backend.md, "Custom os/arch layers"). The
+/// target picks the implementation: `if comptime` on `target.os` and
+/// `target.arch` (docs/packages.md, "Per-target code"). Only x86-64 Linux
+/// can be built today; AArch64 Linux can be checked
+/// (`lode check --targets=aarch64-linux`).
 package os
 
-/// Linux x86-64 system call numbers.
-const SYS_READ = 0
-const SYS_WRITE = 1
-const SYS_EXIT_GROUP = 231
-
-/// Linux error numbers (a failed system call returns their negation).
-pub const EINTR: isize = 4
-pub const EIO: isize = 5
-pub const EBADF: isize = 9
-pub const ENOSPC: isize = 28
-pub const EPIPE: isize = 32
-pub const EDQUOT: isize = 122
-
-/// The errors of the system calls this package makes.
-pub enum Error {
-	/// `EBADF`: not an open file descriptor, or not open for this.
-	bad_fd
-	/// `EPIPE`: the reading end of a pipe is closed (seen only when SIGPIPE
-	/// doesn't end the process first).
-	broken_pipe
-	/// `ENOSPC` or `EDQUOT`: the device is full, or the quota reached.
-	no_space
-	/// `EIO`: a low-level I/O error, or a result the kernel never gives.
-	io
-	/// Any other error number.
-	other(errno: u16)
-}
-
-/// The error a failed system call's result `n` (a negative error number)
-/// stands for.
-pub fn error(n: isize) -> Error {
-	if n == -EBADF {
-		return .bad_fd
+if comptime target.os == .linux {
+	/// The system call numbers, which differ between architectures.
+	if comptime target.arch == .x86_64 {
+		const SYS_READ = 0
+		const SYS_WRITE = 1
+		const SYS_EXIT_GROUP = 231
+	} else if comptime target.arch == .aarch64 {
+		const SYS_READ = 63
+		const SYS_WRITE = 64
+		const SYS_EXIT_GROUP = 94
+	} else {
+		compile_error("std/os: Linux on this architecture is not supported yet")
 	}
-	if n == -EIO {
+
+	/// Linux error numbers (a failed system call returns their negation), the
+	/// same on every architecture Lode supports.
+	pub const EINTR: isize = 4
+	pub const EIO: isize = 5
+	pub const EBADF: isize = 9
+	pub const ENOSPC: isize = 28
+	pub const EPIPE: isize = 32
+	pub const EDQUOT: isize = 122
+
+	/// The errors of the system calls this package makes.
+	pub enum Error {
+		/// `EBADF`: not an open file descriptor, or not open for this.
+		bad_fd
+		/// `EPIPE`: the reading end of a pipe is closed (seen only when SIGPIPE
+		/// doesn't end the process first).
+		broken_pipe
+		/// `ENOSPC` or `EDQUOT`: the device is full, or the quota reached.
+		no_space
+		/// `EIO`: a low-level I/O error, or a result the kernel never gives.
+		io
+		/// Any other error number.
+		other(errno: u16)
+	}
+
+	/// The error a failed system call's result `n` (a negative error number)
+	/// stands for.
+	pub fn error(n: isize) -> Error {
+		if n == -EBADF {
+			return .bad_fd
+		}
+		if n == -EIO {
+			return .io
+		}
+		if n == -EPIPE {
+			return .broken_pipe
+		}
+		if n == -ENOSPC {
+			return .no_space
+		}
+		if n == -EDQUOT {
+			return .no_space
+		}
+		if n < 0 && n >= -0xffff {
+			return .other(u16(-n))
+		}
 		return .io
 	}
-	if n == -EPIPE {
-		return .broken_pipe
-	}
-	if n == -ENOSPC {
-		return .no_space
-	}
-	if n == -EDQUOT {
-		return .no_space
-	}
-	if n < 0 && n >= -0xffff {
-		return .other(u16(-n))
-	}
-	return .io
-}
 
-/// The standard file descriptors.
-pub const STDIN: i32 = 0
-pub const STDOUT: i32 = 1
-pub const STDERR: i32 = 2
+	/// The standard file descriptors.
+	pub const STDIN: i32 = 0
+	pub const STDOUT: i32 = 1
+	pub const STDERR: i32 = 2
 
-/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of
-/// bytes read (0 at the end of the input, possibly fewer than `len`), or a
-/// negative error number.
-///
-/// The caller must ensure `data` points to `len` writable bytes.
-pub unsafe fn read(fd: i32, data: *u8, len: usize) -> isize {
-	return syscall(SYS_READ, fd, data, len)
-}
+	/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of
+	/// bytes read (0 at the end of the input, possibly fewer than `len`), or a
+	/// negative error number.
+	///
+	/// The caller must ensure `data` points to `len` writable bytes.
+	pub unsafe fn read(fd: i32, data: *u8, len: usize) -> isize {
+		return syscall(SYS_READ, fd, data, len)
+	}
 
-/// Write the `len` bytes at `data` to `fd`, once. Returns the number of bytes
-/// written (possibly fewer than `len`), or a negative error number.
-///
-/// The caller must ensure `data` points to `len` readable bytes.
-pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
-	return syscall(SYS_WRITE, fd, data, len)
-}
+	/// Write the `len` bytes at `data` to `fd`, once. Returns the number of bytes
+	/// written (possibly fewer than `len`), or a negative error number.
+	///
+	/// The caller must ensure `data` points to `len` readable bytes.
+	pub unsafe fn write(fd: i32, data: *u8, len: usize) -> isize {
+		return syscall(SYS_WRITE, fd, data, len)
+	}
 
-/// Write all of the bytes `b` to `fd` (a `str` gives them with `s.bytes()`),
-/// retrying after partial writes and interrupted calls. Returns 0, or the
-/// negative error number of the first failure.
-///
-/// The loop is written for size: one `syscall` instead of a call to `write`
-/// (inlining one costs 140 bytes today), each check a plain `if` (an `||`
-/// costs a merge block), and both `-EIO` cases share one exit.
-pub fn write_all(fd: i32, b: []u8) -> isize {
-	var rest = b
-	loop {
-		if rest.len == 0 {
-			return 0
+	/// Write all of the bytes `b` to `fd` (a `str` gives them with `s.bytes()`),
+	/// retrying after partial writes and interrupted calls. Returns 0, or the
+	/// negative error number of the first failure.
+	///
+	/// The loop is written for size: one `syscall` instead of a call to `write`
+	/// (inlining one costs 140 bytes today), each check a plain `if` (an `||`
+	/// costs a merge block), and both `-EIO` cases share one exit.
+	pub fn write_all(fd: i32, b: []u8) -> isize {
+		var rest = b
+		loop {
+			if rest.len == 0 {
+				return 0
+			}
+			var n: isize
+			unsafe {
+				n = syscall(SYS_WRITE, fd, rest.ptr, rest.len)
+			}
+			if n == -EINTR {
+				continue
+			}
+			if n < 0 {
+				return n
+			}
+			// The kernel never reports writing nothing, or more than asked.
+			if n == 0 {
+				break
+			}
+			if usize(n) > rest.len {
+				break
+			}
+			rest = rest[usize(n)..]
 		}
-		var n: isize
+		return -EIO
+	}
+
+	/// End the process now, with exit status `code` (the parent sees its low 8
+	/// bits).
+	///
+	/// This is the `exit_group` system call, which ends every thread of the
+	/// process, not only the calling one (`exit`). Nothing else runs: no `defer`
+	/// or `errdefer` body, in this function or its callers. There's no output
+	/// buffer to lose, since every write is a system call.
+	///
+	/// It returns `never`: the code after a call to it can't be reached, and a
+	/// function that returns a value needs no `return` after it. `exit_group`
+	/// doesn't return, but the checker doesn't know what a system call does, so
+	/// an endless `loop` follows it. It never runs, and costs one jump.
+	pub fn exit(code: i32) -> never {
 		unsafe {
-			n = syscall(SYS_WRITE, fd, rest.ptr, rest.len)
+			syscall(SYS_EXIT_GROUP, code)
 		}
-		if n == -EINTR {
-			continue
-		}
-		if n < 0 {
-			return n
-		}
-		// The kernel never reports writing nothing, or more than asked.
-		if n == 0 {
-			break
-		}
-		if usize(n) > rest.len {
-			break
-		}
-		rest = rest[usize(n)..]
+		loop {}
 	}
-	return -EIO
-}
 
-/// End the process now, with exit status `code` (the parent sees its low 8
-/// bits).
-///
-/// This is the `exit_group` system call, which ends every thread of the
-/// process, not only the calling one (`exit`). Nothing else runs: no `defer`
-/// or `errdefer` body, in this function or its callers. There's no output
-/// buffer to lose, since every write is a system call.
-///
-/// It returns `never`: the code after a call to it can't be reached, and a
-/// function that returns a value needs no `return` after it. `exit_group`
-/// doesn't return, but the checker doesn't know what a system call does, so
-/// an endless `loop` follows it. It never runs, and costs one jump.
-pub fn exit(code: i32) -> never {
-	unsafe {
-		syscall(SYS_EXIT_GROUP, code)
+	/// End the process now, because it can't go on (docs/errors.md): with exit
+	/// status 134, the one a shell shows for a process killed by `SIGABRT` (128
+	/// plus 6). It's `exit(134)`, written so that it's easy to find: no signal
+	/// is raised, so there's no core dump, and nothing else runs.
+	pub fn abort() -> never {
+		exit(134)
 	}
-	loop {}
-}
-
-/// End the process now, because it can't go on (docs/errors.md): with exit
-/// status 134, the one a shell shows for a process killed by `SIGABRT` (128
-/// plus 6). It's `exit(134)`, written so that it's easy to find: no signal
-/// is raised, so there's no core dump, and nothing else runs.
-pub fn abort() -> never {
-	exit(134)
+} else {
+	compile_error("std/os: unsupported target")
 }

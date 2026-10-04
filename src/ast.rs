@@ -30,6 +30,29 @@ pub enum Item {
     Const(ConstDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
+    /// `if comptime cond { items } else { items }` at package level: the
+    /// declarations of the branch `cond` picks for the target.
+    If(ItemIf),
+    /// `compile_error("message")` at package level: an error when the
+    /// declarations around it are compiled (in a taken branch of an
+    /// `if comptime`, or at all). The call expression.
+    CompileError(Expr),
+}
+
+/// `if comptime cond { ... } else ...` at package level.
+#[derive(Debug)]
+pub struct ItemIf {
+    pub cond: Expr,
+    pub then: Vec<Item>,
+    pub otherwise: Option<ItemElse>,
+    pub span: Span,
+}
+
+/// The `else` of a package-level `if comptime`.
+#[derive(Debug)]
+pub enum ItemElse {
+    If(Box<ItemIf>),
+    Items(Vec<Item>),
 }
 
 /// `enum Name { variant ... }` or `enum Name: T { variant = value ... }`,
@@ -119,6 +142,9 @@ pub struct Throws {
 /// `const NAME: T = value` at package level.
 #[derive(Debug)]
 pub struct ConstDecl {
+    /// `@comptime_budget(n)` on the line before: the most steps evaluating
+    /// the value may take, instead of the default.
+    pub budget: Option<Expr>,
     pub is_pub: bool,
     pub name: Ident,
     /// `None` for an untyped constant, which adapts to its context like a literal.
@@ -323,6 +349,9 @@ pub enum ForIter {
 
 #[derive(Clone, Debug)]
 pub struct IfStmt {
+    /// `if comptime cond`: `cond` is known when compiling, and only the
+    /// branch it picks is checked.
+    pub comptime: bool,
     /// `if let name = cond`: `cond` is an optional, and the `then` block
     /// runs with its value bound to `name` when it's not `none`.
     pub binding: Option<Ident>,

@@ -253,6 +253,17 @@ impl Parser {
 
     fn item(&mut self) -> PResult<Item> {
         let start = self.span();
+        if self.at_p(P::At) {
+            return self.attributed_item();
+        }
+        if self.at_kw(Kw::If) {
+            return self.item_if().map(Item::If);
+        }
+        if matches!(self.peek(), Tok::Ident(n) if n == "compile_error")
+            && *self.peek_at(1) == Tok::P(P::LParen)
+        {
+            return Ok(Item::CompileError(self.expr()?));
+        }
         let is_pub = self.eat_kw(Kw::Pub);
         match self.peek().clone() {
             Tok::Kw(Kw::Fn) => self.fn_decl(is_pub, false, start).map(Item::Fn),
@@ -276,6 +287,86 @@ impl Parser {
         }
     }
 
+    /// `@comptime_budget(n)` on its own line, then the `const` it applies
+    /// to.
+    fn attributed_item(&mut self) -> PResult<Item> {
+        let at = self.bump().span; // @
+        let name = self.ident("an attribute name")?;
+        if name.name != "comptime_budget" {
+            return self.error(
+                at.to(name.span),
+                format!("unknown attribute `@{}`", name.name),
+            );
+        }
+        self.expect_p(P::LParen)?;
+        let budget = self.nested_expr()?;
+        self.expect_p(P::RParen)?;
+        self.skip_newlines();
+        let start = self.span();
+        let is_pub = self.eat_kw(Kw::Pub);
+        if !self.at_kw(Kw::Const) {
+            return self.error(
+                at.to(name.span),
+                "`@comptime_budget` applies to a `const` declaration, on the next line",
+            );
+        }
+        let mut c = self.const_decl(is_pub, start)?;
+        c.budget = Some(budget);
+        Ok(Item::Const(c))
+    }
+
+    /// `if comptime cond { items } else ...` at package level.
+    fn item_if(&mut self) -> PResult<ItemIf> {
+        let start = self.bump().span; // if
+        if !self.eat_kw(Kw::Comptime) {
+            return self.error(
+                start,
+                "a declaration can only be in an `if comptime`, whose condition is known when compiling",
+            );
+        }
+        let cond = self.header_expr()?;
+        let then = self.item_block()?;
+        if *self.peek() == Tok::Newline && *self.peek_at(1) == Tok::Kw(Kw::Else) {
+            self.bump();
+        }
+        let otherwise = if self.eat_kw(Kw::Else) {
+            if self.at_kw(Kw::If) {
+                Some(ItemElse::If(Box::new(self.item_if()?)))
+            } else {
+                Some(ItemElse::Items(self.item_block()?))
+            }
+        } else {
+            None
+        };
+        Ok(ItemIf {
+            cond,
+            then,
+            otherwise,
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// `{ items }`, the declarations of a branch of a package-level `if
+    /// comptime`.
+    fn item_block(&mut self) -> PResult<Vec<Item>> {
+        self.expect_p(P::LBrace)?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            match self.peek() {
+                Tok::P(P::RBrace) => break,
+                Tok::Eof => return self.expected("`}`"),
+                _ => {}
+            }
+            match self.item() {
+                Ok(item) => items.push(item),
+                Err(Failed) => self.sync_item(),
+            }
+        }
+        self.bump(); // }
+        Ok(items)
+    }
+
     fn const_decl(&mut self, is_pub: bool, start: Span) -> PResult<ConstDecl> {
         self.bump(); // const
         let name = self.ident("a constant name")?;
@@ -287,6 +378,7 @@ impl Parser {
         self.expect_p(P::Eq)?;
         let value = self.expr()?;
         Ok(ConstDecl {
+            budget: None,
             is_pub,
             name,
             ty,
@@ -1049,6 +1141,10 @@ impl Parser {
 
     fn if_stmt(&mut self) -> PResult<IfStmt> {
         let start = self.bump().span; // if
+        let comptime = self.eat_kw(Kw::Comptime);
+        if comptime && self.at_kw(Kw::Let) {
+            return self.error(self.span(), "`if comptime` can't bind a value with `let`");
+        }
         let binding = if self.eat_kw(Kw::Let) {
             let name = self.ident("a variable name")?;
             self.expect_p(P::Eq)?;
@@ -1077,6 +1173,7 @@ impl Parser {
             None => then.span,
         };
         Ok(IfStmt {
+            comptime,
             binding,
             cond,
             then,

@@ -4,25 +4,29 @@
 //! types, and discharges the proof obligations of docs/safety.md using the
 //! flow-sensitive facts in [`facts`]. Its output is the typed tree in [`tree`].
 
+mod eval;
 mod expr;
 pub mod facts;
 mod generic;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::ast::{self, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
+use crate::target::Target;
 use crate::types::{Field, IntTy, Len, Primitive, Range, Trait, Ty, Variant, primitive};
 
 use facts::{Env, Linear, Term};
 pub use tree::*;
 
-/// Check every loaded package (dependencies first, the root package last).
-/// `ptr_bits` is the target's address width.
-pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) {
+/// Check every loaded package (dependencies first, the root package last)
+/// for `target`, which picks the branches of `if comptime` and is the value
+/// of `target`.
+pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>) {
     let mut ck = Checker {
         diags: Vec::new(),
         pkgs: Vec::new(),
@@ -36,26 +40,46 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         generic_calls: Vec::new(),
         declared_bounds: HashMap::new(),
         pending_bounds: None,
-        ptr_bits,
+        ptr_bits: target.pointer_bits,
+        target: *target,
+        fn_decls: Vec::new(),
+        func_states: Vec::new(),
+        checked_order: Vec::new(),
+        const_exprs: Vec::new(),
+        declaring: true,
+        package_error: false,
     };
     ck.collect(packages);
+    ck.declaring = false;
+    if ck.package_error {
+        let program = Program {
+            funcs: Vec::new(),
+            strings: Vec::new(),
+            tables: Vec::new(),
+            main: None,
+            packages: packages.iter().map(|p| p.path.clone()).collect(),
+            warnings: Vec::new(),
+        };
+        return (program, ck.diags);
+    }
 
-    // Check every constant, used or not, so its errors are reported.
+    // Check every constant, used or not, so its errors are reported. The
+    // functions a constant's value calls are checked on the way.
     for id in 0..ck.consts.len() {
         ck.const_value(id);
     }
-
-    let mut funcs = Vec::new();
-    for (pkg, package) in packages.iter().enumerate() {
-        for file in &package.files {
-            for item in &file.items {
-                if let ast::Item::Fn(f) = item {
-                    let id = funcs.len();
-                    funcs.push(ck.function(f, id, pkg, file.id));
-                }
-            }
+    for id in 0..ck.fn_decls.len() {
+        if matches!(ck.func_states[id], FuncState::Unchecked) {
+            ck.check_function(id);
         }
     }
+    let funcs: Vec<Func> = std::mem::take(&mut ck.func_states)
+        .into_iter()
+        .map(|state| match state {
+            FuncState::Done(f, _) => Rc::try_unwrap(f).unwrap_or_else(|f| (*f).clone()),
+            _ => unreachable!("every function is checked"),
+        })
+        .collect();
 
     let root = packages.len().saturating_sub(1);
     let main = match ck.pkgs.get(root).and_then(|p| p.items.get("main")) {
@@ -149,6 +173,20 @@ enum ConstVal {
     Untyped(i128),
     /// An array constant, of its type, by index into [`Checker::tables`].
     Table(Ty, usize),
+    /// A constant of another type (`bool`, a struct, an enum, an optional,
+    /// an array of them): the expression that builds it, by index into
+    /// [`Checker::const_exprs`].
+    Expr(usize),
+}
+
+/// Where a function is in being checked: in order, or earlier, on demand,
+/// when a constant's value calls it.
+enum FuncState {
+    Unchecked,
+    Checking,
+    /// Checked, and whether without errors (only then can it run at
+    /// compile time).
+    Done(Rc<Func>, bool),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +228,22 @@ struct Checker<'a> {
     /// generic types whose bounds are checked once every type is known.
     pending_bounds: Option<Vec<(Ty, Span)>>,
     ptr_bits: u32,
+    /// The target checked for.
+    target: Target,
+    /// Every function's declaration, package and file, by id.
+    fn_decls: Vec<(&'a ast::FnDecl, usize, FileId)>,
+    /// Every function's checking state, by id.
+    func_states: Vec<FuncState>,
+    /// The functions checked so far, in order (for [`Checker::rollback`]).
+    checked_order: Vec<FuncId>,
+    /// The values of the constants of [`ConstVal::Expr`].
+    const_exprs: Vec<TExpr>,
+    /// Whether types and signatures are being declared: a constant needed
+    /// for them can't call functions, which aren't all known yet.
+    declaring: bool,
+    /// Whether a package-level `compile_error` was reached: the program
+    /// isn't checked further.
+    package_error: bool,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -243,6 +297,12 @@ struct FnCx {
     /// The locals a value was moved out of somewhere (see
     /// [`Checker::consume`]), for the message when one is used unassigned.
     moved: HashSet<LocalId>,
+    /// Whether this is code that only runs at compile time (a constant's
+    /// value, an `if comptime` condition). Its proof obligations are
+    /// discharged by running it (docs/generics.md, Proof obligations in
+    /// compile-time code): an operation that isn't proven is wrapped in an
+    /// [`TExprKind::Unproven`] instead of being an error.
+    comptime: bool,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -276,6 +336,9 @@ struct Mark {
     strs: StrOrigins,
     moved: HashSet<LocalId>,
     generic_calls: usize,
+    checked: usize,
+    tables: usize,
+    const_exprs: usize,
 }
 
 impl FnCx {
@@ -303,6 +366,7 @@ impl FnCx {
             type_params: Vec::new(),
             value_locals: Vec::new(),
             moved: HashSet::new(),
+            comptime: false,
         }
     }
 
@@ -332,6 +396,53 @@ const MATCHED: &str = "$match";
 
 /// The return type of a function that doesn't return.
 const NEVER: &str = "never";
+
+/// `compile_error("message")`: an error where it's reached.
+const COMPILE_ERROR: &str = "compile_error";
+
+/// The compile-time value describing the target.
+const TARGET: &str = "target";
+
+/// The names an expression uses (not in the blocks of its `catch`es), with
+/// their spans.
+fn expr_names<'e>(e: &'e ast::Expr, out: &mut Vec<(&'e str, Span)>) {
+    match &e.kind {
+        ExprKind::Name(n) => out.push((n, e.span)),
+        ExprKind::Int(_)
+        | ExprKind::Char(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None
+        | ExprKind::Dot(_) => {}
+        ExprKind::Unary(_, a)
+        | ExprKind::Field(a, _)
+        | ExprKind::TypeArgs(a, _)
+        | ExprKind::Paren(a)
+        | ExprKind::Try(a)
+        | ExprKind::Throw(a)
+        | ExprKind::Ref(a) => expr_names(a, out),
+        ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
+            expr_names(a, out);
+            expr_names(b, out);
+        }
+        ExprKind::Slice(base, start, end) => {
+            expr_names(base, out);
+            start.iter().chain(end).for_each(|a| expr_names(a, out));
+        }
+        ExprKind::Call(callee, args) => {
+            expr_names(callee, out);
+            args.iter().for_each(|a| expr_names(a, out));
+        }
+        ExprKind::ArrayLit(items) => items.iter().for_each(|a| expr_names(a, out)),
+        ExprKind::StructLit(_, fields) => fields.iter().for_each(|f| expr_names(&f.value, out)),
+        ExprKind::Catch { value, handler, .. } => {
+            expr_names(value, out);
+            if let ast::CatchHandler::Value(v) = handler {
+                expr_names(v, out);
+            }
+        }
+    }
+}
 
 /// The blocks of the `catch`es in an expression, at any depth.
 fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
@@ -1007,7 +1118,9 @@ impl<'a> Checker<'a> {
                 }
                 self.imports.insert(file.id, names);
 
-                for item in &file.items {
+                let mut items = Vec::new();
+                self.active_items(&file.items, &mut items);
+                for item in items {
                     let (name, entry) = match item {
                         // Methods and associated functions are found
                         // through their type, once types are known.
@@ -1048,6 +1161,9 @@ impl<'a> Checker<'a> {
                             enums.push((e, pkg, file.id, ty));
                             (&e.name, Item::Type(ty))
                         }
+                        ast::Item::If(_) | ast::Item::CompileError(_) => {
+                            unreachable!("replaced by `active_items`")
+                        }
                     };
                     if self.pkgs[pkg].items.contains_key(&name.name) {
                         self.error(
@@ -1058,6 +1174,11 @@ impl<'a> Checker<'a> {
                     self.pkgs[pkg].items.insert(name.name.clone(), entry);
                 }
             }
+        }
+        // A package that can't be compiled for the target said so: what uses
+        // it would only give errors that follow from that one.
+        if self.package_error {
+            return;
         }
         // Field types and signatures come once every item is known: an array
         // length in a type can name a constant declared further down, and a
@@ -1089,11 +1210,235 @@ impl<'a> Checker<'a> {
                 .and_then(|o| self.method_owner(o, &f.name, id, pkg, file));
             owners.push(owner);
         }
-        for ((f, pkg, file), owner) in fns.into_iter().zip(owners) {
+        for (&(f, pkg, file), owner) in fns.iter().zip(owners) {
             let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
             let sig = self.signature(&mut cx, f, owner);
             self.sigs.push(sig);
         }
+        self.func_states = fns.iter().map(|_| FuncState::Unchecked).collect();
+        self.fn_decls = fns;
+    }
+
+    /// The items of a file that are compiled for the target: those outside
+    /// any `if comptime`, and those in the branches the target picks. A
+    /// `compile_error` among them is reported.
+    fn active_items(&mut self, items: &'a [ast::Item], out: &mut Vec<&'a ast::Item>) {
+        for item in items {
+            match item {
+                ast::Item::If(i) => {
+                    let mut branch = Some(i);
+                    while let Some(i) = branch.take() {
+                        match self.item_cond(&i.cond) {
+                            Some(true) => self.active_items(&i.then, out),
+                            Some(false) => match &i.otherwise {
+                                Some(ast::ItemElse::If(inner)) => branch = Some(inner),
+                                Some(ast::ItemElse::Items(items)) => self.active_items(items, out),
+                                None => {}
+                            },
+                            None => {}
+                        }
+                    }
+                }
+                ast::Item::CompileError(call) => {
+                    self.compile_error(call);
+                    self.package_error = true;
+                }
+                _ => out.push(item),
+            }
+        }
+    }
+
+    /// Report `compile_error("message")`, reached in code compiled for the
+    /// target.
+    fn compile_error(&mut self, call: &ast::Expr) {
+        let ExprKind::Call(_, args) = &call.kind else {
+            unreachable!("a call of `compile_error`")
+        };
+        match args.as_slice() {
+            [
+                ast::Expr {
+                    kind: ExprKind::Str(msg),
+                    ..
+                },
+            ] => {
+                let msg = String::from_utf8_lossy(msg).into_owned();
+                self.diags.push(Diagnostic::error(call.span, msg).with_help(
+                    "`compile_error` is an error in the code compiled for the target: outside of `if comptime`, or in a branch the target takes",
+                ));
+            }
+            _ => self.error(call.span, "`compile_error` takes one string literal"),
+        }
+    }
+
+    /// The value of a package-level `if comptime` condition. It's evaluated
+    /// before names are resolved, so it can only use `target`, literals,
+    /// comparisons, `&&`, `||` and `!` (docs/generics.md, What M7 needs).
+    fn item_cond(&mut self, e: &ast::Expr) -> Option<bool> {
+        match self.cond_value(e)? {
+            CondVal::Bool(b) => Some(b),
+            _ => {
+                self.error(e.span, "the condition of `if comptime` must be a `bool`");
+                None
+            }
+        }
+    }
+
+    fn cond_value(&mut self, e: &ast::Expr) -> Option<CondVal> {
+        use ast::{BinOp, UnOp};
+        match &e.kind {
+            ExprKind::Bool(b) => Some(CondVal::Bool(*b)),
+            ExprKind::Int(v) => match i128::try_from(*v) {
+                Ok(v) => Some(CondVal::Int(v)),
+                Err(_) => {
+                    self.error(e.span, "integer literal is too large");
+                    None
+                }
+            },
+            ExprKind::Paren(inner) => self.cond_value(inner),
+            ExprKind::Dot(name) => Some(CondVal::Dot(name.clone())),
+            ExprKind::Unary(UnOp::Not, inner) => match self.cond_value(inner)? {
+                CondVal::Bool(b) => Some(CondVal::Bool(!b)),
+                _ => {
+                    self.error(inner.span, "`!` needs a `bool`");
+                    None
+                }
+            },
+            ExprKind::Field(base, member) if matches!(&base.kind, ExprKind::Name(n) if n == TARGET) =>
+            {
+                let (ty, v) = self.target_field(member)?;
+                Some(match ty {
+                    Ty::Int(_) => CondVal::Int(v),
+                    _ => CondVal::Enum(ty, v as u32),
+                })
+            }
+            ExprKind::Binary(op @ (BinOp::And | BinOp::Or), l, r) => {
+                let (a, b) = (self.cond_value(l), self.cond_value(r));
+                match (a?, b?) {
+                    (CondVal::Bool(a), CondVal::Bool(b)) => {
+                        Some(CondVal::Bool(if *op == BinOp::And {
+                            a && b
+                        } else {
+                            a || b
+                        }))
+                    }
+                    _ => {
+                        self.error(e.span, format!("`{}` needs `bool` operands", op.as_str()));
+                        None
+                    }
+                }
+            }
+            ExprKind::Binary(
+                op @ (BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge),
+                l,
+                r,
+            ) => {
+                let (a, b) = (self.cond_value(l), self.cond_value(r));
+                let (a, b) = (a?, b?);
+                let equality = matches!(op, BinOp::Eq | BinOp::Ne);
+                let ord = match (&a, &b) {
+                    (CondVal::Int(x), CondVal::Int(y)) => x.cmp(y),
+                    (CondVal::Bool(x), CondVal::Bool(y)) if equality => x.cmp(y),
+                    (CondVal::Enum(t, x), CondVal::Enum(u, y)) if t == u && equality => x.cmp(y),
+                    (CondVal::Enum(t, x), CondVal::Dot(name))
+                    | (CondVal::Dot(name), CondVal::Enum(t, x))
+                        if equality =>
+                    {
+                        let def = t.as_enum().expect("an enum");
+                        let Some((k, _)) = def.variant(&name.name) else {
+                            let names: Vec<String> = def
+                                .variants
+                                .iter()
+                                .map(|v| format!("`.{}`", v.name))
+                                .collect();
+                            self.diags.push(
+                                Diagnostic::error(
+                                    name.span,
+                                    format!("`{t}` has no variant `{}`", name.name),
+                                )
+                                .with_help(format!("its variants are {}", names.join(", "))),
+                            );
+                            return None;
+                        };
+                        x.cmp(&(k as u32))
+                    }
+                    _ => {
+                        self.error(
+                            e.span,
+                            format!("`{}` can't compare these values", op.as_str()),
+                        );
+                        return None;
+                    }
+                };
+                let r = match op {
+                    BinOp::Eq => ord.is_eq(),
+                    BinOp::Ne => ord.is_ne(),
+                    BinOp::Lt => ord.is_lt(),
+                    BinOp::Le => ord.is_le(),
+                    BinOp::Gt => ord.is_gt(),
+                    _ => ord.is_ge(),
+                };
+                Some(CondVal::Bool(r))
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        e.span,
+                        "a package-level `if comptime` condition can only use `target`, literals, comparisons, `&&`, `||` and `!`",
+                    )
+                    .with_help("it's evaluated before the package's names are known"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The type and value of `target.name`: an enum variant's index, or an
+    /// integer.
+    fn target_field(&mut self, member: &ast::Ident) -> Option<(Ty, i128)> {
+        let types = crate::target::types();
+        let def = types.target.as_struct().expect("a struct");
+        let Some((k, ty)) = def.field(&member.name) else {
+            let fields: Vec<String> = crate::target::FIELD_NAMES
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect();
+            self.diags.push(
+                Diagnostic::error(
+                    member.span,
+                    format!("`target` has no field `{}`", member.name),
+                )
+                .with_help(format!("its fields are {}", fields.join(", "))),
+            );
+            return None;
+        };
+        Some((ty, self.target.field_values()[k]))
+    }
+
+    /// The value of `target`, of the built-in struct `target.Target`.
+    fn target_value(&self) -> TExpr {
+        let types = crate::target::types();
+        let def = types.target.as_struct().expect("a struct");
+        let fields = def
+            .fields
+            .iter()
+            .zip(self.target.field_values())
+            .enumerate()
+            .map(|(k, (f, v))| (k as u32, scalar_expr(f.ty, v)))
+            .collect();
+        TExpr {
+            kind: TExprKind::StructLit(fields),
+            ty: types.target,
+        }
+    }
+
+    /// Whether `e` is a call of `compile_error`, as a statement (unless a
+    /// variable or an item of that name hides it).
+    fn is_compile_error(&self, cx: &FnCx, e: &ast::Expr) -> bool {
+        matches!(&e.kind, ExprKind::Call(callee, _)
+            if matches!(&callee.kind, ExprKind::Name(n)
+                if n == COMPILE_ERROR
+                    && cx.lookup(n).is_none()
+                    && !self.pkgs[cx.pkg].items.contains_key(n)))
     }
 
     /// The type `fn Owner.name` belongs to: a struct or an enum declared in
@@ -1952,19 +2297,6 @@ impl<'a> Checker<'a> {
             Some(t) => {
                 let ty = self.resolve_type(&mut cx, t);
                 match ty {
-                    Some(ty @ Ty::Int(_)) => self
-                        .expr(&mut cx, &decl.value, Some(ty))
-                        .and_then(|c| self.coerce(&mut cx, c, ty, decl.value.span))
-                        .and_then(|c| match c.range {
-                            Some(r) if r.lo == r.hi => Some(ConstVal::Typed(ty, r.lo)),
-                            _ => {
-                                self.error(
-                                    decl.value.span,
-                                    "the value of a constant must be known when compiling",
-                                );
-                                None
-                            }
-                        }),
                     Some(ty) if table_leaf(ty).is_some() && table_scalars(ty) > TABLE_MAX => {
                         self.error(
                             t.span(),
@@ -1972,18 +2304,7 @@ impl<'a> Checker<'a> {
                         );
                         None
                     }
-                    Some(ty) if table_leaf(ty).is_some() => {
-                        let mut values = Vec::new();
-                        self.table_values(&mut cx, &decl.value, ty, &mut values)
-                            .map(|()| {
-                                self.tables.push(Table {
-                                    name: decl.name.name.clone(),
-                                    ty,
-                                    values,
-                                });
-                                ConstVal::Table(ty, self.tables.len() - 1)
-                            })
-                    }
+                    Some(ty) if const_type(ty) => self.computed_const(&mut cx, decl, ty),
                     Some(other) => {
                         self.error(
                             t.span(),
@@ -2001,74 +2322,106 @@ impl<'a> Checker<'a> {
         value
     }
 
-    /// Append the scalars of `e`, the value of an array constant (or of one
-    /// of its elements) of type `ty`, to `out`: from array literals,
-    /// `[v; n]`, other array constants, and scalars known when compiling.
-    fn table_values(
-        &mut self,
-        cx: &mut FnCx,
-        e: &ast::Expr,
-        ty: Ty,
-        out: &mut Vec<i128>,
-    ) -> Option<()> {
-        let Some((elem, n)) = ty.as_known_array() else {
-            let c = self.expr(cx, e, Some(ty))?;
-            let c = self.coerce(cx, c, ty, e.span)?;
-            let v = match (&c.expr.kind, c.range) {
-                (TExprKind::Bool(b), _) => i128::from(*b),
-                (_, Some(r)) if r.lo == r.hi && ty.as_int().is_some() => r.lo,
+    /// The value of the typed constant `decl`, of type `ty`, computed at
+    /// compile time (docs/generics.md, What M7 needs): any expression of
+    /// the type, calls of ordinary functions included. Its proof
+    /// obligations are discharged by running it.
+    fn computed_const(&mut self, cx: &mut FnCx, decl: &ast::ConstDecl, ty: Ty) -> Option<ConstVal> {
+        cx.comptime = true;
+        let c = self.expr(cx, &decl.value, Some(ty))?;
+        let c = self.coerce(cx, c, ty, decl.value.span)?;
+        // A value the checker already knows.
+        if let (TExprKind::Int(v), Ty::Int(_)) = (&c.expr.kind, ty) {
+            return Some(ConstVal::Typed(ty, *v));
+        }
+        if let TExprKind::Table(id) = c.expr.kind {
+            return Some(ConstVal::Table(ty, id));
+        }
+        let budget = match &decl.budget {
+            None => eval::DEFAULT_STEPS,
+            Some(b) => match self.untyped_int(cx, b).map(u64::try_from) {
+                Some(Ok(n)) if n > 0 => n,
                 _ => {
                     self.error(
-                        e.span,
-                        "the elements of an array constant must be known when compiling",
+                        b.span,
+                        "the budget must be a positive integer literal or untyped constant",
                     );
                     return None;
                 }
-            };
-            out.push(v);
-            return Some(());
+            },
         };
-        let found = |count: u64| format!("expected `{ty}`, found an array of {count} element(s)");
-        match &e.kind {
-            ExprKind::Paren(inner) => self.table_values(cx, inner, ty, out),
-            ExprKind::ArrayLit(elems) => {
-                if elems.len() as u64 != n {
-                    self.error(e.span, found(elems.len() as u64));
-                    return None;
-                }
-                let mut ok = true;
-                for el in elems {
-                    ok &= self.table_values(cx, el, elem, out).is_some();
-                }
-                ok.then_some(())
-            }
-            ExprKind::ArrayRepeat(value, count) => {
-                let count = self.const_count(cx, count)?;
-                if count != n {
-                    self.error(e.span, found(count));
-                    return None;
-                }
-                let start = out.len();
-                self.table_values(cx, value, elem, out)?;
-                let one: Vec<i128> = out[start..].to_vec();
-                for _ in 1..n {
-                    out.extend_from_slice(&one);
-                }
-                Some(())
-            }
-            _ => {
-                let c = self.expr(cx, e, Some(ty))?;
-                let c = self.coerce(cx, c, ty, e.span)?;
-                let TExprKind::Table(id) = c.expr.kind else {
-                    self.error(
-                        e.span,
-                        "the value of an array constant must be an array literal or another array constant",
-                    );
-                    return None;
-                };
-                out.extend_from_slice(&self.tables[id].values);
-                Some(())
-            }
+        let what = format!("`{}`", decl.name.name);
+        let subject = eval::Subject {
+            what: &what,
+            span: decl.value.span,
+            budget_span: decl.budget.as_ref().map(|b| b.span),
+        };
+        let v = self.evaluate(&c.expr, cx.locals.len(), budget, &subject)?;
+        if let Ty::Int(_) = ty {
+            let mut out = Vec::new();
+            eval::flatten(&v, &mut out);
+            return Some(ConstVal::Typed(ty, out[0]));
+        }
+        if table_leaf(ty).is_some() {
+            let mut values = Vec::new();
+            eval::flatten(&v, &mut values);
+            self.tables.push(Table {
+                name: decl.name.name.clone(),
+                ty,
+                values,
+            });
+            return Some(ConstVal::Table(ty, self.tables.len() - 1));
+        }
+        if eval::scalars(&v) > CONST_EXPR_MAX {
+            self.diags.push(
+                Diagnostic::error(
+                    decl.value.span,
+                    format!(
+                        "a constant of type `{ty}` has at most {CONST_EXPR_MAX} scalars"
+                    ),
+                )
+                .with_help("only arrays of integers and `bool` are kept in read-only data; others are built where they're used"),
+            );
+            return None;
+        }
+        self.const_exprs.push(eval::materialize(&v, ty));
+        Some(ConstVal::Expr(self.const_exprs.len() - 1))
+    }
+
+    /// Check function `id`'s body, now.
+    fn check_function(&mut self, id: FuncId) {
+        self.func_states[id] = FuncState::Checking;
+        let errors = self.diags.iter().filter(|d| d.is_error()).count();
+        let (decl, pkg, file) = self.fn_decls[id];
+        let func = self.function(decl, id, pkg, file);
+        let ok = self.diags.iter().filter(|d| d.is_error()).count() == errors;
+        self.func_states[id] = FuncState::Done(Rc::new(func), ok);
+        self.checked_order.push(id);
+    }
+
+    /// Function `id`'s checked body, for the evaluator, checked now if it
+    /// isn't yet (docs/generics.md, The evaluator): `None` if it has errors
+    /// (reported), `Some(None)` if it's being checked (its body needs the
+    /// value being computed), and an error while types and signatures are
+    /// declared.
+    fn func_for_eval(&mut self, id: FuncId) -> Result<Option<Rc<Func>>, String> {
+        if self.declaring {
+            return Err(
+                "a constant needed to declare a type or a signature can't call a function"
+                    .to_owned(),
+            );
+        }
+        if let FuncState::Unchecked = self.func_states[id] {
+            self.check_function(id);
+        }
+        match &self.func_states[id] {
+            FuncState::Done(f, true) => Ok(Some(f.clone())),
+            FuncState::Done(_, false) => Ok(None),
+            FuncState::Checking => Err(format!(
+                "it calls `{}`, whose body needs this value: it depends on itself",
+                self.sigs[id].name
+            )),
+            FuncState::Unchecked => unreachable!("checked above"),
         }
     }
 
@@ -2738,6 +3091,13 @@ impl<'a> Checker<'a> {
                 self.check_kept_view(cx, &checked, value.span)?;
                 self.record_value(cx, local, &checked);
                 Some(TStmt::Assign(local, checked.expr))
+            }
+            // Reached in code that's checked: an error. The program isn't
+            // compiled, so this stands for code that doesn't go on, which
+            // a function returning a value needs after it.
+            Stmt::Expr(e) if self.is_compile_error(cx, e) => {
+                self.compile_error(e);
+                Some(TStmt::Loop(Vec::new()))
             }
             Stmt::Expr(e) => match &e.kind {
                 ExprKind::Call(..) | ExprKind::Try(_) => {
@@ -3731,6 +4091,9 @@ impl<'a> Checker<'a> {
             strs: cx.strs.clone(),
             moved: cx.moved.clone(),
             generic_calls: self.generic_calls.len(),
+            checked: self.checked_order.len(),
+            tables: self.tables.len(),
+            const_exprs: self.const_exprs.len(),
         }
     }
 
@@ -3744,6 +4107,14 @@ impl<'a> Checker<'a> {
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
             c.state = state;
         }
+        // The functions checked on demand since, for constants evaluated
+        // since, are checked again when needed, so their errors are
+        // reported once.
+        for id in self.checked_order.drain(mark.checked..) {
+            self.func_states[id] = FuncState::Unchecked;
+        }
+        self.tables.truncate(mark.tables);
+        self.const_exprs.truncate(mark.const_exprs);
     }
 
     /// A `for` loop, in a scope of its own (for the loop variable and the
@@ -4235,7 +4606,60 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `if comptime cond { ... } else ...` in a function: only the branch
+    /// `cond` picks is checked (the others only had to parse), and it's a
+    /// block of its own. Without a value for `cond`, neither is.
+    fn comptime_if(&mut self, cx: &mut FnCx, i: &ast::IfStmt) -> TStmt {
+        let stmts = match self.comptime_cond(cx, &i.cond) {
+            Some(true) => self.block(cx, &i.then.stmts),
+            Some(false) => match &i.otherwise {
+                None => Vec::new(),
+                Some(ast::Else::Block(b)) => self.block(cx, &b.stmts),
+                Some(ast::Else::If(inner)) => vec![self.if_stmt(cx, inner)],
+            },
+            None => Vec::new(),
+        };
+        TStmt::Block(stmts)
+    }
+
+    /// The value of an `if comptime` condition in a function: an expression
+    /// of constants, `target` and calls, evaluated now.
+    fn comptime_cond(&mut self, cx: &FnCx, e: &ast::Expr) -> Option<bool> {
+        let mut locals = Vec::new();
+        expr_names(e, &mut locals);
+        if let Some((name, span)) = locals.into_iter().find(|(n, _)| cx.lookup(n).is_some()) {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("`{name}` is a variable, so this condition isn't known when compiling"),
+                )
+                .with_help("an `if comptime` condition uses constants, `target` and calls; use `if` to test a variable"),
+            );
+            return None;
+        }
+        let mut ccx = FnCx::new(cx.pkg, cx.file, Ty::Unit, false);
+        ccx.comptime = true;
+        let c = self.expr(&mut ccx, e, Some(Ty::Bool))?;
+        let c = self.coerce(&mut ccx, c, Ty::Bool, e.span)?;
+        if let TExprKind::Bool(b) = c.expr.kind {
+            return Some(b);
+        }
+        let subject = eval::Subject {
+            what: "the condition",
+            span: e.span,
+            budget_span: None,
+        };
+        let v = self.evaluate(&c.expr, ccx.locals.len(), eval::DEFAULT_STEPS, &subject)?;
+        match v {
+            eval::Value::Bool(b) => Some(b),
+            other => unreachable!("a `bool` condition gave {other:?}"),
+        }
+    }
+
     fn if_stmt(&mut self, cx: &mut FnCx, i: &ast::IfStmt) -> TStmt {
+        if i.comptime {
+            return self.comptime_if(cx, i);
+        }
         if let Some(name) = &i.binding {
             return self.if_let(cx, i, name);
         }
@@ -4277,6 +4701,54 @@ impl<'a> Checker<'a> {
             None => (None, facts::CondFacts::default()),
         }
     }
+}
+
+/// The most scalars a constant that isn't an array of integers or `bool`
+/// holds: it's built where it's used, not kept in read-only data.
+const CONST_EXPR_MAX: u64 = 256;
+
+/// Whether a constant can have type `ty`: an integer, `bool`, or an array,
+/// struct, enum or optional of those (anything stored, but views and
+/// pointers).
+fn const_type(ty: Ty) -> bool {
+    match ty {
+        Ty::Int(_) | Ty::Bool => true,
+        Ty::Array(_) => const_type(ty.as_array().expect("an array").0),
+        Ty::Optional(_) => const_type(ty.as_optional().expect("an optional")),
+        Ty::Struct(_) => ty
+            .as_struct()
+            .expect("a struct")
+            .fields
+            .iter()
+            .all(|f| const_type(f.ty)),
+        Ty::Enum(_) => ty
+            .as_enum()
+            .expect("an enum")
+            .variants
+            .iter()
+            .all(|v| v.fields.iter().all(|f| const_type(f.ty))),
+        _ => false,
+    }
+}
+
+/// A value in a package-level `if comptime` condition.
+enum CondVal {
+    Bool(bool),
+    Int(i128),
+    /// A variant of an enum, by index.
+    Enum(Ty, u32),
+    /// `.name`, a variant of the enum it's compared with.
+    Dot(ast::Ident),
+}
+
+/// The expression of an integer, or of an enum's variant without payload
+/// (by index).
+fn scalar_expr(ty: Ty, v: i128) -> TExpr {
+    let kind = match ty {
+        Ty::Enum(_) => TExprKind::Variant(v as u32, Vec::new()),
+        _ => TExprKind::Int(v),
+    };
+    TExpr { kind, ty }
 }
 
 /// The scalar type at the bottom of an array type that can be a constant

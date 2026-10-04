@@ -17,6 +17,9 @@ pub struct Diagnostic {
     pub message: String,
     pub span: Span,
     pub help: Vec<String>,
+    /// Places related to the message, each with what it is: rendered as
+    /// `note: text (file:line:col)`.
+    pub notes: Vec<(Span, String)>,
 }
 
 impl Diagnostic {
@@ -26,6 +29,7 @@ impl Diagnostic {
             message: message.into(),
             span,
             help: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
@@ -38,6 +42,11 @@ impl Diagnostic {
 
     pub fn with_help(mut self, help: impl Into<String>) -> Diagnostic {
         self.help.push(help.into());
+        self
+    }
+
+    pub fn with_note(mut self, span: Span, note: impl Into<String>) -> Diagnostic {
+        self.notes.push((span, note.into()));
         self
     }
 
@@ -94,6 +103,11 @@ impl Diagnostic {
         let _ = writeln!(out, "{pad} | {prefix}{}", "^".repeat(width));
         for h in &self.help {
             let _ = writeln!(out, "{pad} = help: {h}");
+        }
+        for (span, note) in &self.notes {
+            let file = files.get(span.file);
+            let (line, col) = file.line_col(span.start);
+            let _ = writeln!(out, "{pad} = note: {note} ({}:{line}:{col})", file.name);
         }
         out
     }

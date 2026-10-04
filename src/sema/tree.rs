@@ -42,7 +42,7 @@ pub struct Table {
     pub values: Vec<i128>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
     /// The linker symbol: `<package path>.<name>`, e.g. `std/io.print`. An
@@ -82,7 +82,7 @@ impl Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Local {
     pub name: String,
     pub ty: Ty,
@@ -279,6 +279,13 @@ pub enum TExprKind {
     /// [`Ty::Never`]) where a value of another type is expected, as in
     /// `opt ?? fail()`. The call doesn't return, so there's never a value.
     Never(Box<TExpr>),
+    /// An operation whose proof obligation (overflow, an index in bounds,
+    /// a lossless conversion...) wasn't proven, in code that only runs at
+    /// compile time: a constant's value or an `if comptime` condition. The
+    /// evaluator checks it as it runs, and a failure is an error at the
+    /// span (docs/generics.md, Proof obligations in compile-time code).
+    /// Never lowered.
+    Unproven(Span, Box<TExpr>),
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -398,7 +405,8 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Try(inner)
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
-        | TExprKind::Never(inner) => vec![inner],
+        | TExprKind::Never(inner)
+        | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],
@@ -487,7 +495,8 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Try(inner)
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
-        | TExprKind::Never(inner) => vec![inner],
+        | TExprKind::Never(inner)
+        | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],

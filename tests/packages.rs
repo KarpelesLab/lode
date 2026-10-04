@@ -93,7 +93,7 @@ fn check(name: &str, main: &str) -> Result<lode::sema::Program, Vec<String>> {
     let (packages, mut diags) = lode::load::load(&mut files, root, &root_dir);
     let _ = std::fs::remove_dir_all(&root_dir);
     if diags.is_empty() {
-        let (program, sema_diags) = lode::sema::check(&packages, lode::PTR_BITS);
+        let (program, sema_diags) = lode::sema::check(&packages, lode::target::Target::host());
         if sema_diags.is_empty() {
             return Ok(program);
         }

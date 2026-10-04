@@ -25,6 +25,7 @@ pub mod parse;
 pub mod sema;
 pub mod source;
 pub mod stack;
+pub mod target;
 pub mod types;
 
 use std::path::PathBuf;
@@ -44,6 +45,7 @@ use crate::diag::{Diagnostic, has_errors};
 use crate::lower::Lowered;
 use crate::source::{FileId, SourceMap, Span};
 use crate::stack::StackReport;
+pub use crate::target::Target;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -73,17 +75,67 @@ pub fn std_root() -> PathBuf {
 /// program's [`sema::Program::warnings`] (or with the errors, if there are
 /// any).
 pub fn check(files: &mut SourceMap, root: FileId) -> Result<sema::Program, Error> {
+    check_for(files, root, Target::host())
+}
+
+/// [`check`] for `target`.
+pub fn check_for(
+    files: &mut SourceMap,
+    root: FileId,
+    target: &Target,
+) -> Result<sema::Program, Error> {
     let (packages, mut diags) = load::load(files, root, &std_root());
     if has_errors(&diags) {
         return Err(Error::Source(diags));
     }
-    let (mut program, sema_diags) = sema::check(&packages, PTR_BITS);
+    let (mut program, sema_diags) = check_packages(&packages, target);
     diags.extend(sema_diags);
     if has_errors(&diags) {
         return Err(Error::Source(diags));
     }
     program.warnings = diags;
     Ok(program)
+}
+
+/// Check a program for each of `targets` (docs/comptime.md, Keeping dead
+/// branches from rotting). It's loaded and parsed once. For each target,
+/// in order: its errors and warnings. An error loading the program is
+/// `Err`.
+pub fn check_targets(
+    files: &mut SourceMap,
+    root: FileId,
+    targets: &[&Target],
+) -> Result<Vec<Vec<Diagnostic>>, Error> {
+    let (packages, diags) = load::load(files, root, &std_root());
+    if has_errors(&diags) {
+        return Err(Error::Source(diags));
+    }
+    Ok(targets
+        .iter()
+        .map(|target| {
+            let mut all = diags.clone();
+            all.extend(check_packages(&packages, target).1);
+            all
+        })
+        .collect())
+}
+
+/// How much stack the checker gets: compile-time evaluation recurses with
+/// the program's calls (docs/generics.md, The evaluator). Only what's used
+/// is committed.
+const CHECK_STACK: usize = 256 << 20;
+
+/// Run the checker on loaded packages, on a thread with a deep stack.
+fn check_packages(packages: &[load::Package], target: &Target) -> (sema::Program, Vec<Diagnostic>) {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .name("lode-check".to_owned())
+            .stack_size(CHECK_STACK)
+            .spawn_scoped(s, || sema::check(packages, target))
+            .expect("can start the checker's thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
 }
 
 /// Compile a program to a verified, optimized IR module.

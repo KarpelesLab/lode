@@ -1071,6 +1071,7 @@ impl FnLower<'_> {
                 self.expr(call);
                 return self.no_value(e.ty);
             }
+            TExprKind::Unproven(..) => unreachable!("only in code run at compile time"),
             TExprKind::EnumValue(inner) => {
                 let base = self.place(inner);
                 self.load_tag(base, inner.ty)

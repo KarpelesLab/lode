@@ -92,6 +92,16 @@ impl Checked {
         self.expr.ty
     }
 
+    /// This operation, whose proof obligation isn't proven, in code that
+    /// only runs at compile time (see [`FnCx::comptime`]): checked as it
+    /// runs, with a failure reported at `span`. Its value is anything of
+    /// its type.
+    pub(super) fn unproven(self, span: Span) -> Checked {
+        let ty = self.ty();
+        let range = type_range(ty);
+        Checked::new(TExprKind::Unproven(span, Box::new(self.expr)), ty, range)
+    }
+
     /// The known range, or the full range of the type.
     pub(super) fn int_range(&self) -> Range {
         self.range
@@ -532,7 +542,7 @@ impl Checker<'_> {
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Const(id)) => match self.const_value(id)? {
                         ConstVal::Untyped(v) => Some(v),
-                        ConstVal::Typed(..) | ConstVal::Table(..) => None,
+                        ConstVal::Typed(..) | ConstVal::Table(..) | ConstVal::Expr(_) => None,
                     },
                     _ => None,
                 }
@@ -546,7 +556,7 @@ impl Checker<'_> {
                     Some(&Item::Const(id)) if pkg == cx.pkg || self.consts[id].decl.is_pub => {
                         match self.const_value(id)? {
                             ConstVal::Untyped(v) => Some(v),
-                            ConstVal::Typed(..) | ConstVal::Table(..) => None,
+                            ConstVal::Typed(..) | ConstVal::Table(..) | ConstVal::Expr(_) => None,
                         }
                     }
                     _ => None,
@@ -1554,7 +1564,7 @@ impl Checker<'_> {
         // A length is at most the largest `isize`: no object is bigger.
         let any_len = Range {
             lo: 0,
-            hi: i128::from(i64::MAX),
+            hi: self.len_max(),
         };
         let term = match view.kind {
             TExprKind::Local(l) => Some(Term::Len(l)),
@@ -1621,6 +1631,22 @@ impl Checker<'_> {
         }
 
         let r = i.int_range();
+        if cx.comptime {
+            let in_bounds = match b.ty().as_array().and_then(|(_, n)| n.known()) {
+                Some(n) => r.lo >= 0 && r.hi < i128::from(n),
+                None => false,
+            };
+            let range = match elem {
+                Ty::Int(_) => self.table_elem_range(&b.expr, r),
+                _ => None,
+            };
+            let c = Checked::new(
+                TExprKind::Index(Box::new(b.expr), Box::new(i.expr)),
+                elem,
+                range,
+            );
+            return Some(if in_bounds { c } else { c.unproven(index.span) });
+        }
         let help_check = match (&index.kind, &base.kind) {
             (ExprKind::Name(i), ExprKind::Name(xs)) if !i.starts_with('$') => {
                 format!("check it first (`if {i} < {xs}.len`), or loop with `for`")
@@ -1650,7 +1676,7 @@ impl Checker<'_> {
                     format!("the length is `{p}`, which can be {lr}")
                 } else if lr.lo == lr.hi {
                     format!("the length is {lr}")
-                } else if lr.lo == 0 && lr.hi == i128::from(i64::MAX) {
+                } else if lr.lo == 0 && lr.hi == self.len_max() {
                     "nothing is known about the length".to_owned()
                 } else {
                     format!("the length can be {lr}")
@@ -1760,6 +1786,15 @@ impl Checker<'_> {
                 return None;
             }
         }
+        if cx.comptime {
+            let ty = view.ty();
+            let kind = TExprKind::Slice(
+                Box::new(view.expr),
+                s.map(|c| Box::new(c.expr)),
+                e.map(|c| Box::new(c.expr)),
+            );
+            return Some(Checked::new(kind, ty, None).unproven(span));
+        }
 
         // How the code names a bound and the base, for help.
         let name = |e: Option<&ast::Expr>| match e.map(|e| &e.kind) {
@@ -1774,7 +1809,7 @@ impl Checker<'_> {
         let len_r = len.int_range();
         let len_desc = if len_r.lo == len_r.hi {
             format!("the length is {len_r}")
-        } else if len_r.lo == 0 && len_r.hi == i128::from(i64::MAX) {
+        } else if len_r.lo == 0 && len_r.hi == self.len_max() {
             "nothing is known about the length".to_owned()
         } else {
             format!("the length can be {len_r}")
@@ -1882,7 +1917,7 @@ impl Checker<'_> {
         if let Some(c) = diff(first, last) {
             lo = lo.max(c.saturating_neg());
         }
-        let mut hi = lr.hi.saturating_sub(fr.lo).min(i128::from(i64::MAX));
+        let mut hi = lr.hi.saturating_sub(fr.lo).min(self.len_max());
         if let Some(c) = diff(last, first) {
             hi = hi.min(c);
         }
@@ -2002,6 +2037,10 @@ impl Checker<'_> {
         if let Some(&item) = self.pkgs[cx.pkg].items.get(name) {
             return self.item_value(item, name, span);
         }
+        if name == super::TARGET && self.imported(cx, name).is_none() {
+            let e = self.target_value();
+            return Some(Checked::new(e.kind, e.ty, None));
+        }
         let msg = if self.imported(cx, name).is_some() {
             format!("`{name}` is a package; use one of its members, like `{name}.something`")
         } else if Self::type_param(cx, name).is_some() || primitive(name, self.ptr_bits).is_some() {
@@ -2061,6 +2100,11 @@ impl Checker<'_> {
                     Some(Checked::new(TExprKind::Int(v), ty, Some(Range::exact(v))))
                 }
                 ConstVal::Table(ty, id) => Some(Checked::new(TExprKind::Table(id), ty, None)),
+                ConstVal::Expr(k) => {
+                    let e = self.const_exprs[k].clone();
+                    let ty = e.ty;
+                    Some(Checked::new(e.kind, ty, None))
+                }
                 ConstVal::Untyped(_) => unreachable!("handled by untyped_int"),
             },
             Item::Func(_) => {
@@ -2117,6 +2161,16 @@ impl Checker<'_> {
             let item = self.package_item(cx, pkg, &member.name, member.span)?;
             return self.item_value(item, &format!("{pkg_name}.{}", member.name), span);
         }
+        // `target.os` and the like: known when compiling.
+        if let ExprKind::Name(n) = &base.kind
+            && n == super::TARGET
+            && cx.lookup(n).is_none()
+            && !self.pkgs[cx.pkg].items.contains_key(n)
+        {
+            let (ty, v) = self.target_field(member)?;
+            let range = matches!(ty, Ty::Int(_)).then(|| Range::exact(v));
+            return Some(Checked::new(super::scalar_expr(ty, v).kind, ty, range));
+        }
         if self.unknown_receiver(cx, base) {
             return None;
         }
@@ -2142,10 +2196,18 @@ impl Checker<'_> {
                     Some(_) => field_term(&b.expr, i),
                     None => None,
                 };
+                // A field of a literal (a struct constant's value) is known.
+                let literal = match &b.expr.kind {
+                    TExprKind::StructLit(fields) => fields.iter().find_map(|(k, v)| match v.kind {
+                        TExprKind::Int(v) if *k as usize == i => Some(Range::exact(v)),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
                 let mut c = Checked::new(
                     TExprKind::Field(Box::new(b.expr), i as u32),
                     fty,
-                    term.and_then(|t| super::read_range(cx, t)),
+                    literal.or_else(|| term.and_then(|t| super::read_range(cx, t))),
                 );
                 c.term = term.map(Linear::of);
                 Some(c)
@@ -2200,6 +2262,12 @@ impl Checker<'_> {
             bits: self.ptr_bits,
             size: true,
         })
+    }
+
+    /// The longest a view can be: the largest `isize` of the target, since
+    /// no object is bigger.
+    pub(super) fn len_max(&self) -> i128 {
+        (1i128 << (self.ptr_bits - 1)) - 1
     }
 
     fn isize_ty(&self) -> Ty {
@@ -2328,7 +2396,12 @@ impl Checker<'_> {
                 let min = n.min.expect("a signed type");
                 // For a type parameter, above every signed type's smallest
                 // value.
-                if (n.param && r.lo <= min) || r.lo == min {
+                let overflows = (n.param && r.lo <= min) || r.lo == min;
+                if overflows && cx.comptime {
+                    let neg = TExprKind::Unary(TUnOp::Neg, Box::new(c.expr));
+                    return Some(Checked::new(neg, t, None).unproven(span));
+                }
+                if overflows {
                     let mut d = Diagnostic::error(
                         span,
                         format!("cannot prove that this negation does not overflow `{t}`"),
@@ -2718,6 +2791,15 @@ impl Checker<'_> {
                         // A value of the type: within the values it can have.
                         (top, res.intersect(full).unwrap_or(res))
                     }
+                    _ if cx.comptime => {
+                        let top = match op {
+                            BinOp::Add => TBinOp::Add(Mode::Proven),
+                            BinOp::Sub => TBinOp::Sub(Mode::Proven),
+                            _ => TBinOp::Mul(Mode::Proven),
+                        };
+                        let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
+                        return Some(Checked::new(kind, t, None).unproven(span));
+                    }
                     _ => {
                         let (wrap, sat) = match op {
                             BinOp::Add => ("+%", "+|"),
@@ -2752,6 +2834,15 @@ impl Checker<'_> {
             BinOp::AddSat => (TBinOp::Add(Mode::Saturate), full),
             BinOp::SubSat => (TBinOp::Sub(Mode::Saturate), full),
             BinOp::MulSat => (TBinOp::Mul(Mode::Saturate), full),
+            BinOp::Div | BinOp::Rem if cx.comptime => {
+                let top = if op == BinOp::Div {
+                    TBinOp::Div
+                } else {
+                    TBinOp::Rem
+                };
+                let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
+                return Some(Checked::new(kind, t, None).unproven(span));
+            }
             BinOp::Div | BinOp::Rem => {
                 // Ruled out by the ranges, or by a hole (`b != 0`).
                 let (a_term, b_term) = (l.term, r.term);
@@ -2901,12 +2992,21 @@ impl Checker<'_> {
             return None;
         }
         let amount = r.int_range();
-        if op != BinOp::ShlWrap
+        let unproven = op != BinOp::ShlWrap
             && !amount.within(Range {
                 lo: 0,
                 hi: i128::from(n.bits) - 1,
-            })
-        {
+            });
+        if unproven && cx.comptime {
+            let top = if op == BinOp::Shl {
+                TBinOp::Shl
+            } else {
+                TBinOp::Shr
+            };
+            let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
+            return Some(Checked::new(kind, t, None).unproven(rhs.span));
+        }
+        if unproven {
             let mut d = Diagnostic::error(
                 rhs.span,
                 format!(
@@ -3053,6 +3153,7 @@ impl Checker<'_> {
                     return self.param_conversion(cx, ty, args, span);
                 }
                 if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
+                    self.callable(id, callee.span)?;
                     (id, name.clone())
                 } else if let Some(&Item::Type(ty)) = self.pkgs[cx.pkg].items.get(name) {
                     if ty.as_enum().is_some() {
@@ -3081,7 +3182,10 @@ impl Checker<'_> {
                 };
                 let pkg = self.imported(cx, pkg_name).expect("checked");
                 match self.package_item(cx, pkg, &member.name, member.span)? {
-                    Item::Func(id) => (id, format!("{pkg_name}.{}", member.name)),
+                    Item::Func(id) => {
+                        self.callable(id, callee.span)?;
+                        (id, format!("{pkg_name}.{}", member.name))
+                    }
                     Item::Type(ty) if ty.as_enum().is_some() => {
                         return self.enum_from(cx, ty, args, span);
                     }
@@ -3534,10 +3638,28 @@ impl Checker<'_> {
     /// The method or associated function `member` of the type `ty`:
     /// `Some(None)` if there's none, `None` if it's private to another
     /// package (reported).
+    /// Whether function `id` can be called here: not in a constant needed
+    /// to declare a type or a signature (an array length), which is
+    /// evaluated before every function's signature is known.
+    fn callable(&mut self, id: FuncId, span: Span) -> Option<()> {
+        if id < self.sigs.len() {
+            return Some(());
+        }
+        self.diags.push(
+            Diagnostic::error(
+                span,
+                "a constant needed to declare a type or a signature can't call a function",
+            )
+            .with_help("types and signatures are declared before functions are checked: compute it from literals and other constants"),
+        );
+        None
+    }
+
     fn find_method(&mut self, cx: &FnCx, ty: Ty, member: &ast::Ident) -> Option<Option<FuncId>> {
         let Some(&id) = self.methods.get(&(ty, member.name.clone())) else {
             return Some(None);
         };
+        self.callable(id, member.span)?;
         let sig = &self.sigs[id];
         if sig.pkg != cx.pkg && !sig.is_pub {
             let path = self.pkgs[sig.pkg].path.clone();
@@ -3786,6 +3908,9 @@ impl Checker<'_> {
             return None;
         }
         let r = c.int_range();
+        if !r.within(to.range()) && cx.comptime {
+            return Some(c.converted(Ty::Int(to), None).unproven(span));
+        }
         if !r.within(to.range()) {
             self.diags.push(
                 Diagnostic::error(span, format!("cannot prove that this `{from}` value fits in `{to}`"))

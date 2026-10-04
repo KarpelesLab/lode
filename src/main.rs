@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use latticefoundry::transform::pipeline::OptLevel;
+use lode::Target;
 use lode::source::{FileId, SourceFile, SourceMap};
 
 const USAGE: &str = "\
@@ -13,7 +14,8 @@ usage:
   lode build <file.lode> [-o <output>] [-O0|-O1|-O2|-O3] [--emit=ir]
              [--stack-usage]
   lode run <file.lode> [-O0|-O1|-O2|-O3]
-  lode check <file.lode>
+  lode check <file.lode> [--targets=<target,...>|--targets=all]
+  lode targets
   lode fmt [--check] <files or directories...>
   lode version | help
 
@@ -22,7 +24,10 @@ usage:
           --stack-usage prints each function's stack frame and the
           worst-case stack depth, or why there is no bound)
   run     build to a temporary file, run it, exit with its status
-  check   check the program without generating code
+  check   check the program without generating code, for x86_64-linux
+          or for each of --targets (all: every target the compiler
+          knows)
+  targets list the targets: each can be checked, x86_64-linux built
   fmt     rewrite files in the canonical format (directories are searched
           for .lode files); --check changes nothing, lists the files that
           aren't canonical and fails if there are any
@@ -39,6 +44,7 @@ fn main() -> ExitCode {
         "build" => build(rest),
         "run" => run(rest),
         "check" => check(rest),
+        "targets" => Ok(targets()),
         "fmt" => fmt(rest),
         "version" | "--version" | "-V" => {
             println!("lode {}", lode::VERSION);
@@ -65,6 +71,8 @@ struct Options {
     opt: OptLevel,
     emit_ir: bool,
     stack_usage: bool,
+    /// `--targets=...`, for `lode check`.
+    targets: Option<Vec<&'static Target>>,
 }
 
 /// Reject the options only `lode build` takes.
@@ -72,6 +80,7 @@ fn build_only(opts: &Options, command: &str) -> Result<(), String> {
     for (set, flag) in [
         (opts.emit_ir, "--emit=ir"),
         (opts.stack_usage, "--stack-usage"),
+        (opts.targets.is_some(), "--targets"),
     ] {
         if set {
             return Err(format!(
@@ -88,12 +97,16 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut opt = OptLevel::O0;
     let mut emit_ir = false;
     let mut stack_usage = false;
+    let mut targets = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => output = Some(it.next().ok_or("`-o` needs a path")?.clone()),
             "--emit=ir" => emit_ir = true,
             "--stack-usage" => stack_usage = true,
+            flag if flag.starts_with("--targets=") => {
+                targets = Some(parse_targets(&flag["--targets=".len()..])?)
+            }
             flag if OptLevel::parse_flag(flag).is_some() => {
                 opt = OptLevel::parse_flag(flag).expect("checked")
             }
@@ -109,7 +122,41 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         opt,
         emit_ir,
         stack_usage,
+        targets,
     })
+}
+
+/// The targets of `--targets=`: a comma-separated list of names, or `all`.
+fn parse_targets(list: &str) -> Result<Vec<&'static Target>, String> {
+    if list == "all" {
+        return Ok(lode::target::TARGETS.iter().collect());
+    }
+    let mut out: Vec<&'static Target> = Vec::new();
+    for name in list.split(',') {
+        let t = Target::by_name(name).ok_or_else(|| {
+            format!(
+                "unknown target `{name}` (the targets are {}, or `all`)",
+                lode::target::names()
+            )
+        })?;
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// `lode targets`: every target, and what can be done for it.
+fn targets() -> ExitCode {
+    for t in lode::target::TARGETS {
+        let what = if t.can_build {
+            "check and build"
+        } else {
+            "check"
+        };
+        println!("{:<14} {:>2}-bit  {what}", t.name, t.pointer_bits);
+    }
+    ExitCode::SUCCESS
 }
 
 fn load(path: &str) -> Result<(SourceMap, FileId), String> {
@@ -142,9 +189,13 @@ fn report(files: &SourceMap, err: lode::Error) -> ExitCode {
 }
 
 fn check(args: &[String]) -> Result<ExitCode, String> {
-    let opts = parse_options(args)?;
+    let mut opts = parse_options(args)?;
+    let targets = opts.targets.take();
     build_only(&opts, "check")?;
     let (mut files, root) = load(&opts.input)?;
+    if let Some(targets) = targets {
+        return Ok(check_targets(&mut files, root, &targets));
+    }
     Ok(match lode::check(&mut files, root) {
         Ok(program) => {
             warn(&files, &program.warnings);
@@ -152,6 +203,45 @@ fn check(args: &[String]) -> Result<ExitCode, String> {
         }
         Err(e) => report(&files, e),
     })
+}
+
+/// `lode check --targets=...`: check for each target, and print each
+/// message once, saying which targets it's for unless it's all of them.
+fn check_targets(files: &mut SourceMap, root: FileId, targets: &[&'static Target]) -> ExitCode {
+    let per_target = match lode::check_targets(files, root, targets) {
+        Ok(diags) => diags,
+        Err(e) => return report(files, e),
+    };
+    // Each distinct message, in order, with the targets it's for.
+    let mut found: Vec<(String, lode::diag::Diagnostic, Vec<&str>)> = Vec::new();
+    for (target, diags) in targets.iter().zip(per_target) {
+        for d in diags {
+            let text = d.render(files);
+            match found.iter_mut().find(|(t, ..)| *t == text) {
+                Some((.., on)) => on.push(target.name),
+                None => found.push((text, d, vec![target.name])),
+            }
+        }
+    }
+    let mut errors = 0;
+    for (text, d, on) in found {
+        if d.is_error() {
+            errors += 1;
+        }
+        if on.len() == targets.len() {
+            eprint!("{text}");
+        } else {
+            let d = d.with_help(format!("for the target(s) {}", on.join(", ")));
+            eprint!("{}", d.render(files));
+        }
+    }
+    let names: Vec<&str> = targets.iter().map(|t| t.name).collect();
+    if errors > 0 {
+        eprintln!("lode: {errors} error(s), checking for {}", names.join(", "));
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn build(args: &[String]) -> Result<ExitCode, String> {
