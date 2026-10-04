@@ -25,9 +25,9 @@ fn first(b: []u8) -> u8 {
 fn main() {
 	let s = "hello, world"
 	let b = s.bytes()
-	io.print_u64(count(s, 'l'))
+	io.print_int(count(s, 'l'))
 	io.print(" ")
-	io.print_u64(b.len - 7)
+	io.print_int(b.len - 7)
 	io.print(" ")
 	// Reversed into a buffer, then written as raw bytes.
 	var out: [5]u8 = [0; 5]

@@ -85,17 +85,17 @@ fn Weekday.name(self) -> str {
 }
 
 fn show(d: Date) {
-	io.print_i64(d.year)
+	io.print_int(d.year)
 	io.print("-")
-	io.print_u64(d.month)
+	io.print_int(d.month)
 	io.print("-")
-	io.print_u64(d.day)
+	io.print_int(d.day)
 	io.print(" ")
 	if !valid(d) {
 		io.print("invalid\n")
 		return
 	}
-	io.print_i64(days_from_civil(d))
+	io.print_int(days_from_civil(d))
 	io.print(" ")
 	io.print(weekday(d).name())
 	io.print("\n")

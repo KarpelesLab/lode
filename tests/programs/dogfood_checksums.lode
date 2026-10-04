@@ -72,7 +72,7 @@ fn hex32(v: u32) {
 			io.print("x")
 		} else {
 			// no way to print one byte without unsafe; print its digit value
-			io.print_u64(c)
+			io.print_int(c)
 			io.print(",")
 		}
 	}
@@ -83,7 +83,7 @@ fn main() -> u8 {
 	// "Wikipedia"
 	let w: [9]u8 = ['W', 'i', 'k', 'i', 'p', 'e', 'd', 'i', 'a']
 	let ad = adler32(w)
-	io.print_u64(ad)
+	io.print_int(ad)
 	io.print("\n")
 	if ad != 0x11e60398 {
 		return 1
@@ -92,7 +92,7 @@ fn main() -> u8 {
 	let s: [9]u8 = ['1', '2', '3', '4', '5', '6', '7', '8', '9']
 	let t = crc_table()
 	let c = crc32(t, s)
-	io.print_u64(c)
+	io.print_int(c)
 	io.print("\n")
 	hex32(c)
 	if c != 0xcbf43926 {
@@ -101,7 +101,7 @@ fn main() -> u8 {
 	// "abcde"
 	let f: [5]u8 = ['a', 'b', 'c', 'd', 'e']
 	let fl = fletcher16(f)
-	io.print_u64(fl)
+	io.print_int(fl)
 	io.print("\n")
 	if fl != 0xc8f0 {
 		return 3

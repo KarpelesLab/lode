@@ -1,0 +1,41 @@
+/// Math on any ordered or integer type.
+package math
+
+/// The smaller of `a` and `b` (`a` if they're equal).
+pub fn min[T: Ordered](sink a: T, sink b: T) -> T {
+	if b.lt(a) {
+		return b
+	}
+	return a
+}
+
+/// The larger of `a` and `b` (`a` if they're equal).
+pub fn max[T: Ordered](sink a: T, sink b: T) -> T {
+	if a.lt(b) {
+		return b
+	}
+	return a
+}
+
+/// `x` brought into `lo..=hi`: `lo` if it's below, `hi` if it's above.
+/// When `hi` is below `lo`, a value below `lo` gives `lo`, and any other
+/// gives `hi`.
+pub fn clamp[T: Ordered](sink x: T, sink lo: T, sink hi: T) -> T {
+	if x.lt(lo) {
+		return lo
+	}
+	if hi.lt(x) {
+		return hi
+	}
+	return x
+}
+
+/// The absolute value of `x`. It saturates: the smallest value of a
+/// signed type, whose absolute value doesn't fit, gives the largest
+/// (`abs(i8(-128))` is 127).
+pub fn abs[T: Integer](x: T) -> T {
+	if x < 0 {
+		return 0 -| x
+	}
+	return x
+}

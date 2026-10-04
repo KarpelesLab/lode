@@ -20,12 +20,12 @@ enum Cmd {
 }
 
 fn u(v: u64) {
-	io.print_u64(v)
+	io.print_int(v)
 	io.print(" ")
 }
 
 fn s(v: i64) {
-	io.print_i64(v)
+	io.print_int(v)
 	io.print(" ")
 }
 

@@ -47,13 +47,13 @@ fn report(s: str) {
 	io.print(s)
 	io.print(" -> ")
 	match parse_u32(s.bytes()) {
-		ok(v) => io.print_u64(v)
+		ok(v) => io.print_int(v)
 		err(e) => {
 			match e {
 				empty => io.print("empty")
 				invalid_digit(p) => {
 					io.print("bad digit at ")
-					io.print_u64(p)
+					io.print_int(p)
 				}
 				overflow => io.print("overflow")
 			}

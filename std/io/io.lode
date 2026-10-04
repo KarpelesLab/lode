@@ -101,28 +101,28 @@ pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize {
 }
 
 // Integer output. `print("{}", n)` will replace these once the compiler has
-// `comptime` (docs/comptime.md, "Format strings"), so the set stays small:
-// decimal `u64` and `i64`, which every other integer type converts to.
+// `comptime` (docs/generics.md, "Format strings").
 
-/// Write `n` to standard output in decimal, ignoring errors like `print`.
-pub fn print_u64(n: u64) {
-	write_decimal(os.STDOUT, n, false)
+/// Write the integer `n` to standard output in decimal, with a `-` if it's
+/// negative, ignoring errors like `print`. `n` can be of any integer type:
+/// `io.print_int(x)`, or `io.print_int[u64](5)` for a literal.
+pub fn print_int[T: Integer](n: T) {
+	write_int(os.STDOUT, n)
 }
 
-/// Write `n` to standard output in decimal, with a `-` if it's negative,
-/// ignoring errors like `print`.
-pub fn print_i64(n: i64) {
-	write_decimal(os.STDOUT, magnitude(n), n < 0)
+/// `print_int` to standard error.
+pub fn eprint_int[T: Integer](n: T) {
+	write_int(os.STDERR, n)
 }
 
-/// `print_u64` to standard error.
-pub fn eprint_u64(n: u64) {
-	write_decimal(os.STDERR, n, false)
-}
-
-/// `print_i64` to standard error.
-pub fn eprint_i64(n: i64) {
-	write_decimal(os.STDERR, magnitude(n), n < 0)
+/// Write the integer `n` in decimal to `fd`. Every integer type converts to
+/// `i64` when negative, or to `u64` when not.
+fn write_int[T: Integer](fd: i32, n: T) {
+	if n < 0 {
+		write_decimal(fd, magnitude(i64(n)), true)
+		return
+	}
+	write_decimal(fd, u64(n), false)
 }
 
 /// The absolute value of `n`. `-n` overflows for the smallest `i64`, so a

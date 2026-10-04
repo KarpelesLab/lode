@@ -97,23 +97,23 @@ fn main() -> u8 {
 		match l.tok {
 			number(v) => {
 				io.print("num ")
-				io.print_u64(v)
+				io.print_int(v)
 			}
 			ident(s, n) => {
 				io.print("ident @")
-				io.print_u64(s)
+				io.print_int(s)
 				io.print(" len ")
-				io.print_u64(n)
+				io.print_int(n)
 			}
 			op(c) => {
 				io.print("op ")
-				io.print_u64(c)
+				io.print_int(c)
 			}
 			lparen => io.print("(")
 			rparen => io.print(")")
 			bad(p) => {
 				io.print("bad @")
-				io.print_u64(p)
+				io.print_int(p)
 			}
 			eof => {
 				io.print("eof\n")

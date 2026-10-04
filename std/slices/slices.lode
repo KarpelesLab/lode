@@ -1,0 +1,76 @@
+/// Operations on slices of any element type.
+package slices
+
+/// Sort `xs` in place, smallest first. Heapsort: at most `2 n log2(n)`
+/// comparisons, no allocation, a constant amount of stack. Equal elements
+/// may change order.
+pub fn sort[T: Ordered + Copy](inout xs: []T) {
+	if xs.len < 2 {
+		return
+	}
+	// Make a heap: each element at least as large as its children, at
+	// `2i + 1` and `2i + 2`.
+	var start = xs.len / 2
+	while start > 0 {
+		start = start - 1
+		sift_down(&xs, start, xs.len)
+	}
+	// Move the largest to the end, and make the rest a heap again.
+	var end = xs.len
+	while end > 1 {
+		end = end - 1
+		let top = xs[0]
+		xs[0] = xs[end]
+		xs[end] = top
+		sift_down(&xs, 0, end)
+	}
+}
+
+/// Move `xs[root]` down the heap made of `xs[..end]` until it's at least
+/// as large as its children.
+fn sift_down[T: Ordered + Copy](inout xs: []T, start: usize, end: usize) {
+	if end > xs.len {
+		return
+	}
+	var root = start
+	loop {
+		if root >= end {
+			return
+		}
+		// `root < end <= xs.len`, and no slice is longer than the largest
+		// `isize`: this doesn't overflow.
+		let child = root * 2 + 1
+		if child >= end {
+			return
+		}
+		let right = child + 1
+		if right < end && xs[child].lt(xs[right]) {
+			if !xs[root].lt(xs[right]) {
+				return
+			}
+			let v = xs[root]
+			xs[root] = xs[right]
+			xs[right] = v
+			root = right
+		} else {
+			if !xs[root].lt(xs[child]) {
+				return
+			}
+			let v = xs[root]
+			xs[root] = xs[child]
+			xs[child] = v
+			root = child
+		}
+	}
+}
+
+/// Whether `xs` is sorted, smallest first: no element is smaller than the
+/// one before it.
+pub fn is_sorted[T: Ordered](xs: []T) -> bool {
+	for i in 1..xs.len {
+		if xs[i].lt(xs[i - 1]) {
+			return false
+		}
+	}
+	return true
+}

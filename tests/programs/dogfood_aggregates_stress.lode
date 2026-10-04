@@ -18,7 +18,7 @@ enum Node {
 }
 
 fn u(v: u64) {
-	io.print_u64(v)
+	io.print_int(v)
 	io.print(" ")
 }
 

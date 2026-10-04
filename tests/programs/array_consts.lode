@@ -32,11 +32,11 @@ fn main() {
 	for d in DAYS {
 		year +%= d
 	}
-	io.print_u64(year)
+	io.print_int(year)
 	io.print(" ")
-	io.print_u64(month_len(0))
+	io.print_int(month_len(0))
 	io.print(" ")
-	io.print_u64(FEB)
+	io.print_int(FEB)
 	io.print(" ")
 	var smallest: i16 = 0
 	for row in SQUARES {
@@ -46,9 +46,9 @@ fn main() {
 			}
 		}
 	}
-	io.print_i64(smallest)
+	io.print_int(smallest)
 	io.print(" ")
-	io.print_i64(SQUARES[2][2])
+	io.print_int(SQUARES[2][2])
 	io.print(" ")
 	var copy = ALIAS
 	copy[1] = 29
@@ -57,6 +57,6 @@ fn main() {
 	}
 	let view: []u8 = DAYS
 	// 31 - 28 fits: the elements are 28..=31.
-	io.print_u64(DAYS[0] - DAYS[1] + u8(view.len) - 11 - 1 + 1)
+	io.print_int(DAYS[0] - DAYS[1] + u8(view.len) - 11 - 1 + 1)
 	io.print("\n")
 }

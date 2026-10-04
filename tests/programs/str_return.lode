@@ -47,6 +47,6 @@ fn main() {
 	io.print(count_word(0))
 	io.print("\n")
 	let s = count_word(0)
-	io.print_u64(s.bytes().len + 1)
+	io.print_int(s.bytes().len + 1)
 	io.print("\n")
 }

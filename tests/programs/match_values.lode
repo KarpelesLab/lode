@@ -21,11 +21,11 @@ fn describe(k: u8) {
 	match k {
 		0 => io.print("zero")
 		1 | 2 => io.print("small")
-		3..=9 => io.print_u64(k - 3 + 3)
+		3..=9 => io.print_int(k - 3 + 3)
 		BIG..=254 => {
 			io.print("big")
 			// `k + 1` is proven: `k` is at most 254 here.
-			io.print_u64(k + 1 - 1)
+			io.print_int(k + 1 - 1)
 		}
 		_ => {
 			// Not 0..=9, 200..=254: 255 or 10..=199. `k - 10` is proven.
@@ -69,7 +69,7 @@ fn letter(c: u32) {
 	}
 	match c - 'a' + 1 {
 		1..=8 => io.print("early")
-		9..=26 => io.print_u64(c - 'h') // proven: c is 105..=122
+		9..=26 => io.print_int(c - 'h') // proven: c is 105..=122
 		_ => io.print("?")
 	}
 }
@@ -89,13 +89,13 @@ fn main() {
 	io.print(" ")
 	yes_no(false)
 	io.print("\n")
-	io.print_u64(sign(5))
+	io.print_int(sign(5))
 	io.print(" ")
-	io.print_u64(sign(0))
+	io.print_int(sign(0))
 	io.print(" ")
-	io.print_u64(sign(-128))
+	io.print_int(sign(-128))
 	io.print(" ")
-	io.print_u64(arity(Op.neg))
+	io.print_int(arity(Op.neg))
 	io.print(" ")
 	letter('q')
 	io.print("\n")
