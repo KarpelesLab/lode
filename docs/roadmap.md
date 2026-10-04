@@ -29,6 +29,15 @@ world is now 655 bytes, still 2 syscalls.
 
 - **M4: Enums, `match`, optionals.** Sum types with exhaustive `match`, and
   `?T` with `if let`, `else` and `??`.
+- **Checker: facts through loops.** Writing `std/io`'s integer output hit
+  three gaps in the fact language. They push natural code into unnatural
+  shapes, so they come before more language features:
+  - facts about a variable a loop assigns are dropped entirely at the loop
+    head, even bounds every iteration keeps (`i` only counting down from
+    `buf.len`), so `while i > 0 { i = i - 1; buf[i] = ... }` doesn't compile;
+  - facts set inside a loop are lost after it;
+  - a buffer must be filled before use (`[0; 21]`), even when only the part
+    that's written is ever read.
 - **M5: Errors.** `throws`, `try`, `catch`, error sets, `defer`/`errdefer`.
   `io.stdout().write` becomes the checked way to write.
 - **M6: Methods and parameter conventions.** `fn T.name(self)`, `inout`,
