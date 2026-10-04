@@ -1,0 +1,12 @@
+// error: unknown package or variable `io`
+// error: unknown package or variable `os`
+// error: unknown package or variable `nope`
+// help: add `import "std/io"`
+// help: add `import "std/os"`
+package main
+
+fn main() {
+	io.print("hello\n")
+	let n: usize = os.SYS_WRITE
+	nope.f()
+}

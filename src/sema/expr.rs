@@ -930,8 +930,46 @@ impl Checker<'_> {
         } else {
             format!("cannot find `{name}` in this scope")
         };
-        self.error(span, msg);
+        let mut d = Diagnostic::error(span, msg);
+        if let Some(help) = self.import_help(cx, name) {
+            d = d.with_help(help);
+        }
+        self.diags.push(d);
         None
+    }
+
+    /// For `name.member` where `name` is neither a local, a package-level
+    /// item nor an imported package: report it (with the import to add, if
+    /// there's a standard package of that name), and return true.
+    fn unknown_receiver(&mut self, cx: &FnCx, base: &ast::Expr) -> bool {
+        let ExprKind::Name(name) = &base.kind else {
+            return false;
+        };
+        if cx.lookup(name).is_some()
+            || self.pkgs[cx.pkg].items.contains_key(name)
+            || self.imported(cx, name).is_some()
+        {
+            return false;
+        }
+        let mut d = Diagnostic::error(base.span, format!("unknown package or variable `{name}`"));
+        if let Some(help) = self.import_help(cx, name) {
+            d = d.with_help(help);
+        }
+        self.diags.push(d);
+        true
+    }
+
+    /// The help for a name that isn't imported but is a standard package:
+    /// the import to add.
+    fn import_help(&self, cx: &FnCx, name: &str) -> Option<String> {
+        if cx.lookup(name).is_some() || self.imported(cx, name).is_some() || name.is_empty() {
+            return None;
+        }
+        let path = format!("std/{name}");
+        let loaded = self.pkgs.iter().any(|p| p.path == path);
+        let valid = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        (loaded || (valid && crate::std_root().join(name).is_dir()))
+            .then(|| format!("add `import \"{path}\"`"))
     }
 
     /// A package-level item used as a value.
@@ -984,6 +1022,9 @@ impl Checker<'_> {
         {
             let item = self.package_item(cx, pkg, &member.name, member.span)?;
             return self.item_value(item, &format!("{pkg_name}.{}", member.name), span);
+        }
+        if self.unknown_receiver(cx, base) {
+            return None;
         }
         let b = self.expr(cx, base, None)?;
         match (b.ty(), member.name.as_str()) {
@@ -1622,6 +1663,11 @@ impl Checker<'_> {
             && let Some(ty) = self.type_path(cx, base)
         {
             return self.enum_variant(cx, ty?, member, Some(args), span);
+        }
+        if let ExprKind::Field(base, _) = &callee.kind
+            && self.unknown_receiver(cx, base)
+        {
+            return None;
         }
         let target = match &callee.kind {
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
