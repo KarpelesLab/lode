@@ -28,7 +28,7 @@ fn mul(a: Mat, b: Mat) -> Mat {
 		for j in 0..N {
 			var s: i64 = 0
 			for k in 0..N {
-				s = s +% a.m[i][k] *% b.m[k][j] // WORKAROUND: elements have no facts; no `+%=`
+				s +%= a.m[i][k] *% b.m[k][j] // WORKAROUND: elements have no facts
 			}
 			c.m[i][j] = s
 		}
@@ -64,7 +64,7 @@ fn power(a: Mat, e: u32) -> Mat {
 fn trace(a: Mat) -> i64 {
 	var t: i64 = 0
 	for i in 0..N {
-		t = t +% a.m[i][i] // WORKAROUND, as above
+		t +%= a.m[i][i] // WORKAROUND, as above
 	}
 	return t
 }

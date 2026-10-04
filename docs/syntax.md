@@ -114,6 +114,7 @@ fn main() {
 | --- | --- |
 | Immutable binding | `let x = 5` |
 | Mutable binding | `var x: u32 = 0` |
+| Compound assignment | `x += 1`, `x +%= 1`, `flags \|= bit`: every binary operator `op` has `x op= v` |
 | Function | `fn name(a: T, b: U) -> R { ... }` |
 | Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
 | Generic parameters | `fn max[T: Ordered](a: T, b: T) -> T` |

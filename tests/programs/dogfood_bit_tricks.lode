@@ -19,7 +19,7 @@ fn popcount(x: u64) -> u32 {
 	var n: u32 = 0
 	while v != 0 {
 		v = v & (v - 1)
-		n = n +% 1 // WORKAROUND: loop runs at most 64/32 times; not countable
+		n +%= 1 // WORKAROUND: loop runs at most 64/32 times; not countable
 	}
 	return n
 }
@@ -51,7 +51,7 @@ fn leading_zeros(x: u32) -> u32 {
 	var v = x
 	while v & 0x80000000 == 0 {
 		v = v << 1
-		n = n +% 1 // WORKAROUND: loop runs at most 64/32 times; not countable
+		n +%= 1 // WORKAROUND: loop runs at most 64/32 times; not countable
 	}
 	return n
 }
@@ -101,7 +101,7 @@ fn main() -> u8 {
 	for k in 0..200 {
 		x = x *% 6364136223846793005 +% 1442695040888963407
 		if u64(popcount(x)) != popcount_swar(x) {
-			mismatches = mismatches +% 1
+			mismatches +%= 1
 		}
 	}
 	line("mismatches = ", mismatches)

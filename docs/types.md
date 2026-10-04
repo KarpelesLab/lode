@@ -44,6 +44,12 @@ also `!(a == MIN && b == -1)`. `a.checked_div(b)` returns `?T`.
 
 Shifts: `a << n` requires `n < bits(T)`. `a <<% n` masks `n`.
 
+Every binary arithmetic, bitwise and shift operator `op` has an assignment
+form `x op= v` (`+= -= *= /= %= +%= -%= *%= +|= -|= *|= &= |= ^= <<= <<%= >>=`).
+It means `x = x op v`, with the same proof obligation, and evaluates the
+place `x` once. It works on variables, fields, elements and `inout`
+parameters.
+
 Why proofs and not traps: a trap is an implicit crash path. Why not wrap by
 default: silent wrapping is a common source of security bugs. Requiring proof
 is stricter than both, and it's workable because most arithmetic in real code

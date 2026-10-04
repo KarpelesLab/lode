@@ -35,7 +35,7 @@ fn neighbors(g: Grid, r: usize, c: usize) -> u8 {
 			let rr = (r % H + H + dr - 1) % H
 			let cc = (c % W + W + dc - 1) % W
 			if g.cells[rr][cc] {
-				n = n +% 1 // WORKAROUND: the checker doesn't count iterations
+				n +%= 1 // WORKAROUND: the checker doesn't count iterations
 			}
 		}
 	}
@@ -72,7 +72,7 @@ fn population(g: Grid) -> u32 {
 	for row in g.cells {
 		for cell in row {
 			if cell {
-				n = n +% 1 // WORKAROUND, as above (and `+%=` does not parse)
+				n +%= 1 // WORKAROUND, as above
 			}
 		}
 	}

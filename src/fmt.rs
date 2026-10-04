@@ -746,6 +746,10 @@ mod tests {
             fmt("fn f() {\n\tx  +=  u8( a )-1\n\tp = p+done\n}\n"),
             "fn f() {\n\tx += u8(a) - 1\n\tp = p + done\n}\n"
         );
+        assert_eq!(
+            fmt("fn f() {\n\tx+%=1\n\ty|=2\n\tz<<%=3\n\ta.b[i]*|=c\n\tk^=-1\n}\n"),
+            "fn f() {\n\tx +%= 1\n\ty |= 2\n\tz <<%= 3\n\ta.b[i] *|= c\n\tk ^= -1\n}\n"
+        );
         // `??` is a prefix in a type and a binary operator in an expression.
         assert_eq!(
             fmt("fn f(o: ?? u8, p: [2]?u8) -> u8 {\n\treturn o??p[0]?? 1\n}\n"),

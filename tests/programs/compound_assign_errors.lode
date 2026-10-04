@@ -1,0 +1,20 @@
+// error: cannot prove that this shift amount is less than 8
+// error: `|` needs integers, found `bool`
+// error: cannot assign to `k`, which is immutable
+package main
+
+// `op=` has the binary operator's rules: `<<=` needs a proven amount, while
+// `<<%=` takes it modulo the width.
+fn f(k: u8, n: u8) -> u8 {
+	var x: u8 = 1
+	x <<%= n
+	x <<= n
+	var ok = true
+	ok |= false
+	k &= 1
+	return x
+}
+
+fn main() -> u8 {
+	return f(1, 2)
+}

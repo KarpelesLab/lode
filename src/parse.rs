@@ -767,6 +767,16 @@ impl Parser {
                     Tok::P(P::RemAssign) => Some(BinOp::Rem),
                     Tok::P(P::ShlAssign) => Some(BinOp::Shl),
                     Tok::P(P::ShrAssign) => Some(BinOp::Shr),
+                    Tok::P(P::ShlWrapAssign) => Some(BinOp::ShlWrap),
+                    Tok::P(P::AddWrapAssign) => Some(BinOp::AddWrap),
+                    Tok::P(P::SubWrapAssign) => Some(BinOp::SubWrap),
+                    Tok::P(P::MulWrapAssign) => Some(BinOp::MulWrap),
+                    Tok::P(P::AddSatAssign) => Some(BinOp::AddSat),
+                    Tok::P(P::SubSatAssign) => Some(BinOp::SubSat),
+                    Tok::P(P::MulSatAssign) => Some(BinOp::MulSat),
+                    Tok::P(P::AndAssign) => Some(BinOp::BitAnd),
+                    Tok::P(P::OrAssign) => Some(BinOp::BitOr),
+                    Tok::P(P::XorAssign) => Some(BinOp::BitXor),
                     _ => return Ok(Stmt::Expr(target)),
                 };
                 self.bump();

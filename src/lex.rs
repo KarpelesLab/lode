@@ -104,6 +104,13 @@ macro_rules! puncts {
 }
 
 puncts! {
+    ShlWrapAssign = "<<%=",
+    AddWrapAssign = "+%=",
+    SubWrapAssign = "-%=",
+    MulWrapAssign = "*%=",
+    AddSatAssign = "+|=",
+    SubSatAssign = "-|=",
+    MulSatAssign = "*|=",
     ShlWrap = "<<%",
     ShlAssign = "<<=",
     ShrAssign = ">>=",
@@ -118,6 +125,9 @@ puncts! {
     MulAssign = "*=",
     DivAssign = "/=",
     RemAssign = "%=",
+    AndAssign = "&=",
+    OrAssign = "|=",
+    XorAssign = "^=",
     Arrow = "->",
     FatArrow = "=>",
     DotDot = "..",
@@ -512,6 +522,17 @@ mod tests {
         assert!(t.contains(&Tok::P(AddWrap)));
         assert!(t.contains(&Tok::P(AddSat)));
         assert!(t.contains(&Tok::P(ShlWrap)));
+        let t = toks("a +%= b; c <<%= d; e *|= f; g |= h; i ^= j; k &= l");
+        for p in [
+            AddWrapAssign,
+            ShlWrapAssign,
+            MulSatAssign,
+            OrAssign,
+            XorAssign,
+            AndAssign,
+        ] {
+            assert!(t.contains(&Tok::P(p)), "{p:?}");
+        }
     }
 
     #[test]
