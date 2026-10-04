@@ -989,8 +989,8 @@ impl FnLower<'_> {
                 let ty = self.view_ir();
                 let tmp = self.b.alloca(ty);
                 self.call(*f, args, e.ty, Some(tmp));
-                let p = self.b.struct_field(tmp, ty, 0);
-                let n = self.b.struct_field(tmp, ty, 1);
+                let p = self.struct_field(tmp, ty, 0);
+                let n = self.struct_field(tmp, ty, 1);
                 let p = self.b.load(self.t.ptr, p, 8);
                 let n = self.b.load(self.t.i64, n, 8);
                 return Val::View(p, n);
@@ -1092,7 +1092,7 @@ impl FnLower<'_> {
                 };
                 let elem = e.ty.as_slice().expect("a slice");
                 let elem = self.ir_ty(elem);
-                let p = self.b.array_elem(p, elem, start);
+                let p = self.array_elem(p, elem, start);
                 let n = self.b.sub(end, start, Flags::nuw());
                 return Val::View(p, n);
             }
@@ -1242,8 +1242,8 @@ impl FnLower<'_> {
             unreachable!("a view, found {v:?}")
         };
         let ty = self.view_ir();
-        let pa = self.b.struct_field(dst, ty, 0);
-        let na = self.b.struct_field(dst, ty, 1);
+        let pa = self.struct_field(dst, ty, 0);
+        let na = self.struct_field(dst, ty, 1);
         self.b.store(self.t.ptr, pa, p, 8);
         self.b.store(self.t.i64, na, n, 8);
     }
@@ -1306,7 +1306,7 @@ impl FnLower<'_> {
     /// The tag of the enum or optional of type `ty` at `base`.
     fn load_tag(&mut self, base: ValueId, ty: Ty) -> ValueId {
         let sum = self.sum_ir(ty);
-        let addr = self.b.struct_field(base, sum.ty, 0);
+        let addr = self.struct_field(base, sum.ty, 0);
         let tag = self.t.int(sum.tag);
         self.b.load(tag, addr, align_of(Ty::Int(sum.tag)))
     }
@@ -1315,7 +1315,7 @@ impl FnLower<'_> {
     /// (its payload is written separately).
     fn store_tag(&mut self, base: ValueId, ty: Ty, variant: u32) {
         let sum = self.sum_ir(ty);
-        let addr = self.b.struct_field(base, sum.ty, 0);
+        let addr = self.struct_field(base, sum.ty, 0);
         let tag = self.t.int(sum.tag);
         let v = self
             .b
@@ -1327,9 +1327,9 @@ impl FnLower<'_> {
     /// or optional of type `ty` at `base`.
     fn payload_at(&mut self, base: ValueId, ty: Ty, variant: u32, field: u32) -> ValueId {
         let sum = self.sum_ir(ty);
-        let area = self.b.struct_field(base, sum.ty, 1);
+        let area = self.struct_field(base, sum.ty, 1);
         let payload = sum.payloads[variant as usize].expect("a variant with a payload");
-        self.b.struct_field(area, payload, field)
+        self.struct_field(area, payload, field)
     }
 
     /// Branch on `tag`, the tag of a value of the enum or optional type
@@ -1474,7 +1474,7 @@ impl FnLower<'_> {
         let lt = self.b.cast(CastOp::ZExt, lt, tag);
         let gt = self.b.cast(CastOp::ZExt, gt, tag);
         let v = self.b.sub(gt, lt, Flags::NONE);
-        let addr = self.b.struct_field(dst, sum.ty, 0);
+        let addr = self.struct_field(dst, sum.ty, 0);
         self.b.store(tag, addr, v, align_of(Ty::Int(sum.tag)));
     }
 
@@ -1486,10 +1486,53 @@ impl FnLower<'_> {
         }
     }
 
+    /// `base` moved by the constant `bytes`: `base` itself for 0, so a
+    /// field, payload or element at offset 0 costs no instruction (LF
+    /// counts each one against its inlining threshold).
+    fn byte_offset(&mut self, base: ValueId, bytes: u64) -> ValueId {
+        if bytes == 0 {
+            return base;
+        }
+        let off = self.b.const_i64(self.t.i64, bytes as i64);
+        self.b.ptr_add(base, off, true)
+    }
+
+    /// The address of field `i` of the IR struct `ty` at `base`.
+    fn struct_field(&mut self, base: ValueId, ty: TypeId, i: u32) -> ValueId {
+        let (offset, _) = self.b.types().field_offset(ty, i);
+        self.byte_offset(base, offset)
+    }
+
+    /// The address of element `index` (an `i64`) of an array of the IR type
+    /// `elem` at `base`. A constant index is a constant offset, and an
+    /// element of one byte needs no multiplication.
+    fn array_elem(&mut self, base: ValueId, elem: TypeId, index: ValueId) -> ValueId {
+        let stride = self.b.types().stride(elem);
+        if let Some(k) = self.const_u64(index) {
+            return self.byte_offset(base, k.wrapping_mul(stride));
+        }
+        let offset = if stride == 1 {
+            index
+        } else {
+            let s = self.b.const_i64(self.t.i64, stride as i64);
+            self.b.mul(index, s, Flags::NONE)
+        };
+        self.b.ptr_add(base, offset, true)
+    }
+
+    /// The value of `v` if it's an integer constant that fits in a `u64`.
+    fn const_u64(&self, v: ValueId) -> Option<u64> {
+        let c = self.b.const_of(v)?;
+        match self.b.consts().get(c) {
+            Const::Int { value, .. } => value.to_u64(),
+            _ => None,
+        }
+    }
+
     /// The address of field `i` of the struct of type `ty` at `base`.
     fn field_at(&mut self, base: ValueId, ty: Ty, i: u32) -> ValueId {
         let ir_ty = self.ir_ty(ty);
-        self.b.struct_field(base, ir_ty, i)
+        self.struct_field(base, ir_ty, i)
     }
 
     /// The address of the element or field an [`TExprKind::Index`] or a
@@ -1512,7 +1555,7 @@ impl FnLower<'_> {
         };
         let i = self.offset(index);
         let elem = self.ir_ty(e.ty);
-        self.b.array_elem(base, elem, i)
+        self.array_elem(base, elem, i)
     }
 
     /// An index or a slice bound, as an `i64`. It's proven non-negative, so
@@ -1550,7 +1593,7 @@ impl FnLower<'_> {
     /// The address of element `k` of the array of `elem` at `base`.
     fn elem_at(&mut self, base: ValueId, elem: Ty, k: ValueId) -> ValueId {
         let ir_ty = self.ir_ty(elem);
-        self.b.array_elem(base, ir_ty, k)
+        self.array_elem(base, ir_ty, k)
     }
 
     /// Run `body` for each `k` in `0..n` (an `i64`): unrolled when the array
@@ -1599,8 +1642,8 @@ impl FnLower<'_> {
             let sum = self.sum_ir(ty);
             let tag_ty = self.t.int(sum.tag);
             let align = align_of(Ty::Int(sum.tag));
-            let s = self.b.struct_field(src, sum.ty, 0);
-            let d = self.b.struct_field(dst, sum.ty, 0);
+            let s = self.struct_field(src, sum.ty, 0);
+            let d = self.struct_field(dst, sum.ty, 0);
             let tag = self.b.load(tag_ty, s, align);
             self.b.store(tag_ty, d, tag, align);
             self.each_payload(tag, ty, |this, v| {
