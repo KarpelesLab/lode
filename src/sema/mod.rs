@@ -165,6 +165,8 @@ struct FnCx {
     unsafe_depth: u32,
     /// The facts known at the current point.
     env: Env,
+    /// How many of the first locals are the function's parameters.
+    params: usize,
     /// For each loop around the current point, innermost last: where its
     /// body has left an iteration so far.
     loops: Vec<LoopEdges>,
@@ -200,6 +202,7 @@ impl FnCx {
             unsafe_depth: u32::from(is_unsafe),
             env: Env::default(),
             loops: Vec::new(),
+            params: 0,
         }
     }
 
@@ -1211,6 +1214,7 @@ impl<'a> Checker<'a> {
             }
             params.push(self.declare(&mut cx, &p.name.name, ty, false));
         }
+        cx.params = params.len();
         let body = self.block(&mut cx, &f.body.stmts);
         if ret != Ty::Unit && !terminates(&body) {
             self.error(
@@ -1230,6 +1234,15 @@ impl<'a> Checker<'a> {
             locals: cx.locals,
             body,
             span: f.span,
+        }
+    }
+
+    /// The help for assigning to the immutable `local`, named `name`.
+    fn immutable_help(cx: &FnCx, local: LocalId, name: &str) -> String {
+        if local < cx.params {
+            format!("parameters are read-only; to change a copy, declare one: `var m = {name}`")
+        } else {
+            format!("declare it with `var {name}` to make it mutable")
         }
     }
 
@@ -1531,7 +1544,7 @@ impl<'a> Checker<'a> {
                             target.span,
                             format!("cannot assign to `{name}`, which is immutable"),
                         )
-                        .with_help(format!("declare it with `var {name}` to make it mutable")),
+                        .with_help(Self::immutable_help(cx, local, name)),
                     );
                     return None;
                 }
@@ -2421,7 +2434,7 @@ impl<'a> Checker<'a> {
                     target.span,
                     format!("cannot assign to {part} of `{name}`, which is immutable"),
                 )
-                .with_help(format!("declare it with `var {name}` to make it mutable")),
+                .with_help(Self::immutable_help(cx, local, name)),
             );
             return None;
         }

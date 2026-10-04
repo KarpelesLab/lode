@@ -1,0 +1,22 @@
+// error: cannot assign to `n`, which is immutable
+// error: cannot assign to a field of `p`, which is immutable
+// error: cannot assign to `k`, which is immutable
+// help: parameters are read-only; to change a copy, declare one: `var m = n`
+// help: parameters are read-only; to change a copy, declare one: `var m = p`
+// help: declare it with `var k` to make it mutable
+package main
+
+struct P {
+	x: u8
+}
+
+fn f(p: P, n: u8) -> u8 {
+	n = 3
+	p.x = 4
+	let k: u8 = 5
+	k = 6
+	return n
+}
+
+fn main() {
+}
