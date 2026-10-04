@@ -25,3 +25,4 @@ The examples show semantics. They are not a grammar.
 | [packages.md](packages.md) | Packages, imports, versions, FFI, build metadata |
 | [concurrency.md](concurrency.md) | Threads, data-race freedom, structured concurrency |
 | [backend.md](backend.md) | LatticeFoundry as the backend, optimization profiles, what we need from it |
+| [roadmap.md](roadmap.md) | What the compiler implements next, in order |
