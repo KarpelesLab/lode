@@ -1,8 +1,9 @@
 //! The facts the proof checker knows at a point in a function.
 //!
-//! Two kinds of fact, both decidable and cheap (docs/safety.md):
+//! Three kinds of fact, all decidable and cheap (docs/safety.md):
 //!
 //! - **ranges**: a term's value lies in `lo..=hi`;
+//! - **holes**: a term isn't some value inside its range (`b != 0`);
 //! - **relations**: for two terms `a` and `b`, `a - b <= c`.
 //!
 //! A [`Term`] is an integer local, the length of a view local (a slice or a
@@ -84,6 +85,8 @@ pub struct Env {
     /// The locals that may not be assigned yet on some path to this point
     /// (a `var` declared without a value, a `set` parameter).
     uninit: BTreeSet<LocalId>,
+    /// Values terms are known not to have (`b != 0`), inside their ranges.
+    holes: Vec<(Term, i128)>,
     /// The facts contradict each other: this point can't be reached.
     pub dead: bool,
 }
@@ -111,6 +114,8 @@ pub enum Fact {
     },
     /// `a - b <= c`.
     Rel { a: Term, b: Term, c: i128 },
+    /// `term != value`.
+    Hole { term: Term, value: i128 },
 }
 
 /// The facts a condition gives when it's true and when it's false.
@@ -173,13 +178,22 @@ fn le(x: Side, y: Side, c: i128) -> Vec<Fact> {
     facts
 }
 
-/// Facts from `x != y`: only useful when one side is a single value at an end
-/// of the other side's range.
+/// Facts from `x != y`, when one side is a single value: at an end of the
+/// other side's range, the range narrows; inside it, the term has a hole.
 fn ne(x: Side, y: Side) -> Vec<Fact> {
     let mut facts = Vec::new();
     for (s, k) in [(x, y), (y, x)] {
         if let (Some(lin), true) = (s.term, k.range.lo == k.range.hi) {
             let v = k.range.lo;
+            if s.range.lo < v && v < s.range.hi {
+                if let Some(value) = v.checked_sub(lin.offset) {
+                    facts.push(Fact::Hole {
+                        term: lin.term,
+                        value,
+                    });
+                }
+                continue;
+            }
             // s = term + offset, so the bound on the term is shifted.
             let bound = if s.range.lo == v {
                 Range {
@@ -282,6 +296,23 @@ impl Env {
         self.ranges.get(&term).copied()
     }
 
+    /// Whether `term` is known not to be `value`: it's outside its range,
+    /// or a hole in it.
+    pub fn excludes(&self, term: Term, value: i128) -> bool {
+        self.range(term).is_some_and(|r| !r.contains(value)) || self.holes.contains(&(term, value))
+    }
+
+    /// Whether `x` (a term plus a constant, or none) in `range` is known not
+    /// to be `value`.
+    pub fn excludes_value(&self, x: Option<Linear>, range: Range, value: i128) -> bool {
+        !range.contains(value)
+            || x.is_some_and(|x| {
+                value
+                    .checked_sub(x.offset)
+                    .is_some_and(|v| self.excludes(x.term, v))
+            })
+    }
+
     /// The tightest known `c` with `a - b <= c`.
     pub fn rel(&self, a: Term, b: Term) -> Option<i128> {
         self.rels
@@ -344,6 +375,7 @@ impl Env {
             .retain(|t, _| !matches!(t, Term::Field(l, _) if *l == local));
         self.rels
             .retain(|r| r.a.local() != local && r.b.local() != local);
+        self.holes.retain(|(t, _)| t.local() != local);
     }
 
     /// Forget everything about the fields of the struct local `local`
@@ -353,6 +385,7 @@ impl Env {
         let hit = |t: &Term| matches!(*t, Term::Field(l, k) if l == local && fields.contains(&k));
         self.ranges.retain(|t, _| !hit(t));
         self.rels.retain(|r| !hit(&r.a) && !hit(&r.b));
+        self.holes.retain(|(t, _)| !hit(t));
     }
 
     /// The integer local `local` was assigned its own value plus `k` (as in
@@ -374,8 +407,34 @@ impl Env {
                 Some(Rel { c, ..*r })
             })
             .collect();
+        let holes: Vec<(Term, i128)> = self
+            .holes
+            .iter()
+            .filter(|(t, _)| *t == me)
+            .filter_map(|&(t, v)| Some((t, v.checked_add(k)?)))
+            .collect();
         self.forget_value(local, range);
         self.rels.extend(shifted);
+        for (term, value) in holes {
+            self.apply(&[Fact::Hole { term, value }]);
+        }
+    }
+
+    /// `to` was given the value of `from` plus `offset`: it has `from`'s
+    /// holes, moved by `offset`.
+    pub fn copy_holes(&mut self, from: Term, to: Term, offset: i128) {
+        let holes: Vec<Fact> = self
+            .holes
+            .iter()
+            .filter(|h| h.0 == from)
+            .filter_map(|&(_, v)| {
+                Some(Fact::Hole {
+                    term: to,
+                    value: v.checked_add(offset)?,
+                })
+            })
+            .collect();
+        self.apply(&holes);
     }
 
     /// Forget every fact about `local` (at the head of a loop that assigns
@@ -429,10 +488,9 @@ impl Env {
     ) -> Env {
         let live: Vec<&Env> = edges.iter().filter(|e| !e.dead).collect();
         let mut out = Env {
-            ranges: HashMap::new(),
-            rels: Vec::new(),
             uninit: self.uninit.clone(),
             dead: self.dead,
+            ..Env::default()
         };
         for (&term, &r) in &self.ranges {
             if !about(term.local()) {
@@ -481,6 +539,12 @@ impl Env {
                 out.rels.push(Rel { c, ..*rel });
             }
         }
+        // A hole can't be loosened: it's kept if every edge has it.
+        for &(term, value) in &self.holes {
+            if !about(term.local()) || live.iter().all(|e| e.excludes(term, value)) {
+                out.holes.push((term, value));
+            }
+        }
         out
     }
 
@@ -491,6 +555,8 @@ impl Env {
             && self.ranges == other.ranges
             && self.rels.len() == other.rels.len()
             && self.rels.iter().all(|r| other.rels.contains(r))
+            && self.holes.len() == other.holes.len()
+            && self.holes.iter().all(|h| other.holes.contains(h))
     }
 
     pub fn apply(&mut self, facts: &[Fact]) {
@@ -501,8 +567,15 @@ impl Env {
                     match current.intersect(bound) {
                         Some(r) => {
                             self.ranges.insert(term, r);
+                            self.settle(term);
                         }
                         None => self.dead = true,
+                    }
+                }
+                Fact::Hole { term, value } => {
+                    if !self.excludes(term, value) {
+                        self.holes.push((term, value));
+                        self.settle(term);
                     }
                 }
                 Fact::Rel { a, b, c } => {
@@ -513,6 +586,29 @@ impl Env {
                 }
             }
         }
+    }
+
+    /// Keep `term`'s holes inside its known range: a hole at an end moves
+    /// the end past it (a range that's only a hole can't be reached).
+    fn settle(&mut self, term: Term) {
+        let Some(mut r) = self.range(term) else {
+            return;
+        };
+        loop {
+            if self.holes.contains(&(term, r.lo)) && r.lo < r.hi {
+                r.lo += 1;
+            } else if self.holes.contains(&(term, r.hi)) && r.lo < r.hi {
+                r.hi -= 1;
+            } else {
+                break;
+            }
+        }
+        if r.lo == r.hi && self.holes.contains(&(term, r.lo)) {
+            self.dead = true;
+        }
+        self.ranges.insert(term, r);
+        self.holes
+            .retain(|&(t, v)| t != term || (r.lo < v && v < r.hi));
     }
 
     /// The facts that hold after either of two paths: ranges are widened to
@@ -542,12 +638,24 @@ impl Env {
             .collect();
         // A local is assigned after the join only if it is on both paths.
         let uninit = a.uninit.union(&b.uninit).copied().collect();
-        Env {
+        let mut holes: Vec<(Term, i128)> = Vec::new();
+        for &h in a.holes.iter().chain(&b.holes) {
+            if a.excludes(h.0, h.1) && b.excludes(h.0, h.1) && !holes.contains(&h) {
+                holes.push(h);
+            }
+        }
+        let mut out = Env {
             ranges,
             rels,
             uninit,
+            holes,
             dead: false,
+        };
+        let terms: Vec<Term> = out.holes.iter().map(|h| h.0).collect();
+        for term in terms {
+            out.settle(term);
         }
+        out
     }
 }
 
@@ -744,6 +852,53 @@ mod tests {
         assert!(exact(1, 5).holds_in(about, full, &Env::default()));
         assert!(head.same(&head.clone()));
         assert!(!head.same(&exact(0, 21)));
+    }
+
+    const I32: Range = Range {
+        lo: i32::MIN as i128,
+        hi: i32::MAX as i128,
+    };
+
+    fn signed(local: LocalId) -> Side {
+        Side {
+            term: Some(Linear::of(Term::Local(local))),
+            range: I32,
+            full: I32,
+        }
+    }
+
+    #[test]
+    fn holes() {
+        // b == 0 is false: a hole at 0.
+        let t = Term::Local(0);
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Eq, signed(0), konst(0)).when_false);
+        assert!(env.excludes(t, 0));
+        assert!(!env.excludes(t, 1));
+        assert_eq!(env.range(t), None);
+        // Narrowing to the hole moves past it: b >= 0 gives 1..
+        let mut pos = env.clone();
+        pos.apply(&comparison(CmpOp::Ge, signed(0), konst(0)).when_true);
+        assert_eq!(pos.range(t), Some(Range { lo: 1, hi: I32.hi }));
+        // Shifting moves holes, assigning forgets them.
+        let mut moved = env.clone();
+        moved.shift(0, None, 1);
+        assert!(moved.excludes(t, 1) && !moved.excludes(t, 0));
+        moved.assign(0, None);
+        assert!(!moved.excludes(t, 1));
+        // A join keeps a hole both sides exclude, by a hole or a range.
+        let joined = Env::join(env.clone(), exact(0, 5));
+        assert!(joined.excludes(t, 0));
+        let joined = Env::join(env.clone(), Env::default());
+        assert!(!joined.excludes(t, 0));
+        // At a loop head, a hole holds where an edge excludes the value.
+        let about = |l: LocalId| l == 0;
+        assert!(env.holds_in(about, full, &exact(0, 3)));
+        assert!(!env.holds_in(about, full, &Env::default()));
+        // A range that's only a hole can't be reached.
+        let mut dead = exact(0, 0);
+        dead.apply(&[Fact::Hole { term: t, value: 0 }]);
+        assert!(dead.dead);
     }
 
     #[test]

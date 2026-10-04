@@ -1,6 +1,9 @@
 // error: cannot prove that this addition does not overflow `u64`
 // error: cannot prove that this multiplication does not overflow `i64`
 // error: cannot prove that this addition does not overflow `u32`
+// error: cannot prove that this is not `-9223372036854775808` divided by -1
+// error: cannot prove that this divisor is not zero
+// error: cannot prove that this divisor is not zero
 package main
 
 // Dividing by 1 keeps the whole range.
@@ -19,6 +22,44 @@ fn triple_half(x: i64) -> i64 {
 fn or_top(x: u32) -> u32 {
 	let v = x | 1
 	return v + 1
+}
+
+// `&&` being false gives no fact: either side may be the one that's false.
+fn guarded_pair(a: i64, b: i64) -> i64 {
+	if b == 0 {
+		return 0
+	}
+	if a == -9223372036854775808 && b == -1 {
+		return 0
+	}
+	return a / b
+}
+
+// A hole moves with `b = b + 1`: now `b` isn't 1, but it can be 0.
+fn moved_hole(a: i32, b: i32) -> i32 {
+	if b <= -100 || b >= 100 {
+		return 0
+	}
+	var c = b
+	if c == 0 {
+		return 0
+	}
+	c = c + 1
+	return a / c
+}
+
+// A hole only holds at the head of a loop if every iteration keeps it.
+fn reset_in_loop(xs: []i32, d0: i32) -> i32 {
+	if d0 == 0 {
+		return 0
+	}
+	var d = d0
+	var total: i32 = 0
+	for x in xs {
+		total = total +% 100 / d
+		d = x
+	}
+	return total
 }
 
 fn main() {

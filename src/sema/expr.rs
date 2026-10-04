@@ -1877,14 +1877,19 @@ impl Checker<'_> {
             BinOp::SubSat => (TBinOp::Sub(Mode::Saturate), full),
             BinOp::MulSat => (TBinOp::Mul(Mode::Saturate), full),
             BinOp::Div | BinOp::Rem => {
-                if b.contains(0) {
+                // Ruled out by the ranges, or by a hole (`b != 0`).
+                let (a_term, b_term) = (l.term, r.term);
+                if !cx.env.excludes_value(b_term, b, 0) {
                     self.diags.push(
                         Diagnostic::error(rhs.span, "cannot prove that this divisor is not zero")
                             .with_help(format!("the divisor can be {b}")),
                     );
                     return None;
                 }
-                if t.signed && a.contains(t.min()) && b.contains(-1) {
+                if t.signed
+                    && !cx.env.excludes_value(a_term, a, t.min())
+                    && !cx.env.excludes_value(b_term, b, -1)
+                {
                     self.diags.push(
                         Diagnostic::error(
                             span,
@@ -1892,7 +1897,11 @@ impl Checker<'_> {
                         )
                         .with_help(format!(
                             "the operands can be {a} and {b}; that one result doesn't fit in `{t}`"
-                        )),
+                        ))
+                        .with_help(
+                            "handle a divisor of -1 first: in `if b == -1 { ... } else { a / b }`, \
+                             the division is proven",
+                        ),
                     );
                     return None;
                 }

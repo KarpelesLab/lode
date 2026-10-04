@@ -111,12 +111,14 @@ length of a view local (`xs.len` of a slice or `str` parameter or local), or
 an integer field of a struct local, reached through fields only (`p.x`,
 `r.min.y`, but not `ps[i].x`). An
 expression can be a term plus a constant: `i`, `i + 1`, `xs.len - 1`. There
-are two kinds of fact:
+are three kinds of fact:
 
 - **Ranges:** a term lies in `lo..=hi`.
+- **Holes:** a term is not `k`, for a constant `k` inside its range
+  (`b != 0` for a signed `b`).
 - **Relations:** for two terms, `a - b <= c`.
 
-Both are decidable and cheap, and the rules for how they flow are fixed:
+All are decidable and cheap, and the rules for how they flow are fixed:
 
 | Where | What the checker learns |
 | --- | --- |
@@ -128,9 +130,9 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
 | A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
-| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`). A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
+| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
-| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know. |
+| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know, and holes at values neither branch's facts allow. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. A `match` on a call that throws is the same, with the arms `ok` and `err`. |
 | A call `f(&x)`, `p.scale(2)` | A call changes only the places passed `inout` or `set` (with `&`, or as the receiver of a method that takes `inout self`): what was known about each (a variable, or a struct field and the fields in it) is forgotten. A slice's length doesn't change, and elements have no facts. A variable passed `set` is assigned, with nothing known ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)). |
 | `try f()`, `throw` | The error leaves the function, so it adds nothing to the facts after. After `try`, the facts are those after the call. `throw` always leaves, like `return`. |
@@ -138,7 +140,7 @@ Both are decidable and cheap, and the rules for how they flow are fixed:
 | `defer`, `errdefer` | The body is checked where it's written, knowing the facts there about the variables nothing after it in the block assigns. It can't assign variables declared outside it (or pass them `inout` or `set`), so running it changes no facts. |
 | `a && b`, `a \|\| b` | `b` is checked knowing `a` is true (`&&`) or false (`\|\|`). After, what `b` may change is forgotten. |
 | `a ?? b` | After, what holds whether `b` ran or not: the facts before `b` joined with those after it |
-| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` narrows only when `k` is at an end of `x`'s range. |
+| A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. `x != k` (and `x == k` being false), with `k` a single value: when `k` is at an end of `x`'s range, the range narrows past it; when it's inside, a hole at `k`. A range that narrows to a hole's value moves past it too. |
 | The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
 | `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
 | `loop` | After the loop, the facts at its `break`s, joined. Without a `break`, the code after it can't be reached. |
@@ -150,6 +152,26 @@ A relation can also come from two known relations through one other term:
 `i < n` and `n == xs.len` (from `let n = xs.len`) give `i < xs.len`. Only
 one step: longer chains are not followed, which keeps the check cheap and
 easy to predict.
+
+`a / b` and `a % b` are proven when `b` can't be 0 (its range doesn't
+contain 0, or 0 is a hole in it) and, for a signed type, when `a` can't be
+the type's smallest value or `b` can't be -1 (again by its range or a
+hole). `if a == MIN && b == -1 { return }` gives no fact after it, since
+`&&` being false says neither side is false; write the test so that one
+operand's fact holds where the division is:
+
+```
+if b == 0 {
+	return none
+}
+if b == -1 {
+	if a == MIN {                        // MIN: the type's smallest value
+		return none
+	}
+	return -a                            // a > MIN: proven
+}
+return a / b                             // b != 0 and b != -1: proven
+```
 
 `a[i]` is proven when `i` can't be negative and either `i`'s range is below
 the length's (for an array, its constant `N`), or a relation gives
@@ -178,7 +200,9 @@ body from a few candidate heads, in a fixed order, and taking the first that
 a range end holds if the back-edge's range for the term (or its type's range,
 if none is known) is within it, and a relation `a - b <= c` holds if the
 back-edge gives `a - b <= c'` with `c' <= c` (directly or through one other
-term, as above). A back-edge that can't be reached holds everything.
+term, as above), and a hole at `k` holds if the back-edge's range doesn't
+contain `k` or has a hole there. A back-edge that can't be reached holds
+everything.
 
 Two ways to weaken facts, each fact about `A` on its own (the two ends of a
 range are separate facts):
@@ -188,7 +212,7 @@ range are separate facts):
 - **cover** some back-edges: widen each range just enough to include the
   back-edges' ranges (a term with no range has its type's), and raise each
   relation's `c` to the largest the back-edges give (and forget it if one
-  gives none).
+  gives none). A hole can't be widened: it's forgotten as when dropping.
 
 The candidates, in order:
 

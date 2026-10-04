@@ -42,6 +42,53 @@ fn low_byte(x: i32) -> u8 {
 	return u8(x & 0xff)
 }
 
+const MIN: i64 = -9223372036854775808
+
+// `b == 0` being false leaves a hole at 0 in `b`'s range, which proves the
+// divisor isn't zero; `b == -1` being false, that it isn't -1.
+fn divide(a: i64, b: i64) -> ?i64 {
+	if b == 0 {
+		return none
+	}
+	if b == -1 {
+		if a == MIN {
+			return none
+		}
+		return -a
+	}
+	return a / b
+}
+
+// The same for `!=`: `a` is neither 0 nor -1 where `r / a` is.
+fn mul_fits(a: i64, b: i64) -> bool {
+	let r = a *% b
+	if a == -1 {
+		return b != MIN
+	}
+	if a != 0 {
+		return r / a == b
+	}
+	return true
+}
+
+// Holes go through loops when every iteration keeps them, and a copy has
+// the holes of what it copies: `d` is never 0 here.
+fn sum_of_quotients(xs: []i32, d0: i32) -> i32 {
+	if d0 == 0 || d0 == -1 {
+		return 0
+	}
+	var total: i32 = 0
+	var d = d0
+	for x in xs {
+		total = total +% x / d0
+		total = total +% 1000 / d
+		if x != 0 {
+			d = x
+		}
+	}
+	return total
+}
+
 fn main() -> u8 {
 	if half_plus_one(18446744073709551615) != 9223372036854775808 {
 		return 1
@@ -57,6 +104,16 @@ fn main() -> u8 {
 	}
 	if low_byte(-1) != 255 {
 		return 5
+	}
+	if divide(7, 0) != none || divide(MIN, -1) != none || divide(7, -1) ?? 0 != -7 || divide(-7, 2) ?? 0 != -3 {
+		return 6
+	}
+	if !mul_fits(3, 4) || mul_fits(-1, MIN) || mul_fits(4611686018427387904, 2) || !mul_fits(0, MIN) {
+		return 7
+	}
+	let xs: [3]i32 = [10, -20, 35]
+	if sum_of_quotients(xs, 5) != 255 || sum_of_quotients(xs, -1) != 0 {
+		return 8
 	}
 	return 0
 }

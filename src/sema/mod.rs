@@ -1738,9 +1738,10 @@ impl<'a> Checker<'a> {
             && src.term != Term::Local(local)
         {
             // Another term (a local or a length) plus a constant: related to
-            // it, as in `let i = xs.len - 1`.
+            // it, as in `let i = xs.len - 1`, and has its holes.
             cx.env
                 .apply(&equal(Term::Local(local), src.term, src.offset));
+            cx.env.copy_holes(src.term, Term::Local(local), src.offset);
         }
         if cx.locals[local].ty.is_view() {
             match &value.expr.kind {
