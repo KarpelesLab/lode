@@ -203,6 +203,20 @@ struct FnCx {
     /// For each loop around the current point, innermost last: where its
     /// body has left an iteration so far.
     loops: Vec<LoopEdges>,
+    /// Where the `str` locals' values come from, for `-> str`.
+    strs: StrOrigins,
+}
+
+/// For a function returning a `str`: which locals hold only strings with
+/// static storage (see [`Checker::check_str_returns`]).
+#[derive(Clone, Default)]
+struct StrOrigins {
+    /// For each `str` local (not a parameter) given a value so far: the
+    /// locals its values were copied from, or `None` once it held a value
+    /// that may not be static.
+    deps: HashMap<LocalId, Option<Vec<LocalId>>>,
+    /// The locals returned, and where.
+    returned: Vec<(LocalId, Span)>,
 }
 
 /// The facts where a loop's body leaves an iteration: at each back-edge
@@ -221,6 +235,7 @@ struct Mark {
     diags: usize,
     locals: usize,
     consts: Vec<ConstState>,
+    strs: StrOrigins,
 }
 
 impl FnCx {
@@ -243,6 +258,7 @@ impl FnCx {
             set_params: Vec::new(),
             call_sets: Vec::new(),
             expr_depth: 0,
+            strs: StrOrigins::default(),
         }
     }
 
@@ -1399,14 +1415,16 @@ impl<'a> Checker<'a> {
         }
         let ret = match &f.ret {
             Some(t) => match self.resolve_type(cx, t) {
-                Some(ty @ (Ty::Str | Ty::Slice(_))) => {
-                    let what = match ty {
-                        Ty::Str => "a `str`",
-                        _ => "a slice",
-                    };
+                // A `str` with static storage can be returned (see
+                // `check_str_returns`).
+                Some(Ty::Str) if f.throws.is_some() => {
+                    self.error(t.span(), "a function that throws can't return a `str` yet");
+                    Ty::Str
+                }
+                Some(ty @ Ty::Slice(_)) => {
                     self.error(
                         t.span(),
-                        format!("returning {what} is not supported by the compiler yet"),
+                        "returning a slice is not supported by the compiler yet",
                     );
                     // The type is kept, so the body is still checked.
                     ty
@@ -1703,6 +1721,7 @@ impl<'a> Checker<'a> {
         }
         cx.params = params.len();
         let body = self.block(&mut cx, &f.body.stmts);
+        self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
         debug_assert!(cx.failed.is_empty() || crate::diag::has_errors(&self.diags));
         if ret != Ty::Unit && !terminates(&body) {
@@ -1748,6 +1767,57 @@ impl<'a> Checker<'a> {
             return;
         }
         self.error(span, format!("cannot find `{name}` in this scope"));
+    }
+
+    /// A function returning a `str` returns only strings with static
+    /// storage, which borrow from nothing: string literals, the results of
+    /// other functions returning a `str`, and locals that only ever hold
+    /// such strings. Until the compiler checks that a returned view borrows
+    /// from the parameters (docs/memory.md, Views), that's what keeps a
+    /// returned `str` valid. Report each returned local that may hold
+    /// another string.
+    fn check_str_returns(&mut self, cx: &FnCx) {
+        // The locals that may hold a string that isn't static: any that
+        // was given one, and any copied from such a local.
+        let deps = &cx.strs.deps;
+        let mut tainted: HashSet<LocalId> = deps
+            .iter()
+            .filter(|(_, d)| d.is_none())
+            .map(|(&l, _)| l)
+            .collect();
+        loop {
+            let more: Vec<LocalId> = deps
+                .iter()
+                .filter(|(l, d)| {
+                    !tainted.contains(l)
+                        && d.as_ref().is_some_and(|d| {
+                            d.iter()
+                                .any(|s| tainted.contains(s) || !deps.contains_key(s))
+                        })
+                })
+                .map(|(&l, _)| l)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            tainted.extend(more);
+        }
+        let mut reported = HashSet::new();
+        for &(l, span) in &cx.strs.returned {
+            if (tainted.contains(&l) || !deps.contains_key(&l)) && reported.insert(span) {
+                self.report_str_return(span);
+            }
+        }
+    }
+
+    fn report_str_return(&mut self, span: Span) {
+        self.diags.push(
+            Diagnostic::error(
+                span,
+                "a function can only return a `str` that is a string literal (or another function's `str` result)",
+            )
+            .with_help("a returned `str` can't borrow from the parameters yet (docs/memory.md, Views)"),
+        );
     }
 
     /// The help for assigning to the immutable `local`, named `name`.
@@ -1926,6 +1996,14 @@ impl<'a> Checker<'a> {
 
     /// A local was given a new value: record what's known about it.
     fn record_value(&self, cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
+        if cx.locals[local].ty == Ty::Str {
+            let origin = str_origin(cx, &value.expr);
+            let entry = cx.strs.deps.entry(local).or_insert(Some(Vec::new()));
+            match (entry.as_mut(), origin) {
+                (Some(deps), Some(more)) => deps.extend(more),
+                _ => *entry = None,
+            }
+        }
         match value.term {
             // `i = i + k`: what was known about `i` shifts by `k`.
             Some(src) if src.term == Term::Local(local) => {
@@ -2222,6 +2300,15 @@ impl<'a> Checker<'a> {
                         .and_then(|checked| self.coerce(checked, ret, v.span))
                         .map(|c| c.expr),
                 };
+                if let (Some(e), Ty::Str) = (&value, cx.ret) {
+                    match str_origin(cx, e) {
+                        Some(locals) => {
+                            let at = *span;
+                            cx.strs.returned.extend(locals.into_iter().map(|l| (l, at)));
+                        }
+                        None => self.report_str_return(*span),
+                    }
+                }
                 self.check_set_params(cx, *span);
                 Some(TStmt::Return(value))
             }
@@ -3081,6 +3168,7 @@ impl<'a> Checker<'a> {
             diags: self.diags.len(),
             locals: cx.locals.len(),
             consts: self.consts.iter().map(|c| c.state).collect(),
+            strs: cx.strs.clone(),
         }
     }
 
@@ -3088,6 +3176,7 @@ impl<'a> Checker<'a> {
         self.diags.truncate(mark.diags);
         cx.locals.truncate(mark.locals);
         cx.failed.retain(|&l| l < mark.locals);
+        cx.strs = mark.strs.clone();
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
             c.state = state;
         }
@@ -3575,6 +3664,27 @@ pub fn table_leaf(ty: Ty) -> Option<Ty> {
         elem = inner;
     }
     matches!(elem, Ty::Int(_) | Ty::Bool).then_some(elem)
+}
+
+/// Where the `str` value `e` comes from, if its storage is static: the
+/// locals it's copied from (whose values must be static too), or `None` if
+/// it may borrow from a parameter. A string literal is static, and so is
+/// the result of a function returning a `str`, which returns only static
+/// strings.
+fn str_origin(cx: &FnCx, e: &TExpr) -> Option<Vec<LocalId>> {
+    match &e.kind {
+        TExprKind::Str(_) | TExprKind::Call(..) => Some(Vec::new()),
+        TExprKind::Local(l) if *l >= cx.params => Some(vec![*l]),
+        TExprKind::Try(call) => str_origin(cx, call),
+        TExprKind::Catch { call, handler, .. } => {
+            let mut out = str_origin(cx, call)?;
+            if let Handler::Value(v) = handler {
+                out.extend(str_origin(cx, v)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// The smallest value of `all` that none of `ranges` holds, if any.

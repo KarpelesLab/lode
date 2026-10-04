@@ -72,16 +72,15 @@ fn weekday(d: Date) -> Weekday {
 	return Weekday(w) ?? Weekday.monday
 }
 
-// WORKAROUND: can't return a `str`, even a literal; print it here
-fn print_name(w: Weekday) {
-	match w {
-		monday => io.print("Mon")
-		tuesday => io.print("Tue")
-		wednesday => io.print("Wed")
-		thursday => io.print("Thu")
-		friday => io.print("Fri")
-		saturday => io.print("Sat")
-		sunday => io.print("Sun")
+fn Weekday.name(self) -> str {
+	match self {
+		monday => return "Mon"
+		tuesday => return "Tue"
+		wednesday => return "Wed"
+		thursday => return "Thu"
+		friday => return "Fri"
+		saturday => return "Sat"
+		sunday => return "Sun"
 	}
 }
 
@@ -98,7 +97,7 @@ fn show(d: Date) {
 	}
 	io.print_i64(days_from_civil(d))
 	io.print(" ")
-	print_name(weekday(d))
+	io.print(weekday(d).name())
 	io.print("\n")
 }
 

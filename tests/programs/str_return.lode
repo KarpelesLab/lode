@@ -1,0 +1,52 @@
+// stdout: Tue many one zero\n
+// stdout: 5\n
+package main
+
+import "std/io"
+
+enum Day {
+	mon
+	tue
+}
+
+// A function can return a `str` with static storage: a string literal,
+// another such function's result, or a local that only holds those.
+fn Day.name(self) -> str {
+	match self {
+		mon => return "Mon"
+		tue => return "Tue"
+	}
+}
+
+fn count_word(n: u32) -> str {
+	var word = "many"
+	match n {
+		0 => word = "zero"
+		1 => word = "one"
+		_ => {}
+	}
+	let copy = word
+	return copy
+}
+
+fn longest() -> str {
+	let a = count_word(7)
+	if a.len > 3 {
+		return a
+	}
+	return Day.mon.name()
+}
+
+fn main() {
+	io.print(Day.tue.name())
+	io.print(" ")
+	io.print(longest())
+	io.print(" ")
+	io.print(count_word(1))
+	io.print(" ")
+	io.print(count_word(0))
+	io.print("\n")
+	let s = count_word(0)
+	io.print_u64(s.bytes().len + 1)
+	io.print("\n")
+}

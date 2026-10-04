@@ -237,6 +237,24 @@ of another one: an array where a slice is expected, and `s.bytes()`, the
 the same rules as the receiver: kept in a local, passed to a function, never
 stored.
 
+A function can return a `str` whose storage is static, since it borrows
+from nothing: rule 2 holds trivially, without the checks it needs in
+general. The rule, checked per function:
+
+- a string literal is static;
+- the result of a call to a function returning a `str` is static (every
+  such function obeys this rule);
+- a local is static if every value it's ever given in the function is
+  static (a literal, such a call, or a copy of a static local). A
+  parameter never is: its string may live in the caller's storage.
+
+Every `return` of a function returning a `str` must give a static value.
+The rule doesn't follow control flow: `var s = "x"` assigned a parameter
+anywhere makes every `return s` an error, even one before the assignment.
+Returning a view that borrows from the parameters, and returning slices,
+wait for rule 2 to be checked. A function that throws can't return a `str`
+yet (its result would hold a view in memory).
+
 ## Copies
 
 **Status:** Proposed

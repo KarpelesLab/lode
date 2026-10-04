@@ -70,7 +70,8 @@ What works:
   integers (and `io.eprint...` for standard error), which ignore errors, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`
-- `s.bytes()`, the bytes of a `str` as a read-only `[]u8`
+- `s.bytes()`, the bytes of a `str` as a read-only `[]u8`, and returning a
+  `str` literal from a function (`fn Day.name(self) -> str`)
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe. The checker follows value ranges and relations between variables,

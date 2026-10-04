@@ -100,7 +100,12 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   but not stored in a struct field or returned
   ([memory.md](memory.md#views)).
 
-Not yet: returning a `str` (it needs the view rules of
-[memory.md](memory.md#views)), comparing or slicing strings, rune iteration,
-and other encodings.
+- returning a `str` with static storage: a string literal, another such
+  function's result, or a local that only ever holds those, as in
+  `fn Day.name(self) -> str { ... return "Mon" ... }`
+  ([memory.md](memory.md#views))
+
+Not yet: returning a `str` that borrows from a parameter (it needs the view
+rules of [memory.md](memory.md#views)), comparing or slicing strings, rune
+iteration, and other encodings.
 

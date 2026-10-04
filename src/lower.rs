@@ -158,7 +158,7 @@ impl Types {
     fn signature(&self, f: &Func) -> (Vec<TypeId>, TypeId) {
         let mut params = Vec::new();
         let result = f.result_ty();
-        let ret = if result.in_memory() {
+        let ret = if result.in_memory() || result.is_view() {
             params.push(self.ptr);
             self.void
         } else {
@@ -493,7 +493,7 @@ impl FnLower<'_> {
         // The IR parameters: the result's storage first, if it's in memory,
         // then each parameter's parts.
         let mut next = 0;
-        if self.result_ty.in_memory() {
+        if self.result_ty.in_memory() || self.result_ty.is_view() {
             self.result = Some(self.b.param(entry, 0));
             next = 1;
         }
@@ -660,6 +660,11 @@ impl FnLower<'_> {
             None
         } else {
             match (value, self.result) {
+                (Some(e), Some(dst)) if e.ty.is_view() => {
+                    let v = self.expr(e);
+                    self.write_view(dst, v);
+                    None
+                }
                 (Some(e), Some(dst)) => {
                     self.fill(dst, e);
                     None
@@ -982,6 +987,17 @@ impl FnLower<'_> {
             // nothing writes to it.
             TExprKind::Table(id) => return Val::Mem(self.b.global_ref(self.tables[*id])),
             TExprKind::Local(local) => return self.load(*local),
+            // A returned view is written to a pointer and length in memory.
+            TExprKind::Call(f, args) if e.ty.is_view() => {
+                let ty = self.view_ir();
+                let tmp = self.b.alloca(ty);
+                self.call(*f, args, e.ty, Some(tmp));
+                let p = self.b.struct_field(tmp, ty, 0);
+                let n = self.b.struct_field(tmp, ty, 1);
+                let p = self.b.load(self.t.ptr, p, 8);
+                let n = self.b.load(self.t.i64, n, 8);
+                return Val::View(p, n);
+            }
             TExprKind::Call(..) if e.ty.in_memory() => {
                 let ir_ty = self.ir_ty(e.ty);
                 let tmp = self.b.alloca(ir_ty);
@@ -1163,6 +1179,25 @@ impl FnLower<'_> {
             (Some(v), None) => Val::One(v),
             (None, None) => Val::Unit,
         }
+    }
+
+    /// The IR type of a view in memory, for a function returning one: its
+    /// pointer, then its length.
+    fn view_ir(&mut self) -> TypeId {
+        let (ptr, len) = (self.t.ptr, self.t.i64);
+        self.b.types_mut().struct_(vec![ptr, len])
+    }
+
+    /// Store the view `v` (a returned `str`) at `dst`.
+    fn write_view(&mut self, dst: ValueId, v: Val) {
+        let Val::View(p, n) = v else {
+            unreachable!("a view, found {v:?}")
+        };
+        let ty = self.view_ir();
+        let pa = self.b.struct_field(dst, ty, 0);
+        let na = self.b.struct_field(dst, ty, 1);
+        self.b.store(self.t.ptr, pa, p, 8);
+        self.b.store(self.t.i64, na, n, 8);
     }
 
     /// The IR type of a value stored in memory: a scalar, or an array or a
