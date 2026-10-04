@@ -118,6 +118,13 @@ Lode is now Lode's own work.
   sides, and x86-64 has no `i128`, so neither returns two registers yet.
   A slot isn't promoted to registers after inlining either
   ([LF #13](https://github.com/KarpelesLab/latticefoundry/issues/13)).
+- **Cleanup after inlining.** The `-O2` pipeline ends with an inlining
+  round, then `sccp`, `egraph` and `dce`, but no `simplify_cfg`, and it
+  keeps the functions inlining left without callers. Lode does both
+  itself after optimizing (`compile_ir`): `simplify_cfg`, `sccp` and `dce`
+  once more, then the internal functions nothing reaches become
+  declarations, which emit no code. Over the test programs that's 27% less
+  code; it belongs in LF's pipeline.
 
 ### Resolved open questions in LF, from Lode's side
 - **Exceptions / unwinding:** Lode doesn't need unwinding. Errors are return

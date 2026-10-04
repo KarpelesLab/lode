@@ -9,13 +9,14 @@ the options, the trade-offs and a recommendation. The decisions only the user
 can make are collected at the end, in
 [Questions for the user](#decisions).
 
-M7a, generic functions over the built-in traits, M7b, generic structs
-and enums, value parameters and generic methods, and M7c, traits and
-`impl` blocks, are implemented: what the compiler does is in
-[M7a in the compiler](#m7a-in-the-compiler),
-[M7b in the compiler](#m7b-in-the-compiler) and
-[M7c in the compiler](#m7c-in-the-compiler). The rest is **Proposed**
-unless a section says otherwise.
+M7 is implemented, in five steps: M7a, generic functions over the
+built-in traits; M7b, generic structs and enums, value parameters and
+generic methods; M7c, traits and `impl` blocks; M7d, compile-time
+evaluation and target selection; M7e, format strings. What the compiler
+does is in [M7a in the compiler](#m7a-in-the-compiler),
+[M7b](#m7b-in-the-compiler), [M7c](#m7c-in-the-compiler),
+[M7d](#m7d-in-the-compiler) and [M7e](#m7e-in-the-compiler). The rest is
+**Proposed** unless a section says otherwise.
 
 ## Principles
 
@@ -347,8 +348,9 @@ them.
 ## Built-in traits
 
 **Status:** Proposed; `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
-`Signed` implemented (M7a, built into the compiler), and `impl Ordered`
-for structs and enums (M7c)
+`Signed` implemented (M7a, built into the compiler), `impl Ordered`
+for structs and enums (M7c), and `Format`, declared in Lode in `std/io`
+(M7e)
 
 Some traits are known to the compiler. They are declared in the standard
 library (`std/core`, name Open) so they have documentation and a place in
@@ -364,7 +366,7 @@ them in Lode, and nothing needs that yet.
 | `Integer: Ordered + Copy` | The integer operators | Sealed: only the integer primitives |
 | `Unsigned`, `Signed` | `Integer` and the sign | Sealed |
 | `Copy` | A value can be copied implicitly | Automatic, see below |
-| `Format` | Writable by `print("{}")` ([Format strings](#format-strings)) | Built in for integers, `bool`, `str`; user types write an impl |
+| `Format` | Writable by `print("{}")` ([Format strings](#format-strings)) | `std/io` implements it for integers, `bool`, `str`; user types write an impl |
 | `Send`, `Sync` | May cross / be shared across threads ([concurrency.md](concurrency.md#data-race-freedom)) | Automatic; opt-out and `unsafe impl`. Deferred to the concurrency milestone. |
 
 A **sealed** trait can't be implemented outside the standard library.
@@ -554,8 +556,9 @@ The checking model makes errors local:
 
 ## `comptime`
 
-**Status:** Proposed; items 1 to 4 and 6 of What M7 needs implemented
-(M7d, [in the compiler](#m7d-in-the-compiler)); 5 waits for M7e
+**Status:** Proposed; What M7 needs is implemented: items 1 to 4 and 6 in
+M7d ([in the compiler](#m7d-in-the-compiler)), 5 in M7e
+([in the compiler](#m7e-in-the-compiler))
 
 [comptime.md](comptime.md) describes the mechanism. M7 needs a part of it.
 
@@ -645,6 +648,10 @@ cycle detection", as `const_value` already does for constants.
   M7 has types only in brackets, where bounds check them.
 
 ### Format strings
+
+**Status:** Implemented (M7e), with the differences in
+[M7e in the compiler](#m7e-in-the-compiler): no buffer, and the parts of
+the format found by index rather than in a list
 
 `print("x = {}\n", x)` is the reason std needs comptime soon. It's built
 from three pieces.
@@ -744,7 +751,7 @@ encodings as a library over bytes, `std/encoding`
 
 ## Implementation plan
 
-**Status:** M7a, M7b, M7c and M7d implemented; M7e proposed
+**Status:** Implemented: M7a to M7e
 
 Five steps, each shippable on its own with tests, std changes and docs, as
 the earlier milestones were. Sizes are rough estimates of compiler code
@@ -1027,8 +1034,8 @@ proposal left room:
   of one variant, a type that's never a value: structs without fields
   aren't supported yet ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
 - **Not yet:** generic traits, trait methods with generic parameters of
-  their own, `uses` in traits, `Format` (M7e), `dyn Trait`, and declaring
-  the built-in traits in Lode.
+  their own (since M7e, they are), `uses` in traits, `Format` (M7e), `dyn
+  Trait`, and declaring the built-in traits in Lode.
 
 ### M7d: compile-time evaluation and target selection
 
@@ -1128,8 +1135,9 @@ proposal left room:
   unsupported target")` ([packages.md](packages.md#per-target-code)).
   Hello world is unchanged: 655 bytes, two system calls.
 - **Not yet:** `comptime` parameters, packs, `comptime for` and `match
-  comptime` (M7e); `comptime` blocks and `comptime let`; `str` constants;
-  conditional imports; building for a target other than x86_64-linux.
+  comptime` (M7e has them); `comptime` blocks and `comptime let` (M7e has
+  `comptime let`); `str` constants; conditional imports; building for a
+  target other than x86_64-linux.
 
 ### M7e: format strings
 
@@ -1140,6 +1148,122 @@ proposal left room:
 - **std gains:** `io.print("x = {}\n", x)` and `io.eprint`; `print_u64`,
   `print_i64` and `print_int` go away. Hello world stays 2 syscalls, and
   its size is checked in CI.
+
+### M7e in the compiler
+
+**Status:** Implemented (2026-10-05)
+
+What M7e does, and the choices made while implementing it where this
+proposal left room:
+
+- **`comptime` parameters.** `comptime fmt: str`, of an integer type,
+  `bool` or `str`. The argument must be known when compiling: a literal,
+  a constant, a `comptime` value of the caller, or an expression of
+  those. A variable is an error at the argument: "`fmt` of `io.print` is
+  `comptime`, so its argument must be known when compiling, and `s` is a
+  variable".
+- **Packs.** `[..A: Format]` declares a pack, the last generic parameter,
+  and `args: ..A` is its parameter, the last one: any number of
+  arguments, each of a type with the pack's bounds. In the body,
+  `args.len` is a `usize` known when compiling, `args[i]` needs an `i`
+  known when compiling, and `..args` passes the pack on as a call's last
+  argument. A pack's types may be views, so that `print("{}", s)` takes a
+  `str`: the arguments are read-only parameters, and `args[i]` can only
+  be the `self` of a trait's method or be passed on in another pack. A
+  generic function or type, which may store a value, can't take a pack's
+  type as an argument (an error).
+- **Templates and expansions.** A function with `comptime` parameters or
+  a pack isn't checked on its own. Each call makes (or reuses) an
+  expansion of it: the function for the call's `comptime` values and
+  number of pack arguments, a function of its own (`std/io.print$3`). In
+  it, the `comptime` parameters are values known when compiling, and the
+  pack is that many type parameters and parameters. The expansion is
+  checked like a generic function: once for the pack's types, against
+  their bounds, as proposed; the values known when compiling shape its
+  body, as an `if comptime` condition does. So a template that nothing
+  calls is only parsed, like an `if comptime` branch not taken. An error
+  found in every expansion is reported once. Expansions nest at most 64
+  deep (a template calling itself with new values).
+- **Statements that run when compiling.** `comptime let x = e` computes a
+  value when compiling. `comptime for x in a..b` (of `usize`) or
+  `comptime for x in list` (an array or a slice known when compiling)
+  checks its body once for each value, with `x` known; `break` and
+  `continue` can't leave it, and it repeats at most 1,000 times. `match
+  comptime v { ... }` checks only the arm `v` picks (a variant with its
+  payload, a value, a range, `_`), and no arm matching is an error. An
+  `if comptime` condition can use these values. In code that runs with
+  the program, a value known when compiling is its literal.
+- **Checked by running it** (decision 7), for these too: the value of a
+  `comptime let`, the list of a `comptime for`, the value of a `match
+  comptime`, and a `comptime` argument. There, a `str` can be sliced
+  (`fmt[i..j]`): the evaluator checks the bounds, and that they don't
+  split a character.
+- **`compile_error`** takes values for the `{}` in its message:
+  `compile_error("{} is odd", n)`, with `{{` and `}}` for braces.
+  `compile_error_at(place, message, values...)` points at `place`, a `str`
+  that's part of a string literal in the source, such as a slice of a
+  format string. In code that runs when compiling (the `catch` of a
+  `comptime let`), it's an error when it's reached. In an expansion, it's
+  reported at the call that made it, or at the outermost one when an
+  expansion calls another (`print`'s format errors are at the user's
+  `print`, not in `std/io`).
+- **`Format`** is a trait of `std/io`:
+  `fn format[W: Writer](self, inout w: W) throws(os.Error)`. That needed
+  trait methods with generic parameters of their own, which M7c didn't
+  have: an impl's method declares the same ones, with the same bounds,
+  and a call through the trait passes them on. Impls for `str` are now
+  allowed. `std/io` implements `Format` for every integer type (decimal,
+  with a `-` when negative), `bool` (`true`, `false`) and `str` (as it
+  is); a user type implements it with `impl io.Format for Point`, which
+  may itself call `io.write_fmt`. A generic function that prints a `T`
+  needs the bound, `[T: Integer + io.Format]`: `Integer` doesn't imply it.
+- **Format strings.** `format_pieces` and `format_piece` in `std/io` are
+  ordinary Lode, run when compiling, and `write_fmt` finds piece `k` with
+  `format_piece(fmt, k)` rather than keeping a list, which would need a
+  growable list of a type that holds a `str`. `{}` is an argument, `{{`
+  and `}}` a brace. A piece of text runs up to a brace, and `{{` or `}}`
+  ends it with the brace, so text without braces is one piece. The
+  errors, at the call: "unclosed `{` in the format string" and "unmatched
+  `}` in the format string" at the brace; a spec like `{:x}` ("a
+  placeholder is `{}`: format specs are not supported yet"); "this `{}`
+  has no argument: 3 placeholders but 2 arguments" at that `{}`; "1
+  placeholder but 2 arguments: each argument needs a `{}` in the format
+  string"; and an argument whose type isn't `Format`: "`Point` doesn't
+  implement `io.Format`, which `io.print` requires of `A`".
+- **`io.print`, `io.eprint`, `io.write_fmt`.**
+  `print[..A: Format](comptime fmt: str, args: ..A)` writes each piece of
+  text with one `os.write_all` and each argument with its `Format` impl,
+  ignoring errors; `eprint` writes to standard error. `write_fmt[W:
+  Writer, ..A: Format](inout w: W, comptime fmt: str, args: ..A)
+  throws(os.Error)` writes to any `Writer` (a `File`, a `StackBuf`) and
+  passes errors on. `print_int` and `eprint_int` are gone (decision 8).
+  `print("hello world\n")` is one `write` and no formatting code.
+- **No buffer** (a choice by measurement). The proposal's
+  `BufWriter[256]` makes one `write` per `print`. A 256-byte buffer in
+  `print` (zeroed, filled byte by byte, flushed) made programs that print
+  integers 1 to 3 KB larger at `-O2`, so each piece is its own `write`:
+  `print("x = {}\n", x)` is three. A buffered writer is for later, with
+  uninitialized buffers ([memory.md](memory.md#uninitialized-buffers)).
+- **An impl's method that doesn't throw, called through a trait's that
+  does** (`print`'s writer ignores errors): `crate::mono` makes an
+  instance of it that returns a result (`<throws>` in its symbol), and
+  the evaluator wraps its value the same way. M7c allowed such impls, but
+  their calls through the trait didn't lower.
+- **Sizes** at `-O2`, with the cleanup after inlining of the same day
+  (unused functions dropped, blocks merged): hello world 577 bytes (655
+  before both); tests/programs/print_integers.lode 3,918 bytes (2,884
+  with `print_int`); the dogfood programs from 2,750 to 21,471 bytes,
+  some larger and some smaller than with `print_int` (dogfood_bit_tricks
+  +1,303, dogfood_integer_edges -2,986). All runnable test programs:
+  436,049 bytes, 2.6% less than with `print_int`. An expansion is a
+  function per format string and argument types, and the error each
+  `Format` impl may throw is checked after it, even when the writer
+  can't fail.
+- **Not yet:** format specs (`{:x}`, widths: `Format` gains a `spec`
+  parameter), `comptime` parameters of other types (types as values),
+  methods with `comptime` parameters or packs, packs for `select`
+  ([concurrency.md](concurrency.md#select-without-syntax)), a buffered
+  writer, and `Format` derived by reflection.
 
 ### After M7
 
@@ -1176,11 +1300,13 @@ others keep the recommended answer unless the user changes them.
 7. **Code that only runs at compile time is checked by running it** instead
    of by the prover ([Proof obligations in compile-time
    code](#proof-obligations-in-compile-time-code)). *Recommended, pending;
-   implemented in M7d for constants' values and `if comptime` conditions.*
+   implemented in M7d for constants' values and
+   `if comptime` conditions, and in M7e for `comptime let`, `comptime
+   for`, `match comptime` and `comptime` arguments.*
 8. **One `print`:** `io.print` becomes the formatted print with a
    compile-time format, and `print(s)` of a runtime string becomes
    `print("{}", s)` ([Format strings](#format-strings)).
-   *Recommended, pending.*
+   *Recommended, pending; implemented in M7e.*
 9. **`dyn Trait` and allocation stay out of M7:** M7 ships with
    fixed-capacity containers, and `dyn` and the allocator context come
    right after ([`dyn Trait`](#dyn-trait),

@@ -6,8 +6,10 @@ lead, with restrictions for predictability.
 
 ## Basics
 
-**Status:** Proposed; implemented for constants (M7d), without `comptime`
-parameters ([generics.md](generics.md#m7d-in-the-compiler))
+**Status:** Proposed; implemented for constants (M7d), and for `comptime`
+parameters, packs, `comptime let`, `comptime for` and `match comptime`
+(M7e) ([generics.md](generics.md#m7d-in-the-compiler),
+[M7e](generics.md#m7e-in-the-compiler))
 
 - A subset of the language runs at compile time: arithmetic, control flow,
   structs, enums, arrays, and calls to functions that only use those.
@@ -15,6 +17,10 @@ parameters ([generics.md](generics.md#m7d-in-the-compiler))
 - `comptime` parameters are known at compile time. Generic `[T]` parameters are
   comptime type parameters constrained by traits ([types.md](types.md#generics-and-traits)).
   What M7 needs of comptime is in [generics.md](generics.md#comptime).
+- In the compiler, a `comptime` parameter is an integer, a `bool` or a
+  `str`, and a function with one is expanded for each value it's called
+  with; `comptime let`, `comptime for` and `match comptime` run while that
+  expansion is checked ([generics.md](generics.md#m7e-in-the-compiler)).
 
 ```
 const CRC_TABLE: [256]u32 = make_crc_table()   // computed while compiling
@@ -80,7 +86,8 @@ breaks. Mitigations:
 
 ## Format strings
 
-**Status:** Proposed
+**Status:** Implemented (M7e), without a buffer
+([generics.md](generics.md#m7e-in-the-compiler))
 
 `print` and similar take their format string as a comptime parameter. The
 format is parsed at compile time, argument types are checked against it, and
@@ -91,12 +98,19 @@ io.print("hello world\n")
 // → one write(1, "hello world\n", 12) syscall. No formatting code is linked.
 
 io.print("x = {}\n", x)
-// → write "x = ", then an inlined integer-to-decimal, then write "\n"
-//   (buffered: one syscall)
+// → write "x = ", then x's `Format` impl (its digits in one write), then
+//   write "\n": three syscalls, as there's no buffer yet
+
+io.print("x = {}\n")
+// error: this `{}` has no argument: 1 placeholder but 0 arguments
 ```
 
 This is how the concept's "hello world is a single `write`" goal is met. It
-also removes the whole class of format-string bugs.
+also removes the whole class of format-string bugs: a placeholder without
+an argument, an argument without a placeholder, an unclosed `{` and an
+argument that can't be formatted are errors at the call, pointing into the
+format string. The parsing is ordinary Lode in `std/io`, run at compile
+time.
 
 ## Reflection
 

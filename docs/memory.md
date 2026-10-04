@@ -362,8 +362,8 @@ filled
 ([packages.md](packages.md#the-standard-library-in-the-compiler-today)):
 bytes written at the back with `push`, or at the front with `push_front`,
 only the written part is read (`get`, `len`, `io.File.write_buf`), and every
-access is proven. (`io.print_int` doesn't use one: it costs 640 bytes more
-than a plain `[21]u8` today, see
+access is proven. (`io.Format` for integers doesn't use one: it cost 640
+bytes more than a plain `[21]u8`, see
 [packages.md](packages.md#the-standard-library-in-the-compiler-today).)
 Two things keep it from skipping the fill:
 

@@ -58,7 +58,7 @@ All builds are size-optimized and stripped. Syscalls are counted after
 | Zig (`-OReleaseSmall -fstrip`) | `print` through a buffered writer | 10.2 KB | 6 |
 | | `File.stdout().writeAll` | 10.2 KB | 6 |
 | | `posix.system.write` | 4.8 KB | 6 |
-| **Lode** (`-O2`) | `io.print` through the standard library | **655 bytes** | **2: `write`, `exit`** |
+| **Lode** (`-O2`) | `io.print` through the standard library | **577 bytes** | **2: `write`, `exit`** |
 | *Lode target* | any of the above | *a few hundred bytes* | *2* |
 
 What this shows:
@@ -91,18 +91,19 @@ the backend (LatticeFoundry's static linker with no libc, and minimal ELF
 layout for the byte count). `bench/hello/run.sh` stays as a regression
 benchmark.
 
-**Lode today** (2026-10-04, same script, LatticeFoundry 0.0.2): the syscall
-target is met. `io.print` goes through `std/io` and `std/os.write_all` (a real
-retry loop, not a special case), and the program makes exactly `write` and
-`exit`. The binary is 655 bytes, 7.4 times smaller than Zig's smallest variant:
-176 bytes of ELF headers, a 16-byte `_start`, 451 bytes of code and padding,
-and the 12-byte string. The compiler emits only the functions `main` reaches,
-and `main` itself is the function `_start` calls. The retry loop is 311
-bytes. One function is never called: `io.print`, after it was inlined into
-`main` (48 bytes with padding). Removing inlined functions and cleaning up the
-CFG after inlining are next, in LatticeFoundry. Better code generation
-(branching on flags, keeping the loop in the syscall's registers, one segment)
-is the rest of the way to "a few hundred bytes".
+**Lode today** (2026-10-05, same script, LatticeFoundry 0.0.2): the syscall
+target is met. `io.print` takes a format string read when compiling
+([comptime.md](comptime.md#format-strings)); with no `{}` in it, it's one
+call of `std/os.write_all` (a real retry loop, not a special case), and the
+program makes exactly `write` and `exit`. The binary is 577 bytes, 8.3 times
+smaller than Zig's smallest variant: 176 bytes of ELF headers, a 16-byte
+`_start`, 373 bytes of code and padding, and the 12-byte string. The
+compiler emits only the functions `main` reaches, `main` itself is the
+function `_start` calls, and after optimizing, the compiler drops the
+functions inlining left without callers (here `io.print`, inlined into
+`main`) and merges the blocks it left. Better code generation (branching on
+flags, keeping the loop in the syscall's registers, one segment) is the rest
+of the way to "a few hundred bytes".
 
 ## Goals
 

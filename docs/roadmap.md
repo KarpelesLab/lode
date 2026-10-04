@@ -84,13 +84,29 @@ itself is in the other documents; this one is only about order.
   one run (x86_64-linux is built; aarch64-linux, wasm32, thumbv7m and avr
   are checked). `std/os` is Linux-only, with the system call numbers of
   x86-64 and AArch64 ([generics.md](generics.md#m7d-in-the-compiler)).
+- **M7e: Format strings** (2026-10-05). `io.print("x = {}\n", x)`: the
+  format string is a `comptime` parameter, read when compiling by ordinary
+  Lode in `std/io`, and the arguments a pack (`[..A: Format]`, `args:
+  ..A`), each written by its `io.Format` impl. A placeholder without an
+  argument, an argument without a placeholder, a brace alone or an
+  argument that isn't `Format` is an error at the call, pointing into the
+  format string. The language gains `comptime` parameters, packs,
+  `comptime let`, `comptime for`, `match comptime`, `compile_error` with
+  values and `compile_error_at`, and trait methods with generic
+  parameters of their own. `io.print_int` is gone: `io.print("{}", n)`,
+  and `io.print("{}", s)` for a `str` known only at run time
+  ([generics.md](generics.md#m7e-in-the-compiler)). That ends M7:
+  generics, traits and compile-time code.
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
 --stack-usage`, CI on GitHub Actions, lowering only the functions `main`
-reaches, and decimal integer output (now `io.print_int`). Hello
-world is now 655 bytes, still 2 syscalls. The checker keeps facts through
-loops: bounds every iteration keeps survive at the loop head, and after a
-loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
+reaches, and decimal integer output (`io.print_int`, then `{}`). After
+optimizing (2026-10-05), the blocks inlining leaves are merged and the
+functions it leaves without callers are dropped: hello world is now 577
+bytes, still 2 syscalls, and the test programs 27% smaller. The checker
+keeps facts through loops: bounds every iteration keeps survive at the
+loop head, and after a loop, the facts at its exits
+([safety.md](safety.md#facts-through-loops)).
 Slicing `a[i..j]` compiles only when the checker proves
 `0 <= i <= j <= a.len`, and `&a[i..j]` passes part of an array to an
 `inout` slice ([types.md](types.md#in-the-compiler-today)).
@@ -102,9 +118,12 @@ Slicing `a[i..j]` compiles only when the checker proves
   options are in [memory.md](memory.md#uninitialized-buffers): option 3's
   type, `StackBuf[N]`, exists, and stops filling once fields can be
   private.
-- **M7e: format strings**, with `comptime` parameters, packs and the
-  `Format` trait, the last step of generics. The proposal is in
-  [generics.md](generics.md#implementation-plan).
+- **After M7**, in the order of [generics.md](generics.md#after-m7):
+  `dyn Trait`; the allocator context and heap containers; `Send`/`Sync`
+  with the concurrency work; `Str[E]`; error-set unions with generic
+  errors; code sharing for small targets; reflection (a derived
+  `Format`). Format specs (`{:x}`, widths) and a buffered writer for
+  `print` come with `Format`'s next step.
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack

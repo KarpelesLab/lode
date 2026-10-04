@@ -33,9 +33,18 @@ fn main() {
 }
 ```
 
-That program is 655 bytes and makes exactly two system calls, `write` and
+That program is 577 bytes and makes exactly two system calls, `write` and
 `exit`. `io.print` is ordinary Lode code in [`std/`](std/), down to the
-`syscall` in `std/os`.
+`syscall` in `std/os`. Its format string is read when compiling:
+
+```
+fn main() {
+	let x: u32 = 7
+	let name = "lode"
+	io.print("x = {}, name = {}\n", x, name)
+	io.print("{} {}\n", x)  // error: this `{}` has no argument: 2 placeholders but 1 argument
+}
+```
 
 What works:
 
@@ -89,6 +98,11 @@ What works:
   semantics as at run time, and be a struct, an enum or an optional; an
   overflow or a bad index while computing one is an error where it
   happens; a step budget (`@comptime_budget(n)`) bounds it
+- `comptime` parameters and packs: `fn print[..A: Format](comptime fmt:
+  str, args: ..A)`, expanded for each format string, with `comptime let`,
+  `comptime for`, `match comptime` and `compile_error("{} is odd", n)`
+  run while compiling; trait methods with generic parameters of their own
+  ([docs/generics.md](docs/generics.md#m7e-in-the-compiler))
 - per-target code: `target` (`target.os == .linux`, `target.arch`,
   `target.pointer_bits`), `if comptime` that checks only the branch the
   target takes, in functions and among declarations, and
@@ -102,8 +116,10 @@ What works:
   and buffers; `std/encoding` (UTF-8 and ASCII over bytes)
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic
-- output: `io.print` for strings, `io.print_int` for integers of any type
-  (and `io.eprint...` for standard error), which ignore errors, and
+- output: `io.print("x = {}\n", x)` with a format string checked when
+  compiling, for integers, `bool`, `str` and types with an `impl
+  io.Format`, and `io.eprint` for standard error, which ignore errors;
+  `io.write_fmt(&w, fmt, ...)` to any `io.Writer`, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`
 - input: `io.stdin().read(&buf)` (the bytes it got, 0 at the end) and

@@ -35,7 +35,7 @@ Go's vocabulary, which is proven:
   only `pub` methods: `pkg.Type.new()`, `value.method()`. A `pub trait` is
   used as `pkg.Trait` in a bound or an `impl`; an `impl`'s methods are as
   visible as its trait.
-- Linker symbols are `<import path>.<name>` (`std/io.print`), and
+- Linker symbols are `<import path>.<name>` (`std/os.write_all`), and
   `<import path>.<Type>.<name>` for a method (`std/io.File.write`); the
   program's own package uses its name (`main.main`). An instance of a
   generic function adds its type arguments: `std/math.max[u32]`; a method
@@ -43,7 +43,9 @@ Go's vocabulary, which is proven:
   `std/buf.StackBuf[64].push`. A method of an `impl` names its trait after
   it: `std/io.File.write_bytes<std/io.Writer>`; a trait's default method
   has the trait's name and the type:
-  `std/io.Writer[std/buf.StackBuf[16]].write`.
+  `std/io.Writer[std/buf.StackBuf[16]].write`. An expansion of a function
+  with `comptime` parameters or a pack is numbered:
+  `std/io.print$3[u32, str]`.
 - So far there are seven packages: `std/os`, `std/io`, `std/math`,
   `std/slices`, `std/buf`, `std/vec` and `std/encoding`.
 - `std/os` is the Linux system calls, for x86-64 and AArch64 (see
@@ -105,19 +107,33 @@ Go's vocabulary, which is proven:
     `fn greet[W: io.Writer](inout w: W) throws(os.Error)`. A `File`'s own
     `write` comes first in `f.write(s)`; `io.Writer.write(&f, s)` calls the
     trait's.
-  - `print(s: str)` and `eprint(s: str)` write a string to standard output
-    and standard error.
-  - `print_int[T: Integer](n: T)` writes an integer of any type in decimal
-    to standard output, with a `-` if it's negative, and `eprint_int` to
-    standard error: `io.print_int(x)`, or `io.print_int[u64](5)` for a
-    literal, which doesn't tell the type. Each call makes one `write` system
-    call, of digits built in a plain `[21]u8`: a `buf.StackBuf[21]` made
-    each program printing integers 640 bytes larger at `-O2`, since
-    `push_front` isn't inlined, its error result goes through memory, and
-    the written part is checked again before the write. They're a stopgap
-    until `print("{}", n)` ([generics.md](generics.md#format-strings)).
-  - `print` and the others but the `File` methods ignore output errors:
-    they're for output that isn't worth failing over.
+  - `print[..A: Format](comptime fmt: str, args: ..A)` writes the format
+    string `fmt` to standard output, each `{}` replaced by the next
+    argument: `io.print("x = {}, name = {}\n", x, name)`. `{{` and `}}`
+    write a brace. A `str` known only at run time is printed with
+    `io.print("{}", s)`. The format is read when compiling: a `{}` without
+    an argument, an argument without a `{}`, an unclosed `{`, a `}` alone
+    and an argument whose type isn't `Format` are errors at the call
+    ([generics.md](generics.md#m7e-in-the-compiler)). Each piece of text is
+    one `write` system call, and so is each integer: there's no buffer.
+    `eprint` writes to standard error.
+  - `write_fmt[W: Writer, ..A: Format](inout w: W, comptime fmt: str, args:
+    ..A) throws(os.Error)` writes a format string to any `Writer`, and
+    throws the error that stopped it: `try io.write_fmt(&f, "{} items\n",
+    n)`, or into a `buf.StackBuf`.
+  - `Format`, a trait for what `{}` writes:
+    `format[W: Writer](self, inout w: W) throws(os.Error)`. Every integer
+    type writes itself in decimal, with a `-` if it's negative (its digits
+    built in a plain `[21]u8`, then one `write_bytes`: a `buf.StackBuf[21]`
+    made each program printing integers 640 bytes larger at `-O2`), `bool`
+    as `true` or `false`, and `str` as it is. Other types implement it:
+    `impl io.Format for Point { fn format[W: io.Writer](self, inout w: W)
+    throws(os.Error) { try io.write_fmt(&w, "({}, {})", self.x, self.y) }
+    }`. A generic function that prints a `T` bounds it: `[T: Integer +
+    io.Format]`.
+  - `print` and `eprint` ignore output errors: they're for output that
+    isn't worth failing over. `write_fmt` and the `File` methods report
+    them.
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
     (the integers, `bool`, and the structs and enums with an

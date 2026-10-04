@@ -567,9 +567,13 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
 - `p.area()` finds the type's own methods, then its impls'; when two
   traits give it, `Shape.area(p)` names one. A trait's method on a type
   parameter is dispatched statically to the impl of each instance.
+- A trait's method may have generic parameters of its own, which an
+  impl's method declares the same way: `fn format[W: io.Writer](self,
+  inout w: W)` (M7e).
 - The details are in [generics.md](generics.md#m7a-in-the-compiler),
-  [generics.md](generics.md#m7b-in-the-compiler) and
-  [generics.md](generics.md#m7c-in-the-compiler).
+  [generics.md](generics.md#m7b-in-the-compiler),
+  [generics.md](generics.md#m7c-in-the-compiler) and
+  [generics.md](generics.md#m7e-in-the-compiler).
 - Not yet: `dyn`, generic traits, refinements on value parameters
   (`[N: usize where N > 0]`).
 

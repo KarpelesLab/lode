@@ -124,7 +124,8 @@ fn main() {
 | Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
 | Refinement | `i: usize where i < buf.len` ([safety.md](safety.md#refinements-in-types)) |
 | Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
-| Compile-time | `comptime`, `if comptime cond { ... }`, `compile_error("...")`, `target.os` (see below) |
+| Compile-time | `comptime fmt: str`, `comptime let`, `comptime for`, `match comptime`, `if comptime cond { ... }`, `compile_error("...")`, `target.os` (see below) |
+| Pack | `fn print[..A: Format](comptime fmt: str, args: ..A)`, `args[i]`, `args.len`, `..args` (see below) |
 | Unsafe | `unsafe fn`, `unsafe { ... }` |
 | Cleanup | `defer`, `errdefer` |
 | Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a[i..j]`, `a.len` (see below) |
@@ -483,8 +484,8 @@ fn sum[T: Integer](xs: []T) -> T {
 
 fn main() {
 	let a: [3]u8 = [4, 9, 2]
-	io.print_int(largest(a) ?? 0)          // T is u8, from the argument
-	io.print_int(sum[u8](a))               // written: u8
+	io.print("{}\n", largest(a) ?? 0)     // T is u8, from the argument
+	io.print("{}\n", sum[u8](a))          // written: u8
 }
 ```
 
@@ -544,7 +545,7 @@ fn main() {
 	let e: Either[u8, bool] = .left(9)
 	var r = Ring[u8, 4].new(0)
 	r.push(p.swap().second)
-	io.print_int(q.first)
+	io.print("{}\n", q.first)
 }
 ```
 
@@ -697,6 +698,56 @@ fn word() -> str {
 - `compile_error("message")`: a statement, or a declaration.
 - `target` names the target being compiled for: `target.os`,
   `target.arch`, `target.pointer_bits`, `target.endian`.
+
+### `comptime` parameters and packs
+
+**Status:** Proposed; implemented in the compiler (M7e, semantics in
+[generics.md](generics.md#m7e-in-the-compiler))
+
+```
+import "std/io"
+
+fn log[..A: io.Format](comptime fmt: str, args: ..A) {
+	io.print("log: ")
+	io.print(fmt, ..args)                   // passes the pack on
+}
+
+fn digits(comptime n: usize) {
+	comptime for i in 0..n {                // the body, once per value
+		io.print("{}", i)
+	}
+}
+
+fn check(comptime s: str) {
+	comptime let n = s.len
+	if comptime n > 8 {
+		compile_error_at(s[8..], "`{}` is longer than 8 bytes", s)
+	}
+}
+
+fn main() {
+	let x: u32 = 7
+	io.print("x = {}, {{x}}\n", x)         // x = 7, {x}
+	log("{} + {}\n", x, u8(1))
+	digits(3)
+}
+```
+
+- `comptime name: T` declares a parameter whose argument is known when
+  compiling. `T` is an integer type, `bool` or `str`.
+- `[..A: Bound]` declares a pack, the last generic parameter, and
+  `args: ..A` its parameter, the last one; `..A` is written nowhere else.
+  `args.len` is the number of arguments, `args[i]` one of them (`i` known
+  when compiling), and `f(..., ..args)` passes them on.
+- `comptime let name = e` (or `comptime let name: T = e`) computes a value
+  when compiling. `comptime for x in a..b { ... }` and `comptime for x in
+  list { ... }` repeat their body for each value. `match comptime v {
+  ... }` checks only the arm `v` picks.
+- `compile_error("... {} ...", values...)` shows values in its message
+  (`{{` and `}}` are braces). `compile_error_at(place, "...", values...)`
+  points at `place`, part of a string literal.
+- `lode fmt` writes `args: ..A` and `f(x, ..args)` with a space before the
+  `..` and none after it.
 
 ## Open questions
 
