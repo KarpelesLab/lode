@@ -65,7 +65,7 @@ What works:
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe. The checker follows value ranges and relations between variables,
   struct fields and lengths through the program, narrowing on conditions, early returns and
-  `for` loops. `+% -% *% <<%` wrap and `+| -|` saturate.
+  `for` loops. `+% -% *% <<%` wrap and `+| -| *|` saturate.
 
 ```
 fn clamp_to_u8(x: i32) -> u8 {

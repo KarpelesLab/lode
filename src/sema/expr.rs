@@ -1519,13 +1519,7 @@ impl Checker<'_> {
             BinOp::MulWrap => (TBinOp::Mul(Mode::Wrap), full),
             BinOp::AddSat => (TBinOp::Add(Mode::Saturate), full),
             BinOp::SubSat => (TBinOp::Sub(Mode::Saturate), full),
-            BinOp::MulSat => {
-                self.error(
-                    span,
-                    "saturating multiplication is not supported by the compiler yet",
-                );
-                return None;
-            }
+            BinOp::MulSat => (TBinOp::Mul(Mode::Saturate), full),
             BinOp::Div | BinOp::Rem => {
                 if b.contains(0) {
                     self.diags.push(

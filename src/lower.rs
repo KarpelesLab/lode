@@ -1581,7 +1581,10 @@ impl FnLower<'_> {
                 let it = operand.as_int().expect("integer operands");
                 self.saturating(matches!(op, TBinOp::Add(_)), it, ty, l, r)
             }
-            TBinOp::Mul(Mode::Saturate) => unreachable!("rejected by the checker"),
+            TBinOp::Mul(Mode::Saturate) => {
+                let it = operand.as_int().expect("integer operands");
+                self.saturating_mul(it, ty, l, r)
+            }
             TBinOp::Div => self.b.bin(
                 if signed { IrOp::SDiv } else { IrOp::UDiv },
                 l,
@@ -1628,6 +1631,69 @@ impl FnLower<'_> {
                 self.b.icmp(pred, l, r)
             }
         }
+    }
+
+    /// Saturating `l * r`. Up to 32 bits, the product is exact in 64 bits:
+    /// clamp it there. For 64 bits, the wrapped product `p` overflowed iff
+    /// `l != 0` and `p / l != r` (an exact product divides back; a wrapped
+    /// one differs from it by a multiple of 2^64, more than `|l|`), except
+    /// for `l == -1`, which overflows only with `r == MIN` and can't be the
+    /// divisor (`MIN / -1` traps). The divisor is 1 in those cases.
+    fn saturating_mul(&mut self, it: IntTy, ty: TypeId, l: ValueId, r: ValueId) -> ValueId {
+        if it.bits <= 32 {
+            let wide = IntTy {
+                signed: it.signed,
+                bits: 64,
+                size: false,
+            };
+            let wide_ty = self.t.int(wide);
+            let (lw, rw) = (self.resize(l, it, wide), self.resize(r, it, wide));
+            let product = self.b.mul(lw, rw, Flags::NONE);
+            let (gt, lt) = if it.signed {
+                (IntPred::Sgt, IntPred::Slt)
+            } else {
+                (IntPred::Ugt, IntPred::Ult)
+            };
+            // The bounds as 64-bit constants (both fit in an `i64`).
+            let max = self.b.const_i64(wide_ty, it.max() as i64);
+            let min = self.b.const_i64(wide_ty, it.min() as i64);
+            let above = self.b.icmp(gt, product, max);
+            let clamped = self.b.select(above, max, product);
+            let below = self.b.icmp(lt, clamped, min);
+            let clamped = self.b.select(below, min, clamped);
+            return self.resize(clamped, wide, it);
+        }
+        let wrapped = self.b.mul(l, r, Flags::NONE);
+        let zero = self.b.const_i64(ty, 0);
+        let one = self.b.const_i64(ty, 1);
+        let l_zero = self.b.icmp(IntPred::Eq, l, zero);
+        if !it.signed {
+            let divisor = self.b.select(l_zero, one, l);
+            let back = self.b.bin(IrOp::UDiv, wrapped, divisor, Flags::NONE);
+            let differs = self.b.icmp(IntPred::Ne, back, r);
+            let f = self.b.const_bool(false);
+            let overflow = self.b.select(l_zero, f, differs);
+            let max = self.b.const_i64(ty, -1);
+            return self.b.select(overflow, max, wrapped);
+        }
+        let minus_one = self.b.const_i64(ty, -1);
+        let min = self.b.const_i64(ty, const_bits(it.min(), it));
+        let max = self.b.const_i64(ty, const_bits(it.max(), it));
+        let l_minus_one = self.b.icmp(IntPred::Eq, l, minus_one);
+        let unsafe_divisor = self.b.bin(IrOp::Or, l_zero, l_minus_one, Flags::NONE);
+        let divisor = self.b.select(unsafe_divisor, one, l);
+        let back = self.b.bin(IrOp::SDiv, wrapped, divisor, Flags::NONE);
+        let differs = self.b.icmp(IntPred::Ne, back, r);
+        let r_min = self.b.icmp(IntPred::Eq, r, min);
+        let f = self.b.const_bool(false);
+        let overflow = self.b.select(l_zero, f, differs);
+        let overflow = self.b.select(l_minus_one, r_min, overflow);
+        // On overflow, neither operand is 0: the true product is negative
+        // (past MIN) iff exactly one of them is.
+        let signs = self.b.bin(IrOp::Xor, l, r, Flags::NONE);
+        let negative = self.b.icmp(IntPred::Slt, signs, zero);
+        let bound = self.b.select(negative, min, max);
+        self.b.select(overflow, bound, wrapped)
     }
 
     /// Saturating `l + r` or `l - r`: compute the wrapped result, detect
