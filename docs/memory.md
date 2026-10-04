@@ -77,10 +77,13 @@ sort(&a)                               // a viewed as a slice it can change
   must have exactly the type `T`: there's no widening.
 - **`inout xs: []T`**: a slice whose elements can be assigned (`xs[i] = v`).
   The argument is `&a` for a `var` array `a` (or a row, `&grid[i]`), or `&xs`
-  for another `inout` slice. The slice itself can't be assigned, so its
-  length doesn't change. It can't be copied into a local either, since the
-  copy would see the elements change. `for x in xs` over it reads each
-  element when it gets to it. A `str` can't be `inout`.
+  for another `inout` slice, or part of one of them: `&a[i..j]`,
+  `&xs[..mid]`. So an in-place algorithm works on a sub-range, and can
+  recurse on its halves (`quicksort(&xs[..p])`). The slice itself can't be
+  assigned, so its length doesn't change. It can't be copied into a local
+  either, nor can a slice of it, since the copy would see the elements
+  change. `for x in xs` over it reads each element when it gets to it. A
+  `str` can't be `inout`.
 - **`sink x: T`**: the value moves in. Every type today is plain data that's
   copied, so `sink` is a copy the callee may change, and the caller's
   variable is unchanged. It matters once types own resources: then the
@@ -107,6 +110,7 @@ different constant indexes:
 | --- | --- |
 | `swap(&p.x, &p.y)`, `swap(&a[0], &a[1])` | Allowed: different fields, different constant indexes |
 | `swap(&a[i], &a[j])` | Error, even where `i != j` is known |
+| `fill(&a[..2], a[3])`, `two(&a[..2], &a[2..])` | Error: a slice overlaps every element and every other slice of its array |
 | `swap(&x, &x)`, `add(&x, x)`, `p.scale(p.x)` | Error |
 | `fill(&a, a.len)` | Allowed: a length is never changed through `&` |
 
@@ -232,10 +236,24 @@ This rule also lets scoped threads use views without copying
 
 **In the compiler today:** views are parameters and locals, never fields,
 and functions don't return them yet. A few built-in projections make a view
-of another one: an array where a slice is expected, and `s.bytes()`, the
-`[]u8` of a `str`. A projection views what its receiver views, so it obeys
-the same rules as the receiver: kept in a local, passed to a function, never
-stored.
+of another one: an array where a slice is expected, `s.bytes()`, the
+`[]u8` of a `str`, and a slice `a[i..j]` of an array or a slice. A
+projection views what its receiver views, so it obeys the same rules as the
+receiver: kept in a local, passed to a function, never stored.
+
+Until rule 2 is checked, the compiler keeps a view from seeing what it
+views change with simpler rules:
+
+- a slice kept in a local (`let s = a[i..j]`, or a `var` given one) may
+  only view a `let` array, an array constant, or another read-only view.
+  Of a `var` array, of a temporary, or of an `inout` slice, it can only be
+  passed straight to a function;
+- `for x in a[i..j]` views `a` for the whole loop, so the loop can't change
+  the array `a` (an `inout` slice is read as the loop goes, as in
+  `for x in xs`);
+- `&a[i..j]` passes part of a `var` array or of an `inout` slice to an
+  `inout` slice parameter, and the [exclusivity](#parameter-conventions-in-the-compiler-today)
+  rule counts it as overlapping all of `a`.
 
 A function can return a `str` whose storage is static, since it borrows
 from nothing: rule 2 holds trivially, without the checks it needs in

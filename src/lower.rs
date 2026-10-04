@@ -1076,6 +1076,26 @@ impl FnLower<'_> {
                 let base = self.place(inner);
                 self.load_tag(base, inner.ty)
             }
+            // A view of part of the base's storage: proven in bounds, so
+            // no check.
+            TExprKind::Slice(base, start, end) => {
+                let Val::View(p, n) = self.expr(base) else {
+                    unreachable!("slicing a {}", base.ty)
+                };
+                let start = start.as_deref().map(|s| self.offset(s));
+                let end = match end.as_deref() {
+                    Some(e) => self.offset(e),
+                    None => n,
+                };
+                let Some(start) = start else {
+                    return Val::View(p, end);
+                };
+                let elem = e.ty.as_slice().expect("a slice");
+                let elem = self.ir_ty(elem);
+                let p = self.b.array_elem(p, elem, start);
+                let n = self.b.sub(end, start, Flags::nuw());
+                return Val::View(p, n);
+            }
             TExprKind::ToSlice(a) => {
                 let p = self.place(a);
                 let (_, n) = a.ty.as_array().expect("an array");
@@ -1446,15 +1466,20 @@ impl FnLower<'_> {
             Val::Mem(p) | Val::View(p, _) => p,
             other => unreachable!("indexing {other:?}"),
         };
+        let i = self.offset(index);
+        let elem = self.ir_ty(e.ty);
+        self.b.array_elem(base, elem, i)
+    }
+
+    /// An index or a slice bound, as an `i64`. It's proven non-negative, so
+    /// zero-extension is exact.
+    fn offset(&mut self, index: &TExpr) -> ValueId {
         let i = self.expr(index).one();
-        // The index is proven non-negative, so zero-extension is exact.
         let from = IntTy {
             signed: false,
             ..index.ty.as_int().expect("integer index")
         };
-        let i = self.resize(i, from, IntTy::new(false, 64));
-        let elem = self.ir_ty(e.ty);
-        self.b.array_elem(base, elem, i)
+        self.resize(i, from, IntTy::new(false, 64))
     }
 
     /// The value of type `ty` stored at `addr`.

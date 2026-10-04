@@ -21,6 +21,24 @@ pub(super) struct Checked {
     pub(super) term: Option<Linear>,
     /// For conditions: the facts it gives when true and when false.
     pub(super) facts: Option<Box<CondFacts>>,
+    /// For integers, a term plus a constant it's known to be at most (`x / 2`
+    /// is at most `x`), when it isn't exactly a term.
+    pub(super) upper: Option<Linear>,
+    /// For a slice `base[start..end]`, what's known about its length.
+    pub(super) len: Option<SliceLen>,
+}
+
+/// What the checker knows about the length of a slice `base[start..end]`,
+/// which is `end - start`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SliceLen {
+    /// The length's range.
+    pub(super) range: Range,
+    /// `end`, as a term plus a constant (the base's length, for `base[i..]`).
+    pub(super) end: Option<Linear>,
+    /// The range of `start`: the length is between `end - start.hi` and
+    /// `end - start.lo`.
+    pub(super) start: Range,
 }
 
 impl Checked {
@@ -30,6 +48,8 @@ impl Checked {
             range,
             term: None,
             facts: None,
+            upper: None,
+            len: None,
         }
     }
 
@@ -154,6 +174,8 @@ enum Step {
     Index(Option<i128>),
     /// A payload field (of a hidden local).
     Payload,
+    /// Some of the elements: a slice `a[i..j]`.
+    Slice,
 }
 
 /// A use of (part of) a variable in an expression: whether it changes it
@@ -183,6 +205,9 @@ fn place_path(e: &TExpr) -> Option<(LocalId, Vec<Step>)> {
             (base, Step::Index(at))
         }
         TExprKind::Payload(base, ..) => (base, Step::Payload),
+        // A slice is some of the elements, at indexes not known here.
+        TExprKind::Slice(base, ..) => (base, Step::Slice),
+        TExprKind::ToSlice(inner) => return place_path(inner),
         _ => return None,
     };
     let (local, mut path) = place_path(base)?;
@@ -251,12 +276,35 @@ fn index_accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
             index_accesses(base, out);
             accesses(index, out);
         }
-        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) => index_accesses(base, out),
+        TExprKind::Slice(base, start, end) => {
+            index_accesses(base, out);
+            for bound in start.iter().chain(end) {
+                accesses(bound, out);
+            }
+        }
+        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) | TExprKind::ToSlice(base) => {
+            index_accesses(base, out)
+        }
         _ => {}
     }
 }
 
-/// How a place is written in messages: `p.x`, `a[i]`, `a[2]`, `a[...]`.
+/// How an index or a slice bound is written in messages: a constant, a
+/// variable's name, or `...`.
+fn index_text(cx: &FnCx, index: &TExpr) -> String {
+    let mut k = index;
+    while let TExprKind::Convert(inner) = &k.kind {
+        k = inner;
+    }
+    match &k.kind {
+        TExprKind::Int(v) => v.to_string(),
+        TExprKind::Local(l) if !cx.locals[*l].name.starts_with('$') => cx.locals[*l].name.clone(),
+        _ => "...".to_owned(),
+    }
+}
+
+/// How a place is written in messages: `p.x`, `a[i]`, `a[2]`, `a[...]`,
+/// `a[i..]`.
 pub(super) fn place_text(cx: &FnCx, e: &TExpr) -> Option<String> {
     Some(match &e.kind {
         TExprKind::Local(l) => cx.locals[*l].name.clone(),
@@ -265,18 +313,17 @@ pub(super) fn place_text(cx: &FnCx, e: &TExpr) -> Option<String> {
             format!("{}.{}", place_text(cx, base)?, def.fields[*i as usize].name)
         }
         TExprKind::Index(base, index) => {
-            let mut k = &**index;
-            while let TExprKind::Convert(inner) = &k.kind {
-                k = inner;
-            }
-            let at = match &k.kind {
-                TExprKind::Int(v) => v.to_string(),
-                TExprKind::Local(l) if !cx.locals[*l].name.starts_with('$') => {
-                    cx.locals[*l].name.clone()
-                }
-                _ => "...".to_owned(),
-            };
-            format!("{}[{at}]", place_text(cx, base)?)
+            format!("{}[{}]", place_text(cx, base)?, index_text(cx, index))
+        }
+        TExprKind::Slice(base, start, end) => {
+            let bound =
+                |b: &Option<Box<TExpr>>| b.as_deref().map_or(String::new(), |b| index_text(cx, b));
+            format!(
+                "{}[{}..{}]",
+                place_text(cx, base)?,
+                bound(start),
+                bound(end)
+            )
         }
         TExprKind::ToSlice(inner) => return place_text(cx, inner),
         _ => return None,
@@ -361,6 +408,38 @@ fn all_ones(x: i128) -> i128 {
     } else {
         (1i128 << bits) - 1
     }
+}
+
+/// The upper bound of `a / b` or `a >> n` of a term `a` (plus a constant)
+/// in `a_range`: when `a >= 0` and the operation can't grow it (`b >= 1`,
+/// `n >= 0`), it's at most `a`; when also `a >= 1` and it shrinks it (`b >=
+/// 2`, `n >= 1`), at most `a - 1`.
+fn shrunk(a: Option<Linear>, a_range: Range, keeps: bool, shrinks: bool) -> Option<Linear> {
+    let a = a?;
+    if a_range.lo >= 1 && shrinks {
+        a.plus(-1)
+    } else if a_range.lo >= 0 && keeps {
+        Some(a)
+    } else {
+        None
+    }
+}
+
+/// Whether `x - y <= c` is known from the relations, for the value `x` (its
+/// term, or the term plus a constant it's at most) and a term `y`.
+fn at_most(cx: &FnCx, x: &Checked, y: Option<Linear>, c: i128) -> bool {
+    let Some(y) = y else {
+        return false;
+    };
+    [x.term, x.upper]
+        .into_iter()
+        .flatten()
+        .any(|t| cx.env.diff_bound(t, y).is_some_and(|d| d <= c))
+}
+
+/// Whether `x <= y` is known, from their ranges or a relation.
+fn proven_le(cx: &FnCx, x: &Checked, y: &Checked) -> bool {
+    x.int_range().hi <= y.int_range().lo || at_most(cx, x, y.term, 0)
 }
 
 fn op_name(op: BinOp) -> &'static str {
@@ -452,9 +531,10 @@ impl Checker<'_> {
         {
             // The value keeps its range: with none known, its own type's,
             // not the wider target's.
-            let (range, term) = (Some(c.int_range()), c.term);
+            let (range, term, upper) = (Some(c.int_range()), c.term, c.upper);
             let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), target, range);
             out.term = term;
+            out.upper = upper;
             return Some(out);
         }
         // An array where a slice of its element type is expected: a view of
@@ -534,10 +614,15 @@ impl Checker<'_> {
             let mut d = Diagnostic::error(span, msg).with_help(
                 "a place passed `inout` or `set` (with `&`, or to a method that takes `inout self`) needs exclusive access: nothing else in the expression may use it",
             );
-            let unknown_index = w.path.iter().zip(&other.path).any(|pair| {
+            let pairs = || w.path.iter().zip(&other.path);
+            let unknown_index = pairs().any(|pair| {
                 matches!(pair, (Step::Index(a), Step::Index(b)) if a.is_none() || b.is_none())
             });
-            if unknown_index {
+            if pairs().any(|(a, b)| *a == Step::Slice || *b == Step::Slice) {
+                d = d.with_help(
+                    "a slice of an array overlaps every element and every other slice of it",
+                );
+            } else if unknown_index {
                 d = d.with_help(
                     "two elements of one array count as overlapping unless their indexes are different constants",
                 );
@@ -612,6 +697,9 @@ impl Checker<'_> {
                 self.array_repeat(cx, value, count, e.span, expected.map(under_optionals))
             }
             ExprKind::Index(base, index) => self.index(cx, base, index),
+            ExprKind::Slice(base, start, end) => {
+                self.slice(cx, base, start.as_deref(), end.as_deref(), e.span)
+            }
             ExprKind::StructLit(ty, fields) => self.struct_literal(cx, ty, fields, e.span),
             ExprKind::None => match expected {
                 Some(t @ Ty::Optional(_)) => {
@@ -1218,13 +1306,10 @@ impl Checker<'_> {
         let (proven, len_desc) = match b.ty().as_array() {
             Some((_, n)) => (r.hi < i128::from(n), format!("the length is {n}")),
             None => {
-                let len = self.view_len(cx, b.expr.clone());
+                let len = self.view_len_of(cx, &b);
                 let lr = len.int_range();
                 let by_range = r.hi < lr.lo;
-                let by_rel = match (i.term, len.term) {
-                    (Some(it), Some(lt)) => cx.env.diff_bound(it, lt).is_some_and(|c| c <= -1),
-                    _ => false,
-                };
+                let by_rel = at_most(cx, &i, len.term, -1);
                 let desc = if lr.lo == lr.hi {
                     format!("the length is {lr}")
                 } else if lr.lo == 0 && lr.hi == i128::from(i64::MAX) {
@@ -1256,6 +1341,222 @@ impl Checker<'_> {
             elem,
             range,
         ))
+    }
+
+    /// The length of the view `v`, with what's known about it when `v` is
+    /// a slice `base[start..end]`: its range, and with a constant start,
+    /// `end` minus it as a term (`xs[..n].len` is `n`).
+    pub(super) fn view_len_of(&self, cx: &FnCx, v: &Checked) -> Checked {
+        let mut len = self.view_len(cx, v.expr.clone());
+        if let Some(sl) = v.len {
+            let r = len.int_range();
+            len.range = Some(r.intersect(sl.range).unwrap_or(sl.range));
+            if len.term.is_none() && sl.start.lo == sl.start.hi {
+                len.term = sl.end.and_then(|e| e.plus(-sl.start.lo));
+            }
+        }
+        len
+    }
+
+    /// `base[start..end]` (either bound may be missing), a view of part of
+    /// an array or slice. It must be proven that `0 <= start <= end <=
+    /// base.len`.
+    fn slice(
+        &mut self,
+        cx: &mut FnCx,
+        base: &ast::Expr,
+        start: Option<&ast::Expr>,
+        end: Option<&ast::Expr>,
+        span: Span,
+    ) -> Option<Checked> {
+        let b = self.expr(cx, base, None);
+        // Untyped bounds are `usize`; any integer type is accepted.
+        let usize_ty = self.usize_ty();
+        let s = start.map(|e| self.expr(cx, e, Some(usize_ty)));
+        let e = end.map(|e| self.expr(cx, e, Some(usize_ty)));
+        let b = b?;
+        let s = s.map_or(Some(None), |c| c.map(Some))?;
+        let e = e.map_or(Some(None), |c| c.map(Some))?;
+        // The base as a view, and its length.
+        let (view, len) = match b.ty() {
+            Ty::Array(_) => {
+                let (elem, n) = b.ty().as_array().expect("an array");
+                let n = i128::from(n);
+                let view =
+                    Checked::new(TExprKind::ToSlice(Box::new(b.expr)), Ty::slice(elem), None);
+                let len = Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)));
+                (view, len)
+            }
+            Ty::Slice(_) => {
+                let len = self.view_len_of(cx, &b);
+                (b, len)
+            }
+            Ty::Str => {
+                self.diags.push(
+                    Diagnostic::error(
+                        base.span,
+                        "a `str` can't be sliced: a slice could split a character",
+                    )
+                    .with_help("slice its bytes instead: `s.bytes()[i..j]` is a `[]u8`"),
+                );
+                return None;
+            }
+            other => {
+                self.error(base.span, format!("`{other}` cannot be sliced"));
+                return None;
+            }
+        };
+        for (c, ast) in [(&s, start), (&e, end)] {
+            if let (Some(c), Some(ast)) = (c, ast)
+                && c.ty().as_int().is_none()
+            {
+                self.error(
+                    ast.span,
+                    format!("a slice's bounds must be integers, found `{}`", c.ty()),
+                );
+                return None;
+            }
+        }
+
+        // How the code names a bound and the base, for help.
+        let name = |e: Option<&ast::Expr>| match e.map(|e| &e.kind) {
+            Some(ExprKind::Name(n)) if !n.starts_with('$') => Some(n.clone()),
+            _ => None,
+        };
+        let len_text = match name(Some(base)) {
+            Some(xs) => format!("`{xs}.len`"),
+            None => "the length".to_owned(),
+        };
+        let can = |r: Range| if r.lo == r.hi { "is" } else { "can be" };
+        let len_r = len.int_range();
+        let len_desc = if len_r.lo == len_r.hi {
+            format!("the length is {len_r}")
+        } else if len_r.lo == 0 && len_r.hi == i128::from(i64::MAX) {
+            "nothing is known about the length".to_owned()
+        } else {
+            format!("the length can be {len_r}")
+        };
+        let mut errors = Vec::new();
+        let zero = Checked::new(TExprKind::Int(0), usize_ty, Some(Range::exact(0)));
+        let first = s.as_ref().unwrap_or(&zero);
+        let last = e.as_ref().unwrap_or(&len);
+        // `0 <= start`, or `0 <= end` without a start.
+        let low = match (&s, &e) {
+            (Some(c), _) => start.map(|a| (c, a, "start")),
+            (None, Some(c)) => end.map(|a| (c, a, "end")),
+            (None, None) => None,
+        };
+        if let Some((c, ast, which)) = low
+            && c.int_range().lo < 0
+        {
+            let r = c.int_range();
+            errors.push(
+                Diagnostic::error(
+                    ast.span,
+                    format!("cannot prove that this slice's {which} is not negative"),
+                )
+                .with_help(format!("the {which} {} {r}", can(r)))
+                .with_help("check it first, or use an unsigned type"),
+            );
+            self.diags.extend(errors);
+            return None;
+        }
+        // `start <= end` (the length, without an end).
+        if let Some(sc) = &s
+            && !proven_le(cx, sc, last)
+        {
+            let r = sc.int_range();
+            let d = match &e {
+                Some(ec) => {
+                    let er = ec.int_range();
+                    let check = match (name(start), name(end)) {
+                        (Some(i), Some(j)) => format!("check it first (`if {i} <= {j}`)"),
+                        _ => "check them first, as in `if i <= j`".to_owned(),
+                    };
+                    Diagnostic::error(
+                        span,
+                        "cannot prove that this slice's start is at most its end",
+                    )
+                    .with_help(format!(
+                        "the start {} {r}, and the end {} {er}",
+                        can(r),
+                        can(er)
+                    ))
+                    .with_help(check)
+                }
+                None => {
+                    let check = match name(start) {
+                        Some(i) => format!(
+                            "check it first (`if {i} <= {}`)",
+                            len_text.trim_matches('`')
+                        ),
+                        None => format!("check it against {len_text} first"),
+                    };
+                    Diagnostic::error(
+                        start.map_or(span, |a| a.span),
+                        "cannot prove that this slice's start is at most the length",
+                    )
+                    .with_help(format!("the start {} {r}, and {len_desc}", can(r)))
+                    .with_help(check)
+                }
+            };
+            errors.push(d);
+        }
+        // `end <= base.len`.
+        if let (Some(ec), Some(end_ast)) = (&e, end)
+            && !proven_le(cx, ec, &len)
+        {
+            let r = ec.int_range();
+            let check = match name(end) {
+                Some(j) => format!(
+                    "check it first (`if {j} <= {}`)",
+                    len_text.trim_matches('`')
+                ),
+                None => format!("check it against {len_text} first"),
+            };
+            errors.push(
+                Diagnostic::error(
+                    end_ast.span,
+                    "cannot prove that this slice's end is at most the length",
+                )
+                .with_help(format!("the end {} {r}, and {len_desc}", can(r)))
+                .with_help(check),
+            );
+        }
+        if !errors.is_empty() {
+            self.diags.extend(errors);
+            return None;
+        }
+
+        // The length, `end - start`: from the ranges, and from relations
+        // between the bounds.
+        let (fr, lr) = (first.int_range(), last.int_range());
+        let diff = |x: &Checked, y: &Checked| match (x.term, y.term) {
+            (Some(x), Some(y)) => cx.env.diff_bound(x, y),
+            _ => None,
+        };
+        let mut lo = lr.lo.saturating_sub(fr.hi).max(0);
+        if let Some(c) = diff(first, last) {
+            lo = lo.max(c.saturating_neg());
+        }
+        let mut hi = lr.hi.saturating_sub(fr.lo).min(i128::from(i64::MAX));
+        if let Some(c) = diff(last, first) {
+            hi = hi.min(c);
+        }
+        let info = SliceLen {
+            range: Range { lo: lo.min(hi), hi },
+            end: last.term,
+            start: fr,
+        };
+        let ty = view.ty();
+        let kind = TExprKind::Slice(
+            Box::new(view.expr),
+            s.map(|c| Box::new(c.expr)),
+            e.map(|c| Box::new(c.expr)),
+        );
+        let mut out = Checked::new(kind, ty, None);
+        out.len = Some(info);
+        Some(out)
     }
 
     /// The range of an integer element `base[i]`, with `i` in `index`, when
@@ -1472,7 +1773,7 @@ impl Checker<'_> {
         }
         let b = self.expr(cx, base, None)?;
         match (b.ty(), member.name.as_str()) {
-            (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len(cx, b.expr)),
+            (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len_of(cx, &b)),
             (Ty::Array(_), "len") => {
                 let (_, n) = b.ty().as_array().expect("an array");
                 let n = i128::from(n);
@@ -2064,9 +2365,15 @@ impl Checker<'_> {
             BinOp::BitXor => (TBinOp::BitXor, full),
             _ => unreachable!("not an arithmetic operator"),
         };
+        let upper = if op == BinOp::Div {
+            shrunk(l.term, a, b.lo >= 1, b.lo >= 2)
+        } else {
+            None
+        };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
         let mut out = Checked::new(kind, Ty::Int(t), Some(range));
         out.term = linear;
+        out.upper = upper;
         Some(out)
     }
 
@@ -2134,8 +2441,15 @@ impl Checker<'_> {
                 (TBinOp::Shr, range)
             }
         };
+        let upper = if top == TBinOp::Shr {
+            shrunk(l.term, a, amount.lo >= 0, amount.lo >= 1)
+        } else {
+            None
+        };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
-        Some(Checked::new(kind, Ty::Int(t), Some(range)))
+        let mut out = Checked::new(kind, Ty::Int(t), Some(range));
+        out.upper = upper;
+        Some(out)
     }
 
     /// A call: of a function, a method (`p.scale(2)`), or an associated
@@ -2514,7 +2828,10 @@ impl Checker<'_> {
         let mut root = &place;
         let local = loop {
             match &root.kind {
-                TExprKind::Field(base, _) | TExprKind::Index(base, _) => root = base,
+                TExprKind::Field(base, _)
+                | TExprKind::Index(base, _)
+                | TExprKind::Slice(base, ..)
+                | TExprKind::ToSlice(base) => root = base,
                 TExprKind::Local(l) => break *l,
                 TExprKind::Table(id) => {
                     let name = &self.tables[*id].name;

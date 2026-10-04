@@ -99,6 +99,12 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   view: like any view, it can be kept in a local and passed to functions,
   but not stored in a struct field or returned
   ([memory.md](memory.md#views)).
+- slicing the bytes: `s.bytes()[i..j]` is a `[]u8`
+  ([types.md](types.md#in-the-compiler-today)). `s[i..j]` is an error: a
+  `str` must stay valid UTF-8, and the checker can't prove that `i` and `j`
+  are character boundaries. Until that's decided (see
+  [Operations](#operations)), a byte slice makes clear it may split a
+  character.
 
 - returning a `str` with static storage: a string literal, another such
   function's result, or a local that only ever holds those, as in
@@ -106,6 +112,6 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   ([memory.md](memory.md#views))
 
 Not yet: returning a `str` that borrows from a parameter (it needs the view
-rules of [memory.md](memory.md#views)), comparing or slicing strings, rune
-iteration, and other encodings.
+rules of [memory.md](memory.md#views)), comparing strings, slicing a `str`
+itself, rune iteration, and other encodings.
 

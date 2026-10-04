@@ -1191,15 +1191,41 @@ impl Parser {
                     span,
                 };
             } else if self.eat_p(P::LBracket) {
+                let start = e.span;
                 self.skip_newlines();
-                let index = self.nested_expr()?;
+                // `a[i]`, or a slice `a[i..j]` with either bound left out.
+                let first = if self.at_p(P::DotDot) {
+                    None
+                } else {
+                    Some(self.nested_expr()?)
+                };
+                self.skip_newlines();
+                let kind = if self.eat_p(P::DotDot) {
+                    self.skip_newlines();
+                    let end = if self.at_p(P::RBracket) {
+                        None
+                    } else {
+                        Some(Box::new(self.nested_expr()?))
+                    };
+                    ExprKind::Slice(Box::new(e), first.map(Box::new), end)
+                } else if self.at_p(P::DotDotEq) {
+                    let at = self.span();
+                    self.diags.push(
+                        Diagnostic::error(
+                            at,
+                            "a slice's end is exclusive: `a[i..j]` ends before `j`",
+                        )
+                        .with_help("for an inclusive end, write `a[i..j + 1]`"),
+                    );
+                    return Err(Failed);
+                } else {
+                    let index = first.expect("an index before `]`");
+                    ExprKind::Index(Box::new(e), Box::new(index))
+                };
                 self.skip_newlines();
                 self.expect_p(P::RBracket)?;
-                let span = e.span.to(self.prev_span());
-                e = Expr {
-                    kind: ExprKind::Index(Box::new(e), Box::new(index)),
-                    span,
-                };
+                let span = start.to(self.prev_span());
+                e = Expr { kind, span };
             } else {
                 return Ok(e);
             }
@@ -1373,6 +1399,41 @@ mod tests {
             panic!()
         };
         assert!(matches!(prod.kind, ExprKind::Binary(BinOp::Mul, ..)));
+    }
+
+    #[test]
+    fn slicing() {
+        let file = parse_ok("fn f() {\n\tg(a[i..j], a[1..], a[..n + 1], a[..], a[i..j][k])\n}\n");
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
+        let Stmt::Expr(e) = &f.body.stmts[0] else {
+            panic!()
+        };
+        let ExprKind::Call(_, args) = &e.kind else {
+            panic!("{e:?}")
+        };
+        let bounds: Vec<(bool, bool)> = args[..4]
+            .iter()
+            .map(|a| match &a.kind {
+                ExprKind::Slice(_, s, e) => (s.is_some(), e.is_some()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            bounds,
+            [(true, true), (true, false), (false, true), (false, false)]
+        );
+        assert!(
+            matches!(&args[4].kind, ExprKind::Index(base, _) if matches!(base.kind, ExprKind::Slice(..)))
+        );
+
+        let (toks, _) = lex("fn f() {\n\tg(a[i..=j])\n}\n", 0);
+        let diags = parse(toks, 0).1;
+        assert_eq!(
+            diags[0].message,
+            "a slice's end is exclusive: `a[i..j]` ends before `j`"
+        );
     }
 
     #[test]

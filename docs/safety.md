@@ -39,6 +39,7 @@ pretend otherwise:
 | --- | --- | --- |
 | Null | There is no null. Absence is `?T`. | [types.md](types.md#optional) |
 | Array or slice index | `a[i]` needs a proof that `i < a.len`. Otherwise use `a.get(i)`, which returns `?T`. | [Proof obligations](#proof-obligations) |
+| Slice | `a[i..j]` needs a proof that `0 <= i <= j <= a.len`. | [Proof obligations](#proof-obligations) |
 | Integer overflow | `+ - *` need a proof that the result fits. Otherwise use a wrapping, saturating or checked operator. | [types.md](types.md#arithmetic) |
 | Division by zero | `/` and `%` need a proof that the divisor is non-zero (and for signed types, not `MIN / -1`). | [types.md](types.md#arithmetic) |
 | Narrowing conversion | `u8(x)` needs a proof that `x` fits. Otherwise use `.wrap()`, `.saturate()` or `.try()`. | [types.md](types.md#conversions) |
@@ -124,14 +125,15 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | --- | --- |
 | A literal or constant | Its exact value |
 | An expression | The range computed from its operands' ranges (e.g. `a + b` from both ranges), as below |
-| `a / b`, `a >> n` | For `/`, on each side of 0 of the divisor's range, the four quotients of the ranges' ends (rounded toward zero) bound the result; the two sides are joined. For `>>`, the four `a.lo >> n.lo` ... `a.hi >> n.hi` (rounded down). So `x / 10` and `x >> 4` of a `u64` are at most a tenth and a sixteenth of the largest `u64` |
+| `a / b`, `a >> n` | For `/`, on each side of 0 of the divisor's range, the four quotients of the ranges' ends (rounded toward zero) bound the result; the two sides are joined. For `>>`, the four `a.lo >> n.lo` ... `a.hi >> n.hi` (rounded down). So `x / 10` and `x >> 4` of a `u64` are at most a tenth and a sixteenth of the largest `u64`. When `a` is a term plus a constant and can't be negative, and `b >= 1` (`n >= 0`), the result is also at most `a`; when `a >= 1` and `b >= 2` (`n >= 1`), at most `a - 1`. `let mid = xs.len / 2` gives the relation `mid <= xs.len - 1` when `xs.len >= 1` |
 | `a % b` | Smaller in size than `b` can be, with the sign of `a`: in `-m..=m`, with `m` the largest size of `b` minus 1, and 0 for an end where `a` can't have that sign. It doesn't depend on `a`'s size, so `a = (a + x) % m` has the same range at every iteration of a loop |
 | `a & b`, `a \| b`, `a ^ b` | `&`: with a non-negative operand, `0..=` its largest value (the smaller of both, if both are). `\|`, `^`: when both are non-negative, at most the smallest `2^k - 1` that's at least both largest values; `\|` is also at least the larger of both smallest values. Otherwise, the type's range |
-| `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize` |
+| `a.len` | For an array, its constant length. For a slice or `str`, a term, in `0..=` the largest `isize`. For a slice `a[i..j]` that isn't a local, the range of `j - i` (below), and with a constant `i`, `j - i` as a term plus a constant: `xs[..n].len` is `n`, `xs[1..].len` is `xs.len - 1` |
+| `a[i..j]` | Its length is `j - i` (`j` is `a.len` when left out, `i` is 0): between `j.lo - i.hi` and `j.hi - i.lo`, narrowed by a relation between `i` and `j` (`j - i <= c` bounds it above by `c`, `i - j <= c` below by `-c`), and never below 0 |
 | `T[i]` of an array constant `T` | Between the smallest and the largest of the elements `i` can pick (of all the elements, past 4096 of them): with `const DAYS: [12]u8 = [31, 28, ...]`, `DAYS[m]` is `28..=31`, and `DAYS[1]` is 28. Other elements have no facts |
 | A struct literal | In `let p = Point{x: 1, y: v}` (or `p = ...`), the fields given as constants: here `p.x` is 1 |
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
-| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
+| `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A value known to be at most a term plus a constant (from `/` or `>>`, above) is related to it that way. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. A slice `s = a[i..j]` has the range of `j - i` as its length, and when `j` is a term plus a constant (`a.len` for `a[i..]`), the relations `j - i.hi <= s.len <= j - i.lo`; so with a constant `i`, `s.len == j - i`. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
 | After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, each relation one branch knows directly that the other gives too (at the weaker bound; see below for what a point gives), and holes at values neither branch's facts allow. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. In a `match` on an integer that is a term (plus a constant), an arm also knows the value is between the smallest and the largest of its pattern's values, and that no earlier arm matched it: a value or a range at an end of what's left narrows the range, a single value inside it is a hole (`0 => ...` then `_ => ...`: in `_`, `k != 0`). After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. A `match` on a call that throws is the same, with the arms `ok` and `err`. |
@@ -181,6 +183,25 @@ return a / b                             // b != 0 and b != -1: proven
 `a[i]` is proven when `i` can't be negative and either `i`'s range is below
 the length's (for an array, its constant `N`), or a relation gives
 `i - a.len <= -1`.
+
+`a[i..j]` is proven when `i` can't be negative (or `j`, for `a[..j]`), and
+`i <= j` and `j <= a.len` are each proven by the ranges (the largest value
+of one is at most the smallest of the other) or by a relation (`i - j <= 0`).
+A missing `i` is 0, and a missing `j` is `a.len`, so `a[i..]` needs
+`i <= a.len`. There's no run-time check, and no `?` form yet:
+
+```
+fn search(xs: []i32, v: i32) -> bool {
+	if xs.len == 0 {
+		return false
+	}
+	let mid = xs.len / 2                     // mid <= xs.len - 1
+	if xs[mid] < v {
+		return search(xs[mid + 1..], v)      // proven: mid + 1 <= xs.len
+	}
+	return xs[mid] == v || search(xs[..mid], v)
+}
+```
 
 Everything else gives no facts. In particular, facts don't cross function
 calls yet (that's what [refinements](#refinements-in-types) are for), array

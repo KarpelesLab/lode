@@ -47,7 +47,7 @@ The canonical form:
   left open, that extra tab is given once, not once per line (as in gofmt).
 - Inside a line, tokens are separated by one space, except:
   - none after `(`, `[` and `.`, and none before `)`, `]`, `,`, `:` and `.`
-  - none around `..` and `..=`: `0..n`, `1..=9`
+  - none around `..` and `..=`: `0..n`, `1..=9`, `a[i + 1..]`
   - none after a unary operator: `-x`, `!ok`, `*u8`
   - none before a call's `(` or an index's `[`: `f(x)`, `a[i]`
   - none inside a type prefix: `[4]u8`, `[]*u8`
@@ -127,7 +127,7 @@ fn main() {
 | Compile-time | `comptime`, `if comptime cond { ... }` |
 | Unsafe | `unsafe fn`, `unsafe { ... }` |
 | Cleanup | `defer`, `errdefer` |
-| Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a.len` (see below) |
+| Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a[i..j]`, `a.len` (see below) |
 | Struct | `struct Point { x: u32 ... }`, `Point{x: 1, y: 2}`, `p.x` (see below) |
 | Enum | `enum Shape { circle(c: Point, r: u32) ... }`, `Shape.circle(p, 2)`, `match s { ... }` (see below) |
 | Loop over a range or elements | `for i in 0..n { ... }`, `for x in xs { ... }` |
@@ -169,6 +169,10 @@ fn main() -> u32 {
   read-only data, used like an array (`DAYS[m]`, `for d in DAYS`).
 - `a[i]` is an element. `a[i] = v` and `a[i][j] op= v` assign to an element
   of a `var` array.
+- `a[i..j]` is a slice of an array or slice: the elements from `i` up to,
+  but not including, `j`. `a[i..]` goes to the end, `a[..j]` starts at 0,
+  and `a[..]` is all of them. The end is always exclusive: `a[i..=j]` is an
+  error.
 - `a.len` is the length: a `usize`, and for an array its constant `N`.
 - `for i in a..b { ... }` runs the body for each integer from `a` up to, but
   not including, `b`. Both bounds are evaluated once, before the loop. When

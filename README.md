@@ -44,7 +44,8 @@ What works:
 - integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
 - arrays (`[4]u8`, `[0; 16]`, `[[1, 2], [3, 4]]`) and slices (`[]u8`),
   read-only except as an `inout` parameter; an array is passed where a slice
-  is expected; array constants (`const DAYS: [12]u8 = [31, 28, ...]`) in
+  is expected; slicing (`a[i..j]`, `a[i..]`, `a[..j]`), proven in bounds
+  with no run-time check, and `&a[i..j]` for an `inout` slice; array constants (`const DAYS: [12]u8 = [31, 28, ...]`) in
   read-only data, whose elements' range the checker knows
 - structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
   with value semantics: `let q = p` copies, and structs and arrays are passed
@@ -73,12 +74,13 @@ What works:
 - input: `io.stdin().read(&buf)` (the bytes it got, 0 at the end) and
   `io.stdin().read_full(&buf)` (until `buf` is full or the input ends),
   which throw an `os.Error`; `os.exit(code)` ends the process at once
-- `s.bytes()`, the bytes of a `str` as a read-only `[]u8`, and returning a
+- `s.bytes()`, the bytes of a `str` as a read-only `[]u8` (sliced with
+  `s.bytes()[i..j]`; a `str` itself can't be sliced yet), and returning a
   `str` literal from a function (`fn Day.name(self) -> str`)
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
-  safe. The checker follows value ranges and relations between variables,
-  struct fields and lengths through the program, narrowing on conditions, early returns and
+  safe, and so must slicing `a[i..j]`. The checker follows value ranges and
+  relations between variables, struct fields and lengths through the program, narrowing on conditions, early returns and
   `for` loops. `+% -% *% <<%` wrap and `+| -| *|` saturate. Every binary
   operator has an assignment form with the same rules: `x += 1`, `x +%= 1`,
   `flags |= bit`.

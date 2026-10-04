@@ -114,6 +114,17 @@ semantics.
   kept in a local may only view a `let` array (or part of one), so it never
   sees the array change. This stands in for the [view rules](memory.md#views)
   until they're checked.
+- `a[i..j]` is a slice of the elements `i` up to, but not including, `j`,
+  of an array or a slice (`s.bytes()` too). `a[i..]` goes to the end,
+  `a[..j]` starts at 0, and `a[..]` is all of them. It views the same
+  storage, without a copy. It must be [proven](safety.md#the-fact-language)
+  that `0 <= i <= j <= a.len`; there's no run-time check. The bounds can
+  have any integer type. A slice of a `var` array follows the rule above:
+  it can be passed to a function, but not kept in a local. `&a[i..j]`
+  passes part of a `var` array or of an `inout` slice to an `inout` slice
+  parameter ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)).
+  A `str` can't be sliced: use `s.bytes()[i..j]`
+  ([strings.md](strings.md#in-the-compiler-today)).
 - Every `a[i]` must be [proven](safety.md#the-fact-language) to be in
   bounds. The index can have any integer type.
 - Arrays are passed and returned by value, like structs (see
@@ -131,7 +142,7 @@ semantics.
   checker knows the range of its elements: `DAYS[i]` is `28..=31`
   ([safety.md](safety.md#the-fact-language)). A constant can't be assigned
   or passed with `&`. At most 2^24 elements.
-- Not yet: returning a slice, slicing (`a[i..j]`), and `a.get(i)`.
+- Not yet: returning a slice, and `a.get(i)`.
 
 ### Structs
 

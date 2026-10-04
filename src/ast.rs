@@ -335,6 +335,9 @@ pub enum ExprKind {
     ArrayRepeat(Box<Expr>, Box<Expr>),
     /// `base[index]`
     Index(Box<Expr>, Box<Expr>),
+    /// `base[start..end]`, where either bound may be left out (`a[i..]`,
+    /// `a[..j]`, `a[..]`).
+    Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
     /// `Point{x: 1, y: 2}`: a struct literal, with its fields in source order.
     StructLit(TypeExpr, Vec<FieldInit>),
     /// `none`: the empty optional.

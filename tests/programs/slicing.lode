@@ -1,0 +1,200 @@
+// stdout: 2 3 4 \n
+// stdout: 3 4 \n
+// exit: 0
+package main
+
+import "std/io"
+
+fn sum(xs: []u32) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+fn print_all(xs: []u32) {
+	for x in xs {
+		io.print_u64(x)
+		io.print(" ")
+	}
+	io.print("\n")
+}
+
+// Constant bounds on a slice need its length: `xs.len >= 3` proves `1..3`.
+fn middle(xs: []u32) -> u32 {
+	if xs.len < 3 {
+		return 0
+	}
+	return sum(xs[1..3])
+}
+
+// Variable bounds, proven by checks: `i <= j` and `j <= xs.len`.
+fn range_sum(xs: []u32, i: usize, j: usize) -> u32 {
+	if i > j || j > xs.len {
+		return 0
+	}
+	return sum(xs[i..j])
+}
+
+// `xs[1..]` has one element less than `xs`: indexing it below `xs.len - 1`
+// is proven.
+fn rest_first(xs: []u32) -> u32 {
+	if xs.len < 2 {
+		return 0
+	}
+	let rest = xs[1..]
+	return rest[rest.len - 1] -% rest[0]
+}
+
+// `.len` of a slice: `xs[..n].len` is `n`.
+fn prefix_len(xs: []u32, n: usize) -> usize {
+	if n > xs.len {
+		return 0
+	}
+	return xs[..n].len
+}
+
+// A slice local, indexed in a loop over its length.
+fn evens(xs: []u32, from: usize) -> u32 {
+	if from > xs.len {
+		return 0
+	}
+	let tail = xs[from..]
+	var n: u32 = 0
+	for k in 0..tail.len {
+		if tail[k] % 2 == 0 {
+			n = n +% 1
+		}
+	}
+	return n
+}
+
+// A slice of a slice of a slice: the lengths follow.
+fn nested(xs: []u32) -> u32 {
+	if xs.len != 8 {
+		return 0
+	}
+	let a = xs[1..7]
+	let b = a[1..5]
+	let c = b[1..3]
+	// Iterating over a slice of a slice.
+	var total: u32 = 0
+	for x in c[..] {
+		total = total +% x
+	}
+	return total +% u32(a.len) * 100 +% u32(b.len) * 10 +% u32(c.len)
+}
+
+// Binary search over halves: `xs.len / 2` is below `xs.len` when it isn't
+// 0, so `xs[mid]`, `xs[..mid]` and `xs[mid + 1..]` are proven.
+fn contains(xs: []i32, v: i32) -> bool {
+	if xs.len == 0 {
+		return false
+	}
+	let mid = xs.len / 2
+	if xs[mid] == v {
+		return true
+	}
+	if xs[mid] < v {
+		return contains(xs[mid + 1..], v)
+	}
+	return contains(xs[..mid], v)
+}
+
+// The bytes of a string, sliced.
+fn count_char(s: str, c: u8) -> usize {
+	if s.len == 0 {
+		return 0
+	}
+	var n: usize = 0
+	for b in s.bytes()[1..] {
+		if b == c {
+			n = n + 1
+		}
+	}
+	return n
+}
+
+// A slice bound of another integer type.
+fn small_bounds(xs: []u32, k: u8) -> u32 {
+	if k > xs.len {
+		return 0
+	}
+	return sum(xs[..k])
+}
+
+// A `var` slice moving forward through its elements.
+fn skip_zeros(xs: []u8) -> usize {
+	var s = xs
+	while s.len > 0 && s[0] == 0 {
+		s = s[1..]
+	}
+	return s.len
+}
+
+fn main() -> u8 {
+	let a: [5]u32 = [1, 2, 3, 4, 5]
+	// An array sliced in place, with constant bounds.
+	print_all(a[1..4])
+	if sum(a[..]) != 15 || sum(a[3..]) != 9 || sum(a[..2]) != 3 || sum(a[2..2]) != 0 {
+		return 1
+	}
+	if middle(a) != 5 || middle(a[..2]) != 0 {
+		return 2
+	}
+	if range_sum(a, 1, 3) != 5 || range_sum(a, 3, 1) != 0 || range_sum(a, 0, 6) != 0 {
+		return 3
+	}
+	if rest_first(a) != 3 || prefix_len(a, 4) != 4 || prefix_len(a, 6) != 0 {
+		return 4
+	}
+	if evens(a, 1) != 2 || evens(a, 5) != 0 {
+		return 5
+	}
+	let eight: [8]u32 = [0, 1, 2, 3, 4, 5, 6, 7]
+	// a = 1..=6, b = 2..=5, c = 3..=4
+	if nested(eight) != 649 {
+		return 6
+	}
+	print_all(eight[1..7][1..5][1..3][..2][0..2])
+	let sorted: [7]i32 = [-5, -1, 0, 3, 8, 13, 21]
+	for v in sorted {
+		if !contains(sorted, v) {
+			return 7
+		}
+	}
+	if contains(sorted, 4) || contains(sorted, -6) || contains(sorted, 22) {
+		return 8
+	}
+	if count_char("banana", 'a') != 3 || count_char("abc", 'a') != 0 {
+		return 9
+	}
+	if small_bounds(a, 2) != 3 {
+		return 10
+	}
+	// A `var` array can be sliced and passed.
+	var b: [4]u32 = [0, 0, 0, 0]
+	b[2] = 9
+	if sum(b[2..]) != 9 {
+		return 11
+	}
+	// And looped over, when the loop doesn't change it.
+	var total: u32 = 0
+	for x in b[1..] {
+		total = total +% x
+	}
+	if total != 9 {
+		return 14
+	}
+	let z: [5]u8 = [0, 0, 7, 0, 1]
+	if skip_zeros(z) != 3 || skip_zeros(z[..2]) != 0 {
+		return 12
+	}
+	// A slice of a `let` array kept in a local.
+	let s = a[1..]
+	if s.len != 4 || s[3] != 5 {
+		return 13
+	}
+	return 0
+}

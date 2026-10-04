@@ -49,6 +49,9 @@ reaches, and decimal integer output (`io.print_u64`, `io.print_i64`). Hello
 world is now 655 bytes, still 2 syscalls. The checker keeps facts through
 loops: bounds every iteration keeps survive at the loop head, and after a
 loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
+Slicing `a[i..j]` compiles only when the checker proves
+`0 <= i <= j <= a.len`, and `&a[i..j]` passes part of an array to an
+`inout` slice ([types.md](types.md#in-the-compiler-today)).
 
 ## Next
 

@@ -1,0 +1,147 @@
+// error: cannot prove that this slice's start is at most its end
+// error: cannot prove that this slice's end is at most the length
+// error: cannot prove that this slice's end is at most the length
+// error: cannot prove that this slice's start is at most the length
+// error: cannot prove that this slice's start is not negative
+// error: a `str` can't be sliced: a slice could split a character
+// error: cannot keep a slice of `buf`, which is mutable
+// error: cannot keep a slice of `xs`, an `inout` slice
+// error: returning a slice is not supported by the compiler yet
+// error: cannot pass `&xs[1..]`: `xs` is a read-only `[]u8`
+// error: cannot pass `&a[..2]`: `a` is immutable
+// error: `b[..2]` is passed `inout` or `set`, so `b[3]` can't be used in the same expression
+// error: `b[..2]` and `b[2..]` are both passed `inout` or `set` in this expression, and may overlap
+// error: cannot prove that this index is less than the length
+// error: a slice's bounds must be integers, found `bool`
+// error: `u32` cannot be sliced
+// error: cannot loop over a slice of `buf` while the loop changes `buf`
+// help: check it first (`if i <= j`)
+// help: the end is 5, and the length is 4
+// help: check it first (`if j <= xs.len`)
+// help: a slice of an array overlaps every element and every other slice of it
+// help: slice its bytes instead: `s.bytes()[i..j]` is a `[]u8`
+package main
+
+fn sum(xs: []u8) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% u32(x)
+	}
+	return total
+}
+
+fn fill(inout xs: []u8, v: u8) {
+	for i in 0..xs.len {
+		xs[i] = v
+	}
+}
+
+fn fill2(inout xs: []u8, inout ys: []u8, v: u8) {
+	fill(&xs, v)
+	fill(&ys, v)
+}
+
+// Nothing relates `i` and `j`.
+fn unordered(xs: []u8, i: usize, j: usize) -> u32 {
+	if j > xs.len {
+		return 0
+	}
+	return sum(xs[i..j])
+}
+
+// A constant end past an array's end.
+fn past_the_end() -> u32 {
+	let a: [4]u8 = [1, 2, 3, 4]
+	return sum(a[1..5])
+}
+
+// An end with no check.
+fn unchecked_end(xs: []u8, j: usize) -> u32 {
+	return sum(xs[..j])
+}
+
+// A start with no check, and no end.
+fn unchecked_start(xs: []u8) -> u32 {
+	return sum(xs[1..])
+}
+
+// A start that can be negative.
+fn negative_start(xs: []u8, i: i32) -> u32 {
+	return sum(xs[i..])
+}
+
+// A `str` must be sliced through its bytes.
+fn str_slice(s: str) -> u32 {
+	return sum(s[0..1])
+}
+
+// A slice of a `var` array can't be kept: the array can change.
+fn keep_var() -> u32 {
+	var buf: [4]u8 = [0; 4]
+	let s = buf[..2]
+	buf[0] = 1
+	return sum(s)
+}
+
+// Nor a slice of an `inout` slice.
+fn keep_inout(inout xs: []u8) -> u32 {
+	if xs.len == 0 {
+		return 0
+	}
+	let s = xs[1..]
+	return sum(s)
+}
+
+// A slice can't be returned.
+fn tail(xs: []u8) -> []u8 {
+	return xs
+}
+
+// A read-only slice's elements can't be changed through a slice of it.
+fn read_only(xs: []u8) {
+	if xs.len > 0 {
+		fill(&xs[1..], 0)
+	}
+}
+
+fn exclusive() -> u8 {
+	let a: [4]u8 = [0; 4]
+	fill(&a[..2], 1)
+	var b: [4]u8 = [0; 4]
+	// A slice passed `inout` overlaps every other use of its array.
+	fill(&b[..2], b[3])
+	fill2(&b[..2], &b[2..], 1)
+	return 0
+}
+
+// `xs[1..3]` has 2 elements.
+fn short(xs: []u8) -> u8 {
+	if xs.len < 3 {
+		return 0
+	}
+	let s = xs[1..3]
+	return s[2]
+}
+
+fn bad_bound(xs: []u8) -> u32 {
+	return sum(xs[true..])
+}
+
+fn not_sliceable(n: u32) -> u32 {
+	return sum(n[0..1])
+}
+
+// The loop would see the elements it goes over change.
+fn loop_changes() -> u32 {
+	var buf: [4]u8 = [1, 2, 3, 4]
+	var total: u32 = 0
+	for x in buf[1..] {
+		buf[0] = x
+		total = total +% u32(x)
+	}
+	return total
+}
+
+fn main() -> u8 {
+	return 0
+}

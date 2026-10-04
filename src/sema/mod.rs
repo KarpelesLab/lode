@@ -298,6 +298,10 @@ fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
             catch_blocks(a, out);
             catch_blocks(b, out);
         }
+        ExprKind::Slice(base, start, end) => {
+            catch_blocks(base, out);
+            start.iter().chain(end).for_each(|a| catch_blocks(a, out));
+        }
         ExprKind::Call(callee, args) => {
             catch_blocks(callee, out);
             args.iter().for_each(|a| catch_blocks(a, out));
@@ -371,6 +375,10 @@ fn changed_names(e: &ast::Expr, out: &mut HashSet<String>) {
         ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
             changed_names(a, out);
             changed_names(b, out);
+        }
+        ExprKind::Slice(base, start, end) => {
+            changed_names(base, out);
+            start.iter().chain(end).for_each(|a| changed_names(a, out));
         }
         ExprKind::Call(callee, args) => {
             changed_names(callee, out);
@@ -614,10 +622,12 @@ fn flat_field(ty: Ty, mut k: u32) -> Option<Ty> {
     None
 }
 
-/// The variable a place like `a[i].x` is part of: the expression under its
-/// indexes and fields.
+/// The variable a place like `a[i].x` or `a[i..j]` is part of: the
+/// expression under its indexes, slices and fields.
 fn place_root(mut e: &ast::Expr) -> &ast::Expr {
-    while let ExprKind::Index(base, _) | ExprKind::Field(base, _) = &e.kind {
+    while let ExprKind::Index(base, _) | ExprKind::Field(base, _) | ExprKind::Slice(base, ..) =
+        &e.kind
+    {
         e = base;
     }
     e
@@ -2030,6 +2040,47 @@ impl<'a> Checker<'a> {
                 .apply(&equal(Term::Local(local), src.term, src.offset));
             cx.env.copy_holes(src.term, Term::Local(local), src.offset);
         }
+        // At most another term plus a constant, as in `let mid = xs.len / 2`.
+        if let Some(up) = value.upper
+            && up.term != Term::Local(local)
+        {
+            cx.env.apply(&[facts::Fact::Rel {
+                a: Term::Local(local),
+                b: up.term,
+                c: up.offset,
+            }]);
+        }
+        // A slice `v[i..j]` has the length `j - i`: its range, and how it
+        // relates to `j` when that's a term (exactly, when `i` is a
+        // constant).
+        if let Some(sl) = value.len {
+            let len = Term::Len(local);
+            let mut known = vec![facts::Fact::Narrow {
+                term: len,
+                bound: sl.range,
+                full: term_full_by(|l| cx.locals[l].ty, len),
+            }];
+            if let Some(end) = sl.end
+                && end.term.local() != local
+            {
+                // end - start.hi <= len <= end - start.lo
+                if let Some(c) = end.offset.checked_sub(sl.start.lo) {
+                    known.push(facts::Fact::Rel {
+                        a: len,
+                        b: end.term,
+                        c,
+                    });
+                }
+                if let Some(c) = sl.start.hi.checked_sub(end.offset) {
+                    known.push(facts::Fact::Rel {
+                        a: end.term,
+                        b: len,
+                        c,
+                    });
+                }
+            }
+            cx.env.apply(&known);
+        }
         if cx.locals[local].ty.is_view() {
             // `s.bytes()` views the same bytes as `s`.
             let viewed = match &value.expr.kind {
@@ -3245,6 +3296,7 @@ impl<'a> Checker<'a> {
                     }
                     (_, TExprKind::Table(_)) => (xs.clone(), seq.expr),
                     _ => {
+                        self.check_looped_slice(cx, &seq.expr, &assigned, xs.span)?;
                         let hidden = self.declare(cx, SEQ, seq.ty(), false);
                         self.record_value(cx, hidden, &seq);
                         let ty = seq.ty();
@@ -3414,21 +3466,67 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `for x in a[i..j]` views `a` for the whole loop, so the body can't
+    /// change the array `a` (whose elements it would then see change). An
+    /// `inout` slice is read as the loop goes, as in `for x in xs`.
+    fn check_looped_slice(
+        &mut self,
+        cx: &FnCx,
+        seq: &TExpr,
+        assigned: &HashSet<String>,
+        span: Span,
+    ) -> Option<()> {
+        let mut root = seq;
+        while let TExprKind::Slice(base, ..)
+        | TExprKind::ToSlice(base)
+        | TExprKind::Index(base, _)
+        | TExprKind::Field(base, _) = &root.kind
+        {
+            root = base;
+        }
+        if !matches!(seq.kind, TExprKind::Slice(..)) {
+            return Some(());
+        }
+        if let TExprKind::Local(l) = root.kind
+            && !cx.locals[l].ty.is_view()
+            && assigned.contains(&cx.locals[l].name)
+        {
+            let name = &cx.locals[l].name;
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("cannot loop over a slice of `{name}` while the loop changes `{name}`"),
+                )
+                .with_help("loop over the indexes instead: `for k in i..j`"),
+            );
+            return None;
+        }
+        Some(())
+    }
+
     /// A slice stored in a local must not see its array change: the array
     /// can't be changed while a view of it is in use (docs/memory.md, Views),
     /// and until the compiler checks that, a slice local may only view a
     /// `let` array (or part of one), or part of another view. A slice of a
     /// `var` array or of a temporary can still be passed to a function.
     fn check_kept_view(&mut self, cx: &FnCx, value: &expr::Checked, span: Span) -> Option<()> {
-        // A copy of an `inout` slice would see its elements change.
-        if let TExprKind::Local(l) = value.expr.kind
+        // A slice `v[i..j]` views what `v` views.
+        let mut viewed = &value.expr;
+        while let TExprKind::Slice(base, ..) = &viewed.kind {
+            viewed = base;
+        }
+        let sliced = !std::ptr::eq(viewed, &value.expr);
+        // A copy of an `inout` slice, or a slice of one, would see its
+        // elements change.
+        if let TExprKind::Local(l) = viewed.kind
             && cx.locals[l].mutable_view()
         {
             let name = &cx.locals[l].name;
+            let what = if sliced { "a slice" } else { "a copy" };
             self.diags.push(
                 Diagnostic::error(
                     span,
-                    format!("cannot keep a copy of `{name}`, an `inout` slice"),
+                    format!("cannot keep {what} of `{name}`, an `inout` slice"),
                 )
                 .with_help(format!(
                     "its elements can change; use `{name}` itself, or pass it to the function that takes the slice"
@@ -3436,7 +3534,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let TExprKind::ToSlice(array) = &value.expr.kind else {
+        let TExprKind::ToSlice(array) = &viewed.kind else {
             return Some(());
         };
         let mut root = &**array;

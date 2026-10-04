@@ -185,6 +185,12 @@ pub enum TExprKind {
     /// `base[index]` of an array or slice, with the index proven to be in
     /// bounds. An array-typed element is a place, like any array value.
     Index(Box<TExpr>, Box<TExpr>),
+    /// `base[start..end]` of a view (an array is a [`TExprKind::ToSlice`]
+    /// of it), with `0 <= start <= end <= base.len` proven. A missing start
+    /// is 0, a missing end the base's length. A view of the same storage,
+    /// `end - start` elements from `start` on. The bounds are integers of
+    /// any type, evaluated after the base.
+    Slice(Box<TExpr>, Option<Box<TExpr>>, Option<Box<TExpr>>),
     /// `T{name: value, ...}`: a struct literal. Every field is given exactly
     /// once; the values are in source order (the order they're evaluated
     /// in), each with its field's index in the declaration.
@@ -240,7 +246,8 @@ pub enum TExprKind {
     /// a place of a `var` (or of a parameter the callee may change), which
     /// is a [`TExprKind::Local`], [`TExprKind::Field`] or
     /// [`TExprKind::Index`], or a [`TExprKind::ToSlice`] of one for an
-    /// `inout` slice. Of the place's type.
+    /// `inout` slice, or a [`TExprKind::Slice`] of an array or `inout`
+    /// slice. Of the place's type.
     Ref(Box<TExpr>),
 }
 
@@ -340,6 +347,10 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::PtrAdd(l, r)
         | TExprKind::Coalesce(l, r) => vec![l, r],
         TExprKind::StructLit(fields) => fields.iter().map(|(_, v)| v).collect(),
+        TExprKind::Slice(base, start, end) => std::iter::once(&**base)
+            .chain(start.as_deref())
+            .chain(end.as_deref())
+            .collect(),
         TExprKind::Unary(_, inner)
         | TExprKind::Field(inner, _)
         | TExprKind::Convert(inner)
