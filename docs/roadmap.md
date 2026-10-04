@@ -21,8 +21,9 @@ itself is in the other documents; this one is only about order.
   language.
 
 Alongside the milestones (2026-10-04): `lode fmt`, `lode build
---stack-usage`, CI on GitHub Actions, and lowering only the functions `main`
-reaches. Hello world is now 655 bytes, still 2 syscalls.
+--stack-usage`, CI on GitHub Actions, lowering only the functions `main`
+reaches, and decimal integer output (`io.print_u64`, `io.print_i64`). Hello
+world is now 655 bytes, still 2 syscalls.
 
 ## Next
 
