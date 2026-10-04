@@ -26,7 +26,10 @@
 //! # The canonical form
 //!
 //! - One tab per indentation level: one per open `{`, and one per line
-//!   continuing a statement or opening a `(` or `[` that stays open.
+//!   continuing a statement or opening a `(` or `[` that stays open (but not
+//!   both for the same line: `if a && (b ||` continues with one more tab).
+//!   A block is one level deeper than the line starting its header, even
+//!   when the header spans several lines; its `}` aligns with that line.
 //! - One space between tokens, except: none inside `()`/`[]`, before `,`, `:`,
 //!   `;`, `.` and after `.`; none around `..`; none after a unary operator;
 //!   none before a call's `(` or an index's `[`; none inside a type prefix
@@ -347,6 +350,10 @@ struct Frame {
     close: usize,
     /// A `[` in prefix position (an array type or literal, not an index).
     prefix: bool,
+    /// A line has started inside the brackets. Until then, the brackets'
+    /// own indentation already marks a line continuing the first element
+    /// (`if a && (b ||` then `c) {`), so it gets no extra tab.
+    lined: bool,
 }
 
 /// The previous token on the current line.
@@ -369,6 +376,11 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
     let mut line: Option<Line> = None;
     // The indentation of the current line, without continuation.
     let mut line_base = 0;
+    // For each bracket depth (the top level, then one per open bracket): the
+    // indentation of the line that started the current statement or element
+    // at that depth. A block's lines are one level deeper than the line that
+    // starts its header, however many lines the header takes.
+    let mut bases: Vec<usize> = vec![0];
     let mut prev: Option<Prev> = None;
     // The last token line ended in the middle of a statement.
     let mut continuing = false;
@@ -378,13 +390,22 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
             Item::Tok(t) => {
                 let l = line.get_or_insert_with(|| {
                     let content = stack.last().map_or(0, |f| f.content);
+                    let lined = stack.last().is_none_or(|f| f.lined);
                     let indent = if is_closer(&t.tok) {
                         stack.last().map_or(0, |f| f.close)
-                    } else if continuing {
+                    } else if continuing && lined {
                         content + 1
                     } else {
                         content
                     };
+                    if !is_closer(&t.tok) {
+                        if let Some(f) = stack.last_mut() {
+                            f.lined = true;
+                        }
+                        if !continuing && let Some(b) = bases.last_mut() {
+                            *b = content;
+                        }
+                    }
                     line_base = if is_closer(&t.tok) { indent } else { content };
                     Line {
                         indent,
@@ -422,16 +443,26 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
 
                 let mut prefix_close = false;
                 if is_opener(&t.tok) {
-                    let brace = t.tok == Tok::P(P::LBrace);
+                    let base = *bases.last().ok_or("unbalanced brackets")?;
+                    let (content, close) = if t.tok != Tok::P(P::LBrace) {
+                        (l.indent + 1, l.indent)
+                    } else if t.literal {
+                        (line_base + 1, line_base)
+                    } else {
+                        (base + 1, base)
+                    };
+                    bases.push(base);
                     stack.push(Frame {
-                        content: if brace { line_base + 1 } else { l.indent + 1 },
-                        close: if brace { line_base } else { l.indent },
+                        content,
+                        close,
                         prefix: prev
                             .as_ref()
                             .is_none_or(|p| !p.operand_end || p.prefix_close),
+                        lined: false,
                     });
                 } else if is_closer(&t.tok) {
                     let frame = stack.pop().ok_or("unbalanced brackets")?;
+                    bases.pop();
                     prefix_close = t.tok == Tok::P(P::RBracket) && frame.prefix;
                 }
                 let postfix_q = t.tok == Tok::P(P::Question) && !unary;
@@ -463,8 +494,9 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
                 Some(l) => l.comment = Some((*text).to_owned()),
                 None => {
                     let content = stack.last().map_or(0, |f| f.content);
+                    let lined = stack.last().is_none_or(|f| f.lined);
                     lines.push(Line {
-                        indent: content + usize::from(continuing),
+                        indent: content + usize::from(continuing && lined),
                         comment: Some((*text).to_owned()),
                         ..Line::default()
                     });
@@ -854,6 +886,54 @@ pub fn f() { // trailing on the opener
         assert_eq!(
             fmt("fn f(\na: u32,\n  b: u32,\n) -> u32 {\nreturn a\n}\n"),
             "fn f(\n\ta: u32,\n\tb: u32,\n) -> u32 {\n\treturn a\n}\n"
+        );
+    }
+
+    /// A block after a header spanning several lines is indented one level
+    /// from the line starting the header, and each continuation line of the
+    /// header gets exactly one extra tab (as in gofmt).
+    #[test]
+    fn multi_line_headers() {
+        let canonical = [
+            // A signature broken after a `,`.
+            "fn add3(a: u32,\n\tb: u32) -> u32 {\n\treturn a +% b\n}\n",
+            // A condition broken after an operator, without brackets.
+            "fn f() -> u8 {\n\tif g(1) == 3 &&\n\t\tg(2) == 4 {\n\t\treturn 0\n\t}\n\treturn 1\n}\n",
+            // A condition broken inside a `(` opened on the header's line.
+            "fn f(a: u8) -> u8 {\n\tif a == 1 && (a == 2 ||\n\t\ta == 1) {\n\t\treturn 0\n\t}\n\
+             \treturn 1\n}\n",
+            "fn f(a: u8) {\n\twhile a < 9 && (a == 2 ||\n\t\ta == 1) &&\n\t\ta > 0 {\n\
+             \t\ta += 1\n\t}\n}\n",
+            // Inside a `(` opened at the end of a line, continuation adds one.
+            "fn f() {\n\tg(\n\t\ta +\n\t\t\tb,\n\t\tc)\n}\n",
+            "fn f() {\n\tg(a +\n\t\tb,\n\t\tc +\n\t\t\td)\n}\n",
+            // Nested: multi-line headers inside a block with a multi-line header.
+            "fn f(a: u32,\n\tb: u32) {\n\twhile a < b &&\n\t\tb > 0 {\n\
+             \t\tif (a == 1 ||\n\t\t\ta == 2) {\n\t\t\tg(a,\n\t\t\t\tb)\n\t\t} else if a == 3 ||\n\
+             \t\t\ta == 4 {\n\t\t\tbreak\n\t\t}\n\t}\n}\n",
+        ];
+        for src in canonical {
+            assert_eq!(fmt(src), src);
+        }
+        // Over-indented input, as the formatter used to produce it.
+        assert_eq!(
+            fmt("fn add3(a: u32,\n\tb: u32) -> u32 {\n\t\treturn a +% b\n\t}\n"),
+            canonical[0]
+        );
+        assert_eq!(
+            fmt(
+                "fn f(a: u8) -> u8 {\n\tif a == 1 && (a == 2 ||\n\t\t\ta == 1) {\n\t\t\treturn 0\n\
+                 \t\t}\n\treturn 1\n}\n"
+            ),
+            canonical[2]
+        );
+        // Unindented input.
+        assert_eq!(
+            fmt(
+                "fn f(a: u32,\nb: u32) {\nwhile a < b &&\nb > 0 {\nif (a == 1 ||\na == 2) {\n\
+                 g(a,\nb)\n} else if a == 3 ||\na == 4 {\nbreak\n}\n}\n}\n"
+            ),
+            canonical[6]
         );
     }
 
