@@ -1136,7 +1136,7 @@ impl Checker<'_> {
             _ => None,
         };
         let range = term
-            .and_then(|t| cx.env.range(t))
+            .and_then(|t| super::read_range(cx, t))
             .and_then(|r| r.intersect(any_len))
             .unwrap_or(any_len);
         let mut c = Checked::new(
@@ -1251,7 +1251,7 @@ impl Checker<'_> {
             }
             let ty = cx.locals[local].ty;
             let term = Term::Local(local);
-            let mut c = Checked::new(TExprKind::Local(local), ty, cx.env.range(term));
+            let mut c = Checked::new(TExprKind::Local(local), ty, super::read_range(cx, term));
             c.term = type_range(ty).map(|_| Linear::of(term));
             return Some(c);
         }
@@ -1406,7 +1406,7 @@ impl Checker<'_> {
                 let mut c = Checked::new(
                     TExprKind::Field(Box::new(b.expr), i as u32),
                     fty,
-                    term.and_then(|t| cx.env.range(t)),
+                    term.and_then(|t| super::read_range(cx, t)),
                 );
                 c.term = term.map(Linear::of);
                 Some(c)

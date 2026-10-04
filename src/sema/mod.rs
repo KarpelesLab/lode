@@ -464,19 +464,94 @@ fn assigned_locals(cx: &FnCx, body: &[Stmt]) -> HashSet<LocalId> {
 
 /// The values `term` can take by its type, for the locals' types `tys`.
 fn term_full(tys: &[Ty], term: Term) -> Range {
+    term_full_by(|l| tys[l], term)
+}
+
+/// [`term_full`], with the locals' types given by `ty_of`.
+fn term_full_by(ty_of: impl Fn(LocalId) -> Ty, term: Term) -> Range {
     let any = Range {
         lo: i128::MIN,
         hi: i128::MAX,
     };
     match term {
-        Term::Local(l) => type_range(tys[l]).unwrap_or(any),
+        Term::Local(l) => type_range(ty_of(l)).unwrap_or(any),
         // No object is bigger than the largest `isize` (as in `view_len`).
         Term::Len(_) => Range {
             lo: 0,
             hi: i128::from(i64::MAX),
         },
-        Term::Field(l, k) => flat_field(tys[l], k).and_then(type_range).unwrap_or(any),
+        Term::Field(l, k) => flat_field(ty_of(l), k).and_then(type_range).unwrap_or(any),
     }
+}
+
+/// The index of a `for` loop, for the facts at the loop's head: its local,
+/// and the range and term (if any) of the start it counts from.
+struct ForIndex {
+    local: LocalId,
+    start: Range,
+    start_term: Option<Linear>,
+}
+
+/// The relations added to the facts before a loop, `E`, so that the loop's
+/// head can keep them (docs/safety.md, "Facts through loops"). For each
+/// two integer locals `v` and `w` of `assigned`, `v - w <= c` with the
+/// tightest `c` that `E` gives (see [`Env::diff`]). For a `for` loop's
+/// `index` `i`, which starts at `s`, `v - i <= c` with `c` from `v - s`:
+/// the largest `v` minus the smallest `s`, or a relation with `s`.
+fn head_relations(
+    env: &Env,
+    tys: &[Ty],
+    assigned: &HashSet<LocalId>,
+    index: Option<&ForIndex>,
+) -> Vec<facts::Fact> {
+    let mut vars: Vec<LocalId> = assigned
+        .iter()
+        .copied()
+        .filter(|&l| index.is_none_or(|ix| ix.local != l))
+        .filter(|&l| type_range(tys[l]).is_some())
+        .collect();
+    vars.sort_unstable();
+    let mut out = Vec::new();
+    for &v in &vars {
+        for &w in &vars {
+            if v == w {
+                continue;
+            }
+            if let Some(c) = env.diff(Term::Local(v), Term::Local(w)) {
+                out.push(facts::Fact::Rel {
+                    a: Term::Local(v),
+                    b: Term::Local(w),
+                    c,
+                });
+            }
+        }
+        if let Some(ix) = index {
+            let v_lin = Linear::of(Term::Local(v));
+            let by_range = env
+                .range(Term::Local(v))
+                .and_then(|r| r.hi.checked_sub(ix.start.lo));
+            let by_rel = ix.start_term.and_then(|s| env.diff_bound(v_lin, s));
+            let c = match (by_range, by_rel) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            };
+            if let Some(c) = c {
+                out.push(facts::Fact::Rel {
+                    a: Term::Local(v),
+                    b: Term::Local(ix.local),
+                    c,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The range of `term` where an expression reads it: its known range,
+/// narrowed by its relations (see [`Env::range_via`]).
+fn read_range(cx: &FnCx, term: Term) -> Option<Range> {
+    cx.env
+        .range_via(term, |t| term_full_by(|l| cx.locals[l].ty, t))
 }
 
 /// The type of field number `k` of a value of type `ty`, numbered as in
@@ -2005,7 +2080,7 @@ impl<'a> Checker<'a> {
             Stmt::If(i) => Some(self.if_stmt(cx, i)),
             Stmt::While { cond, body, .. } => {
                 let ((cond, facts, body), head, exits) =
-                    self.loop_body(cx, &body.stmts, |ck, cx| {
+                    self.loop_body(cx, &body.stmts, None, |ck, cx| {
                         let (cond, facts) = ck.condition(cx, cond);
                         cx.env.apply(&facts.when_true);
                         let body = ck.block(cx, &body.stmts);
@@ -2020,7 +2095,7 @@ impl<'a> Checker<'a> {
                 Some(TStmt::While(cond.unwrap_or_else(placeholder_bool), body))
             }
             Stmt::Loop { body, .. } => {
-                let (body, _, exits) = self.loop_body(cx, &body.stmts, |ck, cx| {
+                let (body, _, exits) = self.loop_body(cx, &body.stmts, None, |ck, cx| {
                     let body = ck.block(cx, &body.stmts);
                     let reaches_end = !diverges(&body);
                     (body, reaches_end)
@@ -2487,17 +2562,23 @@ impl<'a> Checker<'a> {
         &mut self,
         cx: &mut FnCx,
         body: &[Stmt],
+        index: Option<&ForIndex>,
         mut check: impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
     ) -> (T, Env, Vec<Env>) {
         use facts::Loosen::{Cover, Drop};
-        let assigned = assigned_locals(cx, body);
+        let mut assigned = assigned_locals(cx, body);
+        if let Some(ix) = index {
+            assigned.insert(ix.local);
+        }
         let about = |l: LocalId| assigned.contains(&l);
         let tys: Vec<Ty> = cx.locals.iter().map(|l| l.ty).collect();
         let full = |t: Term| term_full(&tys, t);
         let holds = |head: &Env, edges: &LoopEdges| {
             edges.next.iter().all(|e| head.holds_in(about, full, e))
         };
-        let entry = cx.env.clone();
+        let mut entry = cx.env.clone();
+        entry.apply(&head_relations(&entry, &tys, &assigned, index));
+        let index = index.map(|ix| ix.local);
         let mark = self.mark(cx);
         // The simplest head: everything about the variables forgotten.
         let forget_all = |entry: Env| {
@@ -2509,30 +2590,30 @@ impl<'a> Checker<'a> {
         };
         if 1 + loop_height(body) > SEARCH_HEIGHT {
             let base = forget_all(entry);
-            let (out, edges) = self.loop_pass(cx, base.clone(), &mut check);
+            let (out, edges) = self.loop_pass(cx, base.clone(), index, &mut check);
             return (out, base, edges.exits);
         }
 
         // 1. E
-        let (out, edges) = self.loop_pass(cx, entry.clone(), &mut check);
+        let (out, edges) = self.loop_pass(cx, entry.clone(), index, &mut check);
         if holds(&entry, &edges) {
             return (out, entry, edges.exits);
         }
         // 2. C
         self.rollback(cx, &mark);
         let c = entry.loosen(about, full, &edges.next, Cover);
-        let (out, edges) = self.loop_pass(cx, c.clone(), &mut check);
+        let (out, edges) = self.loop_pass(cx, c.clone(), index, &mut check);
         if holds(&c, &edges) {
             return (out, c, edges.exits);
         }
         // 3. W
         self.rollback(cx, &mark);
         let w = c.loosen(about, full, &edges.next, Drop);
-        let (out, edges) = self.loop_pass(cx, w.clone(), &mut check);
+        let (out, edges) = self.loop_pass(cx, w.clone(), index, &mut check);
         if !holds(&w, &edges) {
             self.rollback(cx, &mark);
             let base = forget_all(entry);
-            let (out, edges) = self.loop_pass(cx, base.clone(), &mut check);
+            let (out, edges) = self.loop_pass(cx, base.clone(), index, &mut check);
             return (out, base, edges.exits);
         }
         // 4. N
@@ -2541,20 +2622,22 @@ impl<'a> Checker<'a> {
             return (out, w, edges.exits);
         }
         self.rollback(cx, &mark);
-        let (out, edges) = self.loop_pass(cx, n.clone(), &mut check);
+        let (out, edges) = self.loop_pass(cx, n.clone(), index, &mut check);
         if holds(&n, &edges) {
             return (out, n, edges.exits);
         }
         self.rollback(cx, &mark);
-        let (out, edges) = self.loop_pass(cx, w.clone(), &mut check);
+        let (out, edges) = self.loop_pass(cx, w.clone(), index, &mut check);
         (out, w, edges.exits)
     }
 
-    /// Check a loop's body once, from the facts `head`.
+    /// Check a loop's body once, from the facts `head`. For a `for` loop,
+    /// the back-edges go on to the next index: `index` is advanced by 1.
     fn loop_pass<T>(
         &mut self,
         cx: &mut FnCx,
         head: Env,
+        index: Option<LocalId>,
         check: &mut impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
     ) -> (T, LoopEdges) {
         cx.env = head;
@@ -2565,6 +2648,15 @@ impl<'a> Checker<'a> {
         let mut edges = cx.loops.pop().expect("pushed above");
         if reaches_end {
             edges.next.push(std::mem::take(&mut cx.env));
+        }
+        if let Some(ix) = index {
+            for e in &mut edges.next {
+                let next = e.range(Term::Local(ix)).map(|r| Range {
+                    lo: r.lo + 1,
+                    hi: r.hi + 1,
+                });
+                e.shift(ix, next, 1);
+            }
         }
         (out, edges)
     }
@@ -2672,22 +2764,34 @@ impl<'a> Checker<'a> {
             }
         };
 
-        let ((index, stmts), head, exits) = self.loop_body(cx, &body.stmts, |ck, cx| {
+        // The index is a local of the loop's head too: the head can relate
+        // the variables the body assigns to it.
+        let ty = start.ty();
+        let index = match &each {
+            Some(_) => self.declare(cx, INDEX, ty, false),
+            None => self.declare(cx, &var.name, ty, false),
+        };
+        let for_index = ForIndex {
+            local: index,
+            start: start.int_range(),
+            start_term: start.term,
+        };
+        // A bound that's a term the body doesn't assign keeps its value for
+        // the whole loop, so the index can be related to it.
+        let unassigned = |cx: &FnCx, t: Term| {
+            let local = &cx.locals[t.local()];
+            local.mutable_view() || !assigned.contains(&local.name)
+        };
+        let (stmts, head, exits) = self.loop_body(cx, &body.stmts, Some(&for_index), |ck, cx| {
             // What the body knows about the loop variable.
-            let ty = start.ty();
-            let index = match &each {
-                Some(_) => ck.declare(cx, INDEX, ty, false),
-                None => ck.declare(cx, &var.name, ty, false),
-            };
             let (lo, hi) = (start.int_range().lo, end.int_range().hi - 1);
             // An empty range: the body never runs, and any range will do.
-            cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
-            // A bound that's a term the body doesn't assign keeps its value for
-            // the whole loop, so the index can be related to it.
-            let unassigned = |cx: &FnCx, t: Term| {
-                let local = &cx.locals[t.local()];
-                local.mutable_view() || !assigned.contains(&local.name)
-            };
+            let full = type_range(ty).expect("an integer");
+            cx.env.apply(&[facts::Fact::Narrow {
+                term: Term::Local(index),
+                bound: Range { lo, hi: hi.max(lo) },
+                full,
+            }]);
             let mut loop_facts = Vec::new();
             if let Some(e) = end.term
                 && unassigned(cx, e.term)
@@ -2752,11 +2856,43 @@ impl<'a> Checker<'a> {
             }
             stmts.extend(ck.block(cx, &body.stmts));
             let reaches_end = !diverges(&stmts);
-            ((index, stmts), reaches_end)
+            (stmts, reaches_end)
         });
-        // The loop ends at its head (the head facts still hold), or at a
-        // `break`.
-        cx.env = exits.into_iter().fold(head, Env::join);
+        // The loop ends at its head (the head facts still hold) when the
+        // index has reached the end: `end <= i`, and `i <= end` if the start
+        // is at most the end. Or it ends at a `break`.
+        let mut done = head;
+        let (s, e) = (start.int_range(), end.int_range());
+        let starts_below = s.hi <= e.lo
+            || matches!((start.term, end.term), (Some(a), Some(b)) if done.diff_bound(a, b).is_some_and(|c| c <= 0));
+        let full = type_range(ty).expect("an integer");
+        let mut exit_facts = vec![facts::Fact::Narrow {
+            term: Term::Local(index),
+            bound: Range {
+                lo: e.lo,
+                hi: if starts_below { e.hi } else { s.hi.max(e.hi) },
+            },
+            full,
+        }];
+        if let Some(b) = end.term
+            && unassigned(cx, b.term)
+        {
+            // b + k <= i: b - i <= -k
+            exit_facts.push(facts::Fact::Rel {
+                a: b.term,
+                b: Term::Local(index),
+                c: -b.offset,
+            });
+            if starts_below {
+                exit_facts.push(facts::Fact::Rel {
+                    a: Term::Local(index),
+                    b: b.term,
+                    c: b.offset,
+                });
+            }
+        }
+        done.apply(&exit_facts);
+        cx.env = exits.into_iter().fold(done, Env::join);
 
         let for_loop = TStmt::For {
             var: index,

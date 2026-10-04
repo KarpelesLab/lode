@@ -339,6 +339,53 @@ impl Env {
         }
     }
 
+    /// The tightest `c` with `a - b <= c` this point gives: from the
+    /// relations (see [`Env::rel_through`]), or from known ranges of both
+    /// (`a.hi - b.lo`).
+    pub fn diff(&self, a: Term, b: Term) -> Option<i128> {
+        let by_ranges = match (self.range(a), self.range(b)) {
+            (Some(ra), Some(rb)) => ra.hi.checked_sub(rb.lo),
+            _ => None,
+        };
+        match (self.rel_through(a, b), by_ranges) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, y) => x.or(y),
+        }
+    }
+
+    /// The range of `term` (its known range, or `full` gives its type's),
+    /// narrowed by each relation with another term and that term's range:
+    /// `term - b <= c` gives `term <= b.hi + c`, and `b - term <= c` gives
+    /// `term >= b.lo - c`. One step: the other term's range isn't narrowed
+    /// in turn. `None` if nothing is known.
+    pub fn range_via(&self, term: Term, full: impl Fn(Term) -> Range) -> Option<Range> {
+        let own = self.range(term);
+        let mut r = own.unwrap_or_else(|| full(term));
+        let mut narrowed = false;
+        for rel in &self.rels {
+            if rel.a == term && rel.b != term {
+                let other = self.range(rel.b).unwrap_or_else(|| full(rel.b));
+                let hi = other.hi.saturating_add(rel.c);
+                if hi < r.hi {
+                    r.hi = hi;
+                    narrowed = true;
+                }
+            } else if rel.b == term && rel.a != term {
+                let other = self.range(rel.a).unwrap_or_else(|| full(rel.a));
+                let lo = other.lo.saturating_sub(rel.c);
+                if lo > r.lo {
+                    r.lo = lo;
+                    narrowed = true;
+                }
+            }
+        }
+        if r.lo > r.hi {
+            // Contradictory facts: this point can't be reached.
+            return own;
+        }
+        if narrowed { Some(r) } else { own }
+    }
+
     /// An upper bound on `x - y` from the relations (see [`Env::rel_through`]).
     pub fn diff_bound(&self, x: Linear, y: Linear) -> Option<i128> {
         let terms = if x.term == y.term {
@@ -528,7 +575,7 @@ impl Env {
             }
             let mut c = Some(rel.c);
             for e in &live {
-                let ec = e.rel_through(rel.a, rel.b);
+                let ec = e.diff(rel.a, rel.b);
                 c = match (how, c, ec) {
                     (Loosen::Drop, Some(c), Some(ec)) if ec <= c => Some(c),
                     (Loosen::Cover, Some(c), Some(ec)) => Some(c.max(ec)),
@@ -626,16 +673,19 @@ impl Env {
             .iter()
             .filter_map(|(term, ra)| b.ranges.get(term).map(|rb| (*term, ra.hull(*rb))))
             .collect();
-        let rels = a
-            .rels
-            .iter()
-            .filter_map(|ra| {
-                b.rel(ra.a, ra.b).map(|cb| Rel {
-                    c: ra.c.max(cb),
-                    ..*ra
-                })
-            })
-            .collect();
+        // A relation either side knows directly, if both give it somehow.
+        let mut rels: Vec<Rel> = Vec::new();
+        for r in a.rels.iter().chain(&b.rels) {
+            if rels.iter().any(|k| k.a == r.a && k.b == r.b) {
+                continue;
+            }
+            if let (Some(ca), Some(cb)) = (a.diff(r.a, r.b), b.diff(r.a, r.b)) {
+                rels.push(Rel {
+                    c: ca.max(cb),
+                    ..*r
+                });
+            }
+        }
         // A local is assigned after the join only if it is on both paths.
         let uninit = a.uninit.union(&b.uninit).copied().collect();
         let mut holes: Vec<(Term, i128)> = Vec::new();
@@ -899,6 +949,46 @@ mod tests {
         let mut dead = exact(0, 0);
         dead.apply(&[Fact::Hole { term: t, value: 0 }]);
         assert!(dead.dead);
+    }
+
+    #[test]
+    fn join_keeps_relations_given_through_a_term() {
+        // One branch: start == i directly. The other: start == pos, i == pos.
+        let (i, start, pos) = (0, 1, 2);
+        let mut a = Env::default();
+        a.apply(&comparison(CmpOp::Eq, var(start), var(i)).when_true);
+        let mut b = Env::default();
+        b.apply(&comparison(CmpOp::Eq, var(start), var(pos)).when_true);
+        b.apply(&comparison(CmpOp::Eq, var(i), var(pos)).when_true);
+        let j = Env::join(a, b);
+        assert_eq!(j.rel(Term::Local(start), Term::Local(i)), Some(0));
+        assert_eq!(j.rel(Term::Local(i), Term::Local(start)), Some(0));
+        // Known ranges give a bound too: 0..=3 and 5..=9 give a - b <= -2.
+        let mut r = exact(0, 3);
+        r.apply(&comparison(CmpOp::Ge, var(1), konst(5)).when_true);
+        r.apply(&comparison(CmpOp::Le, var(1), konst(9)).when_true);
+        assert_eq!(r.diff(Term::Local(0), Term::Local(1)), Some(-2));
+        assert_eq!(Env::default().diff(Term::Local(0), Term::Local(1)), None);
+    }
+
+    #[test]
+    fn reading_through_relations() {
+        // n - i <= 0 and i in 0..=9: n reads as 0..=9.
+        let (n, i) = (0, 1);
+        let mut env = Env::default();
+        env.apply(&comparison(CmpOp::Le, var(n), var(i)).when_true);
+        env.apply(&comparison(CmpOp::Lt, var(i), konst(10)).when_true);
+        assert_eq!(
+            env.range_via(Term::Local(n), full),
+            Some(Range { lo: 0, hi: 9 })
+        );
+        // Only one step: m <= n doesn't go through n's narrowed range.
+        env.apply(&comparison(CmpOp::Le, var(2), var(n)).when_true);
+        assert_eq!(
+            env.range_via(Term::Local(2), full),
+            Some(Range { lo: 0, hi: U32.hi })
+        );
+        assert_eq!(Env::default().range_via(Term::Local(n), full), None);
     }
 
     #[test]

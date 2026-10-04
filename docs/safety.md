@@ -132,7 +132,7 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | `p.x = v`, `p.a = q` | The value's range for the field assigned; everything else about it (or about the fields of a struct field) is forgotten. Assigning a whole struct forgets all its fields. |
 | `let` / `var` / assignment | The value's range. A term plus a constant is related to the term (`let last = xs.len - 1` gives `last - xs.len <= -1`), and has its holes, moved by the constant. A view of a whole `[N]T` array has length `N`, and a copy of a view has its length. Assigning forgets every fact involving the variable, and for a view, its length, except that assigning a variable itself plus a constant (`i = i - 1`, `i += 2`) shifts its relations and holes by the constant (`i <= xs.len` becomes `i - xs.len <= -1`). |
 | `if cond` | Inside the branch, the facts of `cond` being true; in `else`, of it being false |
-| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, relations both know, and holes at values neither branch's facts allow. |
+| After an `if` | If one branch always leaves (`return`, `throw`, `break`, `continue`), the other branch's facts. Otherwise, what both branches agree on: ranges widened to cover both, each relation one branch knows directly that the other gives too (at the weaker bound; see below for what a point gives), and holes at values neither branch's facts allow. |
 | `match`, `if let`, `let ... else` | Each arm starts with the facts from before. After, the arms that don't always leave are joined, as after an `if`. Payload values have no facts. A `match` on a call that throws is the same, with the arms `ok` and `err`. |
 | A call `f(&x)`, `p.scale(2)` | A call changes only the places passed `inout` or `set` (with `&`, or as the receiver of a method that takes `inout self`): what was known about each (a variable, or a struct field and the fields in it) is forgotten. A slice's length doesn't change, and elements have no facts. A variable passed `set` is assigned, with nothing known ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)). |
 | `try f()`, `throw` | The error leaves the function, so it adds nothing to the facts after. After `try`, the facts are those after the call. `throw` always leaves, like `return`. |
@@ -144,14 +144,18 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
 | `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
 | `loop` | After the loop, the facts at its `break`s, joined. Without a `break`, the code after it can't be reached. |
-| `for i in a..b` | In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. After the loop, the head facts, joined with the facts at each `break`. |
+| `for i in a..b` | In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. After the loop, the head facts, with `i` past the end: in `b.lo..=b.hi` (`..=max(a.hi, b.hi)` unless `a.hi <= b.lo` or a relation gives `a <= b`), and when `b` is a term the body doesn't assign, `b <= i`, and `i <= b` in the same case; joined with the facts at each `break`. (`i` itself can't be used after the loop, but relations go through it.) |
 | `for x in xs` | The same as `for` over `0..xs.len` with a hidden index, which proves the hidden `xs[index]` that gives `x` |
 | `x - y` | A known relation bounds the result: `y <= x` proves it doesn't go below zero |
+| Reading a term | Its range, narrowed by each of its relations and the other term's range (or its type's): `a - b <= c` gives `a <= b.hi + c` and `b >= a.lo - c`. One step: the other term's range isn't narrowed in turn. So `n <= i` and `i < xs.len` give `n` below the largest `isize`. |
 
 A relation can also come from two known relations through one other term:
 `i < n` and `n == xs.len` (from `let n = xs.len`) give `i < xs.len`. Only
 one step: longer chains are not followed, which keeps the check cheap and
-easy to predict.
+easy to predict. Where facts are compared or joined (after an `if`, at a
+loop's head), what a point **gives** for `a - b` is the tightest of a
+relation, a chain of two through one other term, and, when it knows ranges
+for both, `a.hi - b.lo`.
 
 `a / b` and `a % b` are proven when `b` can't be 0 (its range doesn't
 contain 0, or 0 is a hole in it) and, for a signed type, when `a` can't be
@@ -200,9 +204,30 @@ body from a few candidate heads, in a fixed order, and taking the first that
 a range end holds if the back-edge's range for the term (or its type's range,
 if none is known) is within it, and a relation `a - b <= c` holds if the
 back-edge gives `a - b <= c'` with `c' <= c` (directly or through one other
-term, as above), and a hole at `k` holds if the back-edge's range doesn't
+term, or from both ranges, as above), and a hole at `k` holds if the back-edge's range doesn't
 contain `k` or has a hole there. A back-edge that can't be reached holds
 everything.
+
+Before the search, `E` gets relations between the variables of `A`, so
+that the head can keep how they move together:
+
+- for each two integer locals `v` and `w` in `A`, `v - w <= c` with the
+  tightest `c` that `E` gives (as above);
+- in a `for` loop, whose index `i` counts from a start `s`, for each integer
+  local `v` in `A`, `v - i <= c` with the tightest of `v.hi - s.lo` (when
+  `E` knows `v`'s range) and what `E` gives for `v - s` (when `s` is a term
+  plus a constant). The index belongs to `A`, and at each back-edge it
+  first goes on to the next value (as `i = i + 1` would), so `n - i <= 0`
+  holds there when `n` grew by at most 1. In the body, `i`'s range is that
+  of the `for` rule, and its head facts are only these relations.
+
+So with `var n = 0` before `for x in xs`, a body that only adds 1 to `n`
+(on some paths) keeps `n <= i` at the head: reading `n` then gives a range
+below `xs.len`'s largest value, so `n + 1` is proven, and after the loop
+`n <= xs.len`. The same holds for `n` and `i` in a `while` loop where both
+start at 0. Two copies of one value (`var i = pos`, `var start = pos`)
+start out related through `pos`, and keep `start <= i` while `start` only
+catches up with `i`.
 
 Two ways to weaken facts, each fact about `A` on its own (the two ends of a
 range are separate facts):

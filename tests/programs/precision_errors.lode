@@ -4,6 +4,8 @@
 // error: cannot prove that this is not `-9223372036854775808` divided by -1
 // error: cannot prove that this divisor is not zero
 // error: cannot prove that this divisor is not zero
+// error: cannot prove that this subtraction does not overflow `usize`
+// error: cannot prove that this subtraction does not overflow `usize`
 package main
 
 // Dividing by 1 keeps the whole range.
@@ -60,6 +62,30 @@ fn reset_in_loop(xs: []i32, d0: i32) -> i32 {
 		d = x
 	}
 	return total
+}
+
+// Growing by 2 per iteration, the counter can pass the length.
+fn count_twice(xs: []u8) -> usize {
+	var n: usize = 0
+	for x in xs {
+		if x == 0 {
+			n = n +| 2
+		}
+	}
+	return xs.len - n
+}
+
+// Only `i - start <= 1` holds, and the copy can pass `i`.
+fn ahead(src: []u8, pos: usize) -> usize {
+	var i = pos
+	var start = pos
+	while i < src.len {
+		if src[i] == ' ' {
+			start = i + 2
+		}
+		i = i + 1
+	}
+	return i - start
 }
 
 fn main() {

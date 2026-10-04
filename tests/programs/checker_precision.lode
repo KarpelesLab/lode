@@ -89,6 +89,60 @@ fn sum_of_quotients(xs: []i32, d0: i32) -> i32 {
 	return total
 }
 
+// A counter that grows by at most 1 per iteration of a `for` loop stays at
+// most the index: `n <= $i` at the head, so `n + 1` can't overflow, and
+// after the loop, `n <= xs.len`.
+fn count_zeros(xs: []u8) -> usize {
+	var n: usize = 0
+	for x in xs {
+		if x == 0 {
+			n = n + 1
+		}
+	}
+	return xs.len - n
+}
+
+// The same with a `while` loop and an index of its own.
+fn count_small(xs: []u8) -> usize {
+	var i: usize = 0
+	var n: usize = 0
+	while i < xs.len {
+		if xs[i] < 10 {
+			n = n + 1
+		}
+		i = i + 1
+	}
+	return i - n
+}
+
+// Compacting in place: the write index never passes the read index, so
+// `buf[w]` is proven.
+fn compact() -> usize {
+	var buf: [8]u8 = [1, 0, 2, 0, 0, 3, 4, 0]
+	var w: usize = 0
+	for r in 0..buf.len {
+		if buf[r] != 0 {
+			buf[w] = buf[r]
+			w = w + 1
+		}
+	}
+	return w * 10 + usize(buf[0])
+}
+
+// Two copies of `pos`, one moving forward and one catching up with it:
+// `start <= i` holds at the head and after the loop.
+fn last_word_len(src: []u8, pos: usize) -> usize {
+	var i = pos
+	var start = pos
+	while i < src.len {
+		if src[i] == ' ' {
+			start = i + 1
+		}
+		i = i + 1
+	}
+	return i - start
+}
+
 fn main() -> u8 {
 	if half_plus_one(18446744073709551615) != 9223372036854775808 {
 		return 1
@@ -114,6 +168,17 @@ fn main() -> u8 {
 	let xs: [3]i32 = [10, -20, 35]
 	if sum_of_quotients(xs, 5) != 255 || sum_of_quotients(xs, -1) != 0 {
 		return 8
+	}
+	let ys: [6]u8 = [0, 5, 0, 20, 0, 7]
+	if count_zeros(ys) != 3 || count_small(ys) != 1 {
+		return 9
+	}
+	if compact() != 41 {
+		return 10
+	}
+	let text: [9]u8 = ['a', 'b', ' ', 'c', 'd', 'e', ' ', 'f', 'g']
+	if last_word_len(text, 0) != 2 || last_word_len(text, 8) != 1 || last_word_len(text, 20) != 0 {
+		return 11
 	}
 	return 0
 }
