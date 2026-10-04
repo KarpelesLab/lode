@@ -2,8 +2,9 @@
 //!
 //! The pipeline: [`load`] (the root file and the packages it imports, each
 //! [`lex`]ed and [`parse`]d) → [`sema`] (types, `unsafe`, and proof
-//! obligations) → [`lower`] (to LatticeFoundry IR) → LatticeFoundry's verify,
-//! optimize, codegen and link. The design of the language is in `docs/`.
+//! obligations, over all the code) → [`lower`] (to LatticeFoundry IR, only the
+//! code `main` [`reach`]es) → LatticeFoundry's verify, optimize, codegen and
+//! link. The design of the language is in `docs/`.
 //!
 //! This is an early compiler: it supports functions, integers, `bool`, `str`,
 //! arrays and slices, raw pointers in `unsafe` code, constants, local
@@ -17,6 +18,7 @@ pub mod lex;
 pub mod load;
 pub mod lower;
 pub mod parse;
+pub mod reach;
 pub mod sema;
 pub mod source;
 pub mod stack;
@@ -128,19 +130,23 @@ pub fn build(
         )]));
     }
     let lowered = compile_ir(files, root, options.opt)?;
+    let entry = lowered
+        .entry
+        .clone()
+        .expect("a program with `main` has an entry");
     let compiled =
         x86_64::compile_module_with(&lowered.module, &lowered.syms, &CodegenOptions::default());
     let mut object = compiled.object;
     emit_strings(&mut object, &lowered.strings);
     let link_options = ImageOptions {
-        entry: lower::ENTRY_SYMBOL.to_owned(),
+        entry: entry.clone(),
         ..ImageOptions::default()
     };
     let image = link::link_executable(vec![object], &link_options)
         .map_err(|e| Error::Backend(format!("link error: {e}")))?;
     Ok(Executable {
         image,
-        stack: StackReport::new(compiled.stack, lower::ENTRY_SYMBOL),
+        stack: StackReport::new(compiled.stack, entry),
     })
 }
 

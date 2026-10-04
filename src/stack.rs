@@ -32,8 +32,9 @@ impl StackReport {
         }
     }
 
-    /// The symbol the bound is computed from: the entry `_start` calls, which
-    /// calls the program's `main`.
+    /// The symbol the bound is computed from: the entry `_start` calls. It is
+    /// the program's `main` (`main.main`), or a wrapper named `main` that
+    /// calls it when Lode code calls `main` too.
     pub fn entry(&self) -> &str {
         &self.entry
     }

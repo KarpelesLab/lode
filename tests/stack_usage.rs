@@ -54,6 +54,8 @@ fn a_program_without_recursion_has_a_bound() {
 fn the_report_uses_lode_names() {
     let stack = hello_world(OptLevel::O0);
     let names: Vec<&str> = stack.functions().iter().map(|f| f.name.as_str()).collect();
+    // The entry is the program's `main`, under its Lode name.
+    assert_eq!(stack.entry(), "main.main");
     assert_eq!(names.first(), Some(&stack.entry()));
     for name in ["main.main", "std/os.write_all"] {
         assert!(names.contains(&name), "{name} missing from {names:?}");

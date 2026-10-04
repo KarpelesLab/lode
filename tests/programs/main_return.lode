@@ -1,0 +1,18 @@
+// stdout: early\n
+package main
+
+import "std/io"
+
+// A `main` that returns nothing exits with status 0, at an early `return`
+// as at its end.
+fn main() {
+	io.print("early\n")
+	if done() {
+		return
+	}
+	io.print("late\n")
+}
+
+fn done() -> bool {
+	return true
+}

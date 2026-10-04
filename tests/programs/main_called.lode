@@ -1,0 +1,14 @@
+// exit: 7
+package main
+
+// `main` is also called from Lode code, so the entry is a wrapper around it.
+fn again(more: bool) -> u8 {
+	if more {
+		return main()
+	}
+	return 7
+}
+
+fn main() -> u8 {
+	return again(false)
+}

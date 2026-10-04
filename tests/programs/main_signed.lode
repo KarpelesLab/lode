@@ -1,0 +1,7 @@
+// exit: 254
+package main
+
+// A signed exit status is sign-extended: -2 is status 254.
+fn main() -> i8 {
+	return -2
+}

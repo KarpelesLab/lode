@@ -19,23 +19,28 @@
 use latticefoundry::Module;
 use latticefoundry::ir::builder::FunctionBuilder;
 use latticefoundry::ir::{
-    BinOp as IrOp, BlockId, CastOp, Const, Flags, FuncId as IrFunc, Global, GlobalId, IntPred,
-    TypeId, ValueId,
+    BinOp as IrOp, BlockId, CastOp, Const, Flags, FuncAttrs, FuncId as IrFunc, Global, GlobalId,
+    IntPred, Linkage, TypeId, ValueId, Visibility,
 };
 use latticefoundry::support::StrInterner;
 
+use crate::reach::Reach;
 use crate::sema::{CmpOp, Func, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
 use crate::types::{IntTy, Ty};
 
-/// The entry symbol LatticeFoundry's linker calls from `_start`; its return
-/// value becomes the process exit status.
-pub const ENTRY_SYMBOL: &str = "main";
+/// The name of the entry wrapper, for a program whose `main` is also called
+/// from Lode code (see [`lower`]).
+pub const ENTRY_WRAPPER: &str = "main";
 
 /// The result of lowering.
 #[derive(Debug)]
 pub struct Lowered {
     pub module: Module,
     pub syms: StrInterner,
+    /// The symbol of the entry function LatticeFoundry's linker calls from
+    /// `_start`, if the program has a `main`. Its `i64` return value is the
+    /// process exit status.
+    pub entry: Option<String>,
     /// Read-only data the object must define: `(symbol, bytes)` for each
     /// string literal.
     pub strings: Vec<(String, Vec<u8>)>,
@@ -131,9 +136,20 @@ enum Slot {
     Mem(ValueId),
 }
 
-/// Lower a checked program to an IR module named `name`. If the program has a
-/// `main`, an entry function named [`ENTRY_SYMBOL`] is added that calls it and
-/// returns its exit status as an `i64`.
+/// Lower a checked program to an IR module named `name`.
+///
+/// Only the code the program reaches is lowered: the functions `main` calls,
+/// directly or not, and the string literals they use. A program without a
+/// `main` (a library) is lowered whole, so `--emit=ir` shows all of it.
+///
+/// `main` itself is the entry function: it keeps its symbol (`main.main`)
+/// and returns its exit status as an `i64`, extended from its integer type,
+/// or `0` for a `main` that returns nothing. When Lode code also calls
+/// `main`, it is lowered as an ordinary function and an entry wrapper named
+/// [`ENTRY_WRAPPER`] calls it.
+///
+/// Every function but the entry has internal linkage: nothing outside the
+/// program calls it, so the backend may drop it once it's inlined.
 pub fn lower(program: &Program, name: &str) -> Lowered {
     let mut syms = StrInterner::new();
     let mut module = Module::new(name.to_owned());
@@ -149,6 +165,12 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             i64: types.int(64),
         }
     };
+    let reach = match program.main {
+        Some(main) => Reach::from(program, main),
+        None => Reach::all(program),
+    };
+    // `main` is the entry itself unless Lode code calls it.
+    let direct_entry = program.main.filter(|_| !reach.root_called);
 
     let mut strings = Vec::new();
     let mut string_globals = Vec::new();
@@ -163,24 +185,38 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             ty,
             init: Some(init),
         }));
-        strings.push((symbol, bytes.clone()));
+        if reach.strings[i] {
+            strings.push((symbol, bytes.clone()));
+        }
     }
 
-    let ids: Vec<IrFunc> = program
+    let internal = FuncAttrs::new(Linkage::Internal, Visibility::Default);
+    let ids: Vec<Option<IrFunc>> = program
         .funcs
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
+            if !reach.reached[i] {
+                return None;
+            }
             let params = f
                 .params
                 .iter()
                 .flat_map(|&p| t.parts(f.locals[p].ty))
                 .collect();
-            let sig = module.types_mut().func(params, t.of(f.ret), false);
-            module.declare_function(syms.intern(&f.symbol), sig)
+            let is_entry = direct_entry == Some(i);
+            let ret = if is_entry { t.i64 } else { t.of(f.ret) };
+            let sig = module.types_mut().func(params, ret, false);
+            let id = module.declare_function(syms.intern(&f.symbol), sig);
+            if !is_entry {
+                module.set_func_attrs(id, internal.clone());
+            }
+            Some(id)
         })
         .collect();
 
-    for (f, &id) in program.funcs.iter().zip(&ids) {
+    for (i, f) in program.funcs.iter().enumerate() {
+        let Some(id) = ids[i] else { continue };
         let b = module.build(id);
         FnLower {
             b,
@@ -191,44 +227,58 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             slots: Vec::new(),
             loops: Vec::new(),
             terminated: false,
+            exit_status: (direct_entry == Some(i)).then_some(f.ret),
         }
         .function(f);
     }
 
-    if let Some(main) = program.main {
-        let sig = module.types_mut().func(Vec::new(), t.i64, false);
-        let entry = module.declare_function(syms.intern(ENTRY_SYMBOL), sig);
-        let ret = program.funcs[main].ret;
-        let mut b = module.build(entry);
-        b.create_entry_block();
-        let callee = b.func_ref(ids[main]);
-        let result = b.call(callee, &[], t.of(ret));
-        let status = match (ret, result) {
-            (Ty::Int(it), Some(v)) if it.bits < 64 => {
-                let op = if it.signed {
-                    CastOp::SExt
-                } else {
-                    CastOp::ZExt
-                };
-                b.cast(op, v, t.i64)
-            }
-            (Ty::Int(_), Some(v)) => v,
-            _ => b.const_i64(t.i64, 0),
-        };
-        b.ret(Some(status));
-    }
+    let entry = match (program.main, direct_entry) {
+        (Some(main), None) => {
+            let sig = module.types_mut().func(Vec::new(), t.i64, false);
+            let entry = module.declare_function(syms.intern(ENTRY_WRAPPER), sig);
+            let ret = program.funcs[main].ret;
+            let mut b = module.build(entry);
+            b.create_entry_block();
+            let callee = b.func_ref(ids[main].expect("main is reached"));
+            let result = b.call(callee, &[], t.of(ret));
+            let status = exit_status(&mut b, t, ret, result);
+            b.ret(Some(status));
+            Some(ENTRY_WRAPPER.to_owned())
+        }
+        (Some(main), Some(_)) => Some(program.funcs[main].symbol.clone()),
+        (None, _) => None,
+    };
 
     Lowered {
         module,
         syms,
+        entry,
         strings,
+    }
+}
+
+/// `main`'s result `v`, of type `ret`, as the `i64` exit status the entry
+/// returns: an integer extended by its signedness, or `0` for `()`.
+fn exit_status(b: &mut FunctionBuilder<'_>, t: Types, ret: Ty, v: Option<ValueId>) -> ValueId {
+    match (ret, v) {
+        (Ty::Int(it), Some(v)) if it.bits < 64 => {
+            let op = if it.signed {
+                CastOp::SExt
+            } else {
+                CastOp::ZExt
+            };
+            b.cast(op, v, t.i64)
+        }
+        (Ty::Int(_), Some(v)) => v,
+        _ => b.const_i64(t.i64, 0),
     }
 }
 
 struct FnLower<'a> {
     b: FunctionBuilder<'a>,
     t: Types,
-    ids: &'a [IrFunc],
+    /// The IR function of each reached function.
+    ids: &'a [Option<IrFunc>],
     strings: &'a [GlobalId],
     string_lens: &'a [Vec<u8>],
     slots: Vec<Slot>,
@@ -236,6 +286,9 @@ struct FnLower<'a> {
     loops: Vec<(BlockId, BlockId)>,
     /// Whether the current block already has its terminator.
     terminated: bool,
+    /// For the entry function, `main`'s return type: its returns become
+    /// `i64` exit statuses.
+    exit_status: Option<Ty>,
 }
 
 /// The most scalar copies an array copy or fill is unrolled into; longer
@@ -307,12 +360,21 @@ impl FnLower<'_> {
         self.stmts(&f.body);
         if !self.terminated {
             if f.ret == Ty::Unit {
-                self.b.ret(None);
+                self.ret(None);
             } else {
                 // The checker proved every path returns, so this block is dead.
                 self.b.unreachable();
             }
         }
+    }
+
+    /// Return `v`; the entry returns it as an exit status.
+    fn ret(&mut self, v: Option<ValueId>) {
+        let v = match self.exit_status {
+            Some(ty) => Some(exit_status(&mut self.b, self.t, ty, v)),
+            None => v,
+        };
+        self.b.ret(v);
     }
 
     fn store(&mut self, local: usize, val: Val) {
@@ -381,7 +443,7 @@ impl FnLower<'_> {
             }
             TStmt::Return(value) => {
                 let v = value.as_ref().map(|e| self.expr(e).one());
-                self.b.ret(v);
+                self.ret(v);
                 self.terminated = true;
             }
             TStmt::If(cond, then, otherwise) => {
@@ -510,7 +572,7 @@ impl FnLower<'_> {
             TExprKind::Local(local) => return self.load(*local),
             TExprKind::Call(f, args) => {
                 let args: Vec<ValueId> = args.iter().flat_map(|a| self.expr(a).parts()).collect();
-                let callee = self.b.func_ref(self.ids[*f]);
+                let callee = self.b.func_ref(self.ids[*f].expect("a reached function"));
                 let ret_ty = self.t.of(e.ty);
                 return match self.b.call(callee, &args, ret_ty) {
                     Some(v) => Val::One(v),
