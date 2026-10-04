@@ -130,6 +130,7 @@ puncts! {
     XorAssign = "^=",
     Arrow = "->",
     FatArrow = "=>",
+    DotDotEq = "..=",
     DotDot = "..",
     EqEq = "==",
     NotEq = "!=",

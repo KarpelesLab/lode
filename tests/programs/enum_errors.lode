@@ -13,7 +13,7 @@
 // error: this arm is never used: it comes after `_`
 // error: `circle` has 2 payload field(s), but the pattern binds 1
 // error: `dot` has no payload, so it's matched without parentheses
-// error: `match` needs an enum or an optional, found `u32`
+// error: `match` needs an enum, an optional, an integer or a `bool`, found `str`
 // error: `Shape` has no variant `square`
 // error: `Shape.circle` has 2 payload field(s), but 1 value(s) were given
 // error: expected `u32`, found `bool`
@@ -95,7 +95,7 @@ fn matches(s: Shape, n: u32) {
 		_ => {
 		}
 	}
-	match n {
+	match "text" {
 		_ => {
 		}
 	}

@@ -2316,10 +2316,13 @@ impl<'a> Checker<'a> {
             _ => Vec::new(),
         };
         let ty = checked.ty();
+        if let Ty::Int(_) | Ty::Bool = ty {
+            return self.value_match(cx, checked, arms, span);
+        }
         let Some(def) = ty.sum() else {
             self.error(
                 value.span,
-                format!("`match` needs an enum or an optional, found `{ty}`"),
+                format!("`match` needs an enum, an optional, an integer or a `bool`, found `{ty}`"),
             );
             return None;
         };
@@ -2346,72 +2349,103 @@ impl<'a> Checker<'a> {
             // The variants the arm handles, and its payload bindings.
             let mut variants = Vec::new();
             let mut bindings: Vec<(&ast::Ident, u32, Ty)> = Vec::new();
-            match &arm.pattern {
-                ast::Pattern::Wildcard(wspan) => {
-                    variants = (0..covered.len() as u32)
-                        .filter(|&v| !covered[v as usize])
-                        .collect();
-                    self.lint_wildcard(cx, ty, &def, &variants, *wspan);
-                    covered.fill(true);
-                    wildcard = wildcard.or(Some(*wspan));
-                }
-                ast::Pattern::Variant {
-                    name,
-                    bindings: names,
-                    ..
-                } => match def.variant(&name.name) {
-                    None => {
-                        self.error(name.span, format!("`{ty}` has no variant `{}`", name.name));
+            let alternatives = arm.pattern.alternatives();
+            for pattern in alternatives {
+                match pattern {
+                    ast::Pattern::Value(_) | ast::Pattern::Range(..) | ast::Pattern::Or(..) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                pattern.span(),
+                                format!("a pattern of `{ty}` is the name of one of its variants"),
+                            )
+                            .with_help("write the variant's name alone, as in `circle(c, r) =>`"),
+                        );
                         ok = false;
                     }
-                    Some((v, variant)) => {
-                        if covered[v] && wildcard.is_none() {
-                            self.error(
-                                name.span,
-                                format!("`{}` is already matched by an earlier arm", name.name),
-                            );
+                    ast::Pattern::Wildcard(wspan) => {
+                        let rest: Vec<u32> = (0..covered.len() as u32)
+                            .filter(|&v| !covered[v as usize])
+                            .collect();
+                        self.lint_wildcard(cx, ty, &def, &rest, *wspan);
+                        variants.extend(rest);
+                        covered.fill(true);
+                        wildcard = wildcard.or(Some(*wspan));
+                    }
+                    ast::Pattern::Variant {
+                        name,
+                        bindings: names,
+                        ..
+                    } => match def.variant(&name.name) {
+                        None => {
+                            self.error(name.span, format!("`{ty}` has no variant `{}`", name.name));
                             ok = false;
                         }
-                        covered[v] = true;
-                        variants.push(v as u32);
-                        match names {
-                            Some(names) if names.len() != variant.fields.len() => {
-                                let msg = if variant.fields.is_empty() {
-                                    format!(
-                                        "`{}` has no payload, so it's matched without parentheses",
-                                        name.name
-                                    )
-                                } else {
-                                    format!(
-                                        "`{}` has {} payload field(s), but the pattern binds {}",
-                                        name.name,
-                                        variant.fields.len(),
-                                        names.len()
-                                    )
-                                };
-                                self.error(arm.pattern.span(), msg);
+                        Some((v, variant)) => {
+                            if covered[v] && wildcard.is_none() {
+                                self.error(
+                                    name.span,
+                                    format!("`{}` is already matched by an earlier arm", name.name),
+                                );
                                 ok = false;
                             }
-                            Some(names) => {
-                                for (k, (b, f)) in names.iter().zip(&variant.fields).enumerate() {
-                                    if b.name == "_" {
-                                        continue;
-                                    }
-                                    if bindings.iter().any(|(o, ..)| o.name == b.name) {
-                                        self.error(
-                                            b.span,
-                                            format!("`{}` is bound twice in this pattern", b.name),
-                                        );
-                                        ok = false;
-                                        continue;
-                                    }
-                                    bindings.push((b, k as u32, f.ty));
+                            covered[v] = true;
+                            variants.push(v as u32);
+                            match names {
+                                Some(_) if alternatives.len() > 1 => {
+                                    self.diags.push(
+                                    Diagnostic::error(
+                                        pattern.span(),
+                                        "variants listed with `|` can't bind payload fields",
+                                    )
+                                    .with_help(format!(
+                                        "match `{}` by its name alone, or in an arm of its own",
+                                        name.name
+                                    )),
+                                );
+                                    ok = false;
                                 }
+                                Some(names) if names.len() != variant.fields.len() => {
+                                    let msg = if variant.fields.is_empty() {
+                                        format!(
+                                            "`{}` has no payload, so it's matched without parentheses",
+                                            name.name
+                                        )
+                                    } else {
+                                        format!(
+                                            "`{}` has {} payload field(s), but the pattern binds {}",
+                                            name.name,
+                                            variant.fields.len(),
+                                            names.len()
+                                        )
+                                    };
+                                    self.error(arm.pattern.span(), msg);
+                                    ok = false;
+                                }
+                                Some(names) => {
+                                    for (k, (b, f)) in names.iter().zip(&variant.fields).enumerate()
+                                    {
+                                        if b.name == "_" {
+                                            continue;
+                                        }
+                                        if bindings.iter().any(|(o, ..)| o.name == b.name) {
+                                            self.error(
+                                                b.span,
+                                                format!(
+                                                    "`{}` is bound twice in this pattern",
+                                                    b.name
+                                                ),
+                                            );
+                                            ok = false;
+                                            continue;
+                                        }
+                                        bindings.push((b, k as u32, f.ty));
+                                    }
+                                }
+                                None => {}
                             }
-                            None => {}
                         }
-                    }
-                },
+                    },
+                }
             }
             // The `err` arm of a call's result (variant 1).
             if variants.contains(&1) {
@@ -2474,6 +2508,219 @@ impl<'a> Checker<'a> {
             arms: tarms,
         });
         Some(one_stmt(before))
+    }
+
+    /// `match value { ... }` on an integer or a `bool` (`checked`), as a
+    /// chain of `if`s on the matched value: an arm runs when the value is
+    /// one of its pattern's values and no earlier arm matched it. Patterns
+    /// are values known when compiling and ranges of them, `|` lists
+    /// several, and `_` matches the rest. Every value must be matched.
+    ///
+    /// When the value is a term (plus a constant), each arm knows it's
+    /// within its pattern's values (from the smallest to the largest), and
+    /// that no earlier arm matched: a value or range at an end of what's
+    /// left narrows it, a single value inside gives a hole.
+    fn value_match(
+        &mut self,
+        cx: &mut FnCx,
+        checked: expr::Checked,
+        arms: &[ast::Arm],
+        span: Span,
+    ) -> Option<TStmt> {
+        let ty = checked.ty();
+        // The values the matched value can have.
+        let all = match ty {
+            Ty::Bool => Range { lo: 0, hi: 1 },
+            _ => checked.int_range(),
+        };
+        let term = checked.term;
+        let full = type_range(ty).unwrap_or(all);
+        let mut before = Vec::new();
+        let matched = matched_local(cx, checked, &mut before);
+        // The facts when no arm so far matched.
+        let mut rest = cx.env.clone();
+        let mut covered: Vec<Range> = Vec::new();
+        let mut wildcard: Option<Span> = None;
+        let mut ok = true;
+        let mut envs = Vec::new();
+        let mut tarms: Vec<(Option<TExpr>, Vec<TStmt>)> = Vec::new();
+        for arm in arms {
+            if wildcard.is_some() {
+                self.diags.push(
+                    Diagnostic::error(
+                        arm.pattern.span(),
+                        "this arm is never used: it comes after `_`",
+                    )
+                    .with_help("`_` matches every value not matched before it"),
+                );
+                ok = false;
+            }
+            let mut ranges: Vec<Range> = Vec::new();
+            let mut wild = None;
+            for pattern in arm.pattern.alternatives() {
+                if let ast::Pattern::Wildcard(w) = pattern {
+                    wild = Some(*w);
+                    continue;
+                }
+                let Some(r) = self.pattern_range(cx, pattern, ty) else {
+                    ok = false;
+                    continue;
+                };
+                let earlier: Vec<Range> = covered.iter().chain(&ranges).copied().collect();
+                if wildcard.is_none() && uncovered(&earlier, r).is_none() {
+                    self.error(
+                        pattern.span(),
+                        "this pattern is never used: its values are matched before it",
+                    );
+                    ok = false;
+                }
+                ranges.push(r);
+            }
+            if let Some(w) = wild {
+                if wildcard.is_none() && uncovered(&covered, all).is_none() {
+                    self.diags.push(Diagnostic::warning(
+                        w,
+                        format!("this `_` matches nothing: every value of `{ty}` is matched above"),
+                    ));
+                }
+                wildcard = wildcard.or(Some(w));
+            }
+            cx.env = rest.clone();
+            if wild.is_none()
+                && let (Some(t), Some(first)) = (term, ranges.first())
+            {
+                // Within the pattern's values.
+                let hull = ranges.iter().fold(*first, |h, r| h.hull(*r));
+                cx.env.apply(&[facts::Fact::Narrow {
+                    term: t.term,
+                    bound: Range {
+                        lo: hull.lo.saturating_sub(t.offset),
+                        hi: hull.hi.saturating_sub(t.offset),
+                    },
+                    full,
+                }]);
+            }
+            cx.scopes.push(HashMap::new());
+            let body = self.block(cx, &arm.body.stmts);
+            cx.scopes.pop();
+            envs.push((std::mem::take(&mut cx.env), diverges(&body)));
+            let cond = match wild {
+                Some(_) => None,
+                None => Some(value_cond(&matched, &ranges, all)),
+            };
+            tarms.push((cond, body));
+            // What the arms after it know: it didn't match.
+            if wild.is_some() {
+                rest = Env::unreachable();
+            } else if let Some(t) = term {
+                for r in &ranges {
+                    exclude(&mut rest, t, *r, all, full);
+                }
+            }
+            covered.extend(ranges);
+        }
+        let exhaustive = wildcard.is_some() || uncovered(&covered, all).is_none();
+        if let (false, Some(v)) = (wildcard.is_some(), uncovered(&covered, all)) {
+            let msg = match ty {
+                Ty::Bool => format!("this `match` doesn't handle `{}`", v == 1),
+                _ => format!("this `match` doesn't handle every `{ty}`: {v} isn't matched"),
+            };
+            self.diags.push(
+                Diagnostic::error(span, msg)
+                    .with_help("add an arm for the rest, or `_ => ...` for every value left"),
+            );
+            ok = false;
+        }
+        cx.env = Self::join_branches(envs);
+        if !ok {
+            // As for a `match` on an enum: kept to end control flow.
+            if !tarms.is_empty() && tarms.iter().all(|(_, b)| diverges(b)) {
+                return Some(TStmt::Return(None));
+            }
+            return None;
+        }
+        // An `if` per arm; the last one of a `match` that handles every
+        // value needs no test.
+        let mut chain: Option<Vec<TStmt>> = None;
+        for (cond, body) in tarms.into_iter().rev() {
+            chain = Some(match (cond, chain) {
+                (Some(c), Some(rest)) => vec![TStmt::If(c, body, rest)],
+                (Some(c), None) if !exhaustive => vec![TStmt::If(c, body, Vec::new())],
+                (_, _) => body,
+            });
+        }
+        before.push(TStmt::Block(chain.unwrap_or_default()));
+        Some(one_stmt(before))
+    }
+
+    /// The values of a pattern of a `match` on a value of type `ty` (an
+    /// integer or `bool`): a value known when compiling, or a range of them.
+    fn pattern_range(&mut self, cx: &mut FnCx, pattern: &ast::Pattern, ty: Ty) -> Option<Range> {
+        match pattern {
+            ast::Pattern::Value(e) => self.pattern_value(cx, e, ty).map(Range::exact),
+            // A name alone is a constant.
+            ast::Pattern::Variant {
+                name,
+                bindings: None,
+                ..
+            } => {
+                let e = ast::Expr {
+                    kind: ExprKind::Name(name.name.clone()),
+                    span: name.span,
+                };
+                self.pattern_value(cx, &e, ty).map(Range::exact)
+            }
+            ast::Pattern::Range(..) if ty == Ty::Bool => {
+                self.error(
+                    pattern.span(),
+                    "a `bool` is matched by `true` and `false`, not ranges",
+                );
+                None
+            }
+            ast::Pattern::Range(lo, hi, span) => {
+                let (lo, hi) = (
+                    self.pattern_value(cx, lo, ty),
+                    self.pattern_value(cx, hi, ty),
+                );
+                let (lo, hi) = (lo?, hi?);
+                if lo > hi {
+                    self.error(
+                        *span,
+                        format!("this range is empty: {lo} is more than {hi}"),
+                    );
+                    return None;
+                }
+                Some(Range { lo, hi })
+            }
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        pattern.span(),
+                        format!("a pattern of `{ty}` is a value, a range `lo..=hi` or `_`"),
+                    )
+                    .with_help("variants with payloads are for enums and optionals"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The value of the pattern `e` against a `ty`: a literal or a constant
+    /// (`bool`s as 0 and 1).
+    fn pattern_value(&mut self, cx: &mut FnCx, e: &ast::Expr, ty: Ty) -> Option<i128> {
+        let c = self.expr(cx, e, Some(ty))?;
+        let c = self.coerce(c, ty, e.span)?;
+        match (&c.expr.kind, c.range) {
+            (TExprKind::Bool(b), _) => Some(i128::from(*b)),
+            (_, Some(r)) if r.lo == r.hi && ty != Ty::Bool => Some(r.lo),
+            _ => {
+                self.error(
+                    e.span,
+                    "a pattern must be a value known when compiling: a literal or a constant",
+                );
+                None
+            }
+        }
     }
 
     /// Warn about a `_` arm that hides variants added later (on an enum of
@@ -3314,6 +3561,113 @@ pub fn table_leaf(ty: Ty) -> Option<Ty> {
         elem = inner;
     }
     matches!(elem, Ty::Int(_) | Ty::Bool).then_some(elem)
+}
+
+/// The smallest value of `all` that none of `ranges` holds, if any.
+fn uncovered(ranges: &[Range], all: Range) -> Option<i128> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_by_key(|r| r.lo);
+    let mut next = all.lo;
+    for r in sorted {
+        if r.lo > next {
+            break;
+        }
+        if r.hi >= next {
+            if r.hi >= all.hi {
+                return None;
+            }
+            next = r.hi + 1;
+        }
+    }
+    (next <= all.hi).then_some(next)
+}
+
+/// Learn in `env` that the value `t` (a term plus a constant, in `all`, of
+/// a type whose range is `full`) isn't in `r`: at an end of what's left,
+/// its range narrows; a single value inside it is a hole.
+fn exclude(env: &mut Env, t: Linear, r: Range, all: Range, full: Range) {
+    let cur = env
+        .range(t.term)
+        .map(|c| Range {
+            lo: c.lo.saturating_add(t.offset),
+            hi: c.hi.saturating_add(t.offset),
+        })
+        .and_then(|c| c.intersect(all))
+        .unwrap_or(all);
+    let fact = if r.lo <= cur.lo && r.hi >= cur.hi {
+        *env = Env::unreachable();
+        return;
+    } else if r.lo <= cur.lo {
+        facts::Fact::Narrow {
+            term: t.term,
+            bound: Range {
+                lo: (r.hi + 1).saturating_sub(t.offset),
+                hi: i128::MAX,
+            },
+            full,
+        }
+    } else if r.hi >= cur.hi {
+        facts::Fact::Narrow {
+            term: t.term,
+            bound: Range {
+                lo: i128::MIN,
+                hi: (r.lo - 1).saturating_sub(t.offset),
+            },
+            full,
+        }
+    } else if r.lo == r.hi {
+        facts::Fact::Hole {
+            term: t.term,
+            value: r.lo.saturating_sub(t.offset),
+        }
+    } else {
+        return;
+    };
+    env.apply(&[fact]);
+}
+
+/// The condition that `matched` (an integer or `bool` with values in
+/// `all`) is in one of `ranges`.
+fn value_cond(matched: &TExpr, ranges: &[Range], all: Range) -> TExpr {
+    let boolean = |kind: TExprKind| TExpr { kind, ty: Ty::Bool };
+    let cmp = |op: CmpOp, v: i128| {
+        boolean(TExprKind::Binary(
+            TBinOp::Cmp(op),
+            Box::new(matched.clone()),
+            Box::new(TExpr {
+                kind: TExprKind::Int(v),
+                ty: matched.ty,
+            }),
+        ))
+    };
+    let one = |r: &Range| {
+        if matched.ty == Ty::Bool {
+            return if r.lo == 1 {
+                matched.clone()
+            } else {
+                boolean(TExprKind::Unary(TUnOp::Not, Box::new(matched.clone())))
+            };
+        }
+        if r.lo == r.hi {
+            return cmp(CmpOp::Eq, r.lo);
+        }
+        match (r.lo > all.lo, r.hi < all.hi) {
+            (true, true) => boolean(TExprKind::And(
+                Box::new(cmp(CmpOp::Ge, r.lo)),
+                Box::new(cmp(CmpOp::Le, r.hi)),
+            )),
+            (true, false) => cmp(CmpOp::Ge, r.lo),
+            (false, true) => cmp(CmpOp::Le, r.hi),
+            (false, false) => boolean(TExprKind::Bool(true)),
+        }
+    };
+    let mut conds = ranges.iter().map(one);
+    let first = conds
+        .next()
+        .unwrap_or_else(|| boolean(TExprKind::Bool(false)));
+    conds.fold(first, |acc, c| {
+        boolean(TExprKind::Or(Box::new(acc), Box::new(c)))
+    })
 }
 
 /// The most scalars an array constant holds (16 MiB of `u8`).

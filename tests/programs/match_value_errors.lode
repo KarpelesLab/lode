@@ -1,0 +1,54 @@
+// error: this `match` doesn't handle every `u8`: 10 isn't matched
+// error: this `match` doesn't handle `false`
+// error: this pattern is never used: its values are matched before it
+// error: this range is empty: 5 is more than 1
+// error: a pattern must be a value known when compiling
+// error: a `bool` is matched by `true` and `false`, not ranges
+// error: a pattern of `Op` is the name of one of its variants
+// error: variants listed with `|` can't bind payload fields
+// error: cannot prove that this subtraction does not overflow `u8`
+// warning: this `_` matches nothing: every value of `bool` is matched above
+package main
+
+enum Op {
+	add(n: u8)
+	neg
+}
+
+fn f(k: u8, b: bool, n: u8, op: Op) -> u8 {
+	match k {
+		0..=9 => return 1
+		11..=255 => return 2
+	}
+	match b {
+		true => return 1
+	}
+	match k {
+		1 | 2 => return 1
+		2 => return 2
+		_ => return 3
+	}
+	match k {
+		5..=1 => return 1
+		n => return 2
+		_ => return 3
+	}
+	match b {
+		false..=true => return 1
+		true | false => return 2
+		_ => return 3
+	}
+	match op {
+		1 => return 1
+		add(x) | neg => return 2
+	}
+	match k {
+		0 => return 0
+		// `k` is 1..=255 here, but nothing more: `k - 2` isn't proven.
+		_ => return k - 1 + (k - 2)
+	}
+}
+
+fn main() -> u8 {
+	return f(1, true, 2, Op.neg)
+}

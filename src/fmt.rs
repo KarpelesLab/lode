@@ -31,9 +31,9 @@
 //!   A block is one level deeper than the line starting its header, even
 //!   when the header spans several lines; its `}` aligns with that line.
 //! - One space between tokens, except: none inside `()`/`[]`, before `,`, `:`,
-//!   `;`, `.` and after `.`; none around `..`; none after a unary operator;
-//!   none before a call's `(` or an index's `[`; none inside a type prefix
-//!   like `[4]u8` or `[]*u8`.
+//!   `;`, `.` and after `.`; none around `..` and `..=`; none after a unary
+//!   operator; none before a call's `(` or an index's `[`; none inside a type
+//!   prefix like `[4]u8` or `[]*u8`.
 //! - `;` between statements becomes a line break. A block written on one line
 //!   (`if a { return 1 }`) is split so each statement has its own line.
 //!   A `{` glued to a name (`Point{x: 1}`) is a literal, not a block, and
@@ -482,7 +482,9 @@ fn render(items: &[Item<'_>]) -> Result<String, String> {
                         || (t.tok == Tok::P(P::LBrace) && t.literal)
                         || matches!(
                             t.tok,
-                            Tok::P(P::LParen | P::LBracket | P::Dot | P::DotDot | P::At)
+                            Tok::P(
+                                P::LParen | P::LBracket | P::Dot | P::DotDot | P::DotDotEq | P::At
+                            )
                         ),
                     prefix_close,
                     ends_stmt: t.ends_stmt,
@@ -546,7 +548,16 @@ fn space_before(prev: &Prev, cur: &TokInfo<'_>, cur_unary: bool) -> bool {
         return false;
     }
     match &cur.tok {
-        Tok::P(P::Comma | P::Semi | P::RParen | P::RBracket | P::RBrace | P::DotDot | P::Colon) => {
+        Tok::P(
+            P::Comma
+            | P::Semi
+            | P::RParen
+            | P::RBracket
+            | P::RBrace
+            | P::DotDot
+            | P::DotDotEq
+            | P::Colon,
+        ) => {
             return false;
         }
         Tok::P(P::Dot) if !cur_unary => return false,
@@ -745,6 +756,10 @@ mod tests {
         assert_eq!(
             fmt("fn f() {\n\tx  +=  u8( a )-1\n\tp = p+done\n}\n"),
             "fn f() {\n\tx += u8(a) - 1\n\tp = p + done\n}\n"
+        );
+        assert_eq!(
+            fmt("fn f() {\n\tmatch k {\n\t\t1 ..= 9|-1=>g()\n\t\tadd|sub => g()\n\t}\n}\n"),
+            "fn f() {\n\tmatch k {\n\t\t1..=9 | -1 => g()\n\t\tadd | sub => g()\n\t}\n}\n"
         );
         assert_eq!(
             fmt("fn f() {\n\tx+%=1\n\ty|=2\n\tz<<%=3\n\ta.b[i]*|=c\n\tk^=-1\n}\n"),

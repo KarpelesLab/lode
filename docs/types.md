@@ -255,9 +255,11 @@ match tok {
   variant without payload uses only the tag. The layout is not a promise.
 - Methods work on enums, C-style ones too, as on structs
   ([Methods](#methods)).
-- Not yet: generic enums, `match` as an expression, `match` on integers,
-  and patterns that nest (`some(circle(c, r))`) or list several variants
-  (`a | b`).
+- `add | sub => ...` handles several variants in one arm; such an arm
+  binds no payload fields.
+- `match` also works on integers and `bool` ([syntax.md](syntax.md#enums-and-match)).
+- Not yet: generic enums, `match` as an expression, and patterns that nest
+  (`some(circle(c, r))`).
 
 ### Optional
 

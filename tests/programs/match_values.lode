@@ -1,0 +1,102 @@
+// stdout: zero small 3 big254 max\n
+// stdout: yes no\n
+// stdout: 2 1 0 1 9\n
+package main
+
+import "std/io"
+
+const BIG: u8 = 200
+
+enum Op {
+	add
+	sub
+	mul
+	neg
+}
+
+// A `match` on an integer: values, constants, ranges and `|`. In each arm,
+// the checker knows the value is within the arm's pattern, and not in an
+// earlier arm's.
+fn describe(k: u8) {
+	match k {
+		0 => io.print("zero")
+		1 | 2 => io.print("small")
+		3..=9 => io.print_u64(k - 3 + 3)
+		BIG..=254 => {
+			io.print("big")
+			// `k + 1` is proven: `k` is at most 254 here.
+			io.print_u64(k + 1 - 1)
+		}
+		_ => {
+			// Not 0..=9, 200..=254: 255 or 10..=199. `k - 10` is proven.
+			let d = k - 10
+			if d == 245 {
+				io.print("max")
+			} else {
+				io.print("mid")
+			}
+		}
+	}
+}
+
+fn yes_no(b: bool) {
+	match b {
+		true => io.print("yes")
+		false => io.print("no")
+	}
+}
+
+// A `match` that covers every value needs no `_`.
+fn sign(x: i8) -> u8 {
+	match x {
+		-128..=-1 => return 0
+		0 => return 1
+		1..=127 => return 2
+	}
+}
+
+fn arity(op: Op) -> u8 {
+	match op {
+		add | sub | mul => return 2
+		neg => return 1
+	}
+}
+
+// The value matched can be an expression.
+fn letter(c: u32) {
+	if c < 'a' {
+		return
+	}
+	match c - 'a' + 1 {
+		1..=8 => io.print("early")
+		9..=26 => io.print_u64(c - 'h') // proven: c is 105..=122
+		_ => io.print("?")
+	}
+}
+
+fn main() {
+	describe(0)
+	io.print(" ")
+	describe(2)
+	io.print(" ")
+	describe(3)
+	io.print(" ")
+	describe(254)
+	io.print(" ")
+	describe(255)
+	io.print("\n")
+	yes_no(true)
+	io.print(" ")
+	yes_no(false)
+	io.print("\n")
+	io.print_u64(sign(5))
+	io.print(" ")
+	io.print_u64(sign(0))
+	io.print(" ")
+	io.print_u64(sign(-128))
+	io.print(" ")
+	io.print_u64(arity(Op.neg))
+	io.print(" ")
+	letter('q')
+	io.print("\n")
+}

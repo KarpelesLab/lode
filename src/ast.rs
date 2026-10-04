@@ -254,12 +254,33 @@ pub enum Pattern {
         bindings: Option<Vec<Ident>>,
         span: Span,
     },
+    /// A value known when compiling, matched against an integer or a
+    /// `bool`: `3`, `-1`, `'a'`, `true`, `pkg.MAX`. A bare name (`MAX`) is
+    /// parsed as a [`Pattern::Variant`]; against an integer, it names a
+    /// constant.
+    Value(Expr),
+    /// `lo..=hi`: the integers from `lo` to `hi`, both included.
+    Range(Expr, Expr, Span),
+    /// `a | b | c`: any of the alternatives.
+    Or(Vec<Pattern>, Span),
 }
 
 impl Pattern {
     pub fn span(&self) -> Span {
         match self {
-            Pattern::Wildcard(span) | Pattern::Variant { span, .. } => *span,
+            Pattern::Wildcard(span)
+            | Pattern::Variant { span, .. }
+            | Pattern::Range(_, _, span)
+            | Pattern::Or(_, span) => *span,
+            Pattern::Value(e) => e.span,
+        }
+    }
+
+    /// The alternatives of the pattern: itself, or those of an `Or`.
+    pub fn alternatives(&self) -> &[Pattern] {
+        match self {
+            Pattern::Or(alts, _) => alts,
+            _ => std::slice::from_ref(self),
         }
     }
 }

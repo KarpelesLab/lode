@@ -845,16 +845,40 @@ impl Parser {
         })
     }
 
+    /// A pattern, or alternatives `a | b | c`.
     fn pattern(&mut self) -> PResult<Pattern> {
+        let first = self.single_pattern()?;
+        if !self.at_p(P::Pipe) {
+            return Ok(first);
+        }
+        let mut alts = vec![first];
+        while self.eat_p(P::Pipe) {
+            alts.push(self.single_pattern()?);
+        }
+        let span = alts[0].span().to(self.prev_span());
+        Ok(Pattern::Or(alts, span))
+    }
+
+    /// `_`, a variant `name` or `name(a, _, c)`, a value (`3`, `-1`, `'a'`,
+    /// `true`, `pkg.MAX`), or a range of them `lo..=hi`.
+    fn single_pattern(&mut self) -> PResult<Pattern> {
         let name = match self.peek().clone() {
             Tok::Ident(n) if n == "_" => return Ok(Pattern::Wildcard(self.bump().span)),
-            Tok::Ident(_) => self.ident("a variant name")?,
+            Tok::Ident(_) if *self.peek_at(1) != Tok::P(P::Dot) => self.ident("a variant name")?,
             // The variants of an optional are `none` and `some`.
             Tok::Kw(Kw::None) => Ident {
                 name: "none".to_owned(),
                 span: self.bump().span,
             },
-            _ => return self.expected("a variant name or `_`"),
+            Tok::Int(_)
+            | Tok::Char(_)
+            | Tok::Ident(_)
+            | Tok::Kw(Kw::True | Kw::False)
+            | Tok::P(P::Minus | P::LParen) => {
+                let value = self.unary()?;
+                return self.range_pattern(Pattern::Value(value));
+            }
+            _ => return self.expected("a pattern: a variant name, a value or `_`"),
         };
         let bindings = if self.eat_p(P::LParen) {
             let mut names = Vec::new();
@@ -875,11 +899,42 @@ impl Parser {
         } else {
             None
         };
-        Ok(Pattern::Variant {
+        let pattern = Pattern::Variant {
             span: name.span.to(self.prev_span()),
             name,
             bindings,
-        })
+        };
+        self.range_pattern(pattern)
+    }
+
+    /// `lo..=hi` if a range follows the pattern `lo` (a value, or a name
+    /// without bindings), or else `lo` itself.
+    fn range_pattern(&mut self, lo: Pattern) -> PResult<Pattern> {
+        if self.at_p(P::DotDot) {
+            return self.error(
+                self.span(),
+                "a range pattern includes its end: write `lo..=hi`",
+            );
+        }
+        if !self.at_p(P::DotDotEq) {
+            return Ok(lo);
+        }
+        let lo = match lo {
+            Pattern::Value(e) => e,
+            Pattern::Variant {
+                name,
+                bindings: None,
+                ..
+            } => Expr {
+                span: name.span,
+                kind: ExprKind::Name(name.name),
+            },
+            other => return self.error(other.span(), "a range needs a value on each side"),
+        };
+        self.bump(); // ..=
+        let hi = self.unary()?;
+        let span = lo.span.to(hi.span);
+        Ok(Pattern::Range(lo, hi, span))
     }
 
     fn if_stmt(&mut self) -> PResult<IfStmt> {
@@ -1588,6 +1643,37 @@ mod tests {
         assert!(errs[0].contains("only a method has `self`"));
         assert!(errs[1].contains("without a type"));
         assert!(errs[2].contains("must be the first parameter"));
+    }
+
+    #[test]
+    fn value_patterns() {
+        let file = parse_ok(
+            "fn f(k: u8) {\n\tmatch k {\n\t\t0 => g()\n\t\t-1 | 'a' | MAX => g()\n\
+             \t\t1..=9 | LO..=pkg.HI => g()\n\t\tadd | sub => g()\n\t\t_ => g()\n\t}\n}\n",
+        );
+        let Item::Fn(f) = &file.items[0] else {
+            panic!()
+        };
+        let Stmt::Match { arms, .. } = &f.body.stmts[0] else {
+            panic!()
+        };
+        assert!(matches!(arms[0].pattern, Pattern::Value(_)));
+        let Pattern::Or(alts, _) = &arms[1].pattern else {
+            panic!("{:?}", arms[1].pattern)
+        };
+        assert!(matches!(alts[0], Pattern::Value(_)));
+        assert!(matches!(alts[2], Pattern::Variant { .. }));
+        assert!(
+            arms[2]
+                .pattern
+                .alternatives()
+                .iter()
+                .all(|p| matches!(p, Pattern::Range(..)))
+        );
+        assert_eq!(arms[3].pattern.alternatives().len(), 2);
+        let errs = parse_errors("fn f(k: u8) {\n\tmatch k {\n\t\t0..9 => g()\n\t}\n}\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("includes its end"));
     }
 
     #[test]

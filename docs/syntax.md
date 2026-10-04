@@ -47,7 +47,7 @@ The canonical form:
   left open, that extra tab is given once, not once per line (as in gofmt).
 - Inside a line, tokens are separated by one space, except:
   - none after `(`, `[` and `.`, and none before `)`, `]`, `,`, `:` and `.`
-  - none around `..`: `0..n`
+  - none around `..` and `..=`: `0..n`, `1..=9`
   - none after a unary operator: `-x`, `!ok`, `*u8`
   - none before a call's `(` or an index's `[`: `f(x)`, `a[i]`
   - none inside a type prefix: `[4]u8`, `[]*u8`
@@ -279,6 +279,24 @@ fn main() -> u32 {
   position; `_` skips one. A variant with a payload can be matched by its
   name alone, ignoring the payload. `_` matches every variant no earlier
   arm matched.
+- `a | b` lists several patterns in one arm: `add | sub => ...`. Variants
+  listed this way can't bind payload fields.
+- `match` works on integers and `bool` too. A pattern is then a value
+  known when compiling (a literal, `'a'`, `-1`, a constant, `true`), or an
+  inclusive range `lo..=hi` of them (Decided: only inclusive, so the last
+  value is written; `lo..hi` is an error). Arms are tried in order. Every
+  value must be handled: by `_`, or by patterns that cover the type's (or
+  the value's known) range, like `true` and `false`, or `0..=127` and
+  `128..=255` for a `u8`. A pattern whose values are all matched before is
+  an error.
+
+  ```
+  match k {
+  	0 => io.print("none")
+  	1..=9 | 100 => io.print("few")
+  	_ => io.print("many") // the checker knows `k != 0` here
+  }
+  ```
 - `match` is a statement. Using it as an expression (each arm's value) is
   still Open.
 

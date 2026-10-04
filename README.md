@@ -50,7 +50,7 @@ What works:
   with value semantics: `let q = p` copies, and structs and arrays are passed
   and returned by value; `==` compares structs and arrays field by field
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
-  (`enum Color: u8 { red = 1 ... }`), exhaustive `match`, and optionals
+  (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
   `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and
   `.circle(p, 2)` where the enum is known
 - errors as return values: `fn parse(s: []u8) throws(ParseError) -> u32`,
