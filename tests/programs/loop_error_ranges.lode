@@ -1,0 +1,16 @@
+// error: cannot prove that this addition does not overflow `u32`
+// help: the operands can be 0..=4294967295 and 0..=4294967295
+package main
+
+// The failed assignment still changes `a`: the error is reported from a head
+// that knows nothing about it, not from the first candidate (`a` is 1).
+fn adler(xs: []u8, y: u32) -> u32 {
+	var a: u32 = 1
+	for x in xs {
+		a = (a + y) % 65521
+	}
+	return a
+}
+
+fn main() {
+}

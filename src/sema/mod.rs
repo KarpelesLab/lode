@@ -1501,7 +1501,18 @@ impl<'a> Checker<'a> {
                 span,
             } => {
                 if let ExprKind::Index(..) | ExprKind::Field(..) = target.kind {
-                    return self.place_assign(cx, target, *op, value, *span);
+                    let out = self.place_assign(cx, target, *op, value, *span);
+                    // An assignment that fails to check still changes the
+                    // variable: what was known about it no longer holds (in
+                    // a loop, its errors must not come from a head that
+                    // only holds because the assignment was skipped).
+                    if out.is_none()
+                        && let ExprKind::Name(name) = &place_root(target).kind
+                        && let Some(local) = cx.lookup(name)
+                    {
+                        cx.env.forget(local);
+                    }
+                    return out;
                 }
                 let ExprKind::Name(name) = &target.kind else {
                     self.error(
@@ -1527,7 +1538,7 @@ impl<'a> Checker<'a> {
                 self.check_defer_assign(cx, local, name, target.span)?;
                 let ty = cx.locals[local].ty;
                 let checked = match op {
-                    None => self.expr(cx, value, Some(ty))?,
+                    None => self.expr(cx, value, Some(ty)),
                     Some(op) => {
                         let combined = ast::Expr {
                             kind: ExprKind::Binary(
@@ -1537,10 +1548,15 @@ impl<'a> Checker<'a> {
                             ),
                             span: *span,
                         };
-                        self.expr(cx, &combined, Some(ty))?
+                        self.expr(cx, &combined, Some(ty))
                     }
                 };
-                let checked = self.coerce(checked, ty, value.span)?;
+                let checked = checked.and_then(|c| self.coerce(c, ty, value.span));
+                let Some(checked) = checked else {
+                    // As for a place above: the variable is still assigned.
+                    cx.env.forget(local);
+                    return None;
+                };
                 self.check_kept_view(cx, &checked, value.span)?;
                 Self::record_value(cx, local, &checked);
                 Some(TStmt::Assign(local, checked.expr))

@@ -12,6 +12,8 @@
 //! - `// warning: text`: checking gives a warning whose message contains
 //!   `text` (one line per expected warning; every warning must be listed,
 //!   with or without errors). A program without this line has no warnings.
+//! - `// help: text`: with `// error:`, some error or warning has a help line
+//!   containing `text` (one line per help; other helps may be given too).
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +31,15 @@ fn expected_warnings(text: &str) -> Vec<String> {
         .take_while(|l| l.starts_with("//"))
         .filter_map(|l| l.strip_prefix("// warning:"))
         .map(|w| w.trim().to_owned())
+        .collect()
+}
+
+/// The `// help:` lines of a program.
+fn expected_helps(text: &str) -> Vec<String> {
+    text.lines()
+        .take_while(|l| l.starts_with("//"))
+        .filter_map(|l| l.strip_prefix("// help:"))
+        .map(|h| h.trim().to_owned())
         .collect()
 }
 
@@ -120,6 +131,7 @@ fn programs_behave_as_declared() {
         let text = std::fs::read_to_string(&path).expect("read program");
         let expect = expectation(&text);
         let warnings = expected_warnings(&text);
+        let helps = expected_helps(&text);
         let mut files = SourceMap::new();
         let root = files.add(SourceFile::new(path.display().to_string(), text));
         match expect {
@@ -176,6 +188,15 @@ fn programs_behave_as_declared() {
                     };
                     failures.extend(compare(&name, "error", &expected, &of(true)));
                     failures.extend(compare(&name, "warning", &warnings, &of(false)));
+                    let found: Vec<&str> = diags
+                        .iter()
+                        .flat_map(|d| d.help.iter().map(String::as_str))
+                        .collect();
+                    for want in &helps {
+                        if !found.iter().any(|h| h.contains(want.as_str())) {
+                            failures.push(format!("{name}: missing help `{want}`; got {found:#?}"));
+                        }
+                    }
                 }
                 Err(lode::Error::Backend(msg)) => failures.push(format!("{name}: {msg}")),
             },
