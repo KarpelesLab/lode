@@ -44,7 +44,8 @@ What works:
 - integer types (`i8`..`i64`, `u8`..`u64`, `isize`, `usize`), `bool`, `str`
 - arrays (`[4]u8`, `[0; 16]`, `[[1, 2], [3, 4]]`) and slices (`[]u8`),
   read-only except as an `inout` parameter; an array is passed where a slice
-  is expected
+  is expected; array constants (`const DAYS: [12]u8 = [31, 28, ...]`) in
+  read-only data, whose elements' range the checker knows
 - structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
   with value semantics: `let q = p` copies, and structs and arrays are passed
   and returned by value; `==` compares structs and arrays field by field

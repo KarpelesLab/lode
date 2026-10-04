@@ -29,6 +29,8 @@ fn is_leap(y: i32) -> bool {
 	return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+const DAYS_IN: [12]u8 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
 fn days_in_month(y: i32, m: u8) -> u8 {
 	if m == 2 && is_leap(y) {
 		return 29
@@ -36,9 +38,7 @@ fn days_in_month(y: i32, m: u8) -> u8 {
 	if m == 0 || m > 12 {
 		return 0
 	}
-	// WORKAROUND: array constants are unsupported; a local table instead
-	let days_in: [12]u8 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-	return days_in[m - 1]
+	return DAYS_IN[m - 1]
 }
 
 fn valid(d: Date) -> bool {

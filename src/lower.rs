@@ -8,7 +8,8 @@
 //! A view (a `str` or a slice) is two IR values, its pointer and its length:
 //! it's passed as two parameters and stored in two slots. String literals
 //! become read-only data symbols ([`Lowered::strings`]) that the object
-//! writer emits.
+//! writer emits, and so do array constants ([`Lowered::tables`]): a use of
+//! one is a pointer to its data, read in place like an array in memory.
 //!
 //! Arrays and structs live in memory. Such an expression lowers to a
 //! pointer to its storage ([`Val::Mem`]): a local's slot, an element or a
@@ -107,6 +108,9 @@ pub struct Lowered {
     /// Read-only data the object must define: `(symbol, bytes)` for each
     /// string literal.
     pub strings: Vec<(String, Vec<u8>)>,
+    /// Read-only data the object must define for each array constant:
+    /// `(symbol, bytes, alignment)`.
+    pub tables: Vec<(String, Vec<u8>, u64)>,
     /// The program's warnings ([`Program::warnings`]).
     pub warnings: Vec<crate::diag::Diagnostic>,
 }
@@ -286,6 +290,32 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         }
     }
 
+    // Array constants are read-only data too, laid out like the IR type of
+    // the array (each scalar at its type's size, row after row).
+    let mut tables = Vec::new();
+    let mut table_globals = Vec::new();
+    for (i, table) in program.tables.iter().enumerate() {
+        let symbol = format!("lode.table.{i}");
+        let ty = ir_array(module.types_mut(), t, table.ty);
+        let layout = module.types().layout(ty);
+        let init = module.intern_const(Const::Poison(ty));
+        table_globals.push(module.add_global(Global {
+            name: syms.intern(&symbol),
+            ty,
+            init: Some(init),
+        }));
+        if reach.tables[i] {
+            let leaf = crate::sema::table_leaf(table.ty).expect("an array of scalars");
+            let size = module.types().layout(t.of(leaf)).size as usize;
+            let mut bytes = Vec::with_capacity(layout.size as usize);
+            for &v in &table.values {
+                bytes.extend_from_slice(&v.to_le_bytes()[..size]);
+            }
+            debug_assert_eq!(bytes.len() as u64, layout.size);
+            tables.push((symbol, bytes, layout.align));
+        }
+    }
+
     let internal = FuncAttrs::new(Linkage::Internal, Visibility::Default);
     let ids: Vec<Option<IrFunc>> = program
         .funcs
@@ -316,6 +346,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             ids: &ids,
             strings: &string_globals,
             string_lens: &program.strings,
+            tables: &table_globals,
             slots: Vec::new(),
             loops: Vec::new(),
             defers: Vec::new(),
@@ -350,7 +381,20 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         syms,
         entry,
         strings,
+        tables,
         warnings: program.warnings.clone(),
+    }
+}
+
+/// The IR type of an array of scalars (or of arrays of them), built at
+/// module level, before any function.
+fn ir_array(types: &mut latticefoundry::ir::TypeContext, t: Types, ty: Ty) -> TypeId {
+    match ty.as_array() {
+        Some((elem, n)) => {
+            let elem = ir_array(types, t, elem);
+            types.array(elem, n)
+        }
+        None => t.of(ty),
     }
 }
 
@@ -378,6 +422,8 @@ struct FnLower<'a> {
     ids: &'a [Option<IrFunc>],
     strings: &'a [GlobalId],
     string_lens: &'a [Vec<u8>],
+    /// The global of each array constant.
+    tables: &'a [GlobalId],
     slots: Vec<Slot>,
     /// `(continue target, break target, defer scopes outside it)` of each
     /// enclosing loop.
@@ -932,6 +978,9 @@ impl FnLower<'_> {
                     .const_i64(self.t.i64, self.string_lens[*id].len() as i64);
                 return Val::View(p, n);
             }
+            // An array constant is read in place, like any array in memory;
+            // nothing writes to it.
+            TExprKind::Table(id) => return Val::Mem(self.b.global_ref(self.tables[*id])),
             TExprKind::Local(local) => return self.load(*local),
             TExprKind::Call(..) if e.ty.in_memory() => {
                 let ir_ty = self.ir_ty(e.ty);

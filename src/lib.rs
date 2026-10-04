@@ -143,7 +143,7 @@ pub fn build(
     let compiled =
         x86_64::compile_module_with(&lowered.module, &lowered.syms, &CodegenOptions::default());
     let mut object = compiled.object;
-    emit_strings(&mut object, &lowered.strings);
+    emit_rodata(&mut object, &lowered.strings, &lowered.tables);
     let link_options = ImageOptions {
         entry: entry.clone(),
         ..ImageOptions::default()
@@ -167,15 +167,27 @@ pub fn build_executable(
     build(files, root, &BuildOptions { opt }).map(|e| e.image)
 }
 
-/// Define the string literals' symbols in a read-only data section (the code
-/// generator only emits code; the IR globals are references to these).
-fn emit_strings(object: &mut ObjectModule, strings: &[(String, Vec<u8>)]) {
-    if strings.is_empty() {
+/// Define the symbols of the string literals and of the array constants
+/// (`(symbol, bytes, alignment)`) in a read-only data section (the IR
+/// globals are references to these). The tables come first, each at its
+/// alignment, then the strings, which need none.
+fn emit_rodata(
+    object: &mut ObjectModule,
+    strings: &[(String, Vec<u8>)],
+    tables: &[(String, Vec<u8>, u64)],
+) {
+    if strings.is_empty() && tables.is_empty() {
         return;
     }
-    let section = object.add_section(Section::new(".rodata", SectionKind::Rodata, 1));
+    let align = tables.iter().map(|t| t.2).max().unwrap_or(1);
+    let section = object.add_section(Section::new(".rodata", SectionKind::Rodata, align));
     let mut bytes = Vec::new();
-    for (name, data) in strings {
+    let items = tables
+        .iter()
+        .map(|(name, data, align)| (name, data, *align))
+        .chain(strings.iter().map(|(name, data)| (name, data, 1)));
+    for (name, data, align) in items {
+        bytes.resize(bytes.len().next_multiple_of(align as usize), 0);
         let offset = bytes.len() as u64;
         bytes.extend_from_slice(data);
         object.add_symbol(Symbol::defined(

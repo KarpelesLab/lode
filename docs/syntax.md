@@ -165,6 +165,8 @@ fn main() -> u32 {
   (`let a: [3]u8 = [1, 2, 3]`), or else from its first element that has a
   type of its own (`[1, x, 2]` with `x: u32` is a `[3]u32`).
 - `[v; N]` repeats one value `N` times. `N` is a constant.
+- `const DAYS: [12]u8 = [31, 28, 31, ...]` is an array constant: a table in
+  read-only data, used like an array (`DAYS[m]`, `for d in DAYS`).
 - `a[i]` is an element. `a[i] = v` and `a[i][j] op= v` assign to an element
   of a `var` array.
 - `a.len` is the length: a `usize`, and for an array its constant `N`.

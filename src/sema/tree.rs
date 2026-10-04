@@ -18,11 +18,25 @@ pub struct Program {
     pub funcs: Vec<Func>,
     /// The contents of every string literal, indexed by [`TExprKind::Str`].
     pub strings: Vec<Vec<u8>>,
+    /// Every array constant, indexed by [`TExprKind::Table`].
+    pub tables: Vec<Table>,
     /// The root package's `main` function, if it has one.
     pub main: Option<FuncId>,
     /// Warnings about the program (it has no errors). They don't stop it
     /// from compiling.
     pub warnings: Vec<crate::diag::Diagnostic>,
+}
+
+/// An array constant (`const DAYS: [12]u8 = [31, 28, ...]`), placed in
+/// read-only data.
+#[derive(Debug)]
+pub struct Table {
+    /// The constant's name, for messages.
+    pub name: String,
+    /// An array type, of integers or `bool`, or of arrays of them.
+    pub ty: Ty,
+    /// The scalars, in memory order (row by row); `bool` as 0 or 1.
+    pub values: Vec<i128>,
 }
 
 #[derive(Debug)]
@@ -146,6 +160,9 @@ pub enum TExprKind {
     Bool(bool),
     /// A string literal, by index into [`Program::strings`].
     Str(usize),
+    /// An array constant, by index into [`Program::tables`]: a value in
+    /// read-only memory, never a place that can be changed.
+    Table(usize),
     Local(LocalId),
     Call(FuncId, Vec<TExpr>),
     Unary(TUnOp, Box<TExpr>),
@@ -304,9 +321,11 @@ pub fn stmt_exprs(s: &TStmt) -> Vec<&TExpr> {
 /// blocks of a `catch`).
 pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
     match &e.kind {
-        TExprKind::Int(_) | TExprKind::Bool(_) | TExprKind::Str(_) | TExprKind::Local(_) => {
-            Vec::new()
-        }
+        TExprKind::Int(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Str(_)
+        | TExprKind::Table(_)
+        | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
         | TExprKind::ArrayLit(items)
         | TExprKind::Syscall(items)

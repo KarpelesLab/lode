@@ -372,6 +372,10 @@ fn op_name(op: BinOp) -> &'static str {
     }
 }
 
+/// The most elements of an array constant [`Checker::table_elem_range`]
+/// looks at one by one; past it, the range of all its elements is used.
+const TABLE_SCAN_LIMIT: usize = 4096;
+
 /// The name of the `syscall` intrinsic (docs/safety.md).
 const SYSCALL: &str = "syscall";
 
@@ -402,7 +406,7 @@ impl Checker<'_> {
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Const(id)) => match self.const_value(id)? {
                         ConstVal::Untyped(v) => Some(v),
-                        ConstVal::Typed(..) => None,
+                        ConstVal::Typed(..) | ConstVal::Table(..) => None,
                     },
                     _ => None,
                 }
@@ -416,7 +420,7 @@ impl Checker<'_> {
                     Some(&Item::Const(id)) if pkg == cx.pkg || self.consts[id].decl.is_pub => {
                         match self.const_value(id)? {
                             ConstVal::Untyped(v) => Some(v),
-                            ConstVal::Typed(..) => None,
+                            ConstVal::Typed(..) | ConstVal::Table(..) => None,
                         }
                     }
                     _ => None,
@@ -1225,11 +1229,86 @@ impl Checker<'_> {
             );
             return None;
         }
+        let range = match elem {
+            Ty::Int(_) => self.table_elem_range(&b.expr, r),
+            _ => None,
+        };
         Some(Checked::new(
             TExprKind::Index(Box::new(b.expr), Box::new(i.expr)),
             elem,
-            None,
+            range,
         ))
+    }
+
+    /// The range of an integer element `base[i]`, with `i` in `index`, when
+    /// `base` is an array constant or a row of one: the smallest and the
+    /// largest of the elements `i` can pick (of all the constant's elements
+    /// if there are too many to look at).
+    fn table_elem_range(&self, base: &TExpr, index: Range) -> Option<Range> {
+        // The indexes from the constant down, as ranges.
+        let mut ranges = vec![index];
+        let mut e = base;
+        let id = loop {
+            match &e.kind {
+                TExprKind::Table(id) => break *id,
+                TExprKind::Index(inner, k) => {
+                    let mut k = &**k;
+                    while let TExprKind::Convert(x) = &k.kind {
+                        k = x;
+                    }
+                    let r = match k.kind {
+                        TExprKind::Int(v) => Range::exact(v),
+                        _ => Range {
+                            lo: 0,
+                            hi: i128::MAX,
+                        },
+                    };
+                    ranges.push(r);
+                    e = inner;
+                }
+                _ => return None,
+            }
+        };
+        ranges.reverse();
+        let table = &self.tables[id];
+        let mut dims = Vec::new();
+        let mut ty = table.ty;
+        while let Some((elem, n)) = ty.as_array() {
+            dims.push(n as usize);
+            ty = elem;
+        }
+        // The positions the indexes can pick: a box, one range per dimension.
+        let mut boxed: Vec<(usize, usize)> = Vec::new();
+        let mut count: usize = 1;
+        for (k, &n) in dims.iter().enumerate() {
+            if n == 0 {
+                return None;
+            }
+            let (lo, hi) = match ranges.get(k) {
+                Some(r) => (
+                    r.lo.clamp(0, n as i128 - 1) as usize,
+                    r.hi.clamp(0, n as i128 - 1) as usize,
+                ),
+                None => (0, n - 1),
+            };
+            count = count.saturating_mul(hi - lo + 1);
+            boxed.push((lo, hi));
+        }
+        let picked: Box<dyn Iterator<Item = i128>> = if count <= TABLE_SCAN_LIMIT {
+            let mut flat = vec![0usize];
+            for (&(lo, hi), &n) in boxed.iter().zip(&dims) {
+                flat = flat
+                    .iter()
+                    .flat_map(|&f| (lo..=hi).map(move |i| f * n + i))
+                    .collect();
+            }
+            Box::new(flat.into_iter().map(|f| table.values[f]))
+        } else {
+            Box::new(table.values.iter().copied())
+        };
+        picked.fold(None, |acc: Option<Range>, v| {
+            Some(acc.map_or(Range::exact(v), |r| r.hull(Range::exact(v))))
+        })
     }
 
     fn name(&mut self, cx: &mut FnCx, name: &str, span: Span) -> Option<Checked> {
@@ -1314,6 +1393,7 @@ impl Checker<'_> {
                 ConstVal::Typed(ty, v) => {
                     Some(Checked::new(TExprKind::Int(v), ty, Some(Range::exact(v))))
                 }
+                ConstVal::Table(ty, id) => Some(Checked::new(TExprKind::Table(id), ty, None)),
                 ConstVal::Untyped(_) => unreachable!("handled by untyped_int"),
             },
             Item::Func(_) => {
@@ -2392,6 +2472,20 @@ impl Checker<'_> {
             match &root.kind {
                 TExprKind::Field(base, _) | TExprKind::Index(base, _) => root = base,
                 TExprKind::Local(l) => break *l,
+                TExprKind::Table(id) => {
+                    let name = &self.tables[*id].name;
+                    let what = match changer {
+                        Changer::Ref => format!("cannot pass `&{name}`"),
+                        Changer::Receiver(method) => {
+                            format!("cannot call `{method}`, which takes `inout self`,")
+                        }
+                    };
+                    self.diags.push(
+                        Diagnostic::error(span, format!("{what}: `{name}` is a constant"))
+                            .with_help(format!("change a copy: `var v = {name}`")),
+                    );
+                    return None;
+                }
                 _ => {
                     let diag = match changer {
                         Changer::Ref => Diagnostic::error(

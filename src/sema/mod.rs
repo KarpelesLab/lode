@@ -30,6 +30,7 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         imports: HashMap::new(),
         methods: HashMap::new(),
         strings: Vec::new(),
+        tables: Vec::new(),
         string_ids: HashMap::new(),
         ptr_bits,
     };
@@ -79,6 +80,7 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
     let program = Program {
         funcs,
         strings: ck.strings,
+        tables: ck.tables,
         main,
         warnings: Vec::new(),
     };
@@ -126,6 +128,8 @@ enum ConstVal {
     /// An untyped integer constant: like a literal, it takes its type from
     /// the context where it's used.
     Untyped(i128),
+    /// An array constant, of its type, by index into [`Checker::tables`].
+    Table(Ty, usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -155,6 +159,8 @@ struct Checker<'a> {
     methods: HashMap<(Ty, String), FuncId>,
     strings: Vec<Vec<u8>>,
     string_ids: HashMap<Vec<u8>, usize>,
+    /// The array constants checked so far.
+    tables: Vec<Table>,
     ptr_bits: u32,
 }
 
@@ -1556,6 +1562,25 @@ impl<'a> Checker<'a> {
                                 None
                             }
                         }),
+                    Some(ty) if table_leaf(ty).is_some() && table_scalars(ty) > TABLE_MAX => {
+                        self.error(
+                            t.span(),
+                            format!("an array constant has at most {TABLE_MAX} elements"),
+                        );
+                        None
+                    }
+                    Some(ty) if table_leaf(ty).is_some() => {
+                        let mut values = Vec::new();
+                        self.table_values(&mut cx, &decl.value, ty, &mut values)
+                            .map(|()| {
+                                self.tables.push(Table {
+                                    name: decl.name.name.clone(),
+                                    ty,
+                                    values,
+                                });
+                                ConstVal::Table(ty, self.tables.len() - 1)
+                            })
+                    }
                     Some(other) => {
                         self.error(
                             t.span(),
@@ -1571,6 +1596,77 @@ impl<'a> Checker<'a> {
         };
         self.consts[id].state = value.map_or(ConstState::Failed, ConstState::Done);
         value
+    }
+
+    /// Append the scalars of `e`, the value of an array constant (or of one
+    /// of its elements) of type `ty`, to `out`: from array literals,
+    /// `[v; n]`, other array constants, and scalars known when compiling.
+    fn table_values(
+        &mut self,
+        cx: &mut FnCx,
+        e: &ast::Expr,
+        ty: Ty,
+        out: &mut Vec<i128>,
+    ) -> Option<()> {
+        let Some((elem, n)) = ty.as_array() else {
+            let c = self.expr(cx, e, Some(ty))?;
+            let c = self.coerce(c, ty, e.span)?;
+            let v = match (&c.expr.kind, c.range) {
+                (TExprKind::Bool(b), _) => i128::from(*b),
+                (_, Some(r)) if r.lo == r.hi && ty.as_int().is_some() => r.lo,
+                _ => {
+                    self.error(
+                        e.span,
+                        "the elements of an array constant must be known when compiling",
+                    );
+                    return None;
+                }
+            };
+            out.push(v);
+            return Some(());
+        };
+        let found = |count: u64| format!("expected `{ty}`, found an array of {count} element(s)");
+        match &e.kind {
+            ExprKind::Paren(inner) => self.table_values(cx, inner, ty, out),
+            ExprKind::ArrayLit(elems) => {
+                if elems.len() as u64 != n {
+                    self.error(e.span, found(elems.len() as u64));
+                    return None;
+                }
+                let mut ok = true;
+                for el in elems {
+                    ok &= self.table_values(cx, el, elem, out).is_some();
+                }
+                ok.then_some(())
+            }
+            ExprKind::ArrayRepeat(value, count) => {
+                let count = self.const_count(cx, count)?;
+                if count != n {
+                    self.error(e.span, found(count));
+                    return None;
+                }
+                let start = out.len();
+                self.table_values(cx, value, elem, out)?;
+                let one: Vec<i128> = out[start..].to_vec();
+                for _ in 1..n {
+                    out.extend_from_slice(&one);
+                }
+                Some(())
+            }
+            _ => {
+                let c = self.expr(cx, e, Some(ty))?;
+                let c = self.coerce(c, ty, e.span)?;
+                let TExprKind::Table(id) = c.expr.kind else {
+                    self.error(
+                        e.span,
+                        "the value of an array constant must be an array literal or another array constant",
+                    );
+                    return None;
+                };
+                out.extend_from_slice(&self.tables[id].values);
+                Some(())
+            }
+        }
     }
 
     fn function(&mut self, f: &ast::FnDecl, id: FuncId, pkg: usize, file: FileId) -> Func {
@@ -1636,6 +1732,22 @@ impl<'a> Checker<'a> {
             body,
             span: f.span,
         }
+    }
+
+    /// Report an assignment to `name`, which is not a variable: a constant,
+    /// or nothing known.
+    fn unknown_target(&mut self, cx: &FnCx, name: &str, span: Span) {
+        if let Some(Item::Const(_)) = self.pkgs[cx.pkg].items.get(name) {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("cannot assign to `{name}`, which is a constant"),
+                )
+                .with_help(format!("change a copy: `var v = {name}`")),
+            );
+            return;
+        }
+        self.error(span, format!("cannot find `{name}` in this scope"));
     }
 
     /// The help for assigning to the immutable `local`, named `name`.
@@ -2000,7 +2112,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let Some(local) = cx.lookup(name) else {
-                    self.error(target.span, format!("cannot find `{name}` in this scope"));
+                    self.unknown_target(cx, name, target.span);
                     return None;
                 };
                 if cx.failed.contains(&local) {
@@ -2774,33 +2886,39 @@ impl<'a> Checker<'a> {
                         return None;
                     }
                 };
-                let seq_name = match (&xs.kind, &seq.expr.kind) {
+                // The sequence the body reads elements of: the local itself,
+                // an array constant itself (read in place, with the facts
+                // about its elements), or else a hidden copy.
+                let (seq_ast, seq_t) = match (&xs.kind, &seq.expr.kind) {
                     (ExprKind::Name(name), TExprKind::Local(_)) if !assigned.contains(name) => {
-                        name.clone()
+                        (xs.clone(), seq.expr)
                     }
+                    (_, TExprKind::Table(_)) => (xs.clone(), seq.expr),
                     _ => {
                         let hidden = self.declare(cx, SEQ, seq.ty(), false);
                         Self::record_value(cx, hidden, &seq);
+                        let ty = seq.ty();
                         before.push(TStmt::Init(hidden, seq.expr));
-                        SEQ.to_owned()
+                        let name = ast::Expr {
+                            kind: ExprKind::Name(SEQ.to_owned()),
+                            span: xs.span,
+                        };
+                        let local = TExpr {
+                            kind: TExprKind::Local(hidden),
+                            ty,
+                        };
+                        (name, local)
                     }
                 };
-                let local = cx.lookup(&seq_name).expect("declared");
                 let end = match len {
                     Some(n) => {
                         let n = i128::from(n);
                         expr::Checked::new(TExprKind::Int(n), usize_ty, Some(Range::exact(n)))
                     }
-                    None => self.view_len(
-                        cx,
-                        TExpr {
-                            kind: TExprKind::Local(local),
-                            ty: cx.locals[local].ty,
-                        },
-                    ),
+                    None => self.view_len(cx, seq_t.clone()),
                 };
                 let start = expr::Checked::new(TExprKind::Int(0), usize_ty, Some(Range::exact(0)));
-                (start, end, Some((seq_name, elem)))
+                (start, end, Some((seq_ast, seq_t, elem)))
             }
         };
 
@@ -2856,13 +2974,13 @@ impl<'a> Checker<'a> {
             cx.env.apply(&loop_facts);
 
             let mut stmts = Vec::new();
-            if let Some((seq_name, elem)) = &each {
+            if let Some((seq_ast, seq_t, elem)) = &each {
                 // let x = seq[$i]
                 let element = ast::Expr {
                     kind: ExprKind::Index(
                         Box::new(ast::Expr {
-                            kind: ExprKind::Name(seq_name.clone()),
                             span: var.span,
+                            ..seq_ast.clone()
                         }),
                         Box::new(ast::Expr {
                             kind: ExprKind::Name(INDEX.to_owned()),
@@ -2874,15 +2992,13 @@ impl<'a> Checker<'a> {
                 let value = if end.range == Some(Range::exact(0)) {
                     // An empty array: the body never runs, so the element read
                     // needs no proof (there's no index that could be proven).
-                    let seq = cx.lookup(seq_name).expect("declared");
                     let index = cx.lookup(INDEX).expect("declared");
-                    let local = |l: LocalId, ty: Ty| TExpr {
-                        kind: TExprKind::Local(l),
-                        ty,
-                    };
                     let kind = TExprKind::Index(
-                        Box::new(local(seq, cx.locals[seq].ty)),
-                        Box::new(local(index, usize_ty)),
+                        Box::new(seq_t.clone()),
+                        Box::new(TExpr {
+                            kind: TExprKind::Local(index),
+                            ty: usize_ty,
+                        }),
                     );
                     Some(expr::Checked::new(kind, *elem, None))
                 } else {
@@ -2978,6 +3094,8 @@ impl<'a> Checker<'a> {
             root = base;
         }
         let diag = match root.kind {
+            // An array constant never changes.
+            TExprKind::Table(_) => return Some(()),
             // Reassigning a `var` view doesn't change what it viewed.
             TExprKind::Local(l)
                 if !cx.locals[l].mutable_view()
@@ -3021,7 +3139,7 @@ impl<'a> Checker<'a> {
             return None;
         };
         let Some(local) = cx.lookup(name) else {
-            self.error(root.span, format!("cannot find `{name}` in this scope"));
+            self.unknown_target(cx, name, root.span);
             return None;
         };
         if cx.failed.contains(&local) {
@@ -3185,6 +3303,27 @@ impl<'a> Checker<'a> {
             }
             None => (None, facts::CondFacts::default()),
         }
+    }
+}
+
+/// The scalar type at the bottom of an array type that can be a constant
+/// (`u8` for `[12]u8` and `[2][3]u8`): an integer or `bool`.
+pub fn table_leaf(ty: Ty) -> Option<Ty> {
+    let (mut elem, _) = ty.as_array()?;
+    while let Some((inner, _)) = elem.as_array() {
+        elem = inner;
+    }
+    matches!(elem, Ty::Int(_) | Ty::Bool).then_some(elem)
+}
+
+/// The most scalars an array constant holds (16 MiB of `u8`).
+const TABLE_MAX: u64 = 1 << 24;
+
+/// How many scalars an array of type `ty` holds.
+fn table_scalars(ty: Ty) -> u64 {
+    match ty.as_array() {
+        Some((elem, n)) => n.saturating_mul(table_scalars(elem)),
+        None => 1,
     }
 }
 

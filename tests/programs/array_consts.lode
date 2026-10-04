@@ -1,0 +1,62 @@
+// stdout: 365 31 28 -7 9 true 4\n
+package main
+
+import "std/io"
+
+// Array constants are read-only data: indexed in place, with the length
+// known, and their elements' range known to the checker.
+const DAYS: [12]u8 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+const SQUARES: [3][3]i16 = [[1, 2, 3], [-7, 5, 6], [7, 8, 9]]
+const FLAGS: [4]bool = [true, false, false, true]
+const ZEROS: [2][8]u64 = [[0; 8]; 2]
+const ALIAS: [12]u8 = DAYS
+const FEB: u8 = DAYS[1]
+
+fn sum(xs: []u8) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total +%= x
+	}
+	return total
+}
+
+fn month_len(m: usize) -> u8 {
+	if m >= DAYS.len {
+		return 0
+	}
+	return DAYS[m] - 28 + 28 // proven: every element is 28..=31
+}
+
+fn main() {
+	var year: u16 = 0
+	for d in DAYS {
+		year +%= d
+	}
+	io.print_u64(year)
+	io.print(" ")
+	io.print_u64(month_len(0))
+	io.print(" ")
+	io.print_u64(FEB)
+	io.print(" ")
+	var smallest: i16 = 0
+	for row in SQUARES {
+		for v in row {
+			if v < smallest {
+				smallest = v
+			}
+		}
+	}
+	io.print_i64(smallest)
+	io.print(" ")
+	io.print_i64(SQUARES[2][2])
+	io.print(" ")
+	var copy = ALIAS
+	copy[1] = 29
+	if sum(DAYS) == 365 && sum(copy) == 366 && FLAGS[3] && ZEROS[1][7] == 0 {
+		io.print("true ")
+	}
+	let view: []u8 = DAYS
+	// 31 - 28 fits: the elements are 28..=31.
+	io.print_u64(DAYS[0] - DAYS[1] + u8(view.len) - 11 - 1 + 1)
+	io.print("\n")
+}

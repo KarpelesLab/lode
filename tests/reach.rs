@@ -114,3 +114,30 @@ fn main() -> u8 {
         Ok(_) => panic!("built a program with a proof error"),
     }
 }
+
+#[test]
+fn only_reached_array_constants_are_emitted() {
+    let src = "\
+package main
+
+const USED: [3]u16 = [1, 2, 0x0304]
+const UNUSED: [2]u8 = [9, 9]
+
+fn unused() -> u8 {
+	return UNUSED[0]
+}
+
+fn main() -> u16 {
+	return USED[2]
+}
+";
+    let (mut files, root) = source("tables.lode", src);
+    let lowered = lode::compile_ir(&mut files, root, OptLevel::O0).expect("compiles");
+    let tables: Vec<(&[u8], u64)> = lowered
+        .tables
+        .iter()
+        .map(|(_, bytes, align)| (bytes.as_slice(), *align))
+        .collect();
+    // Little-endian, each `u16` at its size, aligned for it.
+    assert_eq!(tables, [([1, 0, 2, 0, 4, 3].as_slice(), 2)]);
+}

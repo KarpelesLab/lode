@@ -1,8 +1,9 @@
 //! Which functions a program reaches: a walk of the call graph from `main`.
 //!
-//! Lowering emits only these, and only the string literals they use, so code
-//! nothing calls costs nothing in the executable. Every function is still
-//! checked: an error in code nothing calls fails the build like any other.
+//! Lowering emits only these, and only the string literals and array
+//! constants they use, so code nothing calls costs nothing in the executable.
+//! Every function is still checked: an error in code nothing calls fails the
+//! build like any other.
 //!
 //! A call (`TExprKind::Call`) is the only way to refer to a function today;
 //! a method call is one too, with the receiver as its first argument. The
@@ -19,6 +20,8 @@ pub struct Reach {
     pub reached: Vec<bool>,
     /// `strings[i]`: whether a reached function uses string literal `i`.
     pub strings: Vec<bool>,
+    /// `tables[i]`: whether a reached function uses array constant `i`.
+    pub tables: Vec<bool>,
     /// Whether a reached function calls the root (the root is recursive).
     pub root_called: bool,
 }
@@ -28,6 +31,7 @@ impl Reach {
     pub fn from(program: &Program, root: FuncId) -> Reach {
         let mut reached = vec![false; program.funcs.len()];
         let mut strings = vec![false; program.strings.len()];
+        let mut tables = vec![false; program.tables.len()];
         let mut root_called = false;
         reached[root] = true;
         let mut work = vec![root];
@@ -38,6 +42,9 @@ impl Reach {
             }
             for s in uses.strings.drain(..) {
                 strings[s] = true;
+            }
+            for t in uses.tables.drain(..) {
+                tables[t] = true;
             }
             for callee in uses.calls.drain(..) {
                 root_called |= callee == root;
@@ -50,6 +57,7 @@ impl Reach {
         Reach {
             reached,
             strings,
+            tables,
             root_called,
         }
     }
@@ -60,16 +68,18 @@ impl Reach {
         Reach {
             reached: vec![true; program.funcs.len()],
             strings: vec![true; program.strings.len()],
+            tables: vec![true; program.tables.len()],
             root_called: false,
         }
     }
 }
 
-/// The functions and string literals a function body uses.
+/// The functions, string literals and array constants a function body uses.
 #[derive(Default)]
 struct Uses {
     calls: Vec<FuncId>,
     strings: Vec<usize>,
+    tables: Vec<usize>,
 }
 
 impl Uses {
@@ -103,6 +113,7 @@ impl Uses {
         match &e.kind {
             TExprKind::Call(f, _) => self.calls.push(*f),
             TExprKind::Str(id) => self.strings.push(*id),
+            TExprKind::Table(id) => self.tables.push(*id),
             TExprKind::Catch {
                 handler: Handler::Block(body),
                 ..

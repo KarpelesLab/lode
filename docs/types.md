@@ -122,6 +122,15 @@ semantics.
 - In `unsafe` code, `a.ptr` of an array or slice of integers is a raw
   pointer to its first element (`*u8` for `[N]u8` and `[]u8`). An array's
   pointer points to the array itself, not to a copy.
+- An array of integers or `bool` (or of arrays of them) can be a constant:
+  `const DAYS: [12]u8 = [31, 28, ...]`. Its value is array literals and
+  `[v; n]` whose elements are known when compiling, or another array
+  constant. It lives in read-only data: `DAYS[i]` and `for d in DAYS` read
+  it in place, and passing it where a slice is expected views it without a
+  copy. `let a = DAYS` copies it into a variable that can change. The
+  checker knows the range of its elements: `DAYS[i]` is `28..=31`
+  ([safety.md](safety.md#the-fact-language)). A constant can't be assigned
+  or passed with `&`. At most 2^24 elements.
 - Not yet: returning a slice, slicing (`a[i..j]`), and `a.get(i)`.
 
 ### Structs
