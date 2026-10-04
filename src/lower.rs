@@ -88,6 +88,11 @@
 //! let` or a `let ... else` on a call stores its value in. The packed form
 //! of a value is unique, so `==` compares two packed values as integers.
 //!
+//! A local that a loop body declares, and that nothing outside the body
+//! names, is dead at the end of each iteration: poison is stored in its
+//! slots there ([`iteration_locals`]), so mem2reg doesn't carry its value
+//! around the loop.
+//!
 //! `defer` bodies are emitted at each exit of their block, in reverse
 //! order: at its end, and at every `return`, `throw`, failing `try`,
 //! `break` and `continue` that leaves it. `errdefer` bodies only at the
@@ -106,7 +111,8 @@ use latticefoundry::support::StrInterner;
 
 use crate::mono;
 use crate::sema::{
-    CmpOp, Convention, Func, Handler, Local, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp,
+    CmpOp, Convention, Func, Handler, Local, LocalId, Mode, Program, TBinOp, TExpr, TExprKind,
+    TStmt, TUnOp,
 };
 use crate::types::{IntTy, Ty};
 
@@ -409,6 +415,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             slots: Vec::new(),
             addrs: HashMap::new(),
             loops: Vec::new(),
+            names: Vec::new(),
             defers: Vec::new(),
             terminated: false,
             exit_status: (direct_entry == Some(i)).then_some(f.ret),
@@ -489,9 +496,12 @@ struct FnLower<'a> {
     /// The addresses [`byte_offset`](Self::byte_offset) made, by block,
     /// base and offset.
     addrs: HashMap<(BlockId, ValueId, u64), ValueId>,
-    /// `(continue target, break target, defer scopes outside it)` of each
-    /// enclosing loop.
-    loops: Vec<(BlockId, BlockId, usize)>,
+    /// `(continue target, break target, defer scopes outside it, locals
+    /// dead at the end of an iteration)` of each enclosing loop.
+    loops: Vec<(BlockId, BlockId, usize, Rc<[LocalId]>)>,
+    /// How many times each local is named in the function (see
+    /// [`iteration_locals`]).
+    names: Vec<u32>,
     /// For each statement list being lowered, innermost last: the `defer`
     /// bodies registered so far, with whether each is an `errdefer`.
     defers: Vec<Vec<(Rc<[TStmt]>, bool)>>,
@@ -698,6 +708,81 @@ fn uses_in_place(place: &TExpr, packed: &mut [bool]) {
     }
 }
 
+/// The locals a loop body `body` doesn't carry from one iteration to the
+/// next: those it declares (with `let`, `var` or `for`), named nowhere
+/// else in the function (`names` counts every name in it). The checker
+/// proves a local is assigned before it's read, so each iteration writes
+/// such a local before reading it: its value at the end of an iteration
+/// is dead. Lowering stores poison in their slots there (at the end of
+/// the body and at `continue`), so LF's mem2reg doesn't make them live
+/// around the loop: it doesn't prune dead block parameters, and each one
+/// costs a register or a stack slot for the whole loop.
+fn iteration_locals(body: &[TStmt], names: &[u32]) -> Vec<LocalId> {
+    let mut here = vec![0; names.len()];
+    let mut declared = Vec::new();
+    count_names(body, &mut here, &mut declared);
+    declared.retain(|&l| here[l] == names[l]);
+    declared.sort_unstable();
+    declared.dedup();
+    declared
+}
+
+/// Count each name of a local in `stmts` (its declaration, assignments
+/// and reads) in `names`, and add the locals they declare to `declared`.
+fn count_names(stmts: &[TStmt], names: &mut [u32], declared: &mut Vec<LocalId>) {
+    for s in stmts {
+        match s {
+            TStmt::Init(l, _) | TStmt::For { var: l, .. } => {
+                names[*l] += 1;
+                declared.push(*l);
+            }
+            TStmt::Assign(l, _) => names[*l] += 1,
+            _ => {}
+        }
+        for e in crate::sema::stmt_exprs(s) {
+            count_names_in(e, names, declared);
+        }
+        match s {
+            TStmt::If(_, then, otherwise) => {
+                count_names(then, names, declared);
+                count_names(otherwise, names, declared);
+            }
+            TStmt::While(_, body)
+            | TStmt::For { body, .. }
+            | TStmt::Loop(body)
+            | TStmt::Block(body)
+            | TStmt::Defer { body, .. } => count_names(body, names, declared),
+            TStmt::Match { arms, .. } => {
+                for arm in arms {
+                    count_names(&arm.body, names, declared);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// [`count_names`] in an expression.
+fn count_names_in(e: &TExpr, names: &mut [u32], declared: &mut Vec<LocalId>) {
+    match &e.kind {
+        TExprKind::Local(l) => names[*l] += 1,
+        TExprKind::Catch {
+            binding, handler, ..
+        } => {
+            if let Some(b) = binding {
+                names[*b] += 1;
+            }
+            if let Handler::Block(body) = handler {
+                count_names(body, names, declared);
+            }
+        }
+        _ => {}
+    }
+    for sub in crate::sema::subexprs(e) {
+        count_names_in(sub, names, declared);
+    }
+}
+
 /// Where payload field `field` of variant `variant` starts in the packed
 /// form of a value of type `ty`: after the tag and the fields before it.
 fn payload_shift(ty: Ty, variant: u32, field: u32) -> u32 {
@@ -749,6 +834,8 @@ impl FnLower<'_> {
             });
         }
         let packed = packed_locals(f);
+        self.names = vec![0; f.locals.len()];
+        count_names(&f.body, &mut self.names, &mut Vec::new());
         for (local, param) in f.locals.iter().zip(&params) {
             match *param {
                 // A parameter in memory is the caller's value, read (or for
@@ -872,6 +959,28 @@ impl FnLower<'_> {
             self.run_defers(self.defers.len() - 1, false);
         }
         self.defers.pop();
+    }
+
+    /// Mark the values of `locals` dead: store poison in their slots, so a
+    /// loop doesn't carry them to its next iteration (see
+    /// [`iteration_locals`]).
+    fn kill(&mut self, locals: &[LocalId]) {
+        for &l in locals {
+            self.kill_one(l);
+        }
+    }
+
+    fn kill_one(&mut self, local: usize) {
+        let slots: Vec<(ValueId, TypeId, u32)> = match self.slots[local] {
+            Slot::One { slot, ty, align } => vec![(slot, ty, align)],
+            Slot::Packed(slot, _) => vec![(slot, self.t.i64, 8)],
+            Slot::View { ptr, len } => vec![(ptr, self.t.ptr, 8), (len, self.t.i64, 8)],
+            Slot::Mem(_) => Vec::new(),
+        };
+        for (slot, ty, align) in slots {
+            let p = self.b.poison(ty);
+            self.b.store(ty, slot, p, align);
+        }
     }
 
     /// Emit the `defer` bodies of the scopes from `outer` in, innermost
@@ -1226,9 +1335,13 @@ impl FnLower<'_> {
                 self.start_block(exit);
             }
             TStmt::Break | TStmt::Continue => {
-                let (cont, brk, outer) = *self.loops.last().expect("checked: inside a loop");
+                let (cont, brk, outer, kills) =
+                    self.loops.last().cloned().expect("checked: inside a loop");
                 let target = if matches!(s, TStmt::Break) { brk } else { cont };
                 self.run_defers(outer, false);
+                if matches!(s, TStmt::Continue) {
+                    self.kill(&kills);
+                }
                 self.b.br(target, &[]);
                 self.terminated = true;
             }
@@ -1257,10 +1370,13 @@ impl FnLower<'_> {
 
     fn loop_body(&mut self, body_bb: BlockId, cont: BlockId, exit: BlockId, body: &[TStmt]) {
         self.start_block(body_bb);
-        self.loops.push((cont, exit, self.defers.len()));
+        let kills: Rc<[LocalId]> = iteration_locals(body, &self.names).into();
+        self.loops
+            .push((cont, exit, self.defers.len(), kills.clone()));
         self.stmts(body);
         self.loops.pop();
         if !self.terminated {
+            self.kill(&kills);
             self.b.br(cont, &[]);
         }
     }

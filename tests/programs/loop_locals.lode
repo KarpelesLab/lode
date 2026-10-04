@@ -1,0 +1,127 @@
+// stdout: 24 4 9\n
+// stdout: 10 13\n
+// stdout: 036912 24\n
+package main
+
+import "std/io"
+
+// Locals declared in a loop body are dead at the end of each iteration
+// (src/lower.rs, `iteration_locals`): their slots get poison there. Each
+// function here declares locals in loops in a different way, including
+// ones whose declaration is nested deeper than their uses.
+
+enum Error {
+	odd
+	big
+}
+
+fn half(n: usize) -> ?usize {
+	if n % 2 == 0 {
+		return n / 2
+	}
+	return none
+}
+
+fn checked(n: u32) throws(Error) -> u32 {
+	if n % 2 == 1 {
+		throw .odd
+	}
+	if n > 8 {
+		throw .big
+	}
+	return n
+}
+
+// `let ... else` in a loop, used after the statement that declares it,
+// with `continue` on both sides.
+fn let_else() {
+	var sum: usize = 0
+	var skipped: usize = 0
+	var last: usize = 0
+	for i in 0..10 {
+		let h = half(i) else {
+			skipped +%= 1
+			if skipped > 3 {
+				last = i
+			}
+			continue
+		}
+		if h == 0 {
+			continue
+		}
+		sum = sum +% h *% 2 +% 1
+	}
+	io.print_int(sum)
+	io.print(" ")
+	io.print_int(skipped -% 1)
+	io.print(" ")
+	io.print_int(last)
+	io.print("\n")
+}
+
+// A `var` declared without a value in a loop, assigned on every branch,
+// a `catch` binding, and a nested loop whose locals are read after it.
+fn nested() {
+	var errors: u32 = 0
+	var total: u32 = 0
+	var k: u32 = 0
+	while k < 6 {
+		let cur = k
+		k += 1
+		var step: u32
+		if cur % 2 == 0 {
+			step = 2
+		} else {
+			step = 1
+		}
+		let v = checked(cur *% 2 +% step) catch e {
+			match e {
+				odd => errors +%= 1
+				big => errors +%= 10
+			}
+			continue
+		}
+		var inner: u32 = 0
+		for j in 0..cur {
+			let doubled = j *% 2
+			inner = inner +% doubled
+		}
+		total = total +% v +% inner
+	}
+	io.print_int(total)
+	io.print(" ")
+	io.print_int(errors)
+	io.print("\n")
+}
+
+// A `defer` in a loop body reading the body's locals, and `break`.
+fn deferred() {
+	var n: u32 = 0
+	loop {
+		let here = n *% 3
+		defer io.print_int(here)
+		if n == 4 {
+			break
+		}
+		n += 1
+	}
+	io.print(" ")
+	var m: u32 = 0
+	var acc: u32 = 0
+	while m < 6 {
+		let sq = m *% m
+		m += 1
+		if sq > 10 {
+			continue
+		}
+		acc = acc +% sq +% m
+	}
+	io.print_int(acc)
+	io.print("\n")
+}
+
+fn main() {
+	let_else()
+	nested()
+	deferred()
+}
