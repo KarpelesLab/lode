@@ -1,0 +1,100 @@
+// stdout: 25493856 243 27 124948 \n
+package main
+
+import "std/io"
+
+const BIG = 200000
+
+struct Cell {
+	tag: u8
+	val: ?u32
+	pos: [2]i16
+}
+
+enum Node {
+	leaf(v: Cell)
+	pair(a: Cell, b: Cell)
+	empty
+}
+
+fn u(v: u64) {
+	io.print_u64(v)
+	io.print(" ")
+}
+
+// A big local array, filled and summed.
+fn big_sum() -> u64 {
+	var buf: [BIG]u8 = [0; BIG]
+	for i in 0..buf.len {
+		buf[i] = u8(i & 0xff)
+	}
+	var s: u64 = 0
+	for b in buf {
+		s = s +% u64(b)
+	}
+	return s
+}
+
+fn mk(k: u8) -> Cell {
+	return Cell{tag: k, val: u32(k) * 3, pos: [i16(k), -1]}
+}
+
+fn weight(n: Node) -> u64 {
+	match n {
+		leaf(c) => return u64(c.val ?? 0)
+		pair(a, b) => return u64(a.val ?? 0) +% u64(b.val ?? 0) +% u64(a.tag) +% u64(b.tag)
+		empty => return 0
+	}
+}
+
+fn depth_sum(n: u32, c: Cell) -> u64 {
+	if n == 0 {
+		return u64(c.tag)
+	}
+	var c2 = c
+	c2.tag = c.tag +% 1
+	return depth_sum(n - 1, c2) +% u64(c.tag)
+}
+
+fn rotate(xs: [8]Node) -> [8]Node {
+	var out = xs
+	for i in 0..8 {
+		out[(i + 1) % 8] = xs[i]
+	}
+	return out
+}
+
+fn main() -> u8 {
+	u(big_sum())
+	var nodes: [8]Node = [Node.empty; 8]
+	for i in 0..8 {
+		let k = u8(i)
+		if i % 3 == 0 {
+			nodes[i] = Node.leaf(mk(k))
+		} else if i % 3 == 1 {
+			nodes[i] = Node.pair(mk(k), mk(k +% 10))
+		}
+	}
+	let r = rotate(rotate(nodes))
+	var tot: u64 = 0
+	for n in r {
+		tot = tot +% weight(n)
+	}
+	u(tot)
+	if r[2] != nodes[0] || r[0] != nodes[6] || r == nodes {
+		return 1
+	}
+	var arr: [4]?Cell = [none; 4]
+	arr[2] = mk(9)
+	let arr2 = arr
+	arr[2] = none
+	if arr2[2] == none || arr[2] != none {
+		return 2
+	}
+	if let c = arr2[2] {
+		u(u64(c.val ?? 0))
+	}
+	u(depth_sum(1000, mk(0)))
+	io.print("\n")
+	return 0
+}

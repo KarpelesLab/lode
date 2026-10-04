@@ -1,0 +1,98 @@
+// stdout: full at 8\n
+// stdout: 0 10 20 \n
+// stdout: 30 40 50 60 70 100 101 102 \n
+// stdout: sum 553\n
+package main
+
+import "std/io"
+
+const CAP = 8
+
+struct Ring {
+	head: usize
+	len: usize
+	data: [CAP]u32
+}
+
+fn ring_new() -> Ring {
+	return Ring{head: 0, len: 0, data: [0; CAP]}
+}
+
+fn is_full(r: Ring) -> bool {
+	return r.len == CAP
+}
+
+// Push to the back; returns none when full (the ring is unchanged).
+fn push(r: Ring, v: u32) -> ?Ring {
+	if r.len >= CAP {
+		return none
+	}
+	var out = r
+	// WORKAROUND: re-reduce head; struct invariant head < CAP isn't known
+	let tail = (r.head % CAP + r.len) % CAP
+	out.data[tail] = v
+	out.len = r.len + 1
+	return out
+}
+
+struct Popped {
+	ring: Ring
+	value: u32
+}
+
+fn pop(r: Ring) -> ?Popped {
+	if r.len == 0 {
+		return none
+	}
+	var out = r
+	let h = r.head % CAP // WORKAROUND, as above
+	let v = r.data[h]
+	out.head = (h + 1) % CAP
+	out.len = r.len - 1
+	return Popped{ring: out, value: v}
+}
+
+fn main() -> u8 {
+	var r = ring_new()
+	var i: u32 = 0
+	while i < 10 {
+		let next = push(r, i * 10) else {
+			io.print("full at ")
+			io.print_u64(i)
+			io.print("\n")
+			break
+		}
+		r = next
+		i = i + 1
+	}
+	if !is_full(r) {
+		return 1
+	}
+	// pop three, push three more, then drain
+	for _ in 0..3 {
+		let p = pop(r) else {
+			return 2
+		}
+		io.print_u64(p.value)
+		io.print(" ")
+		r = p.ring
+	}
+	io.print("\n")
+	for k in 100..103 { // WORKAROUND needed: range is usize, see below
+		r = push(r, u32(k)) ?? r
+	}
+	var sum: u64 = 0
+	loop {
+		let p = pop(r) else {
+			break
+		}
+		sum = sum +| p.value // WORKAROUND: unbounded loop count
+		io.print_u64(p.value)
+		io.print(" ")
+		r = p.ring
+	}
+	io.print("\nsum ")
+	io.print_u64(sum)
+	io.print("\n")
+	return 0
+}

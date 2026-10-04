@@ -1,0 +1,105 @@
+// stdout: 12586269025\n
+// stdout: 30 70 110 150 \n
+// stdout: 70 174 278 382 \n
+// stdout: 110 278 446 614 \n
+// stdout: 150 382 614 846 \n
+// stdout: 1496\n
+package main
+
+import "std/io"
+
+const N = 4
+
+struct Mat {
+	m: [N][N]i64
+}
+
+fn identity() -> Mat {
+	var r = Mat{m: [[0; N]; N]}
+	for i in 0..N {
+		r.m[i][i] = 1
+	}
+	return r
+}
+
+fn mul(a: Mat, b: Mat) -> Mat {
+	var c = Mat{m: [[0; N]; N]}
+	for i in 0..N {
+		for j in 0..N {
+			var s: i64 = 0
+			for k in 0..N {
+				s = s +% a.m[i][k] *% b.m[k][j] // WORKAROUND: elements have no facts; no `+%=`
+			}
+			c.m[i][j] = s
+		}
+	}
+	return c
+}
+
+fn transpose(a: Mat) -> Mat {
+	var t = a
+	for i in 0..N {
+		for j in 0..N {
+			t.m[j][i] = a.m[i][j]
+		}
+	}
+	return t
+}
+
+// Fast exponentiation by squaring.
+fn power(a: Mat, e: u32) -> Mat {
+	var result = identity()
+	var base = a
+	var k = e
+	while k > 0 {
+		if k & 1 == 1 {
+			result = mul(result, base)
+		}
+		base = mul(base, base)
+		k = k >> 1
+	}
+	return result
+}
+
+fn trace(a: Mat) -> i64 {
+	var t: i64 = 0
+	for i in 0..N {
+		t = t +% a.m[i][i] // WORKAROUND, as above
+	}
+	return t
+}
+
+fn show(a: Mat) {
+	for row in a.m {
+		for x in row {
+			io.print_i64(x)
+			io.print(" ")
+		}
+		io.print("\n")
+	}
+}
+
+fn main() -> u8 {
+	// Fibonacci through the companion matrix in the top-left corner.
+	var f = identity()
+	f.m[0] = [1, 1, 0, 0]
+	f.m[1] = [1, 0, 0, 0]
+	let f50 = power(f, 50)
+	io.print_i64(f50.m[0][1])
+	io.print("\n")
+	if f50.m[0][1] != 12586269025 {
+		return 1
+	}
+	let a = Mat{m: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16]]}
+	let p = mul(a, transpose(a))
+	show(p)
+	if p != transpose(p) {
+		return 2
+	}
+	io.print_i64(trace(p))
+	io.print("\n")
+	if mul(a, identity()) != a {
+		return 3
+	}
+	return 0
+}

@@ -1,0 +1,109 @@
+// stdout: popcount(0xff00ff) = 16\n
+// stdout: popcount(max) = 64\n
+// stdout: swar(0xff00ff) = 16\n
+// stdout: swar(max) = 64\n
+// stdout: reverse(1) = 2147483648\n
+// stdout: reverse(0xf0) = 251658240\n
+// stdout: clz(1) = 31\n
+// stdout: clz(0x00010000) = 15\n
+// stdout: next_pow2(17) = 32\n
+// stdout: next_pow2(0x80000000) = 2147483648\n
+// stdout: mismatches = 0\n
+package main
+
+import "std/io"
+
+// Kernighan's popcount: clear the lowest set bit until zero.
+fn popcount(x: u64) -> u32 {
+	var v = x
+	var n: u32 = 0
+	while v != 0 {
+		v = v & (v - 1)
+		n = n +% 1 // WORKAROUND: loop runs at most 64/32 times; not countable
+	}
+	return n
+}
+
+// SWAR popcount.
+fn popcount_swar(x: u64) -> u64 {
+	var v = x
+	v = v -% ((v >> 1) & 0x5555555555555555) // WORKAROUND: bit trick, unprovable
+	v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333)
+	v = (v + (v >> 4)) & 0x0f0f0f0f0f0f0f0f
+	return (v *% 0x0101010101010101) >> 56
+}
+
+fn reverse_bits(x: u32) -> u32 {
+	var v = x
+	var r: u32 = 0
+	for i in 0..32 {
+		r = (r << 1) | (v & 1)
+		v = v >> 1
+	}
+	return r
+}
+
+fn leading_zeros(x: u32) -> u32 {
+	if x == 0 {
+		return 32
+	}
+	var n: u32 = 0
+	var v = x
+	while v & 0x80000000 == 0 {
+		v = v << 1
+		n = n +% 1 // WORKAROUND: loop runs at most 64/32 times; not countable
+	}
+	return n
+}
+
+fn is_pow2(x: u64) -> bool {
+	return x != 0 && x & (x - 1) == 0
+}
+
+fn next_pow2(x: u32) -> u32 {
+	if x <= 1 {
+		return 1
+	}
+	if x > 0x80000000 {
+		return 0
+	}
+	var v = x - 1
+	v = v | (v >> 1)
+	v = v | (v >> 2)
+	v = v | (v >> 4)
+	v = v | (v >> 8)
+	v = v | (v >> 16)
+	return v +% 1 // WORKAROUND: `|` loses the bound v <= 0x7fffffff
+}
+
+fn line(label: str, v: u64) {
+	io.print(label)
+	io.print_u64(v)
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	line("popcount(0xff00ff) = ", popcount(0xff00ff))
+	line("popcount(max) = ", popcount(18446744073709551615))
+	line("swar(0xff00ff) = ", popcount_swar(0xff00ff))
+	line("swar(max) = ", popcount_swar(18446744073709551615))
+	line("reverse(1) = ", reverse_bits(1))
+	line("reverse(0xf0) = ", reverse_bits(0xf0))
+	line("clz(1) = ", leading_zeros(1))
+	line("clz(0x00010000) = ", leading_zeros(0x00010000))
+	line("next_pow2(17) = ", next_pow2(17))
+	line("next_pow2(0x80000000) = ", next_pow2(0x80000000))
+	if !is_pow2(4096) || is_pow2(4097) || is_pow2(0) {
+		return 1
+	}
+	var mismatches: u32 = 0
+	var x: u64 = 1
+	for k in 0..200 {
+		x = x *% 6364136223846793005 +% 1442695040888963407
+		if u64(popcount(x)) != popcount_swar(x) {
+			mismatches = mismatches +% 1
+		}
+	}
+	line("mismatches = ", mismatches)
+	return 0
+}

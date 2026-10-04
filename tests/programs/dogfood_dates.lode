@@ -1,0 +1,114 @@
+// stdout: 1970-1-1 0 Thu\n
+// stdout: 2000-2-29 11016 Tue\n
+// stdout: 1900-2-29 invalid\n
+// stdout: 2026-10-4 20730 Sun\n
+// stdout: 1969-12-31 -1 Wed\n
+// stdout: 1-1-1 -719162 Mon\n
+// stdout: 2026-13-1 invalid\n
+package main
+
+import "std/io"
+
+enum Weekday: u8 {
+	monday = 0
+	tuesday = 1
+	wednesday = 2
+	thursday = 3
+	friday = 4
+	saturday = 5
+	sunday = 6
+}
+
+struct Date {
+	year: i32
+	month: u8
+	day: u8
+}
+
+fn is_leap(y: i32) -> bool {
+	return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn days_in_month(y: i32, m: u8) -> u8 {
+	if m == 2 && is_leap(y) {
+		return 29
+	}
+	if m == 0 || m > 12 {
+		return 0
+	}
+	// WORKAROUND: array constants are unsupported; a local table instead
+	let days_in: [12]u8 = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+	return days_in[m - 1]
+}
+
+fn valid(d: Date) -> bool {
+	return d.month >= 1 && d.month <= 12 && d.day >= 1 && d.day <= days_in_month(d.year, d.month)
+}
+
+// Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+fn days_from_civil(d: Date) -> i64 {
+	var y = i64(d.year)
+	if d.month <= 2 {
+		y = y - 1
+	}
+	var era = y / 400
+	if y < 0 {
+		era = (y - 399) / 400
+	}
+	let yoe = y - era * 400
+	var mp = i64(d.month) + 9
+	if d.month > 2 {
+		mp = i64(d.month) - 3
+	}
+	let doy = (153 * mp + 2) / 5 + i64(d.day) - 1
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+	return era * 146097 + doe - 719468
+}
+
+fn weekday(d: Date) -> Weekday {
+	// 1970-01-01 was a Thursday.
+	let n = days_from_civil(d)
+	let w = ((n % 7) + 7 + 3) % 7
+	return Weekday(w) ?? Weekday.monday
+}
+
+// WORKAROUND: can't return a `str`, even a literal; print it here
+fn print_name(w: Weekday) {
+	match w {
+		monday => io.print("Mon")
+		tuesday => io.print("Tue")
+		wednesday => io.print("Wed")
+		thursday => io.print("Thu")
+		friday => io.print("Fri")
+		saturday => io.print("Sat")
+		sunday => io.print("Sun")
+	}
+}
+
+fn show(d: Date) {
+	io.print_i64(d.year)
+	io.print("-")
+	io.print_u64(d.month)
+	io.print("-")
+	io.print_u64(d.day)
+	io.print(" ")
+	if !valid(d) {
+		io.print("invalid\n")
+		return
+	}
+	io.print_i64(days_from_civil(d))
+	io.print(" ")
+	print_name(weekday(d))
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	show(Date{year: 1970, month: 1, day: 1})
+	show(Date{year: 2000, month: 2, day: 29})
+	show(Date{year: 1900, month: 2, day: 29})
+	show(Date{year: 2026, month: 10, day: 4})
+	show(Date{year: 1969, month: 12, day: 31})
+	show(Date{year: 1, month: 1, day: 1})
+	show(Date{year: 2026, month: 13, day: 1})
+	return 0
+}

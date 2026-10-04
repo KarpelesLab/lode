@@ -1,0 +1,103 @@
+// stdout: .#......\n
+// stdout: ..#.....\n
+// stdout: ###.....\n
+// stdout: ........\n
+// stdout: ........\n
+// stdout: ........\n
+// stdout: --\n
+// stdout: ........\n
+// stdout: ..#.....\n
+// stdout: ...#....\n
+// stdout: .###....\n
+// stdout: ........\n
+// stdout: ........\n
+// stdout: 5\n
+package main
+
+import "std/io"
+
+const W = 8
+const H = 6
+
+struct Grid {
+	cells: [H][W]bool
+}
+
+fn neighbors(g: Grid, r: usize, c: usize) -> u8 {
+	var n: u8 = 0
+	for dr in 0..3 {
+		for dc in 0..3 {
+			if dr == 1 && dc == 1 {
+				continue
+			}
+			// wrap around the edges (torus)
+			// WORKAROUND: no refinement on r/c, so reduce them first
+			let rr = (r % H + H + dr - 1) % H
+			let cc = (c % W + W + dc - 1) % W
+			if g.cells[rr][cc] {
+				n = n +% 1 // WORKAROUND: the checker doesn't count iterations
+			}
+		}
+	}
+	return n
+}
+
+fn step(g: Grid) -> Grid {
+	var next = Grid{cells: [[false; W]; H]}
+	for r in 0..H {
+		for c in 0..W {
+			let n = neighbors(g, r, c)
+			let alive = g.cells[r][c]
+			next.cells[r][c] = n == 3 || (alive && n == 2)
+		}
+	}
+	return next
+}
+
+fn show(g: Grid) {
+	for row in g.cells {
+		for cell in row {
+			if cell {
+				io.print("#")
+			} else {
+				io.print(".")
+			}
+		}
+		io.print("\n")
+	}
+}
+
+fn population(g: Grid) -> u32 {
+	var n: u32 = 0
+	for row in g.cells {
+		for cell in row {
+			if cell {
+				n = n +% 1 // WORKAROUND, as above (and `+%=` does not parse)
+			}
+		}
+	}
+	return n
+}
+
+fn main() -> u8 {
+	var g = Grid{cells: [[false; W]; H]}
+	// a glider
+	g.cells[0][1] = true
+	g.cells[1][2] = true
+	g.cells[2][0] = true
+	g.cells[2][1] = true
+	g.cells[2][2] = true
+	show(g)
+	for gen in 0..4 {
+		g = step(g)
+	}
+	io.print("--\n")
+	show(g)
+	io.print_u64(population(g))
+	io.print("\n")
+	// After 4 generations a glider moved one cell down and right.
+	if !g.cells[1][2] || !g.cells[2][3] || !g.cells[3][1] || !g.cells[3][2] || !g.cells[3][3] {
+		return 1
+	}
+	return 0
+}

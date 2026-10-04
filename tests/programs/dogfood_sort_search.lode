@@ -1,0 +1,90 @@
+// stdout: -100 -7 0 1 5 8 13 13 42 99 \n
+// stdout: 13 at 6\n
+// stdout: lower_bound(50) = 9\n
+package main
+
+import "std/io"
+
+const N = 10
+
+// Insertion sort in place on a fixed-size array, returned by value.
+fn insertion_sort(a: [N]i32) -> [N]i32 {
+	var xs = a
+	for i in 1..xs.len {
+		let key = xs[i]
+		var j = i
+		while j > 0 && xs[j - 1] > key {
+			xs[j] = xs[j - 1]
+			j = j - 1
+		}
+		xs[j] = key
+	}
+	return xs
+}
+
+// Lower-bound binary search: the first index whose element is >= v.
+fn lower_bound(xs: []i32, v: i32) -> usize {
+	var lo: usize = 0
+	var hi = xs.len
+	while lo < hi {
+		let mid = lo + (hi - lo) / 2
+		// WORKAROUND: redundant check; the checker can't see mid < hi <= xs.len
+		if mid >= xs.len {
+			break
+		}
+		if xs[mid] < v {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+fn find(xs: []i32, v: i32) -> ?usize {
+	let i = lower_bound(xs, v)
+	if i < xs.len && xs[i] == v {
+		return i
+	}
+	return none
+}
+
+fn is_sorted(xs: []i32) -> bool {
+	for i in 1..xs.len {
+		if xs[i - 1] > xs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+fn print_all(xs: []i32) {
+	for x in xs {
+		io.print_i64(x)
+		io.print(" ")
+	}
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	let data: [N]i32 = [42, -7, 13, 0, 99, -100, 13, 5, 8, 1]
+	let sorted = insertion_sort(data)
+	print_all(sorted)
+	if !is_sorted(sorted) {
+		return 1
+	}
+	if let i = find(sorted, 13) {
+		io.print("13 at ")
+		io.print_u64(i)
+		io.print("\n")
+	} else {
+		return 2
+	}
+	if find(sorted, 14) != none {
+		return 3
+	}
+	io.print("lower_bound(50) = ")
+	io.print_u64(lower_bound(sorted, 50))
+	io.print("\n")
+	return 0
+}

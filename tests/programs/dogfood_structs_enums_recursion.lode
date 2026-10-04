@@ -1,0 +1,141 @@
+// stdout: 7 -7 40 832040 parity \n
+// stdout: 230 1 -1 \n
+// stdout: big neg max min \n
+// stdout: \n
+// stdout: 12 400 128 5 \n
+package main
+
+import "std/io"
+
+struct P {
+	x: i32
+	y: i32
+}
+
+enum Cmd {
+	move(to: P)
+	say(code: u16)
+	repeat(times: u8, what: ?P)
+	halt
+}
+
+fn u(v: u64) {
+	io.print_u64(v)
+	io.print(" ")
+}
+
+fn s(v: i64) {
+	io.print_i64(v)
+	io.print(" ")
+}
+
+fn make_p(k: i32) -> P {
+	return P{x: k, y: 0 -% k}
+}
+
+fn table() -> [5]u16 {
+	return [10, 20, 30, 40, 50]
+}
+
+fn fib(n: u32) -> u64 {
+	if n < 2 {
+		return u64(n)
+	}
+	return fib(n - 1) +% fib(n - 2)
+}
+
+fn is_even(n: u32) -> bool {
+	if n == 0 {
+		return true
+	}
+	return is_odd(n - 1)
+}
+
+fn is_odd(n: u32) -> bool {
+	if n == 0 {
+		return false
+	}
+	return is_even(n - 1)
+}
+
+fn run(cmds: []Cmd) -> i64 {
+	var acc: i64 = 0
+	for c in cmds {
+		match c {
+			move(to) => acc = acc +% i64(to.x) *% 10 +% i64(to.y)
+			say(code) => {
+				if code == 0 {
+					continue
+				}
+				if code == 999 {
+					break
+				}
+				acc = acc +% i64(code)
+			}
+			repeat(t, w) => {
+				var k: u8 = 0
+				while k < t {
+					let q = w ?? P{x: 1, y: 1}
+					acc = acc +% i64(q.x)
+					k = k + 1
+				}
+			}
+			halt => return acc
+		}
+	}
+	return acc -% 1
+}
+
+fn compare_extremes(a: u64, b: i64) {
+	if a > 9223372036854775807 {
+		io.print("big ")
+	}
+	if b < 0 {
+		io.print("neg ")
+	}
+	let c: u64 = 18446744073709551615
+	if a == c {
+		io.print("max ")
+	}
+	if b == -9223372036854775808 {
+		io.print("min ")
+	}
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	s(make_p(7).x)
+	s(make_p(7).y)
+	u(table()[3])
+	u(fib(30))
+	if is_even(10) && is_odd(7) && !is_even(3) {
+		io.print("parity ")
+	}
+	io.print("\n")
+	let cmds: [6]Cmd = [Cmd.move(P{x: 2, y: 3}), Cmd.say(0), Cmd.say(5), Cmd.repeat(3, none), Cmd.repeat(2, P{x: 100, y: 0}), Cmd.say(999)]
+	s(run(cmds))
+	let cmds2: [3]Cmd = [Cmd.say(1), Cmd.halt, Cmd.say(1000)]
+	s(run(cmds2))
+	let empty: [0]Cmd = []
+	s(run(empty))
+	io.print("\n")
+	compare_extremes(18446744073709551615, -9223372036854775808)
+	compare_extremes(1, 1)
+	var total: u32 = 0
+	let xs: [3]u32 = [3, 4, 5]
+	for x in xs {
+		total = total +% x
+	}
+	let x: u8 = 200
+	let x2 = u32(x) * 2
+	u(u64(total))
+	u(u64(x2))
+	let neg: i8 = -128
+	let wide = i64(neg)
+	s(-wide)
+	let m: i16 = -5
+	let n = -m
+	s(n)
+	io.print("\n")
+	return 0
+}

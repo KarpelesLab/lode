@@ -1,0 +1,84 @@
+// stdout: 0 -> 0\n
+// stdout: 12345 -> 12345\n
+// stdout: 4294967295 -> 4294967295\n
+// stdout: 4294967296 -> overflow\n
+// stdout: 99999999999 -> overflow\n
+// stdout: 12a4 -> bad digit at 2\n
+// stdout:  -> empty\n
+package main
+
+import "std/io"
+import "std/os"
+
+enum ParseError {
+	empty
+	invalid_digit(pos: usize)
+	overflow
+}
+
+enum ParseResult {
+	ok(value: u32)
+	err(e: ParseError)
+}
+
+// Parse an unsigned decimal number, rejecting overflow.
+fn parse_u32(s: []u8) -> ParseResult {
+	if s.len == 0 {
+		return ParseResult.err(ParseError.empty)
+	}
+	var n: u32 = 0
+	for i in 0..s.len {
+		let c = s[i]
+		if c < '0' || c > '9' {
+			return ParseResult.err(ParseError.invalid_digit(i))
+		}
+		let d = c - '0'
+		// WORKAROUND: natural `if n > (MAX - d) / 10 { overflow }; n = n * 10 + d`
+		// isn't provable; go through u64 instead.
+		let w = u64(n) * 10 + d
+		if w > 4294967295 {
+			return ParseResult.err(ParseError.overflow)
+		}
+		n = u32(w)
+	}
+	return ParseResult.ok(n)
+}
+
+// WORKAROUND: no safe way to print a []u8 or to get the bytes of a str
+fn print_bytes(s: []u8) {
+	unsafe {
+		os.write(os.STDOUT, s.ptr, s.len)
+	}
+}
+
+fn report(s: []u8) {
+	print_bytes(s)
+	io.print(" -> ")
+	match parse_u32(s) {
+		ok(v) => io.print_u64(v)
+		err(e) => {
+			match e {
+				empty => io.print("empty")
+				invalid_digit(p) => {
+					io.print("bad digit at ")
+					io.print_u64(p)
+				}
+				overflow => io.print("overflow")
+			}
+		}
+	}
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	// WORKAROUND: str has no .bytes(), so inputs are byte arrays
+	report(['0'])
+	report(['1', '2', '3', '4', '5'])
+	report(['4', '2', '9', '4', '9', '6', '7', '2', '9', '5'])
+	report(['4', '2', '9', '4', '9', '6', '7', '2', '9', '6'])
+	report(['9', '9', '9', '9', '9', '9', '9', '9', '9', '9', '9'])
+	report(['1', '2', 'a', '4'])
+	let none_: [0]u8 = []
+	report(none_)
+	return 0
+}

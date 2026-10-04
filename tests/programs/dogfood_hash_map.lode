@@ -1,0 +1,128 @@
+// stdout: count 12\n
+// stdout: 0 -> 0\n
+// stdout: 7919 -> 1\n
+// stdout: 15838 -> 4\n
+// stdout: 23757 -> 1000\n
+// stdout: 31676 -> 16\n
+// stdout: 39595 -> 25\n
+// stdout: 47514 -> 36\n
+// stdout: 55433 -> 49\n
+// stdout: 63352 -> 64\n
+// stdout: 71271 -> 81\n
+// stdout: 79190 -> 100\n
+// stdout: 87109 -> 121\n
+// stdout: 95028 -> none\n
+// stdout: 102947 -> none\n
+package main
+
+import "std/io"
+
+const CAP = 16
+
+struct Entry {
+	key: u32
+	value: u32
+}
+
+struct Map {
+	count: usize
+	slots: [CAP]?Entry
+}
+
+fn hash(k: u32) -> u32 {
+	var h = k
+	h = h ^ (h >> 16)
+	h = h *% 0x45d9f3b
+	h = h ^ (h >> 16)
+	return h
+}
+
+fn map_new() -> Map {
+	return Map{count: 0, slots: [none; CAP]}
+}
+
+// Linear probing. Returns the slot holding `k`, or the first empty one.
+fn probe(m: Map, k: u32) -> ?usize {
+	var i = usize(hash(k) % CAP)
+	for step in 0..CAP {
+		match m.slots[i] {
+			none => return i
+			some(e) => {
+				if e.key == k {
+					return i
+				}
+			}
+		}
+		i = (i + 1) % CAP
+	}
+	return none
+}
+
+fn get(m: Map, k: u32) -> ?u32 {
+	let i = probe(m, k) else {
+		return none
+	}
+	if i >= CAP { // WORKAROUND: probe's result is always < CAP, but no refinement on returns
+		return none
+	}
+	if let e = m.slots[i] {
+		return e.value
+	}
+	return none
+}
+
+fn put(m: Map, k: u32, v: u32) -> ?Map {
+	let i = probe(m, k) else {
+		return none
+	}
+	if i >= CAP {
+		return none
+	}
+	var out = m
+	if out.slots[i] == none {
+		if out.count >= CAP { // WORKAROUND: struct invariant count <= CAP unknown
+			return none
+		}
+		out.count = out.count + 1
+	}
+	out.slots[i] = Entry{key: k, value: v}
+	return out
+}
+
+fn main() -> u8 {
+	var m = map_new()
+	for k in 0..12 {
+		let key = u32(k) * 7919
+		m = put(m, key, u32(k) * u32(k)) ?? m
+	}
+	// overwrite one
+	m = put(m, 7919 * 3, 1000) ?? m
+	io.print("count ")
+	io.print_u64(m.count)
+	io.print("\n")
+	for k in 0..14 {
+		let key = u32(k) * 7919
+		io.print_u64(key)
+		io.print(" -> ")
+		if let v = get(m, key) {
+			io.print_u64(v)
+		} else {
+			io.print("none")
+		}
+		io.print("\n")
+	}
+	// fill to capacity, then one more must fail
+	for k in 100..104 {
+		m = put(m, u32(k), 1) ?? m
+	}
+	if m.count != CAP {
+		return 1
+	}
+	if put(m, 5, 5) != none {
+		return 2
+	}
+	if get(m, 0) != 0 || get(m, 3 * 7919) != 1000 || get(m, 4242) != none {
+		return 3
+	}
+	return 0
+}

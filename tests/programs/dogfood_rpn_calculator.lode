@@ -1,0 +1,201 @@
+// stdout: 28\n
+// stdout: division by zero at 2\n
+// stdout: underflow at 1\n
+// stdout: overflow at 2\n
+// stdout: overflow at 2\n
+// stdout: 2\n
+// stdout: underflow at 16\n
+package main
+
+import "std/io"
+
+const DEPTH = 16
+
+enum Op {
+	push(v: i64)
+	add
+	sub
+	mul
+	div
+	dup
+	swap
+}
+
+enum Outcome {
+	value(v: i64)
+	underflow(at: usize)
+	overflow(at: usize)
+	div_zero(at: usize)
+	stack_full(at: usize)
+}
+
+struct Stack {
+	sp: usize
+	items: [DEPTH]i64
+}
+
+fn run(prog: []Op) -> Outcome {
+	var st = Stack{sp: 0, items: [0; DEPTH]}
+	for pc in 0..prog.len {
+		// WORKAROUND: the loop head can't find `sp <= DEPTH` (it rises under a
+		// check in `push`, falls in `add`); restate it every iteration.
+		if st.sp > DEPTH {
+			return Outcome.stack_full(pc)
+		}
+		match prog[pc] {
+			push(v) => {
+				if st.sp >= DEPTH {
+					return Outcome.stack_full(pc)
+				}
+				st.items[st.sp] = v
+				st.sp = st.sp + 1
+			}
+			dup => {
+				if st.sp == 0 || st.sp >= DEPTH {
+					return Outcome.underflow(pc)
+				}
+				st.items[st.sp] = st.items[st.sp - 1]
+				st.sp = st.sp + 1
+			}
+			swap => {
+				if st.sp < 2 {
+					return Outcome.underflow(pc)
+				}
+				let t = st.items[st.sp - 1]
+				st.items[st.sp - 1] = st.items[st.sp - 2]
+				st.items[st.sp - 2] = t
+			}
+			add => {
+				if st.sp < 2 {
+					return Outcome.underflow(pc)
+				}
+				let b = st.items[st.sp - 1]
+				let a = st.items[st.sp - 2]
+				// WORKAROUND: no checked_add (methods unsupported)
+				let r = a +% b
+				if (a >= 0) == (b >= 0) && (r >= 0) != (a >= 0) {
+					return Outcome.overflow(pc)
+				}
+				st.sp = st.sp - 1
+				st.items[st.sp - 1] = r
+			}
+			sub => {
+				if st.sp < 2 {
+					return Outcome.underflow(pc)
+				}
+				let b = st.items[st.sp - 1]
+				let a = st.items[st.sp - 2]
+				// WORKAROUND: no checked_sub
+				let r = a -% b
+				if (a >= 0) != (b >= 0) && (r >= 0) != (a >= 0) {
+					return Outcome.overflow(pc)
+				}
+				st.sp = st.sp - 1
+				st.items[st.sp - 1] = r
+			}
+			mul => {
+				if st.sp < 2 {
+					return Outcome.underflow(pc)
+				}
+				let b = st.items[st.sp - 1]
+				let a = st.items[st.sp - 2]
+				// WORKAROUND: no checked_mul and no i128; divide back
+				let r = a *% b
+				if a != 0 {
+					if a == -1 && b == -9223372036854775808 {
+						return Outcome.overflow(pc)
+					}
+					if r == -9223372036854775808 && a == -1 {
+						return Outcome.overflow(pc)
+					}
+					// WORKAROUND: `a != 0` gives no fact for a signed `a`
+					if a > 0 {
+						if r / a != b {
+							return Outcome.overflow(pc)
+						}
+					} else if a < -1 {
+						if r / a != b {
+							return Outcome.overflow(pc)
+						}
+					}
+				}
+				st.sp = st.sp - 1
+				st.items[st.sp - 1] = r
+			}
+			div => {
+				if st.sp < 2 {
+					return Outcome.underflow(pc)
+				}
+				let b = st.items[st.sp - 1]
+				let a = st.items[st.sp - 2]
+				if b == 0 {
+					return Outcome.div_zero(pc)
+				}
+				if a == -9223372036854775808 && b == -1 {
+					return Outcome.overflow(pc)
+				}
+				// WORKAROUND: neither `b != 0` nor `!(a == MIN && b == -1)` is a fact
+				var q: i64 = 0
+				if b > 0 {
+					q = a / b
+				} else if b < -1 {
+					q = a / b
+				} else if b == -1 {
+					if a == -9223372036854775808 {
+						return Outcome.overflow(pc)
+					}
+					q = -a
+				}
+				st.sp = st.sp - 1
+				st.items[st.sp - 1] = q
+			}
+		}
+	}
+	if st.sp == 0 {
+		return Outcome.underflow(prog.len)
+	}
+	return Outcome.value(st.items[st.sp - 1])
+}
+
+fn show(o: Outcome) {
+	match o {
+		value(v) => io.print_i64(v)
+		underflow(at) => {
+			io.print("underflow at ")
+			io.print_u64(at)
+		}
+		overflow(at) => {
+			io.print("overflow at ")
+			io.print_u64(at)
+		}
+		div_zero(at) => {
+			io.print("division by zero at ")
+			io.print_u64(at)
+		}
+		stack_full(at) => {
+			io.print("stack full at ")
+			io.print_u64(at)
+		}
+	}
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	// (3 + 4) * (10 - 2) / 2 = 28
+	let p1: [9]Op = [Op.push(3), Op.push(4), Op.add, Op.push(10), Op.push(2), Op.sub, Op.mul, Op.push(2), Op.div]
+	show(run(p1))
+	let p2: [3]Op = [Op.push(1), Op.push(0), Op.div]
+	show(run(p2))
+	let p3: [2]Op = [Op.push(1), Op.add]
+	show(run(p3))
+	let p4: [4]Op = [Op.push(9223372036854775807), Op.dup, Op.add, Op.add]
+	show(run(p4))
+	let p5: [4]Op = [Op.push(-9223372036854775808), Op.push(-1), Op.div, Op.dup]
+	show(run(p5))
+	let p6: [5]Op = [Op.push(5), Op.push(7), Op.swap, Op.sub, Op.dup]
+	show(run(p6))
+	var p7: [20]Op = [Op.dup; 20]
+	p7[0] = Op.push(1)
+	show(run(p7))
+	return 0
+}

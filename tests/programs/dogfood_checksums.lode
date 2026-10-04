@@ -1,0 +1,110 @@
+// stdout: 300286872\n
+// stdout: 3421780262\n
+// stdout: 48,x99,98,102,52,51,57,50,54,\n
+// stdout: 51440\n
+package main
+
+import "std/io"
+
+const MOD_ADLER: u32 = 65521
+
+fn adler32(data: []u8) -> u32 {
+	var a: u32 = 1
+	var b: u32 = 0
+	for x in data {
+		a = (a + u32(x)) % MOD_ADLER // WORKAROUND: implicit u8->u32 widening loses 0..=255
+		b = (b + a) % MOD_ADLER
+	}
+	return (b << 16) | a
+}
+
+fn crc_table() -> [256]u32 {
+	var t: [256]u32 = [0; 256]
+	for n in 0..256 {
+		var c = u32(n)
+		for k in 0..8 {
+			if c & 1 != 0 {
+				c = 0xedb88320 ^ (c >> 1)
+			} else {
+				c = c >> 1
+			}
+		}
+		t[n] = c
+	}
+	return t
+}
+
+fn crc32(table: [256]u32, data: []u8) -> u32 {
+	var c: u32 = 0xffffffff
+	for x in data {
+		c = table[(c ^ x) & 0xff] ^ (c >> 8)
+	}
+	return c ^ 0xffffffff
+}
+
+// Fletcher-16 over the same data.
+fn fletcher16(data: []u8) -> u16 {
+	var s1: u16 = 0
+	var s2: u16 = 0
+	for x in data {
+		s1 = (s1 + u16(x)) % 255 // WORKAROUND, as above
+		s2 = (s2 + s1) % 255
+	}
+	return (s2 << 8) | s1
+}
+
+fn hex32(v: u32) {
+	let digits: [16]u8 = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+	var buf: [8]u8 = [0; 8]
+	var x = v
+	var i = buf.len
+	while i > 0 {
+		i = i - 1
+		buf[i] = digits[x & 0xf]
+		x = x >> 4
+	}
+	var out: [10]u8 = ['0', 'x', 0, 0, 0, 0, 0, 0, 0, 0]
+	for j in 0..8 {
+		out[j + 2] = buf[j]
+	}
+	for c in out {
+		if c == 'x' {
+			io.print("x")
+		} else {
+			// no way to print one byte without unsafe; print its digit value
+			io.print_u64(c)
+			io.print(",")
+		}
+	}
+	io.print("\n")
+}
+
+fn main() -> u8 {
+	// "Wikipedia"
+	let w: [9]u8 = ['W', 'i', 'k', 'i', 'p', 'e', 'd', 'i', 'a']
+	let ad = adler32(w)
+	io.print_u64(ad)
+	io.print("\n")
+	if ad != 0x11e60398 {
+		return 1
+	}
+	// "123456789"
+	let s: [9]u8 = ['1', '2', '3', '4', '5', '6', '7', '8', '9']
+	let t = crc_table()
+	let c = crc32(t, s)
+	io.print_u64(c)
+	io.print("\n")
+	hex32(c)
+	if c != 0xcbf43926 {
+		return 2
+	}
+	// "abcde"
+	let f: [5]u8 = ['a', 'b', 'c', 'd', 'e']
+	let fl = fletcher16(f)
+	io.print_u64(fl)
+	io.print("\n")
+	if fl != 0xc8f0 {
+		return 3
+	}
+	return 0
+}

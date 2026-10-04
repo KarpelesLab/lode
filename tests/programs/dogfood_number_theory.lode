@@ -1,0 +1,100 @@
+// stdout: 2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97 \n
+// stdout: 21 1000 4294967295 24 136318165\n
+package main
+
+import "std/io"
+
+const LIMIT = 100
+
+fn sieve() -> [LIMIT]bool {
+	var composite: [LIMIT]bool = [false; LIMIT]
+	composite[0] = true
+	composite[1] = true
+	var i: usize = 2
+	while i < LIMIT && i * i < LIMIT { // WORKAROUND: `i * i < LIMIT` alone gives no bound on i
+		if !composite[i] {
+			var j = i * i
+			while j < LIMIT {
+				composite[j] = true
+				j = j + i
+			}
+		}
+		i = i + 1
+	}
+	return composite
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+	var x = a
+	var y = b
+	while y != 0 {
+		let t = x % y
+		x = y
+		y = t
+	}
+	return x
+}
+
+// Integer square root by Newton's method.
+fn isqrt(n: u64) -> u64 {
+	if n < 2 {
+		return n
+	}
+	var x = n
+	// FIXED a real overflow at n = max the checker found; `x / 2 + 1` doesn't
+	// prove either (division doesn't narrow the range), so saturate.
+	var y = x / 2 +| 1
+	while y < x {
+		if y == 0 { // WORKAROUND: y >= 1 always, unprovable
+			break
+		}
+		x = y
+		y = (x +| n / x) / 2 // WORKAROUND: can't overflow, can't be proven
+	}
+	return x
+}
+
+fn modpow(base: u64, exp: u64, m: u64) -> u64 {
+	// FIXED: the checker caught `m == 0`, and `result * b` overflowing for m >= 2^32
+	if m <= 1 || m > 0xffffffff {
+		return 0
+	}
+	var result: u64 = 1
+	var b = base % m
+	var e = exp
+	while e > 0 {
+		if e & 1 == 1 {
+			result = result * b % m
+		}
+		b = b * b % m
+		e = e >> 1
+	}
+	return result
+}
+
+fn main() -> u8 {
+	let c = sieve()
+	var count: u32 = 0
+	for i in 0..c.len {
+		if !c[i] {
+			count = count +% 1 // WORKAROUND: at most 100 iterations, not counted
+			io.print_u64(i)
+			io.print(" ")
+		}
+	}
+	io.print("\n")
+	if count != 25 {
+		return 1
+	}
+	io.print_u64(gcd(1071, 462))
+	io.print(" ")
+	io.print_u64(isqrt(1000000))
+	io.print(" ")
+	io.print_u64(isqrt(18446744073709551615))
+	io.print(" ")
+	io.print_u64(modpow(2, 10, 1000))
+	io.print(" ")
+	io.print_u64(modpow(3, 200, 1000000007))
+	io.print("\n")
+	return 0
+}

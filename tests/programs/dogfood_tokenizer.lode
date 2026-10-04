@@ -1,0 +1,135 @@
+// stdout: ident @0 len 3\n
+// stdout: op 43\n
+// stdout: num 12\n
+// stdout: op 42\n
+// stdout: (\n
+// stdout: ident @10 len 5\n
+// stdout: op 45\n
+// stdout: num 7\n
+// stdout: )\n
+// stdout: bad @21\n
+// stdout: ident @23 len 1\n
+// stdout: eof\n
+package main
+
+import "std/io"
+
+enum Token {
+	number(value: u64)
+	ident(start: usize, len: usize)
+	op(c: u8)
+	lparen
+	rparen
+	bad(pos: usize)
+	eof
+}
+
+enum State {
+	start
+	in_number
+	in_ident
+}
+
+fn is_digit(c: u8) -> bool {
+	return c >= '0' && c <= '9'
+}
+
+fn is_alpha(c: u8) -> bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+struct Lexed {
+	tok: Token
+	next: usize
+}
+
+// Scan one token starting at `pos`.
+fn next_token(src: []u8, pos: usize) -> Lexed {
+	var i = pos
+	var state = State.start
+	var value: u64 = 0
+	var start = i // WORKAROUND: `= 0` or `= pos` loses `start <= i`
+	while i < src.len {
+		let c = src[i]
+		match state {
+			start => {
+				if c == ' ' || c == '\t' || c == '\n' {
+					i = i + 1
+				} else if is_digit(c) {
+					state = State.in_number
+				} else if is_alpha(c) {
+					state = State.in_ident
+					start = i
+				} else if c == '+' || c == '-' || c == '*' || c == '/' {
+					return Lexed{tok: Token.op(c), next: i + 1}
+				} else if c == '(' {
+					return Lexed{tok: Token.lparen, next: i + 1}
+				} else if c == ')' {
+					return Lexed{tok: Token.rparen, next: i + 1}
+				} else {
+					return Lexed{tok: Token.bad(i), next: i + 1}
+				}
+			}
+			in_number => {
+				if c < '0' || c > '9' { // WORKAROUND: is_digit(c) gives no facts
+					return Lexed{tok: Token.number(value), next: i}
+				}
+				value = value *% 10 +% (c - '0') // WORKAROUND: `*|` unsupported
+				i = i + 1
+			}
+			in_ident => {
+				if !is_alpha(c) && !is_digit(c) {
+					return Lexed{tok: Token.ident(start, i - start), next: i}
+				}
+				i = i + 1
+			}
+		}
+	}
+	match state {
+		start => return Lexed{tok: Token.eof, next: i}
+		in_number => return Lexed{tok: Token.number(value), next: i}
+		in_ident => return Lexed{tok: Token.ident(start, i - start), next: i}
+	}
+}
+
+fn main() -> u8 {
+	let src: [24]u8 = ['f', 'o', 'o', ' ', '+', ' ', '1', '2', '*', '(', 'b', 'a', 'r', '_', '9', ' ', '-', ' ', '7', ')', ' ', '$', ' ', 'x']
+	var pos: usize = 0
+	var count: u32 = 0
+	loop {
+		let l = next_token(src, pos)
+		pos = l.next
+		count = count +% 1
+		match l.tok {
+			number(v) => {
+				io.print("num ")
+				io.print_u64(v)
+			}
+			ident(s, n) => {
+				io.print("ident @")
+				io.print_u64(s)
+				io.print(" len ")
+				io.print_u64(n)
+			}
+			op(c) => {
+				io.print("op ")
+				io.print_u64(c)
+			}
+			lparen => io.print("(")
+			rparen => io.print(")")
+			bad(p) => {
+				io.print("bad @")
+				io.print_u64(p)
+			}
+			eof => {
+				io.print("eof\n")
+				break
+			}
+		}
+		io.print("\n")
+	}
+	if count != 12 {
+		return 1
+	}
+	return 0
+}
