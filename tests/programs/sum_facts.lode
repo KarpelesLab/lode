@@ -74,10 +74,10 @@ fn add_small[T: Unsigned](a: T, b: T) -> ?T {
 	return a + b
 }
 
-fn show[T: Integer](v: ?T) {
+fn show[T: Integer + io.Format](v: ?T) {
 	match v {
 		none => io.print("none")
-		some(x) => io.print_int(x)
+		some(x) => io.print("{}", x)
 	}
 }
 
@@ -106,10 +106,10 @@ fn main() {
 	io.print(" ")
 	show(add_small[u64](150, 51))
 	io.print(" ")
-	io.print_int(joined(20, 5))
+	io.print("{}", joined(20, 5))
 	io.print(" ")
-	io.print_int(capped_sum([400, 500, 200, 7]))
+	io.print("{}", capped_sum([400, 500, 200, 7]))
 	io.print(" ")
-	io.print_int(joined(250, 3))
+	io.print("{}", joined(250, 3))
 	io.print("\n")
 }

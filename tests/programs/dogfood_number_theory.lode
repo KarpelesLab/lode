@@ -78,23 +78,22 @@ fn main() -> u8 {
 	for i in 0..c.len {
 		if !c[i] {
 			count += 1
-			io.print_int(i)
-			io.print(" ")
+			io.print("{} ", i)
 		}
 	}
 	io.print("\n")
 	if count != 25 {
 		return 1
 	}
-	io.print_int(gcd(1071, 462))
+	io.print("{}", gcd(1071, 462))
 	io.print(" ")
-	io.print_int(isqrt(1000000))
+	io.print("{}", isqrt(1000000))
 	io.print(" ")
-	io.print_int(isqrt(18446744073709551615))
+	io.print("{}", isqrt(18446744073709551615))
 	io.print(" ")
-	io.print_int(modpow(2, 10, 1000))
+	io.print("{}", modpow(2, 10, 1000))
 	io.print(" ")
-	io.print_int(modpow(3, 200, 1000000007))
+	io.print("{}", modpow(3, 200, 1000000007))
 	io.print("\n")
 	return 0
 }

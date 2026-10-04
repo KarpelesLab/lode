@@ -60,7 +60,6 @@ fn main() -> u8 {
 	if v > 0x7fffffffffffffff {
 		return 3
 	}
-	io.print_int(v * 2)
-	io.print("\n")
+	io.print("{}\n", v * 2)
 	return 0
 }

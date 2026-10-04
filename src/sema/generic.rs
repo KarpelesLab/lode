@@ -250,6 +250,7 @@ pub(super) fn type_text(t: &ast::TypeExpr) -> String {
         ast::TypeExpr::Slice(elem, _) => format!("[]{}", type_text(elem)),
         ast::TypeExpr::Optional(inner, _) => format!("?{}", type_text(inner)),
         ast::TypeExpr::Generic(base, _, _) => format!("{}[...]", type_text(base)),
+        ast::TypeExpr::Pack(name, _) => format!("..{}", name.name),
     }
 }
 
@@ -275,11 +276,25 @@ impl Checker<'_> {
     ) -> (Vec<Ty>, Vec<Vec<Trait>>) {
         let mut out = Vec::new();
         let mut declared = Vec::new();
+        cx.pack_params.clear();
         for g in generics {
             if !self.generic_name_ok(g, &out) {
                 continue;
             }
             let name = &g.name.name;
+            // A pack: one type parameter per argument in an expansion, one
+            // standing for them all in the template.
+            if g.pack {
+                let traits = self.bound_traits(cx, g);
+                for _ in 0..cx.expanding.unwrap_or(1) {
+                    let ty = Ty::new_param(name.clone(), Bounds::new(&traits), self.ptr_bits);
+                    self.declared_bounds.insert(ty, traits.clone());
+                    out.push(ty);
+                    declared.push(traits.clone());
+                    cx.pack_params.push(ty);
+                }
+                continue;
+            }
             if let Some(it) = self.value_param_type(g) {
                 let Some(it) = it else {
                     continue;
@@ -345,7 +360,7 @@ impl Checker<'_> {
         }
         let mut out = Vec::new();
         let mut declared = Vec::new();
-        let mut ok = true;
+        let mut ok = self.no_pack(generics, "a type's");
         for (&p, g) in decl.iter().zip(generics) {
             if !self.generic_name_ok(g, &out) {
                 ok = false;
@@ -388,6 +403,22 @@ impl Checker<'_> {
             declared.push(traits);
         }
         ok.then_some((out, declared))
+    }
+
+    /// Report a pack among `generics`, which only a function's can have
+    /// (`whose`: "a type's"). Whether there's none.
+    pub(super) fn no_pack(&mut self, generics: &[ast::GenericParam], whose: &str) -> bool {
+        let Some(g) = generics.iter().find(|g| g.pack) else {
+            return true;
+        };
+        self.diags.push(
+            Diagnostic::error(
+                g.name.span,
+                format!("{whose} generic parameters can't be a pack"),
+            )
+            .with_help("only a function has a pack, as in `fn print[..A: Format](comptime fmt: str, args: ..A)`"),
+        );
+        false
     }
 
     /// Report a generic parameter whose name can't be used: a built-in
@@ -673,6 +704,19 @@ impl Checker<'_> {
         let params = self.sigs[id].type_params.clone();
         for (k, p) in params.iter().enumerate() {
             let (arg, span) = inf.args[k].expect("every type argument is known");
+            // A pack's arguments may be views (a `str`): they're read-only
+            // parameters. One can be passed on in another pack, or be the
+            // `Self` of a trait's method (`args[i].format(&w)`), and nothing
+            // else, which may store it.
+            if self.is_pack_param(id, *p) {
+                ok &= self.arg_satisfies(*p, &self.sigs[id].bounds[k].clone(), arg, name, span);
+                continue;
+            }
+            let self_of_trait = k == 0 && self.is_trait_fn(id);
+            if !self_of_trait && !self.check_no_view_param(arg, span) {
+                ok = false;
+                continue;
+            }
             if self.check_type_arg(arg, span).is_none() {
                 ok = false;
                 continue;
@@ -700,10 +744,31 @@ impl Checker<'_> {
         };
         let mut ok = true;
         for (p, arg) in ty.decl_params().into_iter().zip(ty.type_args().iter()) {
+            if !self.check_no_view_param(*arg, span) {
+                return false;
+            }
             let declared = self.declared_bounds.get(&p).cloned().unwrap_or_default();
             ok &= self.arg_satisfies(p, &declared, *arg, &name, span);
         }
         ok
+    }
+
+    /// Report a type argument that mentions a pack's type parameter, which
+    /// may be a view (see [`Checker::check_bounds`]). Whether it doesn't.
+    pub(super) fn check_no_view_param(&mut self, arg: Ty, span: Span) -> bool {
+        let mut mentioned = Vec::new();
+        arg.params(&mut mentioned);
+        let Some(p) = mentioned.into_iter().find(|p| self.view_params.contains(p)) else {
+            return true;
+        };
+        self.diags.push(
+            Diagnostic::error(
+                span,
+                format!("this is a pack's argument, which may be a view (a `str`), so `{p}` can't be a type argument here"),
+            )
+            .with_help("a pack's arguments are formatted (`args[i].format(&w)`) or passed on (`..args`); a generic function or type may store a value of its type parameter"),
+        );
+        false
     }
 
     /// Whether `arg` has the traits `declared` for the parameter `p` of

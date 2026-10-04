@@ -42,8 +42,9 @@ pub(super) enum Value {
     Unit,
     Int(i128),
     Bool(bool),
-    /// A string literal, by index into the checker's strings.
-    Str(usize),
+    /// A `str`: bytes `start..start + len` of a string, by index into the
+    /// checker's strings.
+    Str(StrVal),
     Array(Rc<Vec<Value>>),
     /// A view of `len` elements of an array, from `start`.
     Slice(Rc<Vec<Value>>, usize, usize),
@@ -53,8 +54,27 @@ pub(super) enum Value {
     Variant(u32, Rc<Vec<Value>>),
 }
 
+/// A `str` at compile time: part of one of the checker's strings, and the
+/// string literal it's part of, when it comes from one in the source (for
+/// errors that point into it, like a format string's).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StrVal {
+    pub(super) id: usize,
+    pub(super) start: usize,
+    pub(super) len: usize,
+    /// The span of the string literal (quotes included) whose value is the
+    /// string `id`.
+    pub(super) origin: Option<Span>,
+}
+
+impl StrVal {
+    pub(super) fn bytes<'s>(&self, strings: &'s [Vec<u8>]) -> &'s [u8] {
+        &strings[self.id][self.start..self.start + self.len]
+    }
+}
+
 impl Value {
-    fn int(&self) -> i128 {
+    pub(super) fn int(&self) -> i128 {
         match self {
             Value::Int(v) => *v,
             Value::Bool(b) => i128::from(*b),
@@ -90,12 +110,17 @@ impl Value {
     }
 }
 
+/// The elements of an array or a slice.
+pub(super) fn elems(v: &Value) -> &[Value] {
+    v.elems()
+}
+
 /// Whether two values of the same type are equal (`==`).
-fn equal(a: &Value, b: &Value, strings: &[Vec<u8>]) -> bool {
+pub(super) fn equal(a: &Value, b: &Value, strings: &[Vec<u8>]) -> bool {
     match (a, b) {
         (Value::Int(_) | Value::Bool(_), _) => a.int() == b.int(),
         (Value::Unit, _) => true,
-        (Value::Str(x), Value::Str(y)) => strings[*x] == strings[*y],
+        (Value::Str(x), Value::Str(y)) => x.bytes(strings) == y.bytes(strings),
         (Value::Struct(x), Value::Struct(y)) => {
             x.iter().zip(y.iter()).all(|(a, b)| equal(a, b, strings))
         }
@@ -135,6 +160,9 @@ pub(super) enum Exit {
 pub(super) enum Fail {
     /// A function it runs has errors, which are reported.
     Reported,
+    /// A `compile_error` was reached: its message, and where it's
+    /// reported.
+    User { msg: String, span: Span },
     Error {
         msg: String,
         /// Where it failed, when that's known (an unproven operation).
@@ -225,6 +253,19 @@ impl<'a> Checker<'a> {
         budget: u64,
         subject: &Subject<'_>,
     ) -> Option<Value> {
+        self.evaluate_with(e, locals, &[], budget, subject)
+    }
+
+    /// [`Checker::evaluate`], with the values `init` of some of the locals
+    /// (those known when compiling).
+    pub(super) fn evaluate_with(
+        &mut self,
+        e: &TExpr,
+        locals: usize,
+        init: &[(LocalId, Value)],
+        budget: u64,
+        subject: &Subject<'_>,
+    ) -> Option<Value> {
         let mut ev = Eval {
             ck: self,
             steps: 0,
@@ -236,6 +277,9 @@ impl<'a> Checker<'a> {
             locals: vec![Value::Uninit; locals],
             subst: Vec::new(),
         };
+        for (l, v) in init {
+            frame.locals[*l] = v.clone();
+        }
         let out = ev.expr(&mut frame, e);
         let fail = match out {
             Ok(v) => return Some(v),
@@ -247,14 +291,18 @@ impl<'a> Checker<'a> {
                 trace: Vec::new(),
             },
         };
-        let Fail::Error {
-            msg,
-            span,
-            help,
-            trace,
-        } = fail
-        else {
-            return None;
+        let (msg, span, help, trace) = match fail {
+            Fail::Reported => return None,
+            Fail::User { msg, span } => {
+                self.diags.push(Diagnostic::error(span, msg));
+                return None;
+            }
+            Fail::Error {
+                msg,
+                span,
+                help,
+                trace,
+            } => (msg, span, help, trace),
         };
         let mut d = Diagnostic::error(
             span.unwrap_or(subject.span),
@@ -454,7 +502,12 @@ impl Eval<'_, '_> {
         Ok(match &e.kind {
             TExprKind::Int(v) => Value::Int(*v),
             TExprKind::Bool(b) => Value::Bool(*b),
-            TExprKind::Str(id) => Value::Str(*id),
+            TExprKind::Str(id) => Value::Str(StrVal {
+                id: *id,
+                start: 0,
+                len: self.ck.strings[*id].len(),
+                origin: None,
+            }),
             TExprKind::Table(id) => {
                 let table = &self.ck.tables[*id];
                 let mut values = table.values.iter().copied();
@@ -470,8 +523,17 @@ impl Eval<'_, '_> {
             TExprKind::GenericCall(f, types, args) => {
                 let types: Vec<Ty> = types.iter().map(|&t| frame.ty(t)).collect();
                 // A trait's method runs the method of `Self`'s impl.
-                let (f, types) = self.ck.dispatch.resolve(*f, &types);
-                self.call(frame, f, types, args)?
+                let (g, types) = self.ck.dispatch.resolve(*f, &types);
+                let v = self.call(frame, g, types, args)?;
+                // An impl's method that doesn't throw, called through a
+                // trait's that does: its value is a success.
+                match e.ty.as_result() {
+                    Some((ok, _)) if g != *f && self.ck.sigs[g].throws.is_none() => match ok {
+                        Ty::Unit => Value::variant_of(0, Vec::new()),
+                        _ => Value::variant_of(0, vec![v]),
+                    },
+                    _ => v,
+                }
             }
             TExprKind::Compare(a, b) => {
                 let (a, b) = (self.expr(frame, a)?.int(), self.expr(frame, b)?.int());
@@ -517,7 +579,7 @@ impl Eval<'_, '_> {
                 Value::Int(v)
             }
             TExprKind::ViewLen(inner) => match self.expr(frame, inner)? {
-                Value::Str(id) => Value::Int(self.ck.strings[id].len() as i128),
+                Value::Str(s) => Value::Int(s.len as i128),
                 v => Value::Int(v.elems().len() as i128),
             },
             TExprKind::ArrayLen(inner) => {
@@ -552,6 +614,9 @@ impl Eval<'_, '_> {
             }
             TExprKind::Slice(base, start, end) => {
                 let b = self.expr(frame, base)?;
+                if let Value::Str(sv) = b {
+                    return self.str_slice(frame, sv, start.as_deref(), end.as_deref());
+                }
                 let len = b.elems().len();
                 let s = match start {
                     Some(s) => self.expr(frame, s)?.int(),
@@ -603,10 +668,11 @@ impl Eval<'_, '_> {
                 }));
             }
             TExprKind::Bytes(inner) => {
-                let Value::Str(id) = self.expr(frame, inner)? else {
+                let Value::Str(s) = self.expr(frame, inner)? else {
                     unreachable!("`bytes` of a string")
                 };
-                let bytes: Vec<Value> = self.ck.strings[id]
+                let bytes: Vec<Value> = s
+                    .bytes(&self.ck.strings)
                     .iter()
                     .map(|&b| Value::Int(i128::from(b)))
                     .collect();
@@ -683,6 +749,27 @@ impl Eval<'_, '_> {
                 self.expr(frame, inner)?;
                 return fail("a `never` function returned");
             }
+            TExprKind::CompileError {
+                place,
+                message,
+                values,
+                span,
+            } => {
+                let place = match place {
+                    Some(p) => Some(self.expr(frame, p)?),
+                    None => None,
+                };
+                let Value::Str(message) = self.expr(frame, message)? else {
+                    unreachable!("a `str` message")
+                };
+                let values = self.exprs(frame, values)?;
+                let msg = match self.ck.user_message(message, &values) {
+                    Ok(msg) => msg,
+                    Err(why) => return fail(why),
+                };
+                let span = place.and_then(|p| self.ck.place_span(&p)).unwrap_or(*span);
+                return Err(Exit::Fail(Fail::User { msg, span }));
+            }
             TExprKind::Unproven(span, inner) => match self.expr(frame, inner) {
                 Err(Exit::Fail(Fail::Error {
                     msg,
@@ -700,6 +787,43 @@ impl Eval<'_, '_> {
                 other => other?,
             },
         })
+    }
+
+    /// `s[start..end]` of a `str`, in code that only runs at compile time:
+    /// the bounds must be in it, and on character boundaries.
+    fn str_slice(
+        &mut self,
+        frame: &mut Frame,
+        sv: StrVal,
+        start: Option<&TExpr>,
+        end: Option<&TExpr>,
+    ) -> R<Value> {
+        let s = match start {
+            Some(e) => self.expr(frame, e)?.int(),
+            None => 0,
+        };
+        let t = match end {
+            Some(e) => self.expr(frame, e)?.int(),
+            None => sv.len as i128,
+        };
+        if s < 0 || s > t || t > sv.len as i128 {
+            return fail(format!(
+                "the slice {s}..{t} is out of bounds: the length is {}",
+                sv.len
+            ));
+        }
+        let bytes = sv.bytes(&self.ck.strings);
+        let boundary = |i: usize| i == bytes.len() || bytes[i] & 0xc0 != 0x80;
+        for i in [s as usize, t as usize] {
+            if !boundary(i) {
+                return fail(format!("the slice {s}..{t} splits a character at {i}"));
+            }
+        }
+        Ok(Value::Str(StrVal {
+            start: sv.start + s as usize,
+            len: (t - s) as usize,
+            ..sv
+        }))
     }
 
     fn binary(&mut self, frame: &Frame, op: TBinOp, ty: Ty, a: Value, b: Value) -> R<Value> {
@@ -830,7 +954,7 @@ impl Eval<'_, '_> {
                     trace,
                 }));
             }
-            Err(Exit::Fail(Fail::Reported)) => return Err(Exit::Fail(Fail::Reported)),
+            Err(Exit::Fail(f)) => return Err(Exit::Fail(f)),
             Err(Exit::Break | Exit::Continue) => unreachable!("a loop's own"),
         };
         // `inout` and `set` arguments get the parameters' last values, even
@@ -1015,7 +1139,10 @@ pub(super) fn materialize(v: &Value, ty: Ty) -> TExpr {
     let kind = match v {
         Value::Int(x) => TExprKind::Int(*x),
         Value::Bool(b) => TExprKind::Bool(*b),
-        Value::Str(id) => TExprKind::Str(*id),
+        Value::Str(s) => {
+            debug_assert!(s.start == 0, "a whole string");
+            TExprKind::Str(s.id)
+        }
         Value::Array(xs) => {
             let (elem, _) = ty.as_array().expect("an array");
             TExprKind::ArrayLit(xs.iter().map(|x| materialize(x, elem)).collect())

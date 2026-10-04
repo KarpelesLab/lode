@@ -93,7 +93,7 @@ fn main() -> u8 {
 	}
 	io.print("--\n")
 	show(g)
-	io.print_int(population(g))
+	io.print("{}", population(g))
 	io.print("\n")
 	// After 4 generations a glider moved one cell down and right.
 	if !g.cells[1][2] || !g.cells[2][3] || !g.cells[3][1] || !g.cells[3][2] || !g.cells[3][3] {

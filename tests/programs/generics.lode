@@ -89,85 +89,84 @@ fn main() -> u8 {
 	// Inferred from the arguments; a literal takes the type the other
 	// argument fixed.
 	let a: u32 = 3
-	io.print_int(larger(a, 7))
+	io.print("{}", larger(a, 7))
 	space()
 	// Explicit.
-	io.print_int(larger[u8](200, 100))
+	io.print("{}", larger[u8](200, 100))
 	space()
 	// Inferred from the expected type.
 	let c: i64 = larger(-5, -9)
-	io.print_int(c)
+	io.print("{}", c)
 	space()
 	if larger(true, false) {
 		io.print("true")
 	}
 	space()
-	io.print_int(largest3[u16](4, 9, 2))
+	io.print("{}", largest3[u16](4, 9, 2))
 	io.print("\n")
 
 	let m: u8 = math.min(3, 4)
-	io.print_int(m)
+	io.print("{}", m)
 	space()
-	io.print_int(math.max[i16](-4, 4))
+	io.print("{}", math.max[i16](-4, 4))
 	space()
-	io.print_int(math.clamp[u64](12, 5, 10))
+	io.print("{}", math.clamp[u64](12, 5, 10))
 	space()
-	io.print_int(math.clamp[i8](-3, 5, 10))
+	io.print("{}", math.clamp[i8](-3, 5, 10))
 	space()
-	io.print_int(math.clamp[i8](-1, -10, 10))
+	io.print("{}", math.clamp[i8](-1, -10, 10))
 	space()
-	io.print_int(math.abs[i8](-128))
+	io.print("{}", math.abs[i8](-128))
 	space()
-	io.print_int(math.abs[u8](0))
+	io.print("{}", math.abs[u8](0))
 	io.print("\n")
 
 	let x: i32 = -2
-	io.print(name(x.cmp(5)))
+	io.print("{}", name(x.cmp(5)))
 	space()
-	io.print(name(a.cmp(3)))
+	io.print("{}", name(a.cmp(3)))
 	space()
-	io.print(name(true.cmp(false)))
+	io.print("{}", name(true.cmp(false)))
 	space()
-	io.print_int(i8(x.cmp(0)))
+	io.print("{}", i8(x.cmp(0)))
 	io.print("\n")
 
 	let ps: [3]Point = [Point{x: 1, y: 2}, Point{x: 3, y: 4}, Point{x: 5, y: 6}]
 	let found = find(ps, Point{x: 5, y: 6})
-	io.print_int(found ?? 9)
+	io.print("{}", found ?? 9)
 	space()
 	if find(ps, Point{x: 0, y: 0}) == none {
 		io.print("none")
 	}
 	space()
 	let shapes: [2]Shape = [.dot, .circle(3)]
-	io.print_int(find(shapes, Shape.circle(3)) ?? 9)
+	io.print("{}", find(shapes, Shape.circle(3)) ?? 9)
 	space()
 	let ls = last(shapes) ?? .dot
 	match ls {
 		dot => io.print("dot")
-		circle(r) => io.print_int(r)
+		circle(r) => io.print("{}", r)
 	}
 	io.print("\n")
 
 	var p: u8 = 6
 	var q: u8 = 12
 	swap(&p, &q)
-	io.print_int(q)
+	io.print("{}", q)
 	space()
-	io.print_int(p)
+	io.print("{}", p)
 	space()
 	var three: [3]u8
 	fill(&three, 255)
-	io.print_int(three[2])
-	io.print("\n")
+	io.print("{}\n", three[2])
 
-	io.print_int(gcd[u32](36, 27))
+	io.print("{}", gcd[u32](36, 27))
 	space()
-	io.print_int(gcd[usize](12, 8))
+	io.print("{}", gcd[usize](12, 8))
 	space()
 	let small: u8 = 1
 	let big: u64 = 20
-	io.print_int(widen(small, big))
+	io.print("{}", widen(small, big))
 	io.print("\n")
 	return 0
 }

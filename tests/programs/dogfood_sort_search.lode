@@ -60,8 +60,7 @@ fn is_sorted(xs: []i32) -> bool {
 
 fn print_all(xs: []i32) {
 	for x in xs {
-		io.print_int(x)
-		io.print(" ")
+		io.print("{} ", x)
 	}
 	io.print("\n")
 }
@@ -74,9 +73,7 @@ fn main() -> u8 {
 		return 1
 	}
 	if let i = find(sorted, 13) {
-		io.print("13 at ")
-		io.print_int(i)
-		io.print("\n")
+		io.print("13 at {}\n", i)
 	} else {
 		return 2
 	}
@@ -84,7 +81,7 @@ fn main() -> u8 {
 		return 3
 	}
 	io.print("lower_bound(50) = ")
-	io.print_int(lower_bound(sorted, 50))
+	io.print("{}", lower_bound(sorted, 50))
 	io.print("\n")
 	return 0
 }

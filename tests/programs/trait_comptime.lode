@@ -61,20 +61,16 @@ const SORTED: [3]Point = sorted([Point{x: 3, y: 0}, Point{x: 1, y: 0}, Point{x: 
 const LESS: bool = Point{x: 1, y: 2}.lt(Point{x: 1, y: 3})
 
 fn main() {
-	io.print_int(AREA)
-	io.print(" ")
-	io.print_int(SMALL.x +| SMALL.y)
+	io.print("{} {}", AREA, SMALL.x +| SMALL.y)
 	for p in SORTED {
-		io.print(" ")
-		io.print_int(p.x)
+		io.print(" {}", p.x)
 	}
 	io.print("\n")
 	var n: u8 = 1
 	if LESS {
 		n = n +| 1
 	}
-	io.print_int(n)
-	io.print(" ")
-	io.print_int(Shape.twice(Rect{w: 2, h: 1}))
+	io.print("{} ", n)
+	io.print("{}", Shape.twice(Rect{w: 2, h: 1}))
 	io.print("\n")
 }

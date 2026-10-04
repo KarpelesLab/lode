@@ -101,12 +101,11 @@ fn sum_to(n: u64) -> u64 {
 }
 
 fn show(n: u64) {
-	io.print_int(n)
-	io.print(" ")
+	io.print("{} ", n)
 }
 
 fn main() {
-	io.print_int(crc32("hello".bytes()))
+	io.print("{}", crc32("hello".bytes()))
 	io.print(" ")
 	// An element's range is known: 81 + 4 is proven not to overflow.
 	show(SQUARES[9] + ORIGIN.y - 80)
@@ -121,7 +120,7 @@ fn main() {
 		wide(n) => show(u64(n))
 	}
 	if ENABLED {
-		io.print_int(LEN)
+		io.print("{}", LEN)
 	}
 	io.print("\n")
 }

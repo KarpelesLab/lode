@@ -4,6 +4,7 @@
 //! types, and discharges the proof obligations of docs/safety.md using the
 //! flow-sensitive facts in [`facts`]. Its output is the typed tree in [`tree`].
 
+mod comptime;
 mod eval;
 mod expr;
 pub mod facts;
@@ -55,6 +56,16 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         impl_methods: HashMap::new(),
         members: HashMap::new(),
         dispatch: Dispatch::default(),
+        expansions: HashMap::new(),
+        expansion_ids: HashMap::new(),
+        expansion_counts: HashMap::new(),
+        expanding: 0,
+        view_params: HashSet::new(),
+        sources: packages
+            .iter()
+            .flat_map(|p| &p.files)
+            .map(|f| (f.id, f.source.as_str()))
+            .collect(),
     };
     ck.collect(packages);
     ck.declaring = false;
@@ -76,10 +87,14 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
     for id in 0..ck.consts.len() {
         ck.const_value(id);
     }
-    for id in 0..ck.fn_decls.len() {
+    // Expansions are added as they're made (and checked then, unless a
+    // trial check of a loop's body rolled that back).
+    let mut id = 0;
+    while id < ck.fn_decls.len() {
         if matches!(ck.func_states[id], FuncState::Unchecked) {
             ck.check_function(id);
         }
+        id += 1;
     }
     let funcs: Vec<Func> = std::mem::take(&mut ck.func_states)
         .into_iter()
@@ -119,6 +134,11 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         }
     }
     ck.check_generic_recursion();
+    // An error in a function with `comptime` parameters is found once per
+    // expansion: it's reported once.
+    let mut seen = HashSet::new();
+    ck.diags
+        .retain(|d| seen.insert((d.span.file, d.span.start, d.span.end, d.message.clone())));
 
     let program = Program {
         funcs,
@@ -178,6 +198,9 @@ struct Sig {
     /// The name in its symbol, after the package's path, when it's not
     /// `name`: a method of an `impl` names its trait (`Point.area<main.Shape>`).
     symbol_name: Option<String>,
+    /// For a function with `comptime` parameters or a pack: the kind of
+    /// each parameter. Its calls are calls of its expansions.
+    template: Option<comptime::Template>,
 }
 
 /// The value of a checked constant.
@@ -273,6 +296,18 @@ struct Checker<'a> {
     members: HashMap<FuncId, traits::Member>,
     /// What calls of trait methods run (see [`Dispatch`]).
     dispatch: Dispatch,
+    /// The expansions of functions with `comptime` parameters or a pack,
+    /// and the expansion of each template for each set of values.
+    expansions: HashMap<FuncId, comptime::Expansion>,
+    expansion_ids: HashMap<comptime::ExpansionKey, FuncId>,
+    /// How many expansions each template has, for their symbols.
+    expansion_counts: HashMap<FuncId, usize>,
+    /// How deep the expansions being checked nest.
+    expanding: usize,
+    /// The type parameters of the expansions' packs, which may be views.
+    view_params: HashSet<Ty>,
+    /// The text of each file, for errors pointing into string literals.
+    sources: HashMap<FileId, &'a str>,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -338,6 +373,23 @@ struct FnCx {
     /// generic parameters it gets from the trait (`Self`) or the impl, and
     /// their bounds.
     member: Option<(Vec<Ty>, Vec<Vec<Trait>>)>,
+    /// The values of the locals known when compiling: `comptime`
+    /// parameters of an expansion, `comptime let` values, the variable of a
+    /// `comptime for`, the bindings of a `match comptime`.
+    ct_values: HashMap<LocalId, eval::Value>,
+    /// In an expansion with a pack: the pack.
+    pack: Option<comptime::PackCx>,
+    /// In an expansion: where its `compile_error`s are reported.
+    report: Option<Span>,
+    /// In the body of a `comptime for`: the loop depth outside it, which a
+    /// `break` or `continue` can't leave to.
+    ct_loop_floor: Option<u32>,
+    /// While the signature of an expansion is resolved: how many arguments
+    /// its pack has.
+    expanding: Option<usize>,
+    /// The type parameters a pack declared (one per argument in an
+    /// expansion).
+    pack_params: Vec<Ty>,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -404,6 +456,12 @@ impl FnCx {
             comptime: false,
             self_ty: None,
             member: None,
+            ct_values: HashMap::new(),
+            pack: None,
+            report: None,
+            ct_loop_floor: None,
+            expanding: None,
+            pack_params: Vec::new(),
         }
     }
 
@@ -440,6 +498,10 @@ const SELF: &str = "Self";
 /// `compile_error("message")`: an error where it's reached.
 const COMPILE_ERROR: &str = "compile_error";
 
+/// `compile_error_at(place, "message")`: an error pointing at `place`, a
+/// part of a string literal.
+const COMPILE_ERROR_AT: &str = "compile_error_at";
+
 /// The compile-time value describing the target.
 const TARGET: &str = "target";
 
@@ -460,7 +522,8 @@ fn expr_names<'e>(e: &'e ast::Expr, out: &mut Vec<(&'e str, Span)>) {
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
         | ExprKind::Throw(a)
-        | ExprKind::Ref(a) => expr_names(a, out),
+        | ExprKind::Ref(a)
+        | ExprKind::Spread(a) => expr_names(a, out),
         ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
             expr_names(a, out);
             expr_names(b, out);
@@ -500,7 +563,8 @@ fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
         | ExprKind::Throw(a)
-        | ExprKind::Ref(a) => catch_blocks(a, out),
+        | ExprKind::Ref(a)
+        | ExprKind::Spread(a) => catch_blocks(a, out),
         ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
             catch_blocks(a, out);
             catch_blocks(b, out);
@@ -530,6 +594,7 @@ fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
 fn own_exprs(s: &Stmt) -> Vec<&ast::Expr> {
     match s {
         Stmt::Let { init, .. } => init.iter().collect(),
+        Stmt::ComptimeLet { init, .. } => vec![init],
         Stmt::Assign { target, value, .. } => vec![target, value],
         Stmt::Expr(e) | Stmt::Throw { value: e, .. } | Stmt::Match { value: e, .. } => vec![e],
         Stmt::Return { value, .. } => value.iter().collect(),
@@ -579,7 +644,8 @@ fn changed_names(e: &ast::Expr, out: &mut HashSet<String>) {
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
         | ExprKind::Throw(a)
-        | ExprKind::Ref(a) => changed_names(a, out),
+        | ExprKind::Ref(a)
+        | ExprKind::Spread(a) => changed_names(a, out),
         ExprKind::Binary(_, a, b) | ExprKind::ArrayRepeat(a, b) | ExprKind::Index(a, b) => {
             changed_names(a, out);
             changed_names(b, out);
@@ -688,7 +754,11 @@ fn loop_height(stmts: &[Stmt]) -> u32 {
                 .max()
                 .unwrap_or(0);
             match s {
-                Stmt::While { .. } | Stmt::Loop { .. } | Stmt::For { .. } => inner + 1,
+                Stmt::While { .. }
+                | Stmt::Loop { .. }
+                | Stmt::For {
+                    comptime: false, ..
+                } => inner + 1,
                 _ => inner,
             }
         })
@@ -1255,6 +1325,7 @@ impl<'a> Checker<'a> {
                             // way code does: `os.Stat`.
                             let shown = Self::shown_name(packages, pkg, &s.name.name);
                             let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
+                            self.no_pack(&s.generics, "a struct's");
                             let (params, _) = self.declare_generics(&mut gcx, &s.generics);
                             let ty = Ty::new_struct(shown, pkg, s.is_pub, params);
                             self.check_type_name(&s.name);
@@ -1264,6 +1335,7 @@ impl<'a> Checker<'a> {
                         ast::Item::Enum(e) => {
                             let shown = Self::shown_name(packages, pkg, &e.name.name);
                             let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
+                            self.no_pack(&e.generics, "an enum's");
                             let (params, _) = self.declare_generics(&mut gcx, &e.generics);
                             let ty = Ty::new_enum(shown, pkg, e.is_pub, params);
                             self.check_type_name(&e.name);
@@ -1555,7 +1627,7 @@ impl<'a> Checker<'a> {
     fn is_compile_error(&self, cx: &FnCx, e: &ast::Expr) -> bool {
         matches!(&e.kind, ExprKind::Call(callee, _)
             if matches!(&callee.kind, ExprKind::Name(n)
-                if n == COMPILE_ERROR
+                if (n == COMPILE_ERROR || n == COMPILE_ERROR_AT)
                     && cx.lookup(n).is_none()
                     && !self.pkgs[cx.pkg].items.contains_key(n)))
     }
@@ -1970,6 +2042,22 @@ impl<'a> Checker<'a> {
     fn resolve_type_or_decl(&mut self, cx: &mut FnCx, t: &TypeExpr) -> Option<Ty> {
         match t {
             TypeExpr::Unit(_) => Some(Ty::Unit),
+            TypeExpr::Pack(name, span) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        *span,
+                        format!(
+                            "`..{}` is only the type of a function's pack parameter",
+                            name.name
+                        ),
+                    )
+                    .with_help(format!(
+                        "as in `fn f[..{0}: Bound](args: ..{0})`",
+                        name.name
+                    )),
+                );
+                None
+            }
             TypeExpr::Array(len, elem, _) => {
                 let elem_ty = self.resolve_type(cx, elem)?;
                 let len = self.array_len_arg(cx, len)?;
@@ -2298,17 +2386,6 @@ impl<'a> Checker<'a> {
             }
         }
         let owner_params = type_params.len();
-        if is_member && let Some(g) = f.generics.first() {
-            self.diags.push(
-                Diagnostic::error(
-                    g.name.span,
-                    "a method of a trait or an `impl` with generic parameters of its own is not supported by the compiler yet",
-                )
-                .with_help("make it a generic function that takes the value: `fn f[T: Trait, U](x: T, ...)`"),
-            );
-        }
-        // (A member's own parameters are reported above, and declared so its
-        // body is checked without more errors.)
         let (own, own_bounds) = self.declare_generics(cx, &f.generics);
         for p in &own {
             if type_params.iter().any(|q| q.to_string() == p.to_string()) {
@@ -2323,7 +2400,69 @@ impl<'a> Checker<'a> {
         cx.type_params = type_params.clone();
         let mut params = Vec::new();
         let has_self = f.params.first().is_some_and(ast::Param::is_self);
-        for p in &f.params {
+        // `comptime` parameters and a pack make a template
+        // ([`comptime`]); its expansions have neither.
+        let kinds: Vec<comptime::ParamKind> = f
+            .params
+            .iter()
+            .map(|p| match (&p.ty, p.comptime) {
+                (_, true) => comptime::ParamKind::Comptime,
+                (TypeExpr::Pack(..), _) => comptime::ParamKind::Pack,
+                _ => comptime::ParamKind::Runtime,
+            })
+            .collect();
+        let is_template = kinds.iter().any(|&k| k != comptime::ParamKind::Runtime)
+            || f.generics.iter().any(|g| g.pack);
+        if is_template && cx.expanding.is_none() {
+            self.check_template(f, is_member || owner.is_some() || f.owner.is_some(), &kinds);
+        }
+        for (p, &kind) in f.params.iter().zip(&kinds) {
+            if kind == comptime::ParamKind::Pack {
+                let TypeExpr::Pack(name, _) = &p.ty else {
+                    unreachable!("a pack's type")
+                };
+                let named = cx
+                    .pack_params
+                    .first()
+                    .is_some_and(|q| q.as_param().is_some_and(|d| d.name == name.name));
+                match cx.expanding {
+                    // One parameter per argument, of its type parameter.
+                    Some(_) if named => {
+                        for (i, &ty) in cx.pack_params.iter().enumerate() {
+                            params.push((
+                                ty,
+                                Convention::Let,
+                                comptime::pack_local(&p.name.name, i),
+                            ));
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        let ty = cx.pack_params.first().copied().unwrap_or(Ty::Unit);
+                        params.push((ty, Convention::Let, p.name.name.clone()));
+                    }
+                }
+                continue;
+            }
+            if kind == comptime::ParamKind::Comptime {
+                let ty = self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit);
+                if cx.expanding.is_none() {
+                    if !matches!(ty, Ty::Int(_) | Ty::Bool | Ty::Str | Ty::Unit) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                p.ty.span(),
+                                format!("a `comptime` parameter of type `{ty}` is not supported by the compiler yet"),
+                            )
+                            .with_help("a `comptime` parameter is an integer, a `bool` or a `str`"),
+                        );
+                    }
+                    if p.convention != Convention::Let {
+                        self.error(p.name.span, "a `comptime` parameter is read-only");
+                    }
+                    params.push((ty, Convention::Let, p.name.name.clone()));
+                }
+                continue;
+            }
             let ty = if p.is_self() {
                 if p.convention == Convention::Set {
                     self.diags.push(
@@ -2385,6 +2524,8 @@ impl<'a> Checker<'a> {
             is_pub: f.is_pub,
             is_unsafe: f.is_unsafe,
             pkg: cx.pkg,
+            template: (is_template && cx.expanding.is_none())
+                .then_some(comptime::Template { kinds }),
             name,
             params,
             has_self,
@@ -2657,8 +2798,10 @@ impl<'a> Checker<'a> {
         cx.type_params = self.sigs[id].type_params.clone();
         cx.self_ty = self.sigs[id].self_ty;
         // A trait's required method has no body: an impl's replaces it in
-        // every call.
-        if let Some(traits::Member::Trait(_, false)) = self.members.get(&id) {
+        // every call. A template isn't checked on its own: its expansions
+        // are.
+        let template = self.sigs[id].template.is_some();
+        if template || matches!(self.members.get(&id), Some(traits::Member::Trait(_, false))) {
             return Func {
                 symbol,
                 name,
@@ -2671,16 +2814,23 @@ impl<'a> Checker<'a> {
                 locals: Vec::new(),
                 body: Vec::new(),
                 span: f.span,
+                template,
             };
         }
         let mut params = Vec::new();
         let param_tys = self.sigs[id].params.clone();
-        for (p, (ty, convention, _)) in f.params.iter().zip(param_tys) {
-            if cx.scopes[0].contains_key(&p.name.name) {
-                self.error(
-                    p.name.span,
-                    format!("parameter `{}` is declared twice", p.name.name),
-                );
+        let expansion = self.expansions.contains_key(&id);
+        for (k, (ty, convention, pname)) in param_tys.into_iter().enumerate() {
+            // An expansion's parameters are the template's runtime ones,
+            // then one per pack argument (hidden names).
+            let p = if expansion {
+                f.params.iter().find(|p| p.name.name == pname)
+            } else {
+                f.params.get(k)
+            };
+            let pspan = p.map_or(f.name.span, |p| p.name.span);
+            if cx.scopes[0].contains_key(&pname) {
+                self.error(pspan, format!("parameter `{pname}` is declared twice"));
             }
             // The callee may change an `inout`, `sink` or `set` parameter;
             // an `inout` slice's elements, not the slice itself.
@@ -2689,9 +2839,9 @@ impl<'a> Checker<'a> {
                 Convention::Inout => !ty.is_view(),
                 Convention::Sink | Convention::Set => true,
             };
-            let local = Self::declare_local(&mut cx, &p.name.name, ty, mutable, Some(convention));
+            let local = Self::declare_local(&mut cx, &pname, ty, mutable, Some(convention));
             // `self` of a type in error: uses of it fail without more errors.
-            if p.is_self() && ty == Ty::Unit {
+            if p.is_some_and(ast::Param::is_self) && ty == Ty::Unit {
                 cx.failed.insert(local);
             }
             if convention == Convention::Set && !ty.is_view() {
@@ -2701,6 +2851,7 @@ impl<'a> Checker<'a> {
             params.push(local);
         }
         cx.params = params.len();
+        self.declare_expansion(&mut cx, id);
         // A value parameter is an immutable local of its type, a term like
         // any other; an instance assigns it its value first.
         for p in cx.type_params.clone() {
@@ -2767,6 +2918,7 @@ impl<'a> Checker<'a> {
             locals: cx.locals,
             body,
             span: f.span,
+            template: false,
         }
     }
 
@@ -3341,9 +3493,13 @@ impl<'a> Checker<'a> {
             // Reached in code that's checked: an error. The program isn't
             // compiled, so this stands for code that doesn't go on, which
             // a function returning a value needs after it.
-            Stmt::Expr(e) if self.is_compile_error(cx, e) => {
-                self.compile_error(e);
+            Stmt::Expr(e) if !cx.comptime && self.is_compile_error(cx, e) => {
+                self.compile_error_stmt(cx, e);
                 Some(TStmt::Loop(Vec::new()))
+            }
+            Stmt::ComptimeLet { name, ty, init, .. } => {
+                self.comptime_let(cx, name, ty.as_ref(), init);
+                None
             }
             Stmt::Expr(e) => match &e.kind {
                 ExprKind::Call(..) | ExprKind::Try(_) => {
@@ -3448,6 +3604,13 @@ impl<'a> Checker<'a> {
                 Some(TStmt::Loop(body))
             }
             Stmt::For {
+                comptime: true,
+                var,
+                iter,
+                body,
+                span,
+            } => self.comptime_for(cx, var, iter, body, *span),
+            Stmt::For {
                 var, iter, body, ..
             } => {
                 cx.scopes.push(HashMap::new());
@@ -3458,6 +3621,16 @@ impl<'a> Checker<'a> {
             Stmt::Break(span) | Stmt::Continue(span) => {
                 if cx.loop_depth == 0 && cx.defer_depth > 0 {
                     self.check_not_in_defer(cx, *span, "`break` or `continue`");
+                    return None;
+                }
+                if cx.ct_loop_floor == Some(cx.loop_depth) {
+                    self.diags.push(
+                        Diagnostic::error(
+                            *span,
+                            "`break` and `continue` can't leave a `comptime for`",
+                        )
+                        .with_help("its body is repeated for each element when compiling: it isn't a loop when the program runs"),
+                    );
                     return None;
                 }
                 if cx.loop_depth == 0 {
@@ -3482,7 +3655,15 @@ impl<'a> Checker<'a> {
                 cx.unsafe_depth -= 1;
                 Some(TStmt::Block(body))
             }
-            Stmt::Match { value, arms, span } => {
+            Stmt::Match {
+                comptime: true,
+                value,
+                arms,
+                ..
+            } => self.comptime_match(cx, value, arms),
+            Stmt::Match {
+                value, arms, span, ..
+            } => {
                 cx.scopes.push(HashMap::new());
                 let out = self.match_stmt(cx, value, arms, *span);
                 cx.scopes.pop();
@@ -4347,6 +4528,7 @@ impl<'a> Checker<'a> {
         self.diags.truncate(mark.diags);
         cx.locals.truncate(mark.locals);
         cx.failed.retain(|&l| l < mark.locals);
+        cx.ct_values.retain(|&l, _| l < mark.locals);
         cx.strs = mark.strs.clone();
         cx.moved = mark.moved.clone();
         self.generic_calls.truncate(mark.generic_calls);
@@ -4873,7 +5055,10 @@ impl<'a> Checker<'a> {
     fn comptime_cond(&mut self, cx: &FnCx, e: &ast::Expr) -> Option<bool> {
         let mut locals = Vec::new();
         expr_names(e, &mut locals);
-        if let Some((name, span)) = locals.into_iter().find(|(n, _)| cx.lookup(n).is_some()) {
+        if let Some((name, span)) = locals.into_iter().find(|(n, _)| {
+            cx.lookup(n)
+                .is_some_and(|l| !Self::is_comptime_local(cx, l))
+        }) {
             self.diags.push(
                 Diagnostic::error(
                     span,
@@ -4883,8 +5068,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let mut ccx = FnCx::new(cx.pkg, cx.file, Ty::Unit, false);
-        ccx.comptime = true;
+        let (mut ccx, init) = self.comptime_cx(cx);
         let c = self.expr(&mut ccx, e, Some(Ty::Bool))?;
         let c = self.coerce(&mut ccx, c, Ty::Bool, e.span)?;
         if let TExprKind::Bool(b) = c.expr.kind {
@@ -4895,7 +5079,13 @@ impl<'a> Checker<'a> {
             span: e.span,
             budget_span: None,
         };
-        let v = self.evaluate(&c.expr, ccx.locals.len(), eval::DEFAULT_STEPS, &subject)?;
+        let v = self.evaluate_with(
+            &c.expr,
+            ccx.locals.len(),
+            &init,
+            eval::DEFAULT_STEPS,
+            &subject,
+        )?;
         match v {
             eval::Value::Bool(b) => Some(b),
             other => unreachable!("a `bool` condition gave {other:?}"),

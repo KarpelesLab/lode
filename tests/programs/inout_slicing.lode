@@ -7,8 +7,7 @@ import "std/io"
 
 fn print_all(xs: []i32) {
 	for x in xs {
-		io.print_int(x)
-		io.print(" ")
+		io.print("{} ", x)
 	}
 	io.print("\n")
 }

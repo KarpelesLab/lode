@@ -72,8 +72,7 @@ fn trace(a: Mat) -> i64 {
 fn show(a: Mat) {
 	for row in a.m {
 		for x in row {
-			io.print_int(x)
-			io.print(" ")
+			io.print("{} ", x)
 		}
 		io.print("\n")
 	}
@@ -85,8 +84,7 @@ fn main() -> u8 {
 	f.m[0] = [1, 1, 0, 0]
 	f.m[1] = [1, 0, 0, 0]
 	let f50 = power(f, 50)
-	io.print_int(f50.m[0][1])
-	io.print("\n")
+	io.print("{}\n", f50.m[0][1])
 	if f50.m[0][1] != 12586269025 {
 		return 1
 	}
@@ -96,7 +94,7 @@ fn main() -> u8 {
 	if p != transpose(p) {
 		return 2
 	}
-	io.print_int(trace(p))
+	io.print("{}", trace(p))
 	io.print("\n")
 	if mul(a, identity()) != a {
 		return 3

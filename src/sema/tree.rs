@@ -86,6 +86,10 @@ pub struct Func {
     pub locals: Vec<Local>,
     pub body: Vec<TStmt>,
     pub span: Span,
+    /// Whether it's a function with `comptime` parameters or a pack, which
+    /// is never lowered: its calls are to its expansions, each a function
+    /// of its own (docs/generics.md, Format strings).
+    pub template: bool,
 }
 
 impl Func {
@@ -303,6 +307,17 @@ pub enum TExprKind {
     /// span (docs/generics.md, Proof obligations in compile-time code).
     /// Never lowered.
     Unproven(Span, Box<TExpr>),
+    /// `compile_error(message, values...)` or `compile_error_at(place,
+    /// message, values...)` in code that only runs at compile time: an
+    /// error when it's reached, of type `never`. It's reported at `place`
+    /// when that's part of a string literal in the source, and otherwise at
+    /// `span`. Never lowered.
+    CompileError {
+        place: Option<Box<TExpr>>,
+        message: Box<TExpr>,
+        values: Vec<TExpr>,
+        span: Span,
+    },
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -428,6 +443,17 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],
         },
+        TExprKind::CompileError {
+            place,
+            message,
+            values,
+            ..
+        } => place
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(&**message))
+            .chain(values)
+            .collect(),
     }
 }
 
@@ -518,6 +544,17 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
             Handler::Value(v) => vec![call, v],
             Handler::Block(_) => vec![call],
         },
+        TExprKind::CompileError {
+            place,
+            message,
+            values,
+            ..
+        } => place
+            .as_deref_mut()
+            .into_iter()
+            .chain(std::iter::once(&mut **message))
+            .chain(values)
+            .collect(),
     }
 }
 

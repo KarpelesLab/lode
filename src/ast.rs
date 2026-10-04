@@ -15,6 +15,9 @@ pub struct File {
     pub package: Option<Ident>,
     pub imports: Vec<Import>,
     pub items: Vec<Item>,
+    /// The file's text, for errors that point into a string literal (set
+    /// by `crate::load`; empty otherwise).
+    pub source: String,
 }
 
 #[derive(Debug)]
@@ -205,6 +208,9 @@ pub struct FnDecl {
 pub struct GenericParam {
     pub name: Ident,
     pub bounds: Vec<Bound>,
+    /// `..A: Format`: a pack, any number of type parameters, each with the
+    /// bounds (docs/generics.md, Format strings).
+    pub pack: bool,
 }
 
 /// The `throws` clause of a function: `throws(E)` names the error type,
@@ -241,6 +247,9 @@ pub enum Convention {
 
 #[derive(Debug)]
 pub struct Param {
+    /// `comptime name: T`: the argument is known when compiling, and each
+    /// value gives the function an expansion of its own.
+    pub comptime: bool,
     pub convention: Convention,
     pub name: Ident,
     pub ty: TypeExpr,
@@ -274,6 +283,9 @@ pub enum TypeExpr {
     /// [`TypeExpr::Qualified`]; an argument is a type, or a value for a
     /// value parameter.
     Generic(Box<TypeExpr>, Vec<TypeArg>, Span),
+    /// `..A`: the type of a pack parameter, `args: ..A`, where `A` is a
+    /// pack of type parameters.
+    Pack(Ident, Span),
 }
 
 impl TypeExpr {
@@ -286,7 +298,8 @@ impl TypeExpr {
             | TypeExpr::Array(_, _, span)
             | TypeExpr::Slice(_, span)
             | TypeExpr::Optional(_, span)
-            | TypeExpr::Generic(_, _, span) => *span,
+            | TypeExpr::Generic(_, _, span)
+            | TypeExpr::Pack(_, span) => *span,
         }
     }
 }
@@ -308,6 +321,13 @@ pub enum Stmt {
         ty: Option<TypeExpr>,
         init: Option<Expr>,
         otherwise: Option<Block>,
+        span: Span,
+    },
+    /// `comptime let x: T = e`: a value computed when compiling.
+    ComptimeLet {
+        name: Ident,
+        ty: Option<TypeExpr>,
+        init: Expr,
         span: Span,
     },
     /// `target = value`, or `target op= value` when `op` is set.
@@ -332,8 +352,11 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
-    /// `for var in iter { ... }`
+    /// `for var in iter { ... }`; with `comptime`, `comptime for`: the
+    /// body is repeated for each element of a list known when compiling,
+    /// with `var` known too.
     For {
+        comptime: bool,
         var: Ident,
         iter: ForIter,
         body: Block,
@@ -343,8 +366,11 @@ pub enum Stmt {
     Continue(Span),
     /// `unsafe { ... }`
     Unsafe(Block),
-    /// `match value { pattern => body ... }`
+    /// `match value { pattern => body ... }`; with `comptime`, `match
+    /// comptime value`: the value is known when compiling, and only the
+    /// arm it picks is checked.
     Match {
+        comptime: bool,
         value: Expr,
         arms: Vec<Arm>,
         span: Span,
@@ -497,6 +523,8 @@ pub enum ExprKind {
     /// `&place`: an argument passed `inout` or `set` (only in a call's
     /// arguments).
     Ref(Box<Expr>),
+    /// `..args`: a pack passed on whole, as a call's last argument.
+    Spread(Box<Expr>),
 }
 
 /// An item in the brackets of [`ExprKind::TypeArgs`]: a type, or an

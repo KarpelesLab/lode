@@ -622,12 +622,10 @@ fn main() -> u8 {
 	deferred(true) catch _ {}
 	io.print(" ")
 	let five = deferred(false) catch 0
+	io.print(" {} ", five +| 2)
+	io.print("{}", signed(-5) catch 0)
 	io.print(" ")
-	io.print_int(five +| 2)
-	io.print(" ")
-	io.print_int(signed(-5) catch 0)
-	io.print(" ")
-	io.print_int(byte(1) catch 0)
+	io.print("{}", byte(1) catch 0)
 	io.print(" ")
 	if flag(2) catch false {
 		io.print("true")
@@ -637,9 +635,9 @@ fn main() -> u8 {
 		io.print("none")
 	}
 	io.print(" ")
-	io.print_int(half(84) ?? 0)
+	io.print("{}", half(84) ?? 0)
 	io.print(" ")
-	io.print_int(i16(delta(false)))
+	io.print("{}", i16(delta(false)))
 	io.print(" ")
 	match small(3) {
 		word(w) => io.print("c")
@@ -648,9 +646,9 @@ fn main() -> u8 {
 		two(x, f) => io.print("x")
 	}
 	io.print(" ")
-	io.print_int(nested(3) catch 0)
+	io.print("{}", nested(3) catch 0)
 	io.print(" ")
-	io.print_int(half(-14) ?? 0)
+	io.print("{}", half(-14) ?? 0)
 	io.print(" ")
 	if (maybe(9) catch none) == 9 {
 		io.print("true")

@@ -548,6 +548,9 @@ fn space_before(prev: &Prev, cur: &TokInfo<'_>, cur_unary: bool) -> bool {
         return false;
     }
     match &cur.tok {
+        // `..A` and `..args`, a pack's type and a pack passed on, after a
+        // `,` or a `:`.
+        Tok::P(P::DotDot) if matches!(prev.tok, Tok::P(P::Comma | P::Colon)) => return true,
         Tok::P(
             P::Comma
             | P::Semi

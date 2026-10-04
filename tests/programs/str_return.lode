@@ -38,15 +38,15 @@ fn longest() -> str {
 }
 
 fn main() {
-	io.print(Day.tue.name())
+	io.print("{}", Day.tue.name())
 	io.print(" ")
-	io.print(longest())
+	io.print("{}", longest())
 	io.print(" ")
-	io.print(count_word(1))
+	io.print("{}", count_word(1))
 	io.print(" ")
-	io.print(count_word(0))
+	io.print("{}", count_word(0))
 	io.print("\n")
 	let s = count_word(0)
-	io.print_int(s.bytes().len + 1)
+	io.print("{}", s.bytes().len + 1)
 	io.print("\n")
 }

@@ -16,9 +16,8 @@ struct Point {
 	y: i32
 }
 
-fn print_sp[T: Integer](n: T) {
-	io.print_int(n)
-	io.print(" ")
+fn print_sp[T: Integer + io.Format](n: T) {
+	io.print("{} ", n)
 }
 
 fn main() {
@@ -36,7 +35,7 @@ fn main() {
 	}
 	print_sp(b.len())
 	print_sp(b.get(3) ?? 99)
-	io.print_int(b.get(4) ?? 99)
+	io.print("{}", b.get(4) ?? 99)
 	io.print("\n")
 
 	// Written from the end, as for digits.
@@ -52,7 +51,7 @@ fn main() {
 	d.push_front('z') catch _ {
 		io.print(" full ")
 	}
-	io.print_int(d.len())
+	io.print("{}", d.len())
 	io.print("\n")
 
 	// Written to a file in one call.
@@ -74,7 +73,7 @@ fn main() {
 	for i in 0..v.len() {
 		let x = v.get(i) ?? 9999
 		if i + 1 == v.len() {
-			io.print_int(x)
+			io.print("{}", x)
 		} else {
 			print_sp(x)
 		}
@@ -103,9 +102,8 @@ fn main() {
 	}
 	io.print("\n")
 
-	// `io.print_int` of a narrow and a wide type, and of 0.
+	// `{}` of a narrow and a wide type, and of 0.
 	print_sp(i8(-42))
 	print_sp(u64(18446744073709551615))
-	io.print_int(u8(0))
-	io.print("\n")
+	io.print("{}\n", u8(0))
 }

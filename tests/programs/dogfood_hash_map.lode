@@ -97,15 +97,12 @@ fn main() -> u8 {
 	}
 	// overwrite one
 	m = put(m, 7919 * 3, 1000) ?? m
-	io.print("count ")
-	io.print_int(m.count)
-	io.print("\n")
+	io.print("count {}\n", m.count)
 	for k in 0..14 {
 		let key = u32(k) * 7919
-		io.print_int(key)
-		io.print(" -> ")
+		io.print("{} -> ", key)
 		if let v = get(m, key) {
-			io.print_int(v)
+			io.print("{}", v)
 		} else {
 			io.print("none")
 		}

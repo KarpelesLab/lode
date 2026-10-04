@@ -2,7 +2,7 @@
 // error: the `impl` of `Code` for `A` doesn't give `WIDTH`
 // error: an `impl` for the generic type `Pair` declares a parameter for each of its parameters and names them, in order
 // error: unknown trait `Unknown`
-// error: a method of a trait or an `impl` with generic parameters of its own is not supported by the compiler yet
+// error: `A.convert` doesn't match `Code.convert`: it has 0 generic parameter(s), the trait's 1
 // error: `Self` is only used in a trait or an `impl`
 // error: `Code` is a trait, not a type
 // error: `Sized` requires `Code`, which `Plain` doesn't implement
@@ -11,6 +11,7 @@
 // help: write `impl[T] Code for Pair[T]`
 // help: add `impl Code for Plain`
 // help: declare it `fn cmp(self, other: Self) -> Ordering`
+// help: declare it `fn convert[U](self, sink u: U) -> U`
 // help: `impl Ordered for Pair` requires bounds of `Pair[Plain]`'s arguments that they don't satisfy
 package main
 
@@ -41,6 +42,10 @@ impl Code for A {
 
 	fn first(bytes: []u8) -> ?u8 {
 		return none
+	}
+
+	fn convert(self, sink u: u8) -> u8 {
+		return u
 	}
 }
 

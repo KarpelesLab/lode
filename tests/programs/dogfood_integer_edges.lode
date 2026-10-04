@@ -14,13 +14,11 @@ package main
 import "std/io"
 
 fn p(v: i64) {
-	io.print_int(v)
-	io.print(" ")
+	io.print("{} ", v)
 }
 
 fn u(v: u64) {
-	io.print_int(v)
-	io.print(" ")
+	io.print("{} ", v)
 }
 
 fn nl() {
@@ -61,16 +59,12 @@ fn signed_div(a: i32, b: i32) {
 }
 
 fn trace(tag: u8, v: bool) -> bool {
-	io.print("[")
-	io.print_int(tag)
-	io.print("]")
+	io.print("[{}]", tag)
 	return v
 }
 
 fn trace_opt(tag: u8, v: ?u16) -> ?u16 {
-	io.print("<")
-	io.print_int(tag)
-	io.print(">")
+	io.print("<{}>", tag)
 	return v
 }
 

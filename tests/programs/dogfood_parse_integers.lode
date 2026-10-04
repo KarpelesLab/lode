@@ -43,16 +43,14 @@ fn parse_u32(s: []u8) -> ParseResult {
 }
 
 fn report(s: str) {
-	io.print(s)
-	io.print(" -> ")
+	io.print("{} -> ", s)
 	match parse_u32(s.bytes()) {
-		ok(v) => io.print_int(v)
+		ok(v) => io.print("{}", v)
 		err(e) => {
 			match e {
 				empty => io.print("empty")
 				invalid_digit(p) => {
-					io.print("bad digit at ")
-					io.print_int(p)
+					io.print("bad digit at {}", p)
 				}
 				overflow => io.print("overflow")
 			}

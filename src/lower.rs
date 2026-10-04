@@ -1787,7 +1787,9 @@ impl FnLower<'_> {
                 self.expr(call);
                 return self.no_value(e.ty);
             }
-            TExprKind::Unproven(..) => unreachable!("only in code run at compile time"),
+            TExprKind::Unproven(..) | TExprKind::CompileError { .. } => {
+                unreachable!("only in code run at compile time")
+            }
             TExprKind::EnumValue(inner) => self.tag_of(inner),
             // A view of part of the base's storage: proven in bounds, so
             // no check.

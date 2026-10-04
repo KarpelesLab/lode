@@ -1,0 +1,46 @@
+// error: this `{}` has no argument: 2 placeholders but 1 argument
+// error: 1 placeholder but 2 arguments: each argument needs a `{}` in the format string
+// error: 0 placeholders but 1 argument
+// error: unclosed `{` in the format string
+// error: unclosed `{` in the format string
+// error: unmatched `}` in the format string: `}}` writes a brace
+// error: a placeholder is `{}`: format specs are not supported yet
+// error: `Point` doesn't implement `io.Format`, which `io.print` requires of `A`
+// error: `[]u8` doesn't implement `io.Format`, which `io.eprint` requires of `A`
+// error: `fmt` of `io.print` is `comptime`, so its argument must be known when compiling, and `s` is a variable
+// error: cannot tell the type of an argument of `io.print`
+// error: this `{}` has no argument: 3 placeholders but 2 arguments
+// error: this `{}` has no argument: 1 placeholder but 0 arguments
+// error: `fmt` of `io.write_fmt` is `comptime`, so its argument must be known when compiling, and `f` is a variable
+// help: add `impl io.Format for Point`
+// help: to print a `str` known only when the program runs, format it: `io.print("{}", s)`
+// help: give each argument a type, as in `u32(5)`: an integer literal doesn't have one
+package main
+
+import "std/io"
+
+struct Point {
+	x: u32
+}
+
+fn main() {
+	let x: u32 = 1
+	let s = "abc"
+	io.print("{} {}\n", x)
+	io.print("{}\n", x, x)
+	io.eprint("no placeholder\n", x)
+	io.print("a { b\n", x)
+	io.print("a {{ {\n", x)
+	io.print("a } b\n")
+	io.print("tab\t{:x}\n", x)
+	io.print("{}\n", Point{x: 1})
+	io.eprint("{}\n", s.bytes())
+	io.print(s)
+	io.print("{}\n", 5)
+	io.print("x = {}, y = {}, z = {}\n", x, x)
+	io.print("no args{}")
+	var out = io.stdout()
+	let f = "{}"
+	io.write_fmt(&out, f, x) catch _ {
+	}
+}

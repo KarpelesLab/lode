@@ -67,21 +67,20 @@ fn grow(inout r: Rect) {
 // fields swapped through a literal that reads the local itself.
 fn nested() {
 	var r = Rect{min: Point{x: 1, y: 2}, max: Point{x: 3, y: 4}}
-	io.print_int(r.max.x)
+	io.print("{}", r.max.x)
 	space()
-	io.print_int(r.max.y)
+	io.print("{}", r.max.y)
 	space()
 	r.max = Point{x: r.max.x *% 10, y: r.max.y *% 10}
-	io.print_int(r.max.x)
+	io.print("{}", r.max.x)
 	space()
-	io.print_int(r.max.y)
+	io.print("{}", r.max.y)
 	space()
 	r.min = Point{x: r.min.y, y: r.min.x}
 	r.min = Point{x: r.min.y, y: r.min.x}
-	io.print_int(r.min.x)
+	io.print("{}", r.min.x)
 	space()
-	io.print_int(r.min.y)
-	io.print("\n")
+	io.print("{}\n", r.min.y)
 }
 
 // Fields updated in loops, with `continue` and `break`, and a struct
@@ -107,11 +106,11 @@ fn loops() {
 			break
 		}
 	}
-	io.print_int(c.total)
+	io.print("{}", c.total)
 	space()
-	io.print_int(p.y)
+	io.print("{}", p.y)
 	space()
-	io.print_int(c.steps +% 1)
+	io.print("{}", c.steps +% 1)
 	space()
 	print_bool(c.seen)
 	io.print("\n")
@@ -124,17 +123,17 @@ fn passed() {
 	a.x = a.x +% 4
 	let b = Point{x: a.y, y: a.x}
 	let r = Rect{min: b, max: a}
-	io.print_int(r.max.x)
+	io.print("{}", r.max.x)
 	space()
-	io.print_int(r.min.x)
+	io.print("{}", r.min.x)
 	space()
 	var s = Rect{min: Point{x: 0, y: 0}, max: Point{x: 1, y: 1}}
 	s.max.x = 3
 	s.max.y = 7
 	grow(&s)
-	io.print_int(area(s) -% 21)
+	io.print("{}", area(s) -% 21)
 	space()
-	io.print_int(s.max.y)
+	io.print("{}", s.max.y)
 	space()
 	print_bool(a == b)
 	io.print("\n")
@@ -149,14 +148,13 @@ fn from_calls() {
 	r.min = make(r.min.y, r.max.y)
 	bump(&p.x)
 	bump(&p.x)
-	io.print_int(r.min.x +% p.x)
+	io.print("{}", r.min.x +% p.x)
 	space()
-	io.print_int(r.max.x +% 1)
+	io.print("{}", r.max.x +% 1)
 	space()
-	io.print_int(r.min.y +% 6)
+	io.print("{}", r.min.y +% 6)
 	space()
-	io.print_int(r.max.y -% 1)
-	io.print("\n")
+	io.print("{}\n", r.max.y -% 1)
 }
 
 // Equality between split locals, with a literal, and with a struct in
@@ -194,16 +192,15 @@ fn generics() {
 	let p = Pair{first: u32(10), second: true}
 	let q = swapped(p)
 	let r = swapped(Pair{first: u8(3), second: u16(99)})
-	io.print_int(q.second)
+	io.print("{}", q.second)
 	space()
-	io.print_int(sum_firsts(u64(12), u64(8)))
+	io.print("{}", sum_firsts(u64(12), u64(8)))
 	space()
 	print_bool(q.first)
 	space()
-	io.print_int(r.first)
+	io.print("{}", r.first)
 	space()
-	io.print_int(r.second)
-	io.print("\n")
+	io.print("{}\n", r.second)
 }
 
 // A struct in a `defer`, and a struct returned from a loop.
@@ -220,11 +217,11 @@ fn fib_pair(n: u32) -> Pair[u64, u64] {
 fn deferred() {
 	var p = Point{x: 1, y: 2}
 	defer io.print("\n")
-	defer io.print_int(p.x *% 3)
+	defer io.print("{}", p.x *% 3)
 	p.x = 55
-	io.print_int(p.x)
+	io.print("{}", p.x)
 	space()
-	io.print_int(p.y *% 3)
+	io.print("{}", p.y *% 3)
 	space()
 }
 
@@ -237,10 +234,10 @@ fn main() {
 	generics()
 	deferred()
 	let f = fib_pair(6)
-	io.print_int(f.first)
+	io.print("{}", f.first)
 	space()
-	io.print_int(f.second -% f.first -% 4)
+	io.print("{}", f.second -% f.first -% 4)
 	space()
-	io.print_int(fib_pair(4).first)
+	io.print("{}", fib_pair(4).first)
 	io.print("\n")
 }

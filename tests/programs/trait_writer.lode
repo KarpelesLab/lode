@@ -54,7 +54,7 @@ fn main() -> u8 {
 	small.write("12345") catch e {
 		if e == .no_space {
 			io.print("full after ")
-			io.print_int(small.len())
+			io.print("{}", small.len())
 			io.print("\n")
 		}
 	}
@@ -63,10 +63,6 @@ fn main() -> u8 {
 	greet(&c, "me") catch _ {
 		return 1
 	}
-	io.print("my writer: ")
-	io.print_int(c.writes)
-	io.print(" writes, ")
-	io.print_int(c.bytes)
-	io.print(" bytes\n")
+	io.print("my writer: {} writes, {} bytes\n", c.writes, c.bytes)
 	return 0
 }

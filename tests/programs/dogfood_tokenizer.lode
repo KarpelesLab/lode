@@ -96,24 +96,18 @@ fn main() -> u8 {
 		count +%= 1
 		match l.tok {
 			number(v) => {
-				io.print("num ")
-				io.print_int(v)
+				io.print("num {}", v)
 			}
 			ident(s, n) => {
-				io.print("ident @")
-				io.print_int(s)
-				io.print(" len ")
-				io.print_int(n)
+				io.print("ident @{} len {}", s, n)
 			}
 			op(c) => {
-				io.print("op ")
-				io.print_int(c)
+				io.print("op {}", c)
 			}
 			lparen => io.print("(")
 			rparen => io.print(")")
 			bad(p) => {
-				io.print("bad @")
-				io.print_int(p)
+				io.print("bad @{}", p)
 			}
 			eof => {
 				io.print("eof\n")

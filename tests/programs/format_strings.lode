@@ -1,0 +1,128 @@
+// stdout: hello, world\n
+// stdout: x = 7, y = -3, ok = true, name = lode\n
+// stdout: u8 0 255, u16 0 65535, u32 0 4294967295\n
+// stdout: u64 0 18446744073709551615, usize 0 18446744073709551615\n
+// stdout: i8 -128 127, i16 -32768 32767, i32 -2147483648 2147483647\n
+// stdout: i64 -9223372036854775808 9223372036854775807\n
+// stdout: isize -9223372036854775808 9223372036854775807\n
+// stdout: {braces} {7} }{\n
+// stdout: 1 2 3 4 5 6 7 8 9 10 11 12\n
+// stdout: (1, 2) (5, 2) [north] [west]\n
+// stdout: é 7 ü\n
+// stdout: abc and abc\n
+// stdout: log: 3 + 4 = 7\n
+// stdout: 0 1 2 3\n
+// stdout: buf: [x = 42]\n
+// stdout: file: 9 items\n
+// stdout: max 255 and 65535\n
+// stdout: done\n
+package main
+
+import "std/buf"
+import "std/io"
+import "std/os"
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+// A user type formats itself through the same `write_fmt`.
+impl io.Format for Point {
+	fn format[W: io.Writer](self, inout w: W) throws(os.Error) {
+		try io.write_fmt(&w, "({}, {})", self.x, self.y)
+	}
+}
+
+enum Dir {
+	north
+	west
+}
+
+impl io.Format for Dir {
+	fn format[W: io.Writer](self, inout w: W) throws(os.Error) {
+		match self {
+			north => try w.write("[north]")
+			west => try w.write("[west]")
+		}
+	}
+}
+
+// A function with a pack passes it on.
+fn log[..A: io.Format](comptime fmt: str, args: ..A) {
+	io.print("log: ")
+	io.print(fmt, ..args)
+}
+
+// `comptime for` repeats its body for each value.
+fn count_to(comptime n: usize) {
+	comptime for i in 0..n {
+		if comptime i > 0 {
+			io.print(" ")
+		}
+		io.print("{}", i)
+	}
+	io.print("\n")
+}
+
+// A generic function prints its `T`.
+fn show_max[T: Integer + io.Format](a: T, b: T) -> T {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+fn main() {
+	io.print("hello, world\n")
+	let x: u32 = 7
+	let y: i8 = -3
+	let ok = x > 3
+	let name = "lode"
+	io.print("x = {}, y = {}, ok = {}, name = {}\n", x, y, ok, name)
+
+	io.print("u8 {} {}, u16 {} {}, u32 {} {}\n", u8(0), u8(255), u16(0), u16(65535), u32(0), u32(4294967295))
+	io.print("u64 {} {}, usize {} {}\n", u64(0), u64(18446744073709551615), usize(0), usize(18446744073709551615))
+	io.print("i8 {} {}, i16 {} {}, i32 {} {}\n", i8(-128), i8(127), i16(-32768), i16(32767), i32(-2147483648), i32(2147483647))
+	io.print("i64 {} {}\n", i64(-9223372036854775808), i64(9223372036854775807))
+	io.print("isize {} {}\n", isize(-9223372036854775808), isize(9223372036854775807))
+
+	io.print("{{braces}} {{{}}} }}{{\n", x)
+	// An empty format writes nothing.
+	io.print("")
+	io.print("{} {} {} {} {} {} {} {} {} {} {} {}\n", u8(1), u16(2), u32(3), u64(4), i8(5), i16(6), i32(7), i64(8), usize(9), isize(10), x + 4, y + 15)
+
+	// A struct local whose fields changed, formatted whole.
+	var p = Point{x: 1, y: 2}
+	io.print("{} ", p)
+	p.x = 5
+	io.print("{} {} {}\n", p, Dir.north, Dir.west)
+
+	io.print("é {} ü\n", x)
+	let s = "abc"
+	io.print("{} and {}\n", s, "abc")
+	log("{} + {} = {}\n", u8(3), u8(4), u8(7))
+	count_to(4)
+
+	// Through a `Writer`: a buffer, and a file.
+	var b = buf.StackBuf[16].new()
+	io.write_fmt(&b, "x = {}", u32(42)) catch _ {
+		io.print("full\n")
+	}
+	io.print("buf: [")
+	var i: usize = 0
+	while i < b.len() {
+		let c = b.get(i) ?? 0
+		io.stdout().write_bytes([c][..]) catch _ {
+		}
+		i += 1
+	}
+	io.print("]\n")
+	var f = io.stdout()
+	io.write_fmt(&f, "file: {} items\n", u8(9)) catch _ {
+	}
+
+	io.print("max {} and {}\n", show_max(u8(1), u8(255)), show_max(u16(65535), u16(2)))
+	io.eprint("to stderr: {}\n", x)
+	io.print("done\n")
+}

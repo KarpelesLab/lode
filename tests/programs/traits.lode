@@ -61,9 +61,9 @@ fn total[T: Shape](xs: []T) -> u32 {
 }
 
 fn describe[T: Shape](x: T) {
-	io.print(x.name())
+	io.print("{}", x.name())
 	io.print(" ")
-	io.print_int(x.area())
+	io.print("{}", x.area())
 }
 
 /// An associated function and a supertrait.
@@ -105,17 +105,17 @@ fn count_to[C: Counter + Copy](n: u8) -> C {
 }
 
 fn show_label[C: Counter](c: C) {
-	io.print_int(c.label())
+	io.print("{}", c.label())
 }
 
 fn main() {
 	let r = Rect{w: 3, h: 2}
-	io.print_int(r.double_area())
+	io.print("{}", r.double_area())
 	io.print(" ")
-	io.print_int(r.area())
+	io.print("{}", r.area())
 	io.print(" ")
 	let rs = [Rect{w: 1, h: 1}, Rect{w: 1, h: 2}]
-	io.print_int(total(rs))
+	io.print("{}", total(rs))
 	io.print("\n")
 
 	describe(Figure.square(2))
@@ -124,9 +124,9 @@ fn main() {
 	io.print("\n")
 
 	let fs = [Figure.square(2), Figure.circle(1), Figure.square(1), Figure.circle(1)]
-	io.print_int(total(fs) +| total(rs))
+	io.print("{}", total(fs) +| total(rs))
 	io.print(" ")
-	io.print_int(Shape.area(Figure.circle(1)) +| Shape.area(r))
+	io.print("{}", Shape.area(Figure.circle(1)) +| Shape.area(r))
 	io.print("\n")
 
 	let c: Tally = count_to(2)
@@ -136,6 +136,6 @@ fn main() {
 	t.bump()
 	show_label(t)
 	io.print(" ")
-	io.print_int(count_to[Tally](2).label())
+	io.print("{}", count_to[Tally](2).label())
 	io.print("\n")
 }

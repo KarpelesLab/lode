@@ -96,29 +96,29 @@ fn get[T: Copy](opt: ?T) -> T {
 	fail(8)
 }
 
-fn fail_with[T: Integer](code: T) -> never {
-	io.print_int(code)
+fn fail_with[T: Integer + io.Format](code: T) -> never {
+	io.print("{}", code)
 	os.exit(9)
 }
 
-fn or_fail_with[T: Integer](opt: ?T, code: T) -> T {
+fn or_fail_with[T: Integer + io.Format](opt: ?T, code: T) -> T {
 	return opt ?? fail_with(code)
 }
 
 fn main() -> u8 {
-	io.print_int(to_u8(7))
+	io.print("{}", to_u8(7))
 	io.print(" ")
 	let p = origin(Point{x: 0, y: 1})
 	if name(true).len != 4 || p.y != 1 {
 		return 1
 	}
-	io.print_int(larger(9, 3))
+	io.print("{}", larger(9, 3))
 	io.print(" ")
-	io.print_int(pick(1))
+	io.print("{}", pick(1))
 	io.print(" ")
-	io.print_int(or_fail(5))
+	io.print("{}", or_fail(5))
 	io.print(" ")
-	io.print_int(get[u16](6) +% u16(or_fail_with[u8](1, 2)))
+	io.print("{}", get[u16](6) +% u16(or_fail_with[u8](1, 2)))
 	io.print("\n")
 	os.abort()
 }

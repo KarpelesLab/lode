@@ -380,7 +380,10 @@ impl Ty {
     /// for Box[A]` covers `Box[u8]`, not `Box[Point]` unless `Point` is
     /// `Ordered`).
     fn has_impl(self, t: Trait) -> bool {
-        if !matches!(self, Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool) {
+        if !matches!(
+            self,
+            Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool | Ty::Str
+        ) {
             return false;
         }
         let Some(imp) = find_impl(t, self) else {

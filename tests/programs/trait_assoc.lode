@@ -96,33 +96,26 @@ fn same[C: Code](a: C.Unit, b: C.Unit) -> bool {
 
 fn main() {
 	let text = "hi!".bytes()
-	io.print_int(round_trip[Ascii](text) -| 1)
+	io.print("{}", round_trip[Ascii](text) -| 1)
 	io.print(" ")
-	io.print_int(Ascii.first(text) ?? 0)
+	io.print("{}", Ascii.first(text) ?? 0)
 	io.print(" ")
-	io.print_int(round_trip[Wide](text) -| 1)
+	io.print("{}", round_trip[Wide](text) -| 1)
 	io.print(" ")
-	io.print_int(width[Ascii]())
+	io.print("{}", width[Ascii]())
 	io.print("\n")
 
-	io.print_int(round_trip[Ascii](text) + 0)
-	io.print(" ")
-	io.print_int(Wide.WIDTH)
-	io.print(" ")
+	io.print("{}", round_trip[Ascii](text) + 0)
+	io.print(" {} ", Wide.WIDTH)
 	var n: u8 = 0
 	if same[Wide](3, 3) && !same[Ascii](1, 2) {
 		n = 1
 	}
-	io.print_int(n)
-	io.print("\n")
+	io.print("{}\n", n)
 
 	var out: [Ascii.WIDTH]u8
 	let k = Ascii.put(7, &out)
-	io.print_int(out[0])
-	io.print(" ")
+	io.print("{} ", out[0])
 	let w: Wide.Unit = 9
-	io.print_int(w)
-	io.print(" ")
-	io.print_int(k +| Ascii.WIDTH)
-	io.print("\n")
+	io.print("{} {}\n", w, k +| Ascii.WIDTH)
 }

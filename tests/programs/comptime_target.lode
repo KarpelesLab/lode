@@ -30,12 +30,12 @@ fn arch_name() -> str {
 }
 
 fn main() -> u8 {
-	io.print(os_name())
+	io.print("{}", os_name())
 	io.print(" ")
-	io.print(arch_name())
+	io.print("{}", arch_name())
 	io.print(" ")
 	// `target` is an ordinary value too, and `if` checks both branches.
-	io.print_int(target.pointer_bits)
+	io.print("{}", target.pointer_bits)
 	if target.endian == .little {
 		io.print(" little\n")
 	} else {

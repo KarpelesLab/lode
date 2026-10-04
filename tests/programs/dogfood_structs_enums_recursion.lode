@@ -20,13 +20,11 @@ enum Cmd {
 }
 
 fn u(v: u64) {
-	io.print_int(v)
-	io.print(" ")
+	io.print("{} ", v)
 }
 
 fn s(v: i64) {
-	io.print_int(v)
-	io.print(" ")
+	io.print("{} ", v)
 }
 
 fn make_p(k: i32) -> P {

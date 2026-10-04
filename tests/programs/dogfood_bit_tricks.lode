@@ -77,9 +77,7 @@ fn next_pow2(x: u32) -> u32 {
 }
 
 fn line(label: str, v: u64) {
-	io.print(label)
-	io.print_int(v)
-	io.print("\n")
+	io.print("{}{}\n", label, v)
 }
 
 fn main() -> u8 {

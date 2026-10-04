@@ -70,7 +70,7 @@ pub fn instantiate(program: &Program) -> Instances {
         }
         None => {
             for (i, f) in program.funcs.iter().enumerate() {
-                if f.type_params.is_empty() {
+                if f.type_params.is_empty() && !f.template {
                     m.instance(i, Vec::new());
                 }
             }
@@ -78,8 +78,14 @@ pub fn instantiate(program: &Program) -> Instances {
         }
     };
     let mut origin = vec![0; m.funcs.len()];
-    while let Some((orig, args, id)) = m.work.pop() {
-        let f = m.make(orig, &args);
+    while let Some((orig, args, throws, id)) = m.work.pop() {
+        let mut f = m.make(orig, &args);
+        // A call through a trait whose method throws expects a result: the
+        // impl's method that doesn't throw is made to, never throwing.
+        if let Some(err) = throws {
+            f.throws = Some(err);
+            f.symbol.push_str("<throws>");
+        }
         origin.resize(m.funcs.len(), 0);
         origin[id] = orig;
         m.funcs[id] = Some(f);
@@ -144,11 +150,13 @@ fn renumber_expr(e: &mut TExpr, new_id: &[FuncId]) {
 
 struct Mono<'p> {
     program: &'p Program,
-    /// The instance of each function and type arguments made so far.
-    ids: HashMap<(FuncId, Vec<Ty>), FuncId>,
-    /// The instances to make: the function, its type arguments, and the
-    /// instance's id.
-    work: Vec<(FuncId, Vec<Ty>, FuncId)>,
+    /// The instance of each function and type arguments made so far, and
+    /// the error type it throws when it's an impl's method that doesn't
+    /// throw, called through a trait's that does.
+    ids: HashMap<(FuncId, Vec<Ty>, Option<Ty>), FuncId>,
+    /// The instances to make: the function, its type arguments, the error
+    /// type it's made to throw, and the instance's id.
+    work: Vec<(FuncId, Vec<Ty>, Option<Ty>, FuncId)>,
     funcs: Vec<Option<Func>>,
     strings: Vec<bool>,
     tables: Vec<bool>,
@@ -160,13 +168,19 @@ impl Mono<'_> {
     /// The id of the instance of function `f` with the type arguments
     /// `args` (concrete types), made later if it's new.
     fn instance(&mut self, f: FuncId, args: Vec<Ty>) -> FuncId {
-        if let Some(&id) = self.ids.get(&(f, args.clone())) {
+        self.instance_throwing(f, args, None)
+    }
+
+    /// [`Mono::instance`], made to throw `throws` if it's given.
+    fn instance_throwing(&mut self, f: FuncId, args: Vec<Ty>, throws: Option<Ty>) -> FuncId {
+        let key = (f, args, throws);
+        if let Some(&id) = self.ids.get(&key) {
             return id;
         }
         let id = self.funcs.len();
         self.funcs.push(None);
-        self.ids.insert((f, args.clone()), id);
-        self.work.push((f, args, id));
+        self.ids.insert(key.clone(), id);
+        self.work.push((key.0, key.1, key.2, id));
         id
     }
 
@@ -246,6 +260,7 @@ impl Mono<'_> {
             locals,
             body,
             span: f.span,
+            template: false,
         }
     }
 
@@ -272,8 +287,12 @@ impl Mono<'_> {
             TExprKind::GenericCall(f, types, args) => {
                 let types: Vec<Ty> = types.iter().map(|t| t.subst(map)).collect();
                 // A trait's method runs the method of `Self`'s impl.
-                let (f, types) = self.program.dispatch.resolve(*f, &types);
-                let id = self.instance(f, types);
+                let (g, types) = self.program.dispatch.resolve(*f, &types);
+                let throws = match (e.ty.as_result(), &self.program.funcs[g].throws) {
+                    (Some((_, err)), None) if g != *f => Some(err),
+                    _ => None,
+                };
+                let id = self.instance_throwing(g, types, throws);
                 self.root_called |= Some(id) == self.root;
                 e.kind = TExprKind::Call(id, std::mem::take(args));
             }

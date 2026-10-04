@@ -64,8 +64,9 @@ impl Loader<'_> {
     fn parse_file(&mut self, id: FileId) -> ast::File {
         let (tokens, diags) = lex(&self.map.get(id).text, id);
         self.diags.extend(diags);
-        let (file, diags) = parse(tokens, id);
+        let (mut file, diags) = parse(tokens, id);
         self.diags.extend(diags);
+        file.source = self.map.get(id).text.clone();
         file
     }
 

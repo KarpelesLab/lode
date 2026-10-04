@@ -32,12 +32,9 @@ fn main() {
 	for d in DAYS {
 		year +%= d
 	}
-	io.print_int(year)
-	io.print(" ")
-	io.print_int(month_len(0))
-	io.print(" ")
-	io.print_int(FEB)
-	io.print(" ")
+	io.print("{} ", year)
+	io.print("{}", month_len(0))
+	io.print(" {} ", FEB)
 	var smallest: i16 = 0
 	for row in SQUARES {
 		for v in row {
@@ -46,10 +43,7 @@ fn main() {
 			}
 		}
 	}
-	io.print_int(smallest)
-	io.print(" ")
-	io.print_int(SQUARES[2][2])
-	io.print(" ")
+	io.print("{} {} ", smallest, SQUARES[2][2])
 	var copy = ALIAS
 	copy[1] = 29
 	if sum(DAYS) == 365 && sum(copy) == 366 && FLAGS[3] && ZEROS[1][7] == 0 {
@@ -57,6 +51,5 @@ fn main() {
 	}
 	let view: []u8 = DAYS
 	// 31 - 28 fits: the elements are 28..=31.
-	io.print_int(DAYS[0] - DAYS[1] + u8(view.len) - 11 - 1 + 1)
-	io.print("\n")
+	io.print("{}\n", DAYS[0] - DAYS[1] + u8(view.len) - 11 - 1 + 1)
 }

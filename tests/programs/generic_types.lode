@@ -74,16 +74,13 @@ fn main() {
 	print_bool(p.second)
 	io.print(" ")
 	print_int_sp(q.first)
-	io.print_int(q.second)
-	io.print("\n")
+	io.print("{}\n", q.second)
 
 	// Nested generics.
 	let n: Pair[Pair[u8, u16], bool] = Pair{first: Pair{first: 1, second: 2}, second: false}
 	print_int_sp(n.first.second)
 	print_bool(n.second)
-	io.print(" ")
-	io.print_int(n.first.first)
-	io.print("\n")
+	io.print(" {}\n", n.first.first)
 
 	// A generic enum: a variant from the context, the enum's name
 	// with its arguments inferred, or written.
@@ -125,11 +122,10 @@ fn main() {
 	let c = boxed_twice(Boxed{value: u8(6), tag: false})
 	print_int_sp(b.value +% 21)
 	print_int_sp(c.value)
-	io.print_int(boxed_twice(Boxed{value: u16(0), tag: c.tag}).value)
+	io.print("{}", boxed_twice(Boxed{value: u16(0), tag: c.tag}).value)
 	io.print("\n")
 }
 
-fn print_int_sp[T: Integer](n: T) {
-	io.print_int(n)
-	io.print(" ")
+fn print_int_sp[T: Integer + io.Format](n: T) {
+	io.print("{} ", n)
 }

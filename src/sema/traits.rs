@@ -90,7 +90,26 @@ fn sig_text(name: &str, sig: &Sig, map: &impl Fn(Ty) -> Option<Ty>) -> String {
             }
         })
         .collect();
-    let mut out = format!("fn {method}({})", params.join(", "));
+    let own: Vec<String> = sig.type_params[sig.owner_params.min(sig.type_params.len())..]
+        .iter()
+        .zip(sig.bounds.iter().skip(sig.owner_params))
+        .map(|(p, b)| {
+            let p = p.subst(map);
+            match b.as_slice() {
+                [] => p.to_string(),
+                b => {
+                    let b: Vec<String> = b.iter().map(Trait::to_string).collect();
+                    format!("{p}: {}", b.join(" + "))
+                }
+            }
+        })
+        .collect();
+    let own = if own.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", own.join(", "))
+    };
+    let mut out = format!("fn {method}{own}({})", params.join(", "));
     if let Some(e) = sig.throws {
         out.push_str(&format!(" throws({})", e.subst(map)));
     }
@@ -449,18 +468,21 @@ impl<'a> Checker<'a> {
             t => {
                 self.diags.push(
                     Diagnostic::error(t.span(), "an `impl` is for a named type")
-                        .with_help("a struct, an enum, an integer type or `bool`"),
+                        .with_help("a struct, an enum, an integer type, `bool` or `str`"),
                 );
                 return None;
             }
         };
-        if !matches!(base_ty, Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool) {
+        if !matches!(
+            base_ty,
+            Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool | Ty::Str
+        ) {
             self.diags.push(
                 Diagnostic::error(
                     decl.ty.span(),
                     format!("an `impl` for `{base_ty}` is not supported by the compiler yet"),
                 )
-                .with_help("an `impl` is for a struct, an enum, an integer type or `bool`"),
+                .with_help("an `impl` is for a struct, an enum, an integer type, `bool` or `str`"),
             );
             return None;
         }
@@ -820,7 +842,6 @@ impl<'a> Checker<'a> {
         let t = self.trait_index[&tr];
         let self_param = self.traits[t].self_param;
         let trait_methods = self.traits[t].methods.clone();
-        let map = |p: Ty| (p == self_param).then_some(ty);
         let mut table = HashMap::new();
         for (name, id) in methods {
             let Some(&(_, tid, _)) = trait_methods.iter().find(|(n, ..)| n == name) else {
@@ -834,7 +855,23 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             };
-            if let Some(why) = self.sig_mismatch(&self.sigs[tid], &self.sigs[*id], &map) {
+            // `Self` is the type, and the trait method's own generic
+            // parameters are the impl method's, in order.
+            let (want_own, imp_own) = (
+                self.sigs[tid].type_params[self.sigs[tid].owner_params..].to_vec(),
+                self.sigs[*id].type_params[self.sigs[*id].owner_params..].to_vec(),
+            );
+            let map = |p: Ty| {
+                if p == self_param {
+                    return Some(ty);
+                }
+                let k = want_own.iter().position(|&q| q == p)?;
+                imp_own.get(k).copied()
+            };
+            let why = self
+                .own_generics_mismatch(&want_own, &imp_own)
+                .or_else(|| self.sig_mismatch(&self.sigs[tid], &self.sigs[*id], &map));
+            if let Some(why) = why {
                 let want = sig_text(&self.sigs[tid].name, &self.sigs[tid], &map);
                 let span = self.sigs[*id].span;
                 self.diags.push(
@@ -856,13 +893,16 @@ impl<'a> Checker<'a> {
                 .push((tr, *id));
             // For the check that instances end: the trait's function may
             // become this one.
+            let mut args = self.impls[k].params.clone();
+            args.extend(want_own);
             self.generic_calls.push(GenericEdge {
                 caller: tid,
                 callee: *id,
-                args: self.impls[k].params.clone(),
+                args,
                 span: self.sigs[*id].span,
             });
         }
+        let map = |p: Ty| (p == self_param).then_some(ty);
         let mut missing = Vec::new();
         for (name, tid, default) in &trait_methods {
             if methods.iter().any(|(n, _)| n == name) {
@@ -894,6 +934,30 @@ impl<'a> Checker<'a> {
             );
         }
         self.dispatch.impls.insert((tr, decl), table);
+    }
+
+    /// Why the generic parameters of an impl's method (`imp`) don't match
+    /// those of the trait's (`want`): `None` if they do (as many, with the
+    /// same bounds).
+    fn own_generics_mismatch(&self, want: &[Ty], imp: &[Ty]) -> Option<String> {
+        if want.len() != imp.len() {
+            return Some(format!(
+                "it has {} generic parameter(s), the trait's {}",
+                imp.len(),
+                want.len()
+            ));
+        }
+        for (&w, &i) in want.iter().zip(imp) {
+            let bounds = |p: Ty| {
+                let mut b = self.declared_bounds.get(&p).cloned().unwrap_or_default();
+                b.sort_by_key(|t| t.to_string());
+                b
+            };
+            if w.value_param() != i.value_param() || bounds(w) != bounds(i) {
+                return Some(format!("`{i}` isn't declared as the trait's `{w}`"));
+            }
+        }
+        None
     }
 
     /// Why the signature `imp` of an impl's method doesn't match `want`,
@@ -1227,7 +1291,13 @@ impl Dispatch {
             .get(&(*t, self_ty.decl()))
             .and_then(|m| m.get(name))
         {
-            Some(&g) => (g, self_ty.type_args().to_vec()),
+            // The impl's parameters are the type's arguments, then come the
+            // method's own.
+            Some(&g) => {
+                let mut args = self_ty.type_args().to_vec();
+                args.extend_from_slice(&types[1..]);
+                (g, args)
+            }
             None => (f, types.to_vec()),
         }
     }

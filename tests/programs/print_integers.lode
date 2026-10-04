@@ -15,13 +15,10 @@ fn unsigned() {
 		if i > 0 {
 			io.print(" ")
 		}
-		io.print_int(values[i])
+		io.print("{}", values[i])
 	}
 	io.print("\n")
-	io.print_int(BIG)
-	io.print(" ")
-	io.print_int(BIG - 1)
-	io.print("\n")
+	io.print("{} {}\n", BIG, BIG - 1)
 }
 
 fn signed() {
@@ -30,28 +27,18 @@ fn signed() {
 		if i > 0 {
 			io.print(" ")
 		}
-		io.print_int(values[i])
+		io.print("{}", values[i])
 	}
 	io.print("\n")
-	io.print_int[i64](9223372036854775807)
-	io.print(" ")
-	io.print_int[i64](-9223372036854775807)
-	io.print(" ")
-	io.print_int[i64](-9223372036854775808)
-	io.print("\n")
+	io.print("{} {} {}\n", i64(9223372036854775807), i64(-9223372036854775807), i64(-9223372036854775808))
 }
 
-// `print_int` takes any integer type.
+// `{}` formats any integer type.
 fn narrow() {
 	let a: u8 = 255
 	let b: i8 = -128
 	let c: u16 = 65535
-	io.print_int(a)
-	io.print(" ")
-	io.print_int(b)
-	io.print(" ")
-	io.print_int(c)
-	io.print("\n")
+	io.print("{} {} {}\n", a, b, c)
 }
 
 fn main() {
@@ -59,6 +46,5 @@ fn main() {
 	signed()
 	narrow()
 	// Standard error isn't part of the expected output.
-	io.eprint_int[u8](7)
-	io.eprint_int[i8](-7)
+	io.eprint("{}{}", u8(7), i8(-7))
 }

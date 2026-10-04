@@ -711,7 +711,18 @@ impl Checker<'_> {
         if let Some(v) = self.untyped_int(cx, e) {
             return self.literal(v, e.span, expected.map(under_optionals));
         }
+        // `args.len` and `args[i]` of a pack.
+        if let Some(c) = self.pack_expr(cx, e) {
+            return c;
+        }
         match &e.kind {
+            ExprKind::Spread(_) => {
+                self.diags.push(
+                    Diagnostic::error(e.span, "`..` passes a pack on, as a call's last argument")
+                        .with_help("as in `print(fmt, ..args)`, for a function with a pack"),
+                );
+                None
+            }
             ExprKind::Int(_) => {
                 self.error(e.span, "integer literal is too large");
                 None
@@ -1804,6 +1815,27 @@ impl Checker<'_> {
                 let len = self.view_len_of(cx, &b);
                 (b, len)
             }
+            // In code that runs when compiling, the evaluator checks the
+            // bounds, and that they don't split a character.
+            Ty::Str if cx.comptime => {
+                for (c, ast) in [(&s, start), (&e, end)] {
+                    if let (Some(c), Some(ast)) = (c, ast)
+                        && num(c.ty()).is_none()
+                    {
+                        self.error(
+                            ast.span,
+                            format!("a slice's bounds must be integers, found `{}`", c.ty()),
+                        );
+                        return None;
+                    }
+                }
+                let slice = TExprKind::Slice(
+                    Box::new(b.expr),
+                    s.map(|c| Box::new(c.expr)),
+                    e.map(|c| Box::new(c.expr)),
+                );
+                return Some(Checked::new(slice, Ty::Str, None).unproven(span));
+            }
             Ty::Str => {
                 self.diags.push(
                     Diagnostic::error(
@@ -2057,6 +2089,14 @@ impl Checker<'_> {
             if cx.failed.contains(&local) {
                 return None;
             }
+            // A value known when compiling is its literal, except a `str` in
+            // code that runs when compiling, which keeps where it comes from
+            // (the evaluator has its value).
+            if let Some(v) = cx.ct_values.get(&local).cloned()
+                && !(cx.comptime && matches!(v, super::eval::Value::Str(_)))
+            {
+                return self.materialize_ct(&v, cx.locals[local].ty, span);
+            }
             if cx.env.is_uninit(local) {
                 if self.moved_error(cx, local, span) {
                     return None;
@@ -2084,6 +2124,17 @@ impl Checker<'_> {
         if name == super::TARGET && self.imported(cx, name).is_none() {
             let e = self.target_value();
             return Some(Checked::new(e.kind, e.ty, None));
+        }
+        if let Some(p) = &cx.pack
+            && p.name == name
+        {
+            self.diags.push(
+                Diagnostic::error(span, format!("`{name}` is a pack, not a value"))
+                    .with_help(format!(
+                        "use `{name}[i]`, with `i` known when compiling, `{name}.len`, or pass it on with `..{name}`"
+                    )),
+            );
+            return None;
         }
         // In a trait or an `impl`, `MAX_LEN` is `Self.MAX_LEN`.
         if let Some(s) = cx.self_ty
@@ -3300,6 +3351,8 @@ impl Checker<'_> {
                     return self.conversion(cx, name, callee.span, args, span);
                 } else if name == SYSCALL {
                     return self.syscall(cx, args, span);
+                } else if self.names_compile_error(cx, name) {
+                    return self.compile_error_expr(cx, name, args, span);
                 } else if name == "Ordering" {
                     return self.enum_from(cx, Ty::ordering(), args, span);
                 } else {
@@ -3404,6 +3457,23 @@ impl Checker<'_> {
                 self.error(callee.span, "only named functions can be called");
                 return None;
             }
+        };
+        // A call of a function with `comptime` parameters or a pack is a
+        // call of its expansion for these arguments.
+        let expanded;
+        let (id, args) = if self.sigs[id].template.is_some() {
+            if let Some((_, bspan)) = &explicit {
+                self.error(
+                    *bspan,
+                    format!("the type arguments of `{name}`, which has `comptime` parameters or a pack, are inferred"),
+                );
+                return None;
+            }
+            let (exp, rest) = self.expand_call(cx, id, &name, args, span)?;
+            expanded = rest;
+            (exp, expanded.as_slice())
+        } else {
+            (id, args)
         };
         let type_params = self.sigs[id].type_params.clone();
         let owner_params = self.sigs[id].owner_params;
@@ -3565,7 +3635,12 @@ impl Checker<'_> {
             }
         }
         if let Some(p) = inf.unknown() {
-            if ok {
+            if ok && self.is_pack_param(id, p) {
+                self.diags.push(
+                    Diagnostic::error(span, format!("cannot tell the type of an argument of `{name}`"))
+                        .with_help("give each argument a type, as in `u32(5)`: an integer literal doesn't have one"),
+                );
+            } else if ok {
                 let write = match name.rsplit_once('.') {
                     Some((ty, method)) if type_params[..owner_params].contains(&p) => {
                         format!("write the type's arguments, as in `{ty}[...].{method}(...)`")

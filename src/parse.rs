@@ -215,6 +215,7 @@ impl Parser {
             package: None,
             imports: Vec::new(),
             items: Vec::new(),
+            source: String::new(),
         };
         self.skip_newlines();
         if self.eat_kw(Kw::Package) {
@@ -861,13 +862,14 @@ impl Parser {
             if self.at_p(P::RBracket) {
                 break;
             }
+            let pack = self.eat_p(P::DotDot);
             let name = self.ident("a type parameter name")?;
             let bounds = if self.eat_p(P::Colon) {
                 self.bounds()?
             } else {
                 Vec::new()
             };
-            params.push(GenericParam { name, bounds });
+            params.push(GenericParam { name, bounds, pack });
             self.skip_newlines();
             if !self.eat_p(P::Comma) {
                 break;
@@ -947,6 +949,7 @@ impl Parser {
     /// A parameter. `owner` is the type of a method (`fn Type.name`), whose
     /// first parameter can be `self`, written without a type.
     fn param(&mut self, owner: Option<&TypeExpr>) -> PResult<Param> {
+        let comptime = self.eat_kw(Kw::Comptime);
         let convention = if self.eat_kw(Kw::Inout) {
             Convention::Inout
         } else if self.eat_kw(Kw::Sink) {
@@ -979,14 +982,23 @@ impl Parser {
                 other => other.clone(),
             };
             return Ok(Param {
+                comptime,
                 convention,
                 name,
                 ty,
             });
         }
         self.expect_p(P::Colon)?;
-        let ty = self.type_expr()?;
+        // `args: ..A`: a pack parameter.
+        let ty = if self.at_p(P::DotDot) {
+            let start = self.bump().span;
+            let pack = self.ident("a pack's type parameter")?;
+            TypeExpr::Pack(pack.clone(), start.to(pack.span))
+        } else {
+            self.type_expr()?
+        };
         Ok(Param {
+            comptime,
             convention,
             name,
             ty,
@@ -1169,27 +1181,31 @@ impl Parser {
             }
             Tok::Kw(Kw::Break) => Ok(Stmt::Break(self.bump().span)),
             Tok::Kw(Kw::Continue) => Ok(Stmt::Continue(self.bump().span)),
-            Tok::Kw(Kw::For) => {
+            Tok::Kw(Kw::For) => self.for_stmt(start, false),
+            Tok::Kw(Kw::Match) => self.match_stmt(),
+            // `comptime let`, `comptime for`.
+            Tok::Kw(Kw::Comptime) if *self.peek_at(1) == Tok::Kw(Kw::For) => {
                 self.bump();
-                let var = self.ident("a loop variable name")?;
-                if !self.eat_kw(Kw::In) {
-                    return self.expected("`in`");
-                }
-                let first = self.header_expr()?;
-                let iter = if self.eat_p(P::DotDot) {
-                    ForIter::Range(first, self.header_expr()?)
+                self.for_stmt(start, true)
+            }
+            Tok::Kw(Kw::Comptime) if *self.peek_at(1) == Tok::Kw(Kw::Let) => {
+                self.bump();
+                self.bump();
+                let name = self.ident("a name")?;
+                let ty = if self.eat_p(P::Colon) {
+                    Some(self.type_expr()?)
                 } else {
-                    ForIter::Each(first)
+                    None
                 };
-                let body = self.block()?;
-                Ok(Stmt::For {
-                    var,
-                    iter,
-                    span: start.to(body.span),
-                    body,
+                self.expect_p(P::Eq)?;
+                let init = self.expr()?;
+                Ok(Stmt::ComptimeLet {
+                    name,
+                    ty,
+                    init,
+                    span: start.to(self.prev_span()),
                 })
             }
-            Tok::Kw(Kw::Match) => self.match_stmt(),
             Tok::Kw(Kw::Throw) => {
                 self.bump();
                 let value = self.expr()?;
@@ -1211,45 +1227,72 @@ impl Parser {
                 self.span(),
                 format!("`{}` is not supported by the compiler yet", kw.as_str()),
             ),
-            _ => {
-                let target = self.expr()?;
-                let op = match self.peek() {
-                    Tok::P(P::Eq) => None,
-                    Tok::P(P::AddAssign) => Some(BinOp::Add),
-                    Tok::P(P::SubAssign) => Some(BinOp::Sub),
-                    Tok::P(P::MulAssign) => Some(BinOp::Mul),
-                    Tok::P(P::DivAssign) => Some(BinOp::Div),
-                    Tok::P(P::RemAssign) => Some(BinOp::Rem),
-                    Tok::P(P::ShlAssign) => Some(BinOp::Shl),
-                    Tok::P(P::ShrAssign) => Some(BinOp::Shr),
-                    Tok::P(P::ShlWrapAssign) => Some(BinOp::ShlWrap),
-                    Tok::P(P::AddWrapAssign) => Some(BinOp::AddWrap),
-                    Tok::P(P::SubWrapAssign) => Some(BinOp::SubWrap),
-                    Tok::P(P::MulWrapAssign) => Some(BinOp::MulWrap),
-                    Tok::P(P::AddSatAssign) => Some(BinOp::AddSat),
-                    Tok::P(P::SubSatAssign) => Some(BinOp::SubSat),
-                    Tok::P(P::MulSatAssign) => Some(BinOp::MulSat),
-                    Tok::P(P::AndAssign) => Some(BinOp::BitAnd),
-                    Tok::P(P::OrAssign) => Some(BinOp::BitOr),
-                    Tok::P(P::XorAssign) => Some(BinOp::BitXor),
-                    _ => return Ok(Stmt::Expr(target)),
-                };
-                self.bump();
-                let value = self.expr()?;
-                Ok(Stmt::Assign {
-                    span: target.span.to(value.span),
-                    target,
-                    op,
-                    value,
-                })
-            }
+            _ => self.simple_stmt(),
         }
+    }
+
+    /// `for var in iter { ... }` (after `comptime`, if `comptime`).
+    fn for_stmt(&mut self, start: Span, comptime: bool) -> PResult<Stmt> {
+        self.bump(); // for
+        let var = self.ident("a loop variable name")?;
+        if !self.eat_kw(Kw::In) {
+            return self.expected("`in`");
+        }
+        let first = self.header_expr()?;
+        let iter = if self.eat_p(P::DotDot) {
+            ForIter::Range(first, self.header_expr()?)
+        } else {
+            ForIter::Each(first)
+        };
+        let body = self.block()?;
+        Ok(Stmt::For {
+            comptime,
+            var,
+            iter,
+            span: start.to(body.span),
+            body,
+        })
+    }
+
+    /// An expression statement, or an assignment.
+    fn simple_stmt(&mut self) -> PResult<Stmt> {
+        let target = self.expr()?;
+        let op = match self.peek() {
+            Tok::P(P::Eq) => None,
+            Tok::P(P::AddAssign) => Some(BinOp::Add),
+            Tok::P(P::SubAssign) => Some(BinOp::Sub),
+            Tok::P(P::MulAssign) => Some(BinOp::Mul),
+            Tok::P(P::DivAssign) => Some(BinOp::Div),
+            Tok::P(P::RemAssign) => Some(BinOp::Rem),
+            Tok::P(P::ShlAssign) => Some(BinOp::Shl),
+            Tok::P(P::ShrAssign) => Some(BinOp::Shr),
+            Tok::P(P::ShlWrapAssign) => Some(BinOp::ShlWrap),
+            Tok::P(P::AddWrapAssign) => Some(BinOp::AddWrap),
+            Tok::P(P::SubWrapAssign) => Some(BinOp::SubWrap),
+            Tok::P(P::MulWrapAssign) => Some(BinOp::MulWrap),
+            Tok::P(P::AddSatAssign) => Some(BinOp::AddSat),
+            Tok::P(P::SubSatAssign) => Some(BinOp::SubSat),
+            Tok::P(P::MulSatAssign) => Some(BinOp::MulSat),
+            Tok::P(P::AndAssign) => Some(BinOp::BitAnd),
+            Tok::P(P::OrAssign) => Some(BinOp::BitOr),
+            Tok::P(P::XorAssign) => Some(BinOp::BitXor),
+            _ => return Ok(Stmt::Expr(target)),
+        };
+        self.bump();
+        let value = self.expr()?;
+        Ok(Stmt::Assign {
+            span: target.span.to(value.span),
+            target,
+            op,
+            value,
+        })
     }
 
     /// `match value { pattern => body ... }`, one arm per line. A body is a
     /// block, or a single statement on the arm's line.
     fn match_stmt(&mut self) -> PResult<Stmt> {
         let start = self.bump().span; // match
+        let comptime = self.eat_kw(Kw::Comptime);
         let value = self.header_expr()?;
         self.expect_p(P::LBrace)?;
         let mut arms = Vec::new();
@@ -1273,6 +1316,7 @@ impl Parser {
         }
         let end = self.bump().span;
         Ok(Stmt::Match {
+            comptime,
             value,
             arms,
             span: start.to(end),
@@ -1619,7 +1663,17 @@ impl Parser {
                     if self.eat_p(P::RParen) {
                         break;
                     }
-                    args.push(self.nested_expr()?);
+                    // `..args`: a pack passed on.
+                    if self.at_p(P::DotDot) {
+                        let start = self.bump().span;
+                        let inner = self.unary()?;
+                        args.push(Expr {
+                            span: start.to(inner.span),
+                            kind: ExprKind::Spread(Box::new(inner)),
+                        });
+                    } else {
+                        args.push(self.nested_expr()?);
+                    }
                     self.skip_newlines();
                     if !self.eat_p(P::Comma) {
                         self.skip_newlines();

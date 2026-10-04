@@ -25,33 +25,21 @@ fn main() {
 	// "héllo" is 5 runes in 6 bytes; "été" too has an `é` (U+00E9).
 	let s = "héllo".bytes()
 	let n = encoding.count[encoding.Utf8](s) ?? 0
-	io.print_int(n)
-	io.print(" ")
-	io.print_int(encoding.count[encoding.Utf8]("naïveté".bytes()) ?? 0)
+	io.print("{} ", n)
+	io.print("{}", encoding.count[encoding.Utf8]("naïveté".bytes()) ?? 0)
 	io.print(" ")
 	let d = encoding.Utf8.decode(s[1..]) ?? encoding.Decoded{rune: 0, len: 0}
-	io.print_int(d.rune)
-	io.print(" ")
-	io.print_int(d.len)
-	io.print("\n")
+	io.print("{} {}\n", d.rune, d.len)
 
 	var out: [encoding.Utf8.MAX_LEN]u8
 	let k = encoding.Utf8.encode(0xe9, &out)
-	io.print_int(k)
-	io.print(" ")
-	io.print_int(out[0])
-	io.print(" ")
-	io.print_int(out[1])
-	io.print("\n")
+	io.print("{} {} {}\n", k, out[0], out[1])
 
 	let smile = "😀".bytes()
 	let e = encoding.Utf8.decode(smile) ?? encoding.Decoded{rune: 0, len: 0}
-	io.print_int(e.rune)
-	io.print(" ")
-	io.print_int(e.len)
+	io.print("{} {}", e.rune, e.len)
 	for b in smile {
-		io.print(" ")
-		io.print_int(b)
+		io.print(" {}", b)
 	}
 	io.print("\n")
 
@@ -86,10 +74,7 @@ fn main() {
 	if round_trip[encoding.Utf8](0x1f600) {
 		good = good + 1
 	}
-	io.print_int(good)
-	io.print(" ")
-	io.print_int(encoding.Utf8.MAX_LEN)
-	io.print(" ")
+	io.print("{} {} ", good, encoding.Utf8.MAX_LEN)
 	if round_trip[encoding.Ascii](65) {
 		io.print("1\n")
 	}

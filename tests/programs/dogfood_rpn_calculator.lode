@@ -141,22 +141,18 @@ fn run(prog: []Op) -> Outcome {
 
 fn show(o: Outcome) {
 	match o {
-		value(v) => io.print_int(v)
+		value(v) => io.print("{}", v)
 		underflow(at) => {
-			io.print("underflow at ")
-			io.print_int(at)
+			io.print("underflow at {}", at)
 		}
 		overflow(at) => {
-			io.print("overflow at ")
-			io.print_int(at)
+			io.print("overflow at {}", at)
 		}
 		div_zero(at) => {
-			io.print("division by zero at ")
-			io.print_int(at)
+			io.print("division by zero at {}", at)
 		}
 		stack_full(at) => {
-			io.print("stack full at ")
-			io.print_int(at)
+			io.print("stack full at {}", at)
 		}
 	}
 	io.print("\n")

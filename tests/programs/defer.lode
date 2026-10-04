@@ -110,7 +110,7 @@ fn catch_return() -> u32 {
 // nowhere after it.
 fn defer_facts(xs: []u8, i: usize) {
 	if i < xs.len {
-		defer io.print_int(xs[i]) // proven: i < xs.len
+		defer io.print("{}", xs[i]) // proven: i < xs.len
 		io.print(".")
 	}
 }

@@ -1,0 +1,98 @@
+// error: a method with `comptime` parameters or a pack is not supported by the compiler yet
+// error: a pack is the last generic parameter
+// error: a pack parameter is the last parameter
+// error: `..T` is the type of a pack: `T` must be the function's pack
+// error: the pack `A` needs a parameter of type `..A`
+// error: a `comptime` parameter of type `Point` is not supported by the compiler yet
+// error: a struct's generic parameters can't be a pack
+// error: `break` and `continue` can't leave a `comptime for`
+// error: no arm of this `match comptime` matches its value
+// error: `v` is a variable, so the value of `w` isn't known when compiling
+// error: `args` is a pack, not a value
+// error: `args` has 1 argument(s), so the index 2 is out of bounds
+// error: 3 is odd
+// error: too long: `abcdef`
+// error: only a pack can be passed on with `..`
+// error: expanding `deep` here nests more than 64 expansions deep
+// help: its body is repeated for each element when compiling: it isn't a loop when the program runs
+// help: declare it last in the brackets: `[..T: Bound]`
+package main
+
+import "std/io"
+
+struct Point {
+	x: u32
+}
+
+struct Many[..A] {
+	x: u8
+}
+
+fn Point.f(self, comptime n: u32) {
+}
+
+fn not_last[..A: io.Format, T](args: ..A) {
+}
+
+fn pack_first[..A: io.Format](args: ..A, n: u32) {
+}
+
+fn not_a_pack[T](args: ..T) {
+}
+
+fn no_param[..A: io.Format](n: u32) {
+}
+
+fn struct_param(comptime p: Point) {
+}
+
+fn breaks(comptime n: usize) {
+	comptime for i in 0..n {
+		break
+	}
+}
+
+fn picks(comptime n: u32) {
+	match comptime n {
+		0 => io.print("zero\n")
+	}
+}
+
+fn known() {
+	let v: u32 = 3
+	comptime let w = v + 1
+}
+
+fn uses_pack[..A: io.Format](args: ..A) {
+	let a = args
+	io.print("{}", args[2])
+}
+
+fn need_even(comptime n: u32) {
+	if comptime n % 2 != 0 {
+		compile_error("{} is odd", n)
+	}
+}
+
+fn short(comptime s: str) {
+	if comptime s.len > 3 {
+		compile_error_at(s[3..], "too long: `{}`", s)
+	}
+}
+
+fn deep(comptime n: u32) {
+	deep(n + 1)
+}
+
+fn main() {
+	breaks(2)
+	picks(1)
+	uses_pack(u8(1))
+	need_even(4)
+	need_even(3)
+	short("abc")
+	short("abcdef")
+	let x: u32 = 1
+	io.print("{}", ..x)
+	deep(0)
+}

@@ -1,0 +1,67 @@
+// stdout: 7 7 true 9 12\n
+// stdout: 4 6\n
+package main
+
+import "std/io"
+
+// A trait's methods may have generic parameters of their own; an impl's
+// method declares the same ones, with the same bounds.
+trait Convert {
+	fn convert[U: Integer](self, u: U) -> U
+
+	fn same[V: Copy](self, sink v: V) -> V {
+		return v
+	}
+}
+
+impl Convert for u8 {
+	fn convert[U: Integer](self, u: U) -> U {
+		return u +| U(self % 100)
+	}
+}
+
+fn through[T: Convert](t: T) -> u64 {
+	return t.convert(u64(9))
+}
+
+// A trait whose method throws, implemented by a method that doesn't, and
+// called through the trait at compile time and at run time.
+enum Full {
+	full
+}
+
+trait Sink {
+	fn put(inout self, v: u8) throws(Full)
+}
+
+struct Counter {
+	n: u32
+}
+
+impl Sink for Counter {
+	fn put(inout self, v: u8) {
+		self.n = self.n +| u32(v)
+	}
+}
+
+fn fill[S: Sink](inout s: S) throws(Full) {
+	try s.put(1)
+	try s.put(3)
+}
+
+fn counted() -> u32 {
+	var c = Counter{n: 0}
+	fill(&c) catch _ {
+		return 0
+	}
+	return c.n
+}
+
+const COUNTED: u32 = counted()
+
+fn main() {
+	let x: u8 = 0
+	let y: u8 = 3
+	io.print("{} {} {} {} {}\n", x.convert(u32(7)), x.same(u16(7)), y.same(true), through(x), through(y))
+	io.print("{} {}\n", COUNTED, counted() +| 2)
+}

@@ -53,17 +53,6 @@ fn digits(n: u32) -> usize {
 fn main() -> u8 {
 	var b = buf.StackBuf[SIZE].new()
 	b.push(1) catch _ {}
-	io.print_int(SIZE)
-	io.print(" ")
-	io.print_int(BIG)
-	io.print(" ")
-	io.print_int(FILLED[5])
-	io.print(" ")
-	io.print_int(PAIR.first)
-	io.print(" ")
-	io.print_int(LIST_LEN)
-	io.print(" ")
-	io.print_int(DIGITS)
-	io.print("\n")
+	io.print("{} {} {} {} {} {}\n", SIZE, BIG, FILLED[5], PAIR.first, LIST_LEN, DIGITS)
 	return 0
 }

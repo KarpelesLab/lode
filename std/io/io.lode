@@ -4,18 +4,91 @@ package io
 import "std/buf"
 import "std/os"
 
-/// Write `s` to standard output.
+/// Write the format string `fmt` to standard output, each `{}` in it
+/// replaced by the next argument as its `Format` impl writes it:
+/// `io.print("x = {}\n", x)`. `{{` and `}}` write a brace. A `str` known
+/// only when the program runs is printed with `io.print("{}", s)`.
+///
+/// The format is read when compiling: a `{` without its `}`, a `}` alone,
+/// or a `{}` without an argument (or an argument without a `{}`) is an
+/// error at the call, and so is an argument whose type doesn't implement
+/// `Format`. Each piece of text is a `write`, and so is each argument:
+/// `io.print("hello world\n")` is one `write`, and no formatting code.
 ///
 /// Output errors are ignored: `print` is for programs whose output isn't worth
 /// failing over (and a closed pipe already ends the process through SIGPIPE).
-/// To handle errors, use `stdout().write(s)`.
-pub fn print(s: str) {
-	os.write_all(os.STDOUT, s.bytes())
+/// To handle errors, use `io.write_fmt(&f, fmt, ...)` with `f` a `File`.
+pub fn print[..A: Format](comptime fmt: str, args: ..A) {
+	var out = Out{fd: os.STDOUT}
+	comptime for k in 0..format_count(fmt, args.len) {
+		match comptime format_piece(fmt, k) {
+			text(start, end) => {
+				comptime let s = fmt[start..end]
+				os.write_all(os.STDOUT, s.bytes())
+			}
+			arg(i) => args[i].format(&out) catch _ {
+			}
+		}
+	}
 }
 
-/// Write `s` to standard error, ignoring errors like `print`.
-pub fn eprint(s: str) {
-	os.write_all(os.STDERR, s.bytes())
+/// `print` to standard error, ignoring errors like `print`.
+pub fn eprint[..A: Format](comptime fmt: str, args: ..A) {
+	var out = Out{fd: os.STDERR}
+	comptime for k in 0..format_count(fmt, args.len) {
+		match comptime format_piece(fmt, k) {
+			text(start, end) => {
+				comptime let s = fmt[start..end]
+				os.write_all(os.STDERR, s.bytes())
+			}
+			arg(i) => args[i].format(&out) catch _ {
+			}
+		}
+	}
+}
+
+/// Write the format string `fmt` to `w`, each `{}` replaced by the next
+/// argument, as `print` does, or throw the error that stopped it:
+/// `try io.write_fmt(&f, "{} items\n", n)`.
+pub fn write_fmt[W: Writer, ..A: Format](inout w: W, comptime fmt: str, args: ..A) throws(os.Error) {
+	comptime let count = format_count(fmt, args.len)
+	comptime for k in 0..count {
+		match comptime format_piece(fmt, k) {
+			text(start, end) => {
+				comptime let s = fmt[start..end]
+				try w.write_bytes(s.bytes())
+			}
+			arg(i) => try args[i].format(&w)
+		}
+	}
+}
+
+/// The number of pieces of the format string `fmt`, checked for `given`
+/// arguments when compiling: an error in it is reported at the call of
+/// `print`, `eprint` or `write_fmt`, pointing into the format string.
+fn format_count(comptime fmt: str, comptime given: usize) -> usize {
+	comptime let count = format_pieces(fmt, given) catch e {
+		match e {
+			unclosed(at) => compile_error_at(fmt[at..at + 1], "unclosed `{{` in the format string")
+			unmatched(at) => compile_error_at(fmt[at..at + 1], "unmatched `}}` in the format string: `}}}}` writes a brace")
+			spec(at, end) => compile_error_at(fmt[at..end], "a placeholder is `{{}}`: format specs are not supported yet")
+			missing(at, placeholders, given) => compile_error_at(fmt[at..at + 2], "this `{{}}` has no argument: {} {} but {} {}", placeholders, placeholder_noun(placeholders), given, argument_noun(given))
+			unused(placeholders, given) => compile_error("{} {} but {} {}: each argument needs a `{{}}` in the format string", placeholders, placeholder_noun(placeholders), given, argument_noun(given))
+		}
+	}
+	return count
+}
+
+/// Standard output or error, for `print` and `eprint`: a `Writer` that
+/// ignores errors.
+struct Out {
+	fd: i32
+}
+
+impl Writer for Out {
+	fn write_bytes(inout self, b: []u8) {
+		os.write_all(self.fd, b)
+	}
 }
 
 /// An open file, by its file descriptor. It doesn't close the file: the
@@ -147,29 +220,101 @@ pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize {
 	}
 }
 
-// Integer output. `print("{}", n)` will replace these once the compiler has
-// `comptime` (docs/generics.md, "Format strings").
+// Formatting: the `Format` trait, its impls, and the format strings of
+// `print` and `write_fmt`, which are read when compiling.
 
-/// Write the integer `n` to standard output in decimal, with a `-` if it's
-/// negative, ignoring errors like `print`. `n` can be of any integer type:
-/// `io.print_int(x)`, or `io.print_int[u64](5)` for a literal.
-pub fn print_int[T: Integer](n: T) {
-	write_int(os.STDOUT, n)
+/// A type whose values can be written as text, as `print`'s `{}` does:
+/// integers in decimal (with a `-` when negative), `bool` as `true` or
+/// `false`, and `str` as it is. Other types implement it with an `impl`:
+/// `impl io.Format for Point { ... }`.
+pub trait Format {
+	/// Write the value as text to `w`, or throw the error that stopped it.
+	fn format[W: Writer](self, inout w: W) throws(os.Error)
 }
 
-/// `print_int` to standard error.
-pub fn eprint_int[T: Integer](n: T) {
-	write_int(os.STDERR, n)
+impl Format for str {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try w.write_bytes(self.bytes())
+	}
 }
 
-/// Write the integer `n` in decimal to `fd`. Every integer type converts to
-/// `i64` when negative, or to `u64` when not.
-fn write_int[T: Integer](fd: i32, n: T) {
+impl Format for bool {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		if self {
+			try w.write_bytes("true".bytes())
+		} else {
+			try w.write_bytes("false".bytes())
+		}
+	}
+}
+
+impl Format for u8 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_decimal(&w, u64(self), false)
+	}
+}
+
+impl Format for u16 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_decimal(&w, u64(self), false)
+	}
+}
+
+impl Format for u32 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_decimal(&w, u64(self), false)
+	}
+}
+
+impl Format for u64 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_decimal(&w, self, false)
+	}
+}
+
+impl Format for usize {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_decimal(&w, u64(self), false)
+	}
+}
+
+impl Format for i8 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_signed(&w, i64(self))
+	}
+}
+
+impl Format for i16 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_signed(&w, i64(self))
+	}
+}
+
+impl Format for i32 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_signed(&w, i64(self))
+	}
+}
+
+impl Format for i64 {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_signed(&w, self)
+	}
+}
+
+impl Format for isize {
+	fn format[W: Writer](self, inout w: W) throws(os.Error) {
+		try write_signed(&w, i64(self))
+	}
+}
+
+/// Write `n` in decimal to `w`, with a `-` if it's negative.
+fn write_signed[W: Writer](inout w: W, n: i64) throws(os.Error) {
 	if n < 0 {
-		write_decimal(fd, magnitude(i64(n)), true)
+		try write_decimal(&w, magnitude(n), true)
 		return
 	}
-	write_decimal(fd, u64(n), false)
+	try write_decimal(&w, u64(n), false)
 }
 
 /// The absolute value of `n`. `-n` overflows for the smallest `i64`, so a
@@ -181,8 +326,8 @@ fn magnitude(n: i64) -> u64 {
 	return u64(n)
 }
 
-/// Write `n` in decimal to `fd`, after a `-` if `negative`, in one
-/// `os.write_all` (errors are ignored, like `print`'s).
+/// Write `n` in decimal to `w`, after a `-` if `negative`, in one
+/// `write_bytes`.
 ///
 /// The digits go into a buffer from the end, and element 0 is kept for the
 /// sign. 20 digits hold the largest `u64`, so the loop always ends when `v`
@@ -194,7 +339,7 @@ fn magnitude(n: i64) -> u64 {
 /// program printing an integer was 640 bytes larger at -O2 (`push_front`
 /// isn't inlined, its thrown error goes through memory, and the written
 /// part is checked again before the write).
-fn write_decimal(fd: i32, n: u64, negative: bool) {
+fn write_decimal[W: Writer](inout w: W, n: u64, negative: bool) throws(os.Error) {
 	var digits: [21]u8 = [0; 21]
 	var i = digits.len - 1
 	var v = n
@@ -213,5 +358,146 @@ fn write_decimal(fd: i32, n: u64, negative: bool) {
 		i = i - 1
 		digits[i] = '-'
 	}
-	os.write_all(fd, digits[i..])
+	try w.write_bytes(digits[i..])
+}
+
+/// A piece of a format string: text written as it is, or an argument.
+enum Piece {
+	/// The bytes `start..end` of the format string.
+	text(start: usize, end: usize)
+	/// Argument number `index`.
+	arg(index: usize)
+}
+
+/// What's wrong with a format string, and where: byte offsets in it.
+enum FormatError {
+	/// The `{` at `at` isn't closed.
+	unclosed(at: usize)
+	/// The `}` at `at` closes nothing.
+	unmatched(at: usize)
+	/// The placeholder `at..end` isn't `{}`.
+	spec(at: usize, end: usize)
+	/// The `{}` at `at` has no argument: there are `placeholders` of them
+	/// for `given` arguments.
+	missing(at: usize, placeholders: usize, given: usize)
+	/// There are `placeholders` placeholders for more arguments, `given`.
+	unused(placeholders: usize, given: usize)
+}
+
+/// A piece of a format string, and the offset where the next one starts.
+struct Next {
+	piece: Piece
+	end: usize
+}
+
+/// The piece of the format string `b` at `at`, the next placeholder being
+/// argument `arg`: `none` at the end. Text runs up to a brace; `{{` and
+/// `}}` end a piece of text with one brace.
+fn next_piece(b: []u8, at: usize, arg: usize) throws(FormatError) -> ?Next {
+	if at >= b.len {
+		return none
+	}
+	let doubled = at + 1 < b.len && b[at + 1] == b[at]
+	if b[at] == '{' && !doubled {
+		var i = at + 1
+		while i < b.len {
+			if b[i] == '}' {
+				if i == at + 1 {
+					return Next{piece: .arg(arg), end: i + 1}
+				}
+				throw .spec(at, i + 1)
+			}
+			if b[i] == '{' {
+				break
+			}
+			i += 1
+		}
+		throw .unclosed(at)
+	}
+	if b[at] == '}' && !doubled {
+		throw .unmatched(at)
+	}
+	var i = at
+	while i < b.len {
+		if b[i] == '{' || b[i] == '}' {
+			if i + 1 < b.len && b[i + 1] == b[i] {
+				return Next{piece: .text(at, i + 1), end: i + 2}
+			}
+			break
+		}
+		i += 1
+	}
+	return Next{piece: .text(at, i), end: i}
+}
+
+/// The number of pieces of the format string `fmt`, checked for `given`
+/// arguments: each `{}` has one, and each argument a `{}`.
+fn format_pieces(fmt: str, given: usize) throws(FormatError) -> usize {
+	let b = fmt.bytes()
+	var at: usize = 0
+	var pieces: usize = 0
+	var placeholders: usize = 0
+	var missing: ?usize = none
+	loop {
+		let found = try next_piece(b, at, placeholders)
+		let next = found else {
+			break
+		}
+		if next.piece == .arg(placeholders) {
+			if placeholders >= given && missing == none {
+				missing = at
+			}
+			placeholders +|= 1
+		}
+		pieces +|= 1
+		at = next.end
+	}
+	if let at = missing {
+		throw .missing(at, placeholders, given)
+	}
+	if placeholders < given {
+		throw .unused(placeholders, given)
+	}
+	return pieces
+}
+
+/// Piece `k` of the format string `fmt`, which `format_pieces` checked.
+fn format_piece(fmt: str, k: usize) -> Piece {
+	let b = fmt.bytes()
+	var at: usize = 0
+	var arg: usize = 0
+	var n: usize = 0
+	loop {
+		let found = next_piece(b, at, arg) catch _ {
+			break
+		}
+		let next = found else {
+			break
+		}
+		if n == k {
+			return next.piece
+		}
+		if next.piece == .arg(arg) {
+			arg +|= 1
+		}
+		n +|= 1
+		at = next.end
+	}
+	return .text(0, 0)
+}
+
+/// "placeholder" or "placeholders", for `n` of them.
+fn placeholder_noun(n: usize) -> str {
+	if n == 1 {
+		return "placeholder"
+	}
+	return "placeholders"
+}
+
+/// "argument" or "arguments", for `n` of them.
+fn argument_noun(n: usize) -> str {
+	if n == 1 {
+		return "argument"
+	}
+	return "arguments"
 }

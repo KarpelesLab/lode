@@ -214,6 +214,37 @@ pub fn lex_with_comments(src: &str, file: FileId) -> (Vec<Token>, Vec<Span>, Vec
     (lx.toks, lx.comments, lx.diags)
 }
 
+/// Where each byte of the string literal starting at `start` in `src` (its
+/// opening `"`) comes from: the offset in `src` of the character or escape
+/// that gives it, then the offset of the closing `"`. For errors that point
+/// into a literal, such as a format string's.
+pub fn literal_offsets(src: &str, start: usize, file: FileId) -> Vec<usize> {
+    let mut lx = Lexer {
+        file,
+        src,
+        bytes: src.as_bytes(),
+        pos: start + 1,
+        toks: Vec::new(),
+        comments: Vec::new(),
+        diags: Vec::new(),
+    };
+    let mut out = Vec::new();
+    loop {
+        let at = lx.pos;
+        if lx.peek(0).is_none_or(|b| b == b'"') {
+            out.push(at);
+            return out;
+        }
+        match lx.literal_char() {
+            Some(bytes) => out.extend(std::iter::repeat_n(at, bytes.len())),
+            None => {
+                out.push(at);
+                return out;
+            }
+        }
+    }
+}
+
 struct Lexer<'a> {
     file: FileId,
     src: &'a str,

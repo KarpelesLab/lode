@@ -8,12 +8,12 @@ package main
 import "std/io"
 import "std/slices"
 
-fn show[T: Integer](xs: []T) {
+fn show[T: Integer + io.Format](xs: []T) {
 	for i in 0..xs.len {
 		if i > 0 {
 			io.print(" ")
 		}
-		io.print_int(xs[i])
+		io.print("{}", xs[i])
 	}
 	io.print("\n")
 }

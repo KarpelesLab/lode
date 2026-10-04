@@ -57,9 +57,7 @@ fn main() -> u8 {
 	var i: u32 = 0
 	while i < 10 {
 		let next = push(r, i * 10) else {
-			io.print("full at ")
-			io.print_int(i)
-			io.print("\n")
+			io.print("full at {}\n", i)
 			break
 		}
 		r = next
@@ -73,8 +71,7 @@ fn main() -> u8 {
 		let p = pop(r) else {
 			return 2
 		}
-		io.print_int(p.value)
-		io.print(" ")
+		io.print("{} ", p.value)
 		r = p.ring
 	}
 	io.print("\n")
@@ -87,12 +84,9 @@ fn main() -> u8 {
 			break
 		}
 		sum = sum +| p.value // WORKAROUND: unbounded loop count
-		io.print_int(p.value)
-		io.print(" ")
+		io.print("{} ", p.value)
 		r = p.ring
 	}
-	io.print("\nsum ")
-	io.print_int(sum)
-	io.print("\n")
+	io.print("\nsum {}\n", sum)
 	return 0
 }

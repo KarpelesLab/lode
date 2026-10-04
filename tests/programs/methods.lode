@@ -104,7 +104,7 @@ fn Parser.skip(inout self, n: u32) throws(ParseError) {
 
 fn main() -> u32 {
 	let p = Point.new(3, 4)
-	io.print_int(p.norm2())
+	io.print("{}", p.norm2())
 	io.print(" ")
 
 	var q = Point.origin()
@@ -115,7 +115,7 @@ fn main() -> u32 {
 		return 1
 	}
 	// Chained calls: `swapped` returns a value, `sum` reads it.
-	io.print_int(p.swapped().moved(0).sum())
+	io.print("{}", p.swapped().moved(0).sum())
 	io.print(" ")
 	let r = q.moved(10)
 	if r.x != 12 || q.x != 2 {
@@ -145,7 +145,6 @@ fn main() -> u32 {
 			empty => {}
 		}
 	}
-	io.print_int(parser.pos)
-	io.print("\n")
+	io.print("{}\n", parser.pos)
 	return 0
 }

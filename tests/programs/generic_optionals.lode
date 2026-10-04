@@ -56,24 +56,21 @@ fn get[T](sink o: ?T) -> T {
 fn main() {
 	var x: u8
 	fill2(&x, 5)
-	io.print_int(x)
-	io.print(" ")
+	io.print("{} ", x)
 	let v = check[i8](-1) catch 9
-	io.print_int(v)
-	io.print(" ")
+	io.print("{} ", v)
 	let w: i16 = twice_checked(300) catch 0
-	io.print_int(w)
-	io.print(" ")
+	io.print("{} ", w)
 	let o: ?u32 = none
-	io.print_int(or_else(o, 4))
+	io.print("{}", or_else(o, 4))
 	io.print(" ")
 	let p: ?u32 = 8
-	io.print_int(unwrap_or(p, 4))
+	io.print("{}", unwrap_or(p, 4))
 	io.print(" ")
 	if is_some(p) && !is_some(o) {
 		io.print("ok")
 	}
 	io.print(" ")
-	io.print_int(get(p))
+	io.print("{}", get(p))
 	io.print("\n")
 }

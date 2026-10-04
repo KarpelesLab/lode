@@ -31,9 +31,6 @@ fn main() -> u8 {
 		}
 		bytes +%= n
 	}
-	io.print_int(bytes)
-	io.print(" bytes, ")
-	io.print_int(lines)
-	io.print(" newlines\n")
+	io.print("{} bytes, {} newlines\n", bytes, lines)
 	return 0
 }

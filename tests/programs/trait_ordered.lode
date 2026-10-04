@@ -76,11 +76,7 @@ impl[A: Ordered] Ordered for Pair[A] {
 }
 
 fn show(p: Point) {
-	io.print("(")
-	io.print_int(p.x)
-	io.print(", ")
-	io.print_int(p.y)
-	io.print(")")
+	io.print("({}, {})", p.x, p.y)
 }
 
 fn order_name(o: Ordering) -> str {
@@ -110,20 +106,20 @@ fn main() {
 
 	var ls = [Level.high, Level.low, Level.mid]
 	slices.sort(&ls)
-	io.print(ls[0].name())
+	io.print("{}", ls[0].name())
 	io.print(" ")
-	io.print(ls[1].name())
+	io.print("{}", ls[1].name())
 	io.print(" ")
-	io.print(ls[2].name())
+	io.print("{}", ls[2].name())
 	io.print("\n")
 
 	let a = Point{x: 1, y: 2}
 	let b = Point{x: 1, y: 3}
-	io.print(order_name(a.cmp(b)))
+	io.print("{}", order_name(a.cmp(b)))
 	io.print(" ")
-	io.print(order_name(Ordered.cmp(b, a)))
+	io.print("{}", order_name(Ordered.cmp(b, a)))
 	io.print(" ")
-	io.print(order_name(a.cmp(a)))
+	io.print("{}", order_name(a.cmp(a)))
 	io.print("\n")
 
 	show(math.min(b, a))
@@ -141,8 +137,5 @@ fn main() {
 		n = n + 1
 	}
 	let lo = math.min(Pair{first: 9, second: 9}, Pair[u8]{first: 1, second: 200})
-	io.print_int(lo.first)
-	io.print(" ")
-	io.print_int(n)
-	io.print("\n")
+	io.print("{} {}\n", lo.first, n)
 }

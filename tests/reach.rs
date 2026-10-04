@@ -36,7 +36,9 @@ fn main() -> u8 {
 #[test]
 fn only_reached_functions_and_strings_are_lowered() {
     let ir = ir("unused.lode", UNUSED);
-    for name in ["@main.main", "@\"std/io.print\"", "@\"std/os.write_all\""] {
+    // `print("hi\n")` calls an expansion of `print` (`std/io.print$2`:
+    // the one in `unused` is checked first).
+    for name in ["@main.main", "@\"std/io.print$", "@\"std/os.write_all\""] {
         assert!(ir.contains(name), "{name} missing:\n{ir}");
     }
     for name in ["@main.unused", "@\"std/io.eprint\"", "@\"std/os.write\""] {
@@ -55,7 +57,7 @@ fn main_is_the_entry() {
     // `main` returns its exit status as an `i64`; everything else is
     // internal.
     assert!(ir.contains("func @main.main() -> i64 {"), "{ir}");
-    assert!(ir.contains("func internal @\"std/io.print\""), "{ir}");
+    assert!(ir.contains("func internal @\"std/io.print$"), "{ir}");
     assert!(!ir.contains("func @main()"), "{ir}");
 
     let (mut files, root) = source("unused.lode", UNUSED);
