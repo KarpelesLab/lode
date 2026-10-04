@@ -93,6 +93,7 @@
 //! `break` and `continue` that leaves it. `errdefer` bodies only at the
 //! exits that leave the function with an error.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use latticefoundry::Module;
@@ -406,6 +407,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             string_lens: &program.strings,
             tables: &table_globals,
             slots: Vec::new(),
+            addrs: HashMap::new(),
             loops: Vec::new(),
             defers: Vec::new(),
             terminated: false,
@@ -484,6 +486,9 @@ struct FnLower<'a> {
     /// The global of each array constant.
     tables: &'a [GlobalId],
     slots: Vec<Slot>,
+    /// The addresses [`byte_offset`](Self::byte_offset) made, by block,
+    /// base and offset.
+    addrs: HashMap<(BlockId, ValueId, u64), ValueId>,
     /// `(continue target, break target, defer scopes outside it)` of each
     /// enclosing loop.
     loops: Vec<(BlockId, BlockId, usize)>,
@@ -2129,12 +2134,22 @@ impl FnLower<'_> {
     /// `base` moved by the constant `bytes`: `base` itself for 0, so a
     /// field, payload or element at offset 0 costs no instruction (LF
     /// counts each one against its inlining threshold).
+    ///
+    /// The same address computed again in the same block is the earlier
+    /// `ptr_add` (LF's optimizer treats `ptr_add` as opaque, so it doesn't
+    /// merge them).
     fn byte_offset(&mut self, base: ValueId, bytes: u64) -> ValueId {
         if bytes == 0 {
             return base;
         }
+        let block = self.b.current_block().expect("in a block");
+        if let Some(&addr) = self.addrs.get(&(block, base, bytes)) {
+            return addr;
+        }
         let off = self.b.const_i64(self.t.i64, bytes as i64);
-        self.b.ptr_add(base, off, true)
+        let addr = self.b.ptr_add(base, off, true);
+        self.addrs.insert((block, base, bytes), addr);
+        addr
     }
 
     /// The address of field `i` of the IR struct `ty` at `base`.
