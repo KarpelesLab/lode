@@ -7,8 +7,7 @@ import "std/os"
 ///
 /// Output errors are ignored: `print` is for programs whose output isn't worth
 /// failing over (and a closed pipe already ends the process through SIGPIPE).
-/// To handle errors, use `os.write_all` and check its result. When the compiler
-/// has `throws`, the checked version will be `io.stdout().write(s)`.
+/// To handle errors, use `write`.
 pub fn print(s: str) {
 	os.write_all(os.STDOUT, s)
 }
@@ -16,6 +15,18 @@ pub fn print(s: str) {
 /// Write `s` to standard error, ignoring errors like `print`.
 pub fn eprint(s: str) {
 	os.write_all(os.STDERR, s)
+}
+
+/// Write all of `s` to the file descriptor `fd` (like `os.STDOUT`), or throw
+/// the error that stopped it.
+///
+/// This is the checked way to write. Once types have methods, it will be
+/// `io.stdout().write(s)`.
+pub fn write(fd: i32, s: str) throws(os.Error) {
+	let n = os.write_all(fd, s)
+	if n < 0 {
+		throw os.error(n)
+	}
 }
 
 // Integer output. `print("{}", n)` will replace these once the compiler has

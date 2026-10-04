@@ -1,0 +1,24 @@
+// stdout: written\n
+package main
+
+import "std/io"
+import "std/os"
+
+// `io.write` reports what stopped it, as an `os.Error`.
+fn main() -> u8 {
+	io.write(os.STDOUT, "written\n") catch _ {
+		return 1
+	}
+	// Nothing to write is a success.
+	io.write(os.STDOUT, "") catch _ {
+		return 2
+	}
+	// Not an open file descriptor.
+	io.write(99, "lost") catch e {
+		match e {
+			bad_fd => return 0
+			_ => return 3
+		}
+	}
+	return 4
+}
