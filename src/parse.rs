@@ -1832,6 +1832,60 @@ mod tests {
     }
 
     #[test]
+    fn generics() {
+        let file = parse_ok(
+            "fn max[T: Ordered + Copy, U](a: T) -> T {\n\treturn f[u32, ?u8, []T, [4]u8](xs[i])\n}\n\
+             fn g() {\n\tlet a = h[u32](1)\n\tlet b = s[i..]\n\tlet c = s[[2]u8]\n}\n",
+        );
+        let Item::Fn(max) = &file.items[0] else {
+            panic!()
+        };
+        let names: Vec<&str> = max.generics.iter().map(|g| g.name.name.as_str()).collect();
+        assert_eq!(names, ["T", "U"]);
+        let bounds: Vec<&str> = max.generics[0]
+            .bounds
+            .iter()
+            .map(|b| b.name.as_str())
+            .collect();
+        assert_eq!(bounds, ["Ordered", "Copy"]);
+        assert!(max.generics[1].bounds.is_empty());
+        let Stmt::Return {
+            value: Some(ret), ..
+        } = &max.body.stmts[0]
+        else {
+            panic!()
+        };
+        let ExprKind::Call(callee, args) = &ret.kind else {
+            panic!()
+        };
+        // Several items, some only a type can be: generic arguments.
+        let ExprKind::TypeArgs(_, items) = &callee.kind else {
+            panic!("{callee:?}")
+        };
+        assert!(matches!(items[0], TypeArg::Expr(_)));
+        assert!(items[1..].iter().all(|i| matches!(i, TypeArg::Type(_))));
+        // One expression: an index, which the checker may read as a type.
+        assert!(matches!(args[0].kind, ExprKind::Index(..)));
+        let g = |k: usize| {
+            let Item::Fn(g) = &file.items[1] else {
+                panic!()
+            };
+            let Stmt::Let { init: Some(e), .. } = &g.body.stmts[k] else {
+                panic!()
+            };
+            e.kind.clone()
+        };
+        assert!(matches!(g(0), ExprKind::Call(c, _) if matches!(c.kind, ExprKind::Index(..))));
+        assert!(matches!(g(1), ExprKind::Slice(..)));
+        assert!(matches!(g(2), ExprKind::TypeArgs(_, items) if items.len() == 1));
+
+        let errs = parse_errors("fn f[]() {\n}\nfn Point.m[T](self) {\n}\n");
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].contains("needs a type parameter"));
+        assert!(errs[1].contains("generic methods"));
+    }
+
+    #[test]
     fn reports_and_recovers() {
         let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntrait S {}\n");
         assert_eq!(errs.len(), 3, "{errs:?}");

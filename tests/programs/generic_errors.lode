@@ -1,0 +1,141 @@
+// error: `<` can't compare values of type `T`
+// error: `+%` needs integers, found `T`
+// error: `==` can't compare values of type `T`
+// error: `T` has no method `lt`
+// error: `T` has no method `len`
+// error: cannot prove that this addition does not overflow `T`
+// error: `200` does not fit in every type `T` can be
+// error: cannot negate a value of `T`, which may be unsigned
+// error: cannot prove that this shift amount is less than 8
+// error: cannot prove that this `u32` value fits in `T`
+// error: expected `T`, found an integer
+// error: `Point` doesn't implement `Ordered`, which `largest` requires of `T`
+// error: `bool` doesn't implement `Integer`, which `twice` requires of `T`
+// error: `U` doesn't implement `Integer`, which `twice` requires of `T`
+// error: cannot tell what `T` is in this call of `largest`
+// error: cannot tell what `T` is in this call of `twice`
+// error: `largest` takes 1 type argument(s), but 2 were given
+// error: `plain` is not generic: it takes no type arguments
+// error: `u32` is a type, not a value
+// error: `xs` is not a generic function, so these brackets would be an index, which is one integer
+// error: expected a type argument, found an expression
+// error: a type argument can't be a view (`str`)
+// error: `largest` is a function; call it
+// error: this calls `nest[?T]`, which calls back here: its instances would never end
+// error: `Sortable` is not a built-in trait
+// error: `T` can't be both `Unsigned` and `Signed`: no type is
+// error: `Ordered` is a trait, not a type
+// error: the type parameter `T` is declared twice
+// help: `T: Ordered` gives methods, not operators
+// help: add the bound `[T: Eq]`
+// help: add the bound to `U`: `[U: Integer]`
+// help: `impl Ordered for Point` is not supported by the compiler yet
+// help: write the type arguments, as in `largest[u32](...)`
+// help: `T` can be any `Integer` type: a value fits in all of them when it's in 0..=127
+package main
+
+struct Point {
+	x: u32
+}
+
+fn largest[T: Ordered](sink a: T, sink b: T) -> T {
+	if a.lt(b) {
+		return b
+	}
+	return a
+}
+
+fn twice[T: Integer](x: T) -> T {
+	return x +| x
+}
+
+fn plain(x: u32) -> u32 {
+	return x
+}
+
+// Operators need a numeric bound; `Ordered` gives methods.
+fn less[T: Ordered](a: T, b: T) -> bool {
+	return a < b
+}
+
+fn add[T: Ordered](a: T, b: T) -> T {
+	return a +% b
+}
+
+// `==` needs `Eq`.
+fn same[T](a: T, b: T) -> bool {
+	return a == b
+}
+
+// Methods come from the bounds only.
+fn below[T](a: T, b: T) -> bool {
+	return a.lt(b)
+}
+
+fn size[T: Copy](a: T) -> usize {
+	return a.len()
+}
+
+// A result must fit in every type `T` can be.
+fn next[T: Integer](a: T) -> T {
+	return a + 1
+}
+
+fn big[T: Integer]() -> T {
+	return 200
+}
+
+fn neg[T: Integer](a: T) -> T {
+	return -a
+}
+
+fn shift[T: Unsigned](a: T) -> T {
+	return a << 8
+}
+
+fn narrow[T: Unsigned](a: u32) -> T {
+	return T(a)
+}
+
+fn not_a_number[T: Ordered]() -> T {
+	return 0
+}
+
+// A type argument is checked against the bounds where it's given.
+fn pass_on[U](x: U) -> U {
+	return twice(x)
+}
+
+// Instances that never end.
+fn nest[T: Copy](x: T) -> u32 {
+	let o: ?T = x
+	return nest(o)
+}
+
+fn unknown_trait[T: Sortable](x: T) {
+}
+
+fn both[T: Unsigned + Signed](x: T) {
+}
+
+fn trait_as_type(x: Ordered) {
+}
+
+fn twice_declared[T, T](x: T) {
+}
+
+fn main() {
+	let p = Point{x: 1}
+	let q = largest(p, p)
+	let r = twice(true)
+	let s = largest(3, 4)
+	twice(5)
+	let t = largest[u8, u8](1, 2)
+	let u = plain[u32](1)
+	let xs: [2]u8 = [1, 2]
+	let v = xs[u32]
+	let w = xs[0, 1]
+	let y = largest[1 + 1](1, 2)
+	let z = largest[str]("a", "b")
+	let f = largest[u8]
+}

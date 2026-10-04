@@ -1012,6 +1012,68 @@ mod tests {
     }
 
     #[test]
+    fn type_parameters() {
+        let u8_ = Ty::Int(IntTy::new(false, 8));
+        let range = |lo: i128, hi: i128| Some(Range { lo, hi });
+
+        let t = Ty::new_param("T".into(), Bounds::new(&[Trait::Integer]), 64);
+        let def = t.as_param().expect("a parameter");
+        assert_eq!(
+            def.values,
+            range(i128::from(i64::MIN), i128::from(u64::MAX))
+        );
+        assert_eq!(def.fits, range(0, 127));
+        assert_eq!(def.signed_min, Some(-128));
+        for tr in [Trait::Eq, Trait::Ordered, Trait::Copy, Trait::Integer] {
+            assert!(t.satisfies(tr), "{tr}");
+        }
+        assert!(!t.satisfies(Trait::Unsigned) && t.to_string() == "T");
+
+        let u = Ty::new_param("U".into(), Bounds::new(&[Trait::Unsigned]), 64);
+        let def = u.as_param().expect("a parameter");
+        assert_eq!(def.values, range(0, i128::from(u64::MAX)));
+        assert_eq!((def.fits, def.signed_min), (range(0, 255), None));
+        let s = Ty::new_param("S".into(), Bounds::new(&[Trait::Signed]), 64);
+        assert_eq!(s.as_param().expect("a parameter").fits, range(-128, 127));
+
+        // Without `Copy`, a parameter isn't copied, nor what holds it; a
+        // view of it is.
+        let o = Ty::new_param("O".into(), Bounds::new(&[Trait::Ordered]), 64);
+        assert!(o.as_param().expect("a parameter").values.is_none());
+        assert!(!o.is_copy() && !Ty::optional(o).is_copy() && Ty::slice(o).is_copy());
+        assert!(o.satisfies(Trait::Eq) && !o.satisfies(Trait::Copy));
+
+        let mut found = Vec::new();
+        Ty::array(Ty::optional(o), 2).params(&mut found);
+        assert_eq!(found, [o]);
+        let with = |p: Ty| (p == o).then_some(u8_);
+        assert_eq!(
+            Ty::array(Ty::optional(o), 2).subst(&with),
+            Ty::array(Ty::optional(u8_), 2)
+        );
+        assert!(!Ty::array(u8_, 2).is_generic() && Ty::slice(o).is_generic());
+
+        // The concrete types' built-in traits.
+        assert!(Ty::Bool.satisfies(Trait::Ordered) && !Ty::Bool.satisfies(Trait::Integer));
+        assert!(Ty::Int(IntTy::new(true, 8)).satisfies(Trait::Signed));
+        assert!(!Ty::Str.satisfies(Trait::Eq) && Ty::array(u8_, 3).satisfies(Trait::Eq));
+
+        let ordering = Ty::ordering();
+        assert_eq!(
+            (ordering, ordering.to_string()),
+            (Ty::ordering(), "Ordering".into())
+        );
+        let values: Vec<i128> = ordering
+            .as_enum()
+            .expect("an enum")
+            .variants
+            .iter()
+            .map(|v| v.value)
+            .collect();
+        assert_eq!(values, [-1, 0, 1]);
+    }
+
+    #[test]
     fn enums_and_optionals() {
         let u8_ = Ty::Int(IntTy::new(false, 8));
         let e = Ty::new_enum("E".into(), 0, true);

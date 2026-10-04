@@ -3216,10 +3216,11 @@ impl<'a> Checker<'a> {
             if moved.is_empty() {
                 return (out, head, edges.exits);
             }
-            for l in moved {
+            for &l in &moved {
                 head.declare_uninit(l);
             }
             self.rollback(cx, &mark);
+            cx.moved.extend(moved);
             (out, edges) = self.loop_pass(cx, head.clone(), index_local, &mut check);
         }
     }

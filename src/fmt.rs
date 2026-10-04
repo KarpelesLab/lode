@@ -773,6 +773,18 @@ mod tests {
     }
 
     #[test]
+    fn generics() {
+        assert_eq!(
+            fmt(
+                "fn max[ T :Ordered+Copy , U ]( sink a:T )->T {\n\treturn a\n}\n\
+                 fn f() {\n\tlet m = max [ u32 ] ( 1,2 )\n\tlet s = g[ ?u8,[ ]u8 , [4]T ](x)\n}\n"
+            ),
+            "fn max[T: Ordered + Copy, U](sink a: T) -> T {\n\treturn a\n}\n\
+             fn f() {\n\tlet m = max[u32](1, 2)\n\tlet s = g[?u8, []u8, [4]T](x)\n}\n"
+        );
+    }
+
+    #[test]
     fn errors_and_variants() {
         assert_eq!(
             fmt(

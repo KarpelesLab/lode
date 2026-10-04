@@ -1,0 +1,162 @@
+// stdout: 3 7 0\n
+// stdout: 100 200 -1\n
+// stdout: 5 250 7\n
+// stdout: 127 0 -5\n
+// stdout: 250 none 260\n
+// stdout: 4 0 15 12 3\n
+package main
+
+import "std/io"
+
+// After `n < limit`, `n + 1` is at most `limit`, a `T`: it fits, whatever
+// `T` is.
+fn count_below[T: Unsigned](xs: []T, limit: T) -> T {
+	var n: T = 0
+	for x in xs {
+		if x < limit && n < limit {
+			n = n + 1
+		}
+	}
+	return n
+}
+
+// After `lo <= hi`, `hi - lo` is at least 0, and at most `hi`, since `lo`
+// isn't negative.
+fn span[T: Unsigned](lo: T, hi: T) -> T {
+	if hi < lo {
+		return 0
+	}
+	return hi - lo
+}
+
+// A literal fits when every type the bound admits holds it.
+fn hundred[T: Integer]() -> T {
+	return 100
+}
+
+fn two_hundred[T: Unsigned]() -> T {
+	return 200
+}
+
+fn minus_one[T: Signed]() -> T {
+	return -1
+}
+
+// Division by a constant needs no other proof.
+fn digits[T: Unsigned](x: T) -> u32 {
+	var n: u32 = 1
+	var v = x
+	while v >= 10 && n < 30 {
+		v = v / 10
+		n = n + 1
+	}
+	return n
+}
+
+// Every `u8` fits in every unsigned type.
+fn from_byte[T: Unsigned](b: u8) -> T {
+	return T(b)
+}
+
+// Every unsigned value fits in a `u64`.
+fn to_u64[T: Unsigned](x: T) -> u64 {
+	return u64(x)
+}
+
+// Above -128, no signed type's smallest value: `-x` fits.
+fn negate[T: Signed](x: T) -> T {
+	if x < -127 {
+		return 0
+	}
+	return -x
+}
+
+// Checked by hand: a sum that wrapped is smaller than what it added to.
+fn checked_sum[T: Unsigned](xs: []T) -> ?T {
+	var total: T = 0
+	for x in xs {
+		let next = total +% x
+		if next < total {
+			return none
+		}
+		total = next
+	}
+	return total
+}
+
+// Bit operations and shifts by less than 8 work on any integer type.
+fn low_nibble[T: Integer](x: T) -> T {
+	return x & 15
+}
+
+fn halves[T: Unsigned](x: T) -> T {
+	return (x >> 1) | (x >> 2)
+}
+
+// An index can be a `T`, converted (or proven) like any integer.
+fn at[T: Unsigned](xs: []u8, i: T) -> u8 {
+	let k = usize(i)
+	if k < xs.len {
+		return xs[k]
+	}
+	return 0
+}
+
+fn space() {
+	io.print(" ")
+}
+
+fn main() {
+	let xs: [5]u16 = [1, 5, 3, 9, 2]
+	io.print_int(count_below[u16](xs, 4))
+	space()
+	io.print_int(span[u8](3, 10))
+	space()
+	io.print_int(span[u64](10, 3))
+	io.print("\n")
+
+	io.print_int(hundred[i8]())
+	space()
+	io.print_int(two_hundred[u8]())
+	space()
+	io.print_int(minus_one[i64]())
+	io.print("\n")
+
+	io.print_int(digits[u64](12345))
+	space()
+	io.print_int(from_byte[u16](250))
+	space()
+	io.print_int(to_u64[u32](7))
+	io.print("\n")
+
+	io.print_int(negate[i8](-127))
+	space()
+	io.print_int(negate[i8](-128))
+	space()
+	io.print_int(negate[i32](5))
+	io.print("\n")
+
+	let a: [2]u8 = [200, 50]
+	let b: [2]u8 = [200, 60]
+	let c: [2]u16 = [200, 60]
+	io.print_int(checked_sum(a) ?? 0)
+	space()
+	if checked_sum(b) == none {
+		io.print("none")
+	}
+	space()
+	io.print_int(checked_sum(c) ?? 0)
+	io.print("\n")
+
+	io.print_int(low_nibble[i32](-12))
+	space()
+	io.print_int(low_nibble[u8](240))
+	space()
+	io.print_int(low_nibble[u64](255))
+	space()
+	io.print_int(halves[u8](16))
+	space()
+	let bytes: [4]u8 = [0, 1, 2, 3]
+	io.print_int(at[u64](bytes, 3))
+	io.print("\n")
+}

@@ -1,0 +1,99 @@
+// error: this copies `b`, a read-only parameter, but `T` isn't `Copy`
+// error: this copies `a`, a read-only parameter, but `T` isn't `Copy`
+// error: this copies `xs[0]`, a `T`, but `T` isn't `Copy`
+// error: this copies `xs[...]`, a `T`, but `T` isn't `Copy`
+// error: `a` is used after it was moved (on some path to here)
+// error: `a` is used after it was moved (on some path to here)
+// error: `x` is used after it was moved (on some path to here)
+// error: `[value; 2]` copies its value, but `T` isn't `Copy`
+// error: this copies `o`, a read-only parameter, but `T` isn't `Copy`
+// error: this copies `a`, a parameter the caller keeps, but `T` isn't `Copy`
+// error: a `defer` block can't move `a`, which is declared outside it
+// help: add the bound `Copy` to copy it: `[T: Copy]`
+// help: or take it as `sink a: T`, which moves the caller's value in
+// help: an element can't be moved out of its array
+// help: a value can't be moved out of an `inout` or `set` parameter
+package main
+
+fn keep[T](sink x: T) -> T {
+	return x
+}
+
+// Returning a read-only parameter copies it.
+fn larger[T: Ordered](a: T, b: T) -> T {
+	if a.lt(b) {
+		return b
+	}
+	return a
+}
+
+// So does keeping an element.
+fn first[T](xs: []T) -> ?T {
+	if xs.len > 0 {
+		return xs[0]
+	}
+	return none
+}
+
+fn each[T: Eq](xs: []T, v: T) -> bool {
+	for x in xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// A `sink` parameter or a local can be moved out of, once.
+fn pair[T](sink a: T) -> [2]T {
+	let b = a
+	return [a, b]
+}
+
+fn maybe[T](sink a: T, c: bool) -> T {
+	if c {
+		let b = keep(a)
+	}
+	return a
+}
+
+fn in_loop[T](sink x: T) {
+	loop {
+		let y = keep(x)
+	}
+}
+
+fn repeat[T](sink a: T) -> [2]T {
+	return [a; 2]
+}
+
+fn unwrap[T](o: ?T) -> bool {
+	if let v = o {
+		return true
+	}
+	return false
+}
+
+fn take[T](inout a: T) -> T {
+	return a
+}
+
+fn deferred[T](sink a: T) {
+	defer {
+		let b = keep(a)
+	}
+}
+
+// Reading in place needs no `Copy`: comparing, calling a method,
+// passing to a parameter that isn't `sink`.
+fn fine[T: Ordered](xs: []T, sink v: T) -> T {
+	for i in 0..xs.len {
+		if xs[i] == v || xs[i].lt(v) {
+			return v
+		}
+	}
+	return keep(v)
+}
+
+fn main() {
+}

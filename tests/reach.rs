@@ -141,3 +141,55 @@ fn main() -> u16 {
     // Little-endian, each `u16` at its size, aligned for it.
     assert_eq!(tables, [([1, 0, 2, 0, 4, 3].as_slice(), 2)]);
 }
+
+#[test]
+fn generic_functions_are_lowered_per_instance() {
+    let src = "\
+package main
+
+struct Point {
+	x: u8
+}
+
+fn pick[T: Copy](c: bool, a: T, b: T) -> T {
+	if c {
+		return a
+	}
+	return b
+}
+
+fn same[T: Eq](a: T, b: T) -> bool {
+	return a == b
+}
+
+fn unused[T: Integer](a: T) -> T {
+	return a
+}
+
+fn main() -> u8 {
+	let p = Point{x: 1}
+	if same(p, pick(true, p, p)) {
+		return pick[u8](false, 1, 2)
+	}
+	return u8(pick[u32](true, 3, 4) % 256)
+}
+";
+    let ir = ir("instances.lode", src);
+    for name in [
+        "@\"main.pick[u8]\"",
+        "@\"main.pick[u32]\"",
+        "@\"main.pick[main.Point]\"",
+        "@\"main.same[main.Point]\"",
+    ] {
+        assert!(ir.contains(name), "{name} missing:\n{ir}");
+    }
+    // Only instances are lowered: never a generic function itself, and
+    // not one nothing calls.
+    for name in ["@main.pick(", "@main.same(", "unused"] {
+        assert!(!ir.contains(name), "{name} lowered:\n{ir}");
+    }
+
+    let (mut files, root) = source("instances.lode", src);
+    let exe = lode::build(&mut files, root, &BuildOptions::default()).expect("builds");
+    assert!(!exe.image.is_empty());
+}

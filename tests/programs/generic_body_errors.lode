@@ -1,0 +1,17 @@
+// error: cannot prove that this addition does not overflow `T`
+// error: `main` can't be generic
+// help: the operands can be any `T` and 1
+// help: use `+%` to wrap around
+package main
+
+// A generic body is checked once, against its bounds: its error is
+// reported once, whatever it's called with.
+fn inc[T: Integer](x: T) -> T {
+	return x + 1
+}
+
+fn main[T]() {
+	let a = inc[u8](1)
+	let b = inc[u64](2)
+	let c = inc[i32](3)
+}
