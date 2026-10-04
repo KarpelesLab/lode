@@ -143,9 +143,58 @@ pub fn compile_ir(files: &mut SourceMap, root: FileId, opt: OptLevel) -> Result<
     verify_module(&lowered.module, "lowered")?;
     pipeline::optimize(&mut lowered.module, opt);
     if opt != OptLevel::O0 {
+        // The pipeline ends with an inlining round and no `simplify_cfg`:
+        // the blocks inlining leaves are merged here, then the functions
+        // it left without callers are dropped.
+        pipeline::run_passes(
+            &mut lowered.module,
+            ["simplify_cfg", "sccp", "dce"]
+                .iter()
+                .map(|n| pipeline::pass_by_name(n).expect("a pass"))
+                .collect(),
+        );
+        drop_unreferenced(&mut lowered);
         verify_module(&lowered.module, "optimized")?;
     }
     Ok(lowered)
+}
+
+/// Make the internal functions that nothing reaches any more (inlined into
+/// every caller) declarations, so no code is emitted for them. A function
+/// is reached from the external ones (the entry) through the functions its
+/// code refers to.
+fn drop_unreferenced(lowered: &mut Lowered) {
+    use latticefoundry::ir::{Function, ValueDef};
+    let module = &mut lowered.module;
+    let mut reached: std::collections::HashSet<latticefoundry::ir::FuncId> = lowered
+        .funcs
+        .iter()
+        .filter(|(_, internal)| !internal)
+        .map(|&(id, _)| id)
+        .collect();
+    let mut work: Vec<_> = reached.iter().copied().collect();
+    while let Some(id) = work.pop() {
+        let f = module.function(id);
+        let insts = f
+            .blocks()
+            .flat_map(|(_, b)| b.insts().iter().copied().chain(b.terminator()));
+        for inst in insts {
+            for &v in f.inst(inst).operands() {
+                if let ValueDef::Func(g) = f.value(v).def
+                    && reached.insert(g)
+                {
+                    work.push(g);
+                }
+            }
+        }
+    }
+    for &(id, _) in &lowered.funcs {
+        if !reached.contains(&id) {
+            let f = module.function(id);
+            let decl = Function::new(f.name, f.sig);
+            module.replace_function(id, decl);
+        }
+    }
 }
 
 /// The IR of a program in LatticeFoundry's text format.

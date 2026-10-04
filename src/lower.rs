@@ -187,6 +187,9 @@ pub struct Lowered {
     pub tables: Vec<(String, Vec<u8>, u64)>,
     /// The program's warnings ([`Program::warnings`]).
     pub warnings: Vec<crate::diag::Diagnostic>,
+    /// The functions defined, and whether each is internal (only called
+    /// from the module: optimization may leave it unreferenced).
+    pub funcs: Vec<(IrFunc, bool)>,
 }
 
 /// IR types for every Lode type, interned up front (the function builder
@@ -442,10 +445,16 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         .function(f);
     }
 
+    let mut funcs: Vec<(IrFunc, bool)> = ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, id)| id.map(|id| (id, direct_entry != Some(i))))
+        .collect();
     let entry = match (reach.main, direct_entry) {
         (Some(main), None) => {
             let sig = module.types_mut().func(Vec::new(), t.i64, false);
             let entry = module.declare_function(syms.intern(ENTRY_WRAPPER), sig);
+            funcs.push((entry, false));
             let ret = reach.funcs[main].ret;
             let mut b = module.build(entry);
             b.create_entry_block();
@@ -466,6 +475,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         strings,
         tables,
         warnings: program.warnings.clone(),
+        funcs,
     }
 }
 
