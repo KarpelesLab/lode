@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The backend. Updated only to released versions (see README.md).
-latticefoundry = "0.0.0"
+latticefoundry = "0.0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

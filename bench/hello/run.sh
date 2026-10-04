@@ -15,7 +15,8 @@ for f in rs_*.rs; do
 done
 for f in zig_*.zig; do zig build-exe -OReleaseSmall -fstrip -femit-bin="$out/${f%.zig}" "$f"; done
 (cd ../.. && cargo build --release --quiet)
-for f in lode_*.lode; do ../../target/release/lode build -O2 -o "$out/${f%.lode}" "$f"; done
+target=$(cd ../.. && cargo metadata --no-deps --format-version 1 | sed 's/.*"target_directory":"\([^"]*\)".*/\1/')
+for f in lode_*.lode; do "$target/release/lode" build -O2 -o "$out/${f%.lode}" "$f"; done
 
 printf '%-18s %10s %9s\n' program bytes syscalls
 for b in "$out"/*; do

@@ -58,7 +58,7 @@ All builds are size-optimized and stripped. Syscalls are counted after
 | Zig (`-OReleaseSmall -fstrip`) | `print` through a buffered writer | 10.2 KB | 6 |
 | | `File.stdout().writeAll` | 10.2 KB | 6 |
 | | `posix.system.write` | 4.8 KB | 6 |
-| **Lode** (`-O2`) | `io.print` through the standard library | **4.1 KB** (about 1.1 KB of content) | **2: `write`, `exit`** |
+| **Lode** (`-O2`) | `io.print` through the standard library | **1.0 KB** (1,049 bytes) | **2: `write`, `exit`** |
 | *Lode target* | any of the above | *a few hundred bytes* | *2* |
 
 What this shows:
@@ -91,15 +91,13 @@ the backend (LatticeFoundry's static linker with no libc, and minimal ELF
 layout for the byte count). `bench/hello/run.sh` stays as a regression
 benchmark.
 
-**Lode today** (2026-09-29, measured with the same script): the syscall target
-is met. `io.print` goes through `std/io` and `std/os.write_all` (a real retry
-loop, not a special case) and the program makes exactly `write` and `exit`.
-The size isn't there yet: the file is 4,108 bytes, but only about 1.1 KB is
-headers and code. LatticeFoundry's linker starts the 12-byte string segment on
-its own page in the file, and the rest is padding. Packing read-only data into
-the code segment, or not page-aligning file offsets, gets the file to about
-1.1 KB. Beyond that it's code size: at `-O2`, the retry loop and its error
-checks remain.
+**Lode today** (2026-10-04, same script, LatticeFoundry 0.0.2): the syscall
+target is met. `io.print` goes through `std/io` and `std/os.write_all` (a real
+retry loop, not a special case), and the program makes exactly `write` and
+`exit`. The binary is 1,049 bytes: 176 bytes of ELF headers, the code, and the
+12-byte string. That's 4.6 times smaller than Zig's smallest variant. Getting to
+"a few hundred bytes" is now about code size: the retry loop and its error
+checks are most of what's left (`-O2` is currently 38 bytes larger than `-O0`).
 
 ## Goals
 

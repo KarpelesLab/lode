@@ -31,7 +31,7 @@ fn main() {
 }
 ```
 
-That program is 4.1 KB and makes exactly two system calls, `write` and
+That program is 1,049 bytes and makes exactly two system calls, `write` and
 `exit`. `io.print` is ordinary Lode code in [`std/`](std/), down to the
 `syscall` in `std/os`.
 

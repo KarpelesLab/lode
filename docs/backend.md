@@ -75,69 +75,37 @@ executables through LF's own linker. See the README for the supported subset.
 
 ## What Lode needs from LatticeFoundry
 
-LF tracks this list in
-[issue #3](https://github.com/KarpelesLab/latticefoundry/issues/3); specific
-bugs and small items get their own issues.
+Specific bugs and needs are filed as
+[LatticeFoundry issues](https://github.com/KarpelesLab/latticefoundry/issues).
+The first list was tracked in
+[LF #3](https://github.com/KarpelesLab/latticefoundry/issues/3), closed
+2026-10-04: everything on it shipped in LF `0.0.2`. Using each feature from
+Lode is now Lode's own work.
 
-This is a living list, roughly in the order Lode will need it. Anything marked
-*unknown* needs to be checked against LF's current state.
+### Available in LF `0.0.2`
 
-### Needed for the first working compiler
-- [x] Building IR from a frontend, verifying, optimizing, and linking a static
-  executable: works for the compiler scaffold.
-- [x] **A syscall intrinsic** (Linux syscall ABI), in LF `0.0.0`: `Syscall`
-  takes a number and up to six `i64`/`ptr` arguments and returns the raw
-  kernel result. It's a full memory clobber that is never removed or
-  reordered. Lode's `syscall` intrinsic lowers to it; `std/os` uses it for
-  `write`.
-- [x] Correct comparisons on `i8`/`i16`. The x86-64 encoder compared narrow
-  values as 32-bit, so leftover upper register bits (e.g. after an `i8` add
-  that wrapped) gave wrong results. C code never hit it because C promotes to
-  `int` first. Fixed in LF's `SetccCmp` encoding, with a regression test.
-- [ ] **Smaller executables** ([LF #2](https://github.com/KarpelesLab/latticefoundry/issues/2)): LF's linker starts each segment on a new page
-  in the file, so a hello world with 12 bytes of string data is 4,108 bytes
-  of which about 3 KB is padding. Merging read-only data into the code
-  segment, or placing segments without page-aligning their file offsets
-  (only `offset ≡ vaddr (mod page)` is required), would bring it to about
-  1.1 KB.
-- [x] The same width issue in `switch`, division and `cond_br`: fixed in LF
-  `0.0.0`.
-- [ ] Volatile load and store, atomics and fences in the IR.
-- [ ] Debug info (DWARF) with source positions from a non-C frontend. LF has
-  DWARF with `-g`.
+| Need | In LF | For Lode |
+| --- | --- | --- |
+| Building, verifying, optimizing and linking from a frontend | since `0.0.0` | Used by the compiler |
+| `Syscall` (Linux ABI, up to 6 arguments, raw `-errno` result) | `0.0.0` | Used: the `syscall` intrinsic, `std/os` |
+| Correct `i8`/`i16` comparisons, `switch`, division, `cond_br` | `0.0.0` | Used (found by Lode's tests) |
+| Packed segments: no page padding in the file ([LF #2](https://github.com/KarpelesLab/latticefoundry/issues/2)) | `0.0.1` | Hello world went from 4,108 to 1,049 bytes |
+| Volatile loads/stores, atomics (`atomic_rmw`, `cmpxchg`), fences with C11 orderings | `0.0.2` | Next: `Atomic[T]`, `Mutex[T]` globals, MMIO |
+| Stack usage per function and call-graph worst case (`StackReport::worst_case_depth`) | `0.0.2` | Next: [stack bounds](safety.md#stack-bounds) |
+| Stack probes (on by default) | `0.0.2` | Overflow reliably hits the guard page |
+| `secret` values, `declassify`, constant-time verifier | `0.0.2` | [`secret[T]`](types.md#secret-types) |
+| Context save/restore/switch with full register state, signal preemption (`lf_ctx_preempt`), opt-in yield points | `0.0.2` | [Green threads](concurrency.md#preemption) |
+| Targets: wasm32, Cortex-M (Thumb-2, soft-float, Intel HEX), AVR (separate address spaces, own linker) | `0.0.2` | Multi-target `std/os` once there's `comptime` |
+| SIMD vectors (SSE2, NEON, scalar fallback) | `0.0.2` | SIMD types |
+| PE/COFF and Mach-O objects, Win64 calling convention, raw binary / Intel HEX | `0.0.2` | Windows and macOS layers |
+| Shared libraries and position-independent code (`--shared`, `--pie`) | `0.0.2` | C-ABI libraries |
+| DWARF debug info with source lines (`-g`) | since `0.0.0` | Lode doesn't emit line numbers yet |
 
-### Needed for the safety story
-- [ ] **Stack usage per function**, exposed after register allocation and frame
-  layout, so the frontend can compute call-graph bounds
-  ([safety.md](safety.md#stack-bounds)).
-- [ ] **Constant-time preservation** ([types.md](types.md#secret-types)): a way
-  to mark values as secret in the IR. Passes must not introduce branches or
-  memory accesses that depend on them, and instruction selection must avoid
-  variable-time instructions. This fits LF's bet B10 ("provenance & effects in
-  the type system"). A narrow `secret` taint might be a practical first step
-  toward it.
-- [ ] Guard-page or stack-probe support for defined stack-overflow aborts.
+### Still open
 
-- [ ] **Preemption support for green threads**
-  ([concurrency.md](concurrency.md#preemption)): a trampoline that saves and
-  restores the complete register state (including vector registers) from a
-  signal or interrupt context. Also optional yield-point insertion in loops
-  whose cost isn't bounded, driven by the cost lattice (B9).
-
-### Needed for target reach
-- [ ] **wasm32** target.
-- [ ] **32-bit ARM (Cortex-M, Thumb-2)** for embedded, including no-FPU
-  soft-float.
-- [ ] **8-bit targets** (AVR first? 6502 / Z80 for the legacy goal). These stress
-  every assumption: 16-bit pointers, multiple address spaces (AVR program
-  memory versus data), no hardware multiply. LF's `Ptr(addrspace)` is reserved
-  for exactly this.
-- [ ] SIMD vector types (`Vector(T, n)`, planned in LF with the first SIMD target).
-- [ ] Output formats other than ELF: PE/COFF (Windows), Mach-O (macOS), raw
-  binary / Intel HEX (firmware). LF lists Windows and macOS formats as a
-  non-goal for now.
-- [ ] Shared-library output, for C-ABI libraries
-  ([packages.md](packages.md#shared-libraries)).
+- **6502 and Z80** targets, for the legacy goal. Not started in LF; file an
+  issue when Lode needs them.
+- **AArch64 position-independent code**: in progress in LF.
 
 ### Resolved open questions in LF, from Lode's side
 - **Exceptions / unwinding:** Lode doesn't need unwinding. Errors are return
