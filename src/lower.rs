@@ -49,16 +49,39 @@
 //! `<package path>.<Type>.<name>`.
 //!
 //! A function returning a value in memory takes a pointer to the caller's
-//! storage for the result as its first IR parameter and returns nothing. The caller passes fresh storage: a new local's slot
-//! for `let x = f()`, otherwise a temporary that's then copied, so the
-//! callee never writes to something it can also read through a parameter.
+//! storage for the result as its first IR parameter and returns nothing.
+//! The caller passes fresh storage: a new local's slot for `let x = f()`,
+//! otherwise a temporary that's then copied, so the callee never writes to
+//! something it can also read through a parameter.
 //!
 //! A function that throws returns a result `throws(E) -> T`, which is an
-//! enum `{ ok(T), err(E) }` in memory, written through the result pointer
-//! like any value in memory. `return v` writes `ok(v)`; `throw e` writes
-//! `err(e)`. A caller's `try`, `catch` or `match` calls into a temporary
-//! (or a hidden local) and tests its tag. There is no unwinding: an error
+//! enum `{ ok(T), err(E) }` with a `u8` tag, `ok` 0 and `err` 1. `return v`
+//! makes `ok(v)`; `throw e` makes `err(e)`. There is no unwinding: an error
 //! is a return value.
+//!
+//! Small results are returned in a register instead, packed in an `i64`.
+//! The packed form of a value is defined for these types only:
+//! - `()`: 0 bits. `bool`: 1 bit. An integer: its width, its bits as they
+//!   are (a signed one isn't sign-extended).
+//! - An enum, an optional or a result: its tag in the low bits (the width
+//!   of its tag type, a `u8` unless a C-style enum declares another, as
+//!   the bits of the tag value), then the active variant's payload fields
+//!   in declaration order, each in its packed form, from the lowest bits
+//!   up. It has a packed form when every payload field of every variant
+//!   has one, and the tag plus the largest payload is at most 64 bits.
+//!   Bits above the active variant's fields are 0.
+//!
+//! Arrays, structs, views and pointers have no packed form. A function
+//! whose result (its return type, or its result type if it throws) is an
+//! enum, an optional or a result with a packed form returns it as an
+//! `i64` and takes no result pointer. So `throws(E) -> ()`, `-> u8`,
+//! `-> u32`, `-> bool` and `-> ?u16` are packed when `E` is an enum whose
+//! payloads fit, as is a C-style enum, `?u8` or `?u32`; `throws(E) ->
+//! u64`, `-> usize` and `?usize` are not (72 bits), nor is any result with
+//! a struct inside. Values in packed form are only ever returned, never
+//! passed or stored: the caller tests and takes apart the `i64` itself for
+//! `try`, `catch` and `??`, and unpacks it into memory for anything else
+//! (a `match` on a hidden local, a `let`, a temporary).
 //!
 //! `defer` bodies are emitted at each exit of their block, in reverse
 //! order: at its end, and at every `return`, `throw`, failing `try`,
@@ -90,6 +113,34 @@ struct SumIr {
     payloads: Vec<Option<TypeId>>,
     /// Each variant's tag value.
     values: Vec<i128>,
+}
+
+/// The width of a result's tag (a `u8`), below its payload in the packed
+/// form.
+const RESULT_TAG_BITS: u32 = 8;
+
+/// The width of an optional's tag (a `u8`).
+const OPTIONAL_TAG_BITS: u32 = 8;
+
+/// A result a call returned.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// In memory, at this address.
+    Mem(ValueId),
+    /// Packed in an `i64`.
+    Packed(ValueId),
+}
+
+/// The error a function leaves with.
+#[derive(Clone, Copy)]
+enum Failure<'e> {
+    /// `throw e`.
+    Expr(&'e TExpr),
+    /// A `try` passing on an error in memory, at this address.
+    Mem(ValueId),
+    /// A `try` passing on a packed result (of the same error type) whose
+    /// variant is `err`.
+    Packed(ValueId),
 }
 
 /// The name of the entry wrapper, for a program whose `main` is also called
@@ -161,7 +212,9 @@ impl Types {
     fn signature(&self, f: &Func) -> (Vec<TypeId>, TypeId) {
         let mut params = Vec::new();
         let result = f.result_ty();
-        let ret = if result.in_memory() || result.is_view() {
+        let ret = if returns_packed(result) {
+            self.i64
+        } else if result.in_memory() || result.is_view() {
             params.push(self.ptr);
             self.void
         } else {
@@ -351,6 +404,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             exit_status: (direct_entry == Some(i)).then_some(f.ret),
             result: None,
             result_ty: f.result_ty(),
+            packed: returns_packed(f.result_ty()),
             throws: f.throws.is_some(),
         }
         .function(f);
@@ -438,6 +492,9 @@ struct FnLower<'a> {
     /// What the function returns: its return type, or its result type if
     /// it throws.
     result_ty: Ty,
+    /// Whether the function returns its result packed in an `i64`
+    /// ([`returns_packed`]).
+    packed: bool,
     /// Whether the function throws (and returns a result).
     throws: bool,
 }
@@ -477,6 +534,44 @@ fn align_of(ty: Ty) -> u32 {
     }
 }
 
+/// The width in bits of the packed form of a value of type `ty` (see the
+/// module docs), if it has one: `()` is 0 bits, `bool` 1, an integer its
+/// width, and an enum, optional or result its tag's width plus its largest
+/// payload, if every payload field has a packed form and the total is at
+/// most 64 bits.
+fn packed_bits(ty: Ty) -> Option<u32> {
+    match ty {
+        Ty::Unit => Some(0),
+        Ty::Bool => Some(1),
+        Ty::Int(t) => Some(t.bits),
+        _ => {
+            let def = ty.sum()?;
+            let mut largest = 0;
+            for v in &def.variants {
+                let mut n = 0;
+                for f in &v.fields {
+                    n += packed_bits(f.ty)?;
+                }
+                largest = largest.max(n);
+            }
+            let bits = def.tag.bits + largest;
+            (bits <= 64).then_some(bits)
+        }
+    }
+}
+
+/// Whether a function whose result has type `ty` returns it packed in an
+/// `i64` instead of writing it through a result pointer: an enum, an
+/// optional or a result with a packed form.
+fn returns_packed(ty: Ty) -> bool {
+    ty.sum().is_some() && packed_bits(ty).is_some()
+}
+
+/// The low `bits` bits of `v`.
+fn mask(v: u64, bits: u32) -> u64 {
+    if bits >= 64 { v } else { v & ((1 << bits) - 1) }
+}
+
 /// `v` (known to be in range for `t`) as the `i64` bit pattern of a `t`-wide
 /// constant, sign-extended from the type's width.
 fn const_bits(v: i128, t: IntTy) -> i64 {
@@ -490,7 +585,7 @@ impl FnLower<'_> {
         // The IR parameters: the result's storage first, if it's in memory,
         // then each parameter's parts.
         let mut next = 0;
-        if self.result_ty.in_memory() || self.result_ty.is_view() {
+        if !self.packed && (self.result_ty.in_memory() || self.result_ty.is_view()) {
             self.result = Some(self.b.param(entry, 0));
             next = 1;
         }
@@ -645,9 +740,16 @@ impl FnLower<'_> {
     }
 
     /// `return value`: write it (as `ok(value)` in a function that throws),
-    /// run every `defer`, and return.
+    /// or pack it, run every `defer`, and return.
     fn return_value(&mut self, value: Option<&TExpr>) {
-        let v = if self.throws {
+        let v = if self.packed {
+            Some(if self.throws {
+                let bits = value.map(|e| self.pack(e));
+                self.pack_variant(self.result_ty, 0, bits)
+            } else {
+                self.pack(value.expect("a value to return"))
+            })
+        } else if self.throws {
             let dst = self.result.expect("a result in memory");
             if let Some(e) = value {
                 let d = self.payload_at(dst, self.result_ty, 0, 0);
@@ -675,57 +777,97 @@ impl FnLower<'_> {
         self.terminated = true;
     }
 
-    /// Leave the function with an error: `write` stores it in the payload
-    /// of `err` at the given address, then every `defer` and `errdefer`
-    /// runs.
-    fn fail(&mut self, write: impl FnOnce(&mut Self, ValueId)) {
-        let dst = self.result.expect("a result in memory");
-        let d = self.payload_at(dst, self.result_ty, 1, 0);
-        write(self, d);
-        self.store_tag(dst, self.result_ty, 1);
+    /// Leave the function with the error `err`, then run every `defer` and
+    /// `errdefer`.
+    fn fail(&mut self, err: Failure<'_>) {
+        let (_, err_ty) = self.result_ty.as_result().expect("a result");
+        let v = if self.packed {
+            let bits = match err {
+                Failure::Expr(e) => self.pack(e),
+                Failure::Mem(src) => self.pack_mem(src, err_ty),
+                // Every result has a `u8` tag with `err` as 1, so a packed
+                // `err` of the same error type is this function's result
+                // as it is.
+                Failure::Packed(p) => p,
+            };
+            Some(match err {
+                Failure::Packed(_) => bits,
+                _ => self.pack_variant(self.result_ty, 1, Some(bits)),
+            })
+        } else {
+            let dst = self.result.expect("a result in memory");
+            let d = self.payload_at(dst, self.result_ty, 1, 0);
+            match err {
+                Failure::Expr(e) => self.fill(d, e),
+                Failure::Mem(src) => self.copy(d, src, err_ty),
+                Failure::Packed(p) => self.unpack(d, err_ty, p, RESULT_TAG_BITS),
+            }
+            self.store_tag(dst, self.result_ty, 1);
+            None
+        };
         self.run_defers(0, true);
-        self.ret(None);
+        self.ret(v);
         self.terminated = true;
     }
 
     /// `throw e`.
     fn throw(&mut self, e: &TExpr) {
-        self.fail(|this, d| this.fill(d, e));
+        self.fail(Failure::Expr(e));
     }
 
-    /// Call `call`, a call to a function that throws, into a temporary, and
-    /// branch on its result: to the returned block for `ok`, to `err_bb`
-    /// for `err`. Returns the temporary and the `ok` block.
-    fn call_result(&mut self, call: &TExpr, err_bb: BlockId) -> (ValueId, BlockId) {
+    /// Call `call`, a call to a function that throws, and branch on its
+    /// result: to the returned block for `ok`, to `err_bb` for `err`.
+    /// Returns the result, packed or in a temporary, and the `ok` block.
+    fn call_result(&mut self, call: &TExpr, err_bb: BlockId) -> (Outcome, BlockId) {
+        let ok_bb = self.b.create_block(&[]);
+        let targets = [(vec![0], ok_bb), (vec![1], err_bb)];
+        if returns_packed(call.ty) {
+            let p = self.pack(call);
+            let tag = self.unpack_scalar(p, 0, Ty::Int(IntTy::new(false, 8)));
+            self.branch_on_tag(tag, call.ty, &targets);
+            return (Outcome::Packed(p), ok_bb);
+        }
         let ir_ty = self.ir_ty(call.ty);
         let tmp = self.b.alloca(ir_ty);
         self.fill(tmp, call);
         let tag = self.load_tag(tmp, call.ty);
-        let ok_bb = self.b.create_block(&[]);
-        self.branch_on_tag(tag, call.ty, &[(vec![0], ok_bb), (vec![1], err_bb)]);
-        (tmp, ok_bb)
+        self.branch_on_tag(tag, call.ty, &targets);
+        (Outcome::Mem(tmp), ok_bb)
     }
 
-    /// The value of `ok` in the result of type `ty` at `base`, or `Unit`.
-    fn ok_value(&mut self, base: ValueId, ty: Ty) -> Val {
+    /// The value of `ok` in the result `result` of type `ty`, or `Unit`.
+    fn ok_value(&mut self, result: Outcome, ty: Ty) -> Val {
         let (value, _) = ty.as_result().expect("a result");
         if value == Ty::Unit {
             return Val::Unit;
         }
-        let addr = self.payload_at(base, ty, 0, 0);
-        self.read(addr, value)
+        match result {
+            Outcome::Mem(base) => {
+                let addr = self.payload_at(base, ty, 0, 0);
+                self.read(addr, value)
+            }
+            Outcome::Packed(p) if value.in_memory() => {
+                let ir_ty = self.ir_ty(value);
+                let tmp = self.b.alloca(ir_ty);
+                self.unpack(tmp, value, p, RESULT_TAG_BITS);
+                Val::Mem(tmp)
+            }
+            Outcome::Packed(p) => Val::One(self.unpack_scalar(p, RESULT_TAG_BITS, value)),
+        }
     }
 
     /// `try call`.
     fn try_call(&mut self, call: &TExpr) -> Val {
-        let (_, err) = call.ty.as_result().expect("a result");
         let err_bb = self.b.create_block(&[]);
-        let (tmp, ok_bb) = self.call_result(call, err_bb);
+        let (result, ok_bb) = self.call_result(call, err_bb);
         self.start_block(err_bb);
-        let src = self.payload_at(tmp, call.ty, 1, 0);
-        self.fail(|this, d| this.copy(d, src, err));
+        let failure = match result {
+            Outcome::Mem(tmp) => Failure::Mem(self.payload_at(tmp, call.ty, 1, 0)),
+            Outcome::Packed(p) => Failure::Packed(p),
+        };
+        self.fail(failure);
         self.start_block(ok_bb);
-        self.ok_value(tmp, call.ty)
+        self.ok_value(result, call.ty)
     }
 
     /// `call catch ...`, of type `ty`.
@@ -741,7 +883,7 @@ impl FnLower<'_> {
             None
         };
         let err_bb = self.b.create_block(&[]);
-        let (tmp, ok_bb) = self.call_result(call, err_bb);
+        let (result, ok_bb) = self.call_result(call, err_bb);
         let join = if scalar {
             let ir_ty = self.t.of(ty);
             self.b.create_block(&[ir_ty])
@@ -761,7 +903,7 @@ impl FnLower<'_> {
         };
 
         self.start_block(ok_bb);
-        let v = self.ok_value(tmp, call.ty);
+        let v = self.ok_value(result, call.ty);
         arrive(self, v);
 
         self.start_block(err_bb);
@@ -769,8 +911,13 @@ impl FnLower<'_> {
             let Slot::Mem(dst) = self.slots[local] else {
                 unreachable!("an error is an enum, in memory")
             };
-            let src = self.payload_at(tmp, call.ty, 1, 0);
-            self.copy(dst, src, err);
+            match result {
+                Outcome::Mem(tmp) => {
+                    let src = self.payload_at(tmp, call.ty, 1, 0);
+                    self.copy(dst, src, err);
+                }
+                Outcome::Packed(p) => self.unpack(dst, err, p, RESULT_TAG_BITS),
+            }
         }
         match handler {
             Handler::Value(v) => match out {
@@ -1204,14 +1351,20 @@ impl FnLower<'_> {
     /// storage (see the module docs). A call to a `never` function is
     /// followed by `unreachable`, and what comes after it goes in a new
     /// block that no path reaches.
+    ///
+    /// A packed result is unpacked into `dst` if there is one, otherwise
+    /// it's the call's value.
     fn call(&mut self, f: usize, args: &[TExpr], ret: Ty, dst: Option<ValueId>) -> Val {
-        let mut values: Vec<ValueId> = dst.into_iter().collect();
+        let packed = returns_packed(ret);
+        let mut values: Vec<ValueId> = dst.filter(|_| !packed).into_iter().collect();
         for a in args {
             let v = self.expr(a).parts();
             values.extend(v);
         }
         let callee = self.b.func_ref(self.ids[f].expect("a reached function"));
-        let ret_ty = if dst.is_some() {
+        let ret_ty = if packed {
+            self.t.i64
+        } else if dst.is_some() {
             self.t.void
         } else {
             self.t.of(ret)
@@ -1221,6 +1374,9 @@ impl FnLower<'_> {
             self.b.unreachable();
             let dead = self.b.create_block(&[]);
             self.start_block(dead);
+        }
+        if let (true, Some(p), Some(d)) = (packed, result, dst) {
+            self.unpack(d, ret, p, 0);
         }
         match (result, dst) {
             (_, Some(p)) => Val::Mem(p),
@@ -1398,6 +1554,9 @@ impl FnLower<'_> {
 
     /// `opt ?? default`, of type `ty`.
     fn coalesce(&mut self, opt: &TExpr, default: &TExpr, ty: Ty) -> Val {
+        if returns_packed(opt.ty) && matches!(opt.kind, TExprKind::Call(..)) {
+            return self.coalesce_packed(opt, default, ty);
+        }
         let base = self.place(opt);
         let tag = self.load_tag(base, opt.ty);
         let some_bb = self.b.create_block(&[]);
@@ -1423,6 +1582,40 @@ impl FnLower<'_> {
         self.start_block(some_bb);
         let src = self.payload_at(base, opt.ty, 1, 0);
         let v = self.read(src, ty).one();
+        self.b.br(join, &[v]);
+        self.start_block(none_bb);
+        let d = self.expr(default).one();
+        self.b.br(join, &[d]);
+        self.start_block(join);
+        Val::One(self.b.param(join, 0))
+    }
+
+    /// `call ?? default`, of type `ty`, for a call returning its optional
+    /// packed: the value is taken from the packed form, not from memory.
+    fn coalesce_packed(&mut self, call: &TExpr, default: &TExpr, ty: Ty) -> Val {
+        let p = self.pack(call);
+        let tag = self.unpack_scalar(p, 0, Ty::Int(IntTy::new(false, 8)));
+        let some_bb = self.b.create_block(&[]);
+        let none_bb = self.b.create_block(&[]);
+        let targets = [(vec![1], some_bb), (vec![0], none_bb)];
+        if ty.in_memory() {
+            let ir_ty = self.ir_ty(ty);
+            let tmp = self.b.alloca(ir_ty);
+            let join = self.b.create_block(&[]);
+            self.branch_on_tag(tag, call.ty, &targets);
+            self.start_block(some_bb);
+            self.unpack(tmp, ty, p, OPTIONAL_TAG_BITS);
+            self.b.br(join, &[]);
+            self.start_block(none_bb);
+            self.fill(tmp, default);
+            self.b.br(join, &[]);
+            self.start_block(join);
+            return Val::Mem(tmp);
+        }
+        let join = self.b.create_block(&[self.t.of(ty)]);
+        self.branch_on_tag(tag, call.ty, &targets);
+        self.start_block(some_bb);
+        let v = self.unpack_scalar(p, OPTIONAL_TAG_BITS, ty);
         self.b.br(join, &[v]);
         self.start_block(none_bb);
         let d = self.expr(default).one();
@@ -1476,6 +1669,192 @@ impl FnLower<'_> {
         let v = self.b.sub(gt, lt, Flags::NONE);
         let addr = self.struct_field(dst, sum.ty, 0);
         self.b.store(tag, addr, v, align_of(Ty::Int(sum.tag)));
+    }
+
+    /// The packed form of `e`, whose type has one (see the module docs), as
+    /// an `i64`. A call that returns it packed, and a variant, are packed
+    /// without going through memory.
+    fn pack(&mut self, e: &TExpr) -> ValueId {
+        match &e.kind {
+            TExprKind::Call(f, args) if returns_packed(e.ty) => {
+                self.call(*f, args, e.ty, None).one()
+            }
+            TExprKind::Variant(v, values) => {
+                let def = e.ty.sum().expect("an enum or an optional");
+                let fields = &def.variants[*v as usize].fields;
+                let mut bits = None;
+                let mut shift = 0;
+                for (value, f) in values.iter().zip(fields) {
+                    let v = self.pack(value);
+                    let acc = match bits {
+                        Some(acc) => acc,
+                        None => self.b.const_i64(self.t.i64, 0),
+                    };
+                    bits = Some(self.or_shifted(acc, v, shift));
+                    shift += packed_bits(f.ty).expect("a packed payload");
+                }
+                self.pack_variant(e.ty, *v, bits)
+            }
+            _ if e.ty == Ty::Unit => {
+                self.expr(e);
+                self.b.const_i64(self.t.i64, 0)
+            }
+            _ if !e.ty.in_memory() => {
+                let v = self.expr(e).one();
+                self.widen(v, e.ty)
+            }
+            _ => {
+                let addr = self.place(e);
+                self.pack_mem(addr, e.ty)
+            }
+        }
+    }
+
+    /// The packed form of variant `variant` of the enum, optional or
+    /// result `ty`, with the packed form of its payload `payload` (none
+    /// for a variant without one).
+    fn pack_variant(&mut self, ty: Ty, variant: u32, payload: Option<ValueId>) -> ValueId {
+        let def = ty.sum().expect("an enum, an optional or a result");
+        let value = const_bits(def.variants[variant as usize].value, def.tag);
+        let tag = self
+            .b
+            .const_i64(self.t.i64, mask(value as u64, def.tag.bits) as i64);
+        match payload {
+            Some(p) => self.or_shifted(tag, p, def.tag.bits),
+            None => tag,
+        }
+    }
+
+    /// The packed form of the value of type `ty` at `addr`. Only the active
+    /// variant's payload is used: the others are read but not selected.
+    fn pack_mem(&mut self, addr: ValueId, ty: Ty) -> ValueId {
+        if ty == Ty::Unit {
+            return self.b.const_i64(self.t.i64, 0);
+        }
+        if !ty.in_memory() {
+            let ir_ty = self.t.of(ty);
+            let v = self.b.load(ir_ty, addr, align_of(ty));
+            return self.widen(v, ty);
+        }
+        let def = ty.sum().expect("an enum, an optional or a result");
+        let tag_ty = Ty::Int(def.tag);
+        let tag = self.load_tag(addr, ty);
+        let mut payload = None;
+        for (v, variant) in def.variants.iter().enumerate() {
+            if variant.fields.is_empty() {
+                continue;
+            }
+            let mut bits = self.b.const_i64(self.t.i64, 0);
+            let mut shift = 0;
+            for (k, f) in variant.fields.iter().enumerate() {
+                let at = self.payload_at(addr, ty, v as u32, k as u32);
+                let field = self.pack_mem(at, f.ty);
+                bits = self.or_shifted(bits, field, shift);
+                shift += packed_bits(f.ty).expect("a packed payload");
+            }
+            let value = self
+                .b
+                .const_i64(self.t.int(def.tag), const_bits(variant.value, def.tag));
+            let is = self.b.icmp(IntPred::Eq, tag, value);
+            let other = match payload {
+                Some(p) => p,
+                None => self.b.const_i64(self.t.i64, 0),
+            };
+            payload = Some(self.b.select(is, bits, other));
+        }
+        let tag = self.widen(tag, tag_ty);
+        match payload {
+            Some(p) => self.or_shifted(tag, p, def.tag.bits),
+            None => tag,
+        }
+    }
+
+    /// Store the value of type `ty` whose packed form is in the bits of
+    /// `p` from `shift` up at `addr`. The payload of the active variant is
+    /// written; when only one variant has a payload, it's written whatever
+    /// the variant.
+    fn unpack(&mut self, addr: ValueId, ty: Ty, p: ValueId, shift: u32) {
+        if ty == Ty::Unit {
+            return;
+        }
+        if !ty.in_memory() {
+            let v = self.unpack_scalar(p, shift, ty);
+            let ir_ty = self.t.of(ty);
+            self.b.store(ir_ty, addr, v, align_of(ty));
+            return;
+        }
+        let def = ty.sum().expect("an enum, an optional or a result");
+        let tag_ty = Ty::Int(def.tag);
+        let tag = self.unpack_scalar(p, shift, tag_ty);
+        let sum = self.sum_ir(ty);
+        let tag_addr = self.struct_field(addr, sum.ty, 0);
+        self.b
+            .store(self.t.int(def.tag), tag_addr, tag, align_of(tag_ty));
+        let payload_at = shift + def.tag.bits;
+        let write = |this: &mut Self, v: u32| {
+            let mut at = payload_at;
+            for (k, f) in def.variants[v as usize].fields.iter().enumerate() {
+                let field = this.payload_at(addr, ty, v, k as u32);
+                this.unpack(field, f.ty, p, at);
+                at += packed_bits(f.ty).expect("a packed payload");
+            }
+        };
+        let with: Vec<u32> = (0..def.variants.len() as u32)
+            .filter(|&v| !def.variants[v as usize].fields.is_empty())
+            .collect();
+        if let [only] = with[..] {
+            write(self, only);
+        } else {
+            self.each_payload(tag, ty, write);
+        }
+    }
+
+    /// The scalar of type `ty` whose packed form is in the bits of `p`
+    /// from `shift` up.
+    fn unpack_scalar(&mut self, p: ValueId, shift: u32, ty: Ty) -> ValueId {
+        let v = if shift == 0 {
+            p
+        } else {
+            let amount = self.b.const_i64(self.t.i64, i64::from(shift));
+            self.b.bin(IrOp::LShr, p, amount, Flags::NONE)
+        };
+        match ty {
+            Ty::Int(t) if t.bits == 64 => v,
+            _ => {
+                let ir_ty = self.t.of(ty);
+                self.b.cast(CastOp::Trunc, v, ir_ty)
+            }
+        }
+    }
+
+    /// The scalar `v` of type `ty` (a `bool` or an integer) zero-extended
+    /// to an `i64`.
+    fn widen(&mut self, v: ValueId, ty: Ty) -> ValueId {
+        match ty {
+            Ty::Int(t) if t.bits == 64 => v,
+            _ => self.b.cast(CastOp::ZExt, v, self.t.i64),
+        }
+    }
+
+    /// `acc | v << shift`, folded when both are constants or `v` is 0.
+    fn or_shifted(&mut self, acc: ValueId, v: ValueId, shift: u32) -> ValueId {
+        let (a, x) = (self.const_u64(acc), self.const_u64(v));
+        if x == Some(0) {
+            return acc;
+        }
+        if let (Some(a), Some(x)) = (a, x) {
+            return self.b.const_i64(self.t.i64, (a | x << shift) as i64);
+        }
+        let shifted = if shift == 0 {
+            v
+        } else {
+            let amount = self.b.const_i64(self.t.i64, i64::from(shift));
+            self.b.bin(IrOp::Shl, v, amount, Flags::NONE)
+        };
+        if a == Some(0) {
+            return shifted;
+        }
+        self.b.bin(IrOp::Or, acc, shifted, Flags::NONE)
     }
 
     /// The storage of an expression whose value lives in memory.

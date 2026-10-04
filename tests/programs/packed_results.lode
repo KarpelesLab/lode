@@ -1,0 +1,455 @@
+// stdout: dED dD 7 -5 1 true none 42 -1 c 3 -7 true\n
+package main
+
+// Results small enough to be returned packed in a register (see
+// src/lower.rs): every shape of them, through `try`, `catch`, `match`,
+// `??`, `if let`, `let ... else`, `==`, generic functions and methods, and
+// mixed with results that are returned in memory.
+
+import "std/io"
+
+enum E {
+	empty
+	bad
+}
+
+// An error with payloads: 8 bits of tag and up to 24 of payload.
+enum Code {
+	none_
+	small(v: u8)
+	pair(a: u8, b: i16)
+}
+
+enum Delta: i16 {
+	down = -1
+	up = 1
+}
+
+// Variants with different payloads, returned packed (8 + 32 bits).
+enum Small {
+	nothing
+	byte(x: u8)
+	two(x: i16, flag: bool)
+	word(w: u32)
+}
+
+fn unit(fail: bool) throws(E) {
+	if fail {
+		throw .bad
+	}
+}
+
+fn byte(v: u8) throws(E) -> u8 {
+	if v == 0 {
+		throw .empty
+	}
+	return v
+}
+
+fn signed(v: i8) throws(E) -> i8 {
+	if v == 0 {
+		throw .empty
+	}
+	return v
+}
+
+fn word(v: u32) throws(Code) -> u32 {
+	if v == 0 {
+		throw .none_
+	}
+	if v == 1 {
+		throw .small(200)
+	}
+	if v == 2 {
+		throw .pair(255, -300)
+	}
+	return v
+}
+
+fn flag(v: u8) throws(E) -> bool {
+	if v > 9 {
+		throw .bad
+	}
+	return v % 2 == 0
+}
+
+fn maybe(v: u8) throws(E) -> ?u8 {
+	if v == 0 {
+		throw .empty
+	}
+	if v == 1 {
+		return none
+	}
+	return v
+}
+
+fn half(v: i32) -> ?i32 {
+	if v % 2 != 0 {
+		return none
+	}
+	return v / 2
+}
+
+fn yes(v: u8) -> ?bool {
+	if v == 0 {
+		return none
+	}
+	return v == 1
+}
+
+fn delta(up: bool) -> Delta {
+	if up {
+		return .up
+	}
+	return .down
+}
+
+fn small(k: u8) -> Small {
+	if k == 0 {
+		return .nothing
+	}
+	if k == 1 {
+		return .byte(77)
+	}
+	if k == 2 {
+		return .two(-2, true)
+	}
+	return .word(4000000000)
+}
+
+// A result in memory (8 + 64 bits) calling packed ones, and the other way
+// around.
+fn wide(v: u8) throws(E) -> u64 {
+	let b = try byte(v)
+	try unit(b == 9)
+	return u64(b) * 1000
+}
+
+fn narrow(v: u8) throws(E) -> u16 {
+	let w = try wide(v)
+	if w > 65535 {
+		throw .bad
+	}
+	return u16(w)
+}
+
+// `try` through several packed results.
+fn nested(v: u8) throws(E) -> u8 {
+	let a = try byte(v)
+	let m = try maybe(a)
+	let f = try flag(a)
+	if f {
+		return m ?? 1
+	}
+	return a
+}
+
+// `errdefer` and `defer` with packed results.
+fn deferred(fail: bool) throws(E) -> u8 {
+	defer io.print("D")
+	errdefer io.print("E")
+	io.print("d")
+	try unit(fail)
+	return 5
+}
+
+fn check[T: Integer](x: T) throws(E) -> T {
+	if x < 0 {
+		throw .bad
+	}
+	return x
+}
+
+fn passed_on[T: Integer](x: T) throws(E) -> T {
+	let v = try check(x)
+	return v
+}
+
+struct Counter {
+	n: u16
+}
+
+fn Counter.bump(inout self, limit: u16) throws(E) -> u16 {
+	if self.n >= limit {
+		throw .bad
+	}
+	self.n += 1
+	return self.n
+}
+
+fn Counter.peek(self) -> ?u16 {
+	if self.n == 0 {
+		return none
+	}
+	return self.n
+}
+
+fn code_value(c: Code) -> i32 {
+	match c {
+		none_ => return 1
+		small(v) => return i32(v)
+		pair(a, b) => return i32(a) + i32(b)
+	}
+}
+
+fn small_value(s: Small) -> i64 {
+	match s {
+		nothing => return 0
+		byte(x) => return i64(x)
+		two(x, f) => {
+			if f {
+				return i64(x) * 10
+			}
+			return i64(x)
+		}
+		word(w) => return i64(w)
+	}
+}
+
+fn results() -> u8 {
+	unit(false) catch _ {
+		return 1
+	}
+	var failed = false
+	unit(true) catch _ {
+		failed = true
+	}
+	if !failed {
+		return 2
+	}
+	if (byte(7) catch 0) != 7 || (byte(0) catch 9) != 9 {
+		return 3
+	}
+	if (signed(-5) catch 0) != -5 || (signed(0) catch 1) != 1 {
+		return 4
+	}
+	// A bound error with payload, then matched.
+	var got: i32 = 0
+	word(2) catch e {
+		got = code_value(e)
+	}
+	if got != -45 {
+		return 5
+	}
+	word(1) catch e {
+		got = code_value(e)
+	}
+	if got != 200 {
+		return 6
+	}
+	if (word(0) catch 3) != 3 || (word(123456) catch 0) != 123456 {
+		return 7
+	}
+	// `match` on a call's result.
+	match word(2) {
+		ok(v) => return 8
+		err(e) => {
+			match e {
+				pair(a, b) => {
+					if a != 255 || b != -300 {
+						return 9
+					}
+				}
+				none_ => return 10
+				small(v) => return 11
+			}
+		}
+	}
+	match byte(3) {
+		ok(v) => {
+			if v != 3 {
+				return 12
+			}
+		}
+		err(e) => return 13
+	}
+	if (flag(4) catch false) != true || (flag(3) catch true) != false || (flag(10) catch true) != true {
+		return 14
+	}
+	// An optional inside a result.
+	let m = maybe(1) catch _ {
+		return 15
+	}
+	if m != none {
+		return 16
+	}
+	if (maybe(8) catch none) ?? 0 != 8 {
+		return 17
+	}
+	maybe(0) catch e {
+		if e != .empty {
+			return 18
+		}
+	}
+	return 0
+}
+
+fn mixed() -> u8 {
+	if (wide(4) catch 0) != 4000 || (wide(0) catch 1) != 1 || (wide(9) catch 2) != 2 {
+		return 20
+	}
+	if (narrow(6) catch 0) != 6000 || (narrow(0) catch 1) != 1 || (narrow(9) catch 2) != 2 {
+		return 21
+	}
+	if (nested(4) catch 0) != 4 || (nested(5) catch 0) != 5 {
+		return 22
+	}
+	if (nested(0) catch 9) != 9 || (nested(1) catch 0) != 1 || (nested(12) catch 7) != 7 {
+		return 23
+	}
+	return 0
+}
+
+fn optionals() -> u8 {
+	if half(8) ?? 0 != 4 || half(-6) ?? 0 != -3 || half(3) ?? 9 != 9 {
+		return 30
+	}
+	if half(3) != none || half(4) != 2 {
+		return 31
+	}
+	if let h = half(-10) {
+		if h != -5 {
+			return 32
+		}
+	} else {
+		return 33
+	}
+	let q = half(12) else {
+		return 34
+	}
+	if q != 6 {
+		return 35
+	}
+	match yes(1) {
+		some(b) => {
+			if !b {
+				return 36
+			}
+		}
+		none => return 37
+	}
+	if yes(0) != none || yes(2) ?? true {
+		return 38
+	}
+	return 0
+}
+
+fn enums() -> u8 {
+	if delta(true) != .up || delta(false) != .down {
+		return 40
+	}
+	match delta(false) {
+		down => {}
+		up => return 41
+	}
+	if small_value(small(0)) != 0 || small_value(small(1)) != 77 {
+		return 42
+	}
+	if small_value(small(2)) != -20 || small_value(small(3)) != 4000000000 {
+		return 43
+	}
+	match small(2) {
+		two(x, f) => {
+			if x != -2 || !f {
+				return 44
+			}
+		}
+		nothing => return 45
+		byte(x) => return 46
+		word(w) => return 47
+	}
+	if small(1) != .byte(77) || small(2) == .two(-2, false) {
+		return 48
+	}
+	return 0
+}
+
+fn generic() -> u8 {
+	if (check[u8](200) catch 0) != 200 || (check[i8](-1) catch 3) != 3 {
+		return 50
+	}
+	// `u64` results are in memory, `i16` ones packed.
+	if (check[u64](18446744073709551615) catch 0) != 18446744073709551615 {
+		return 51
+	}
+	if (passed_on[i16](-300) catch 4) != 4 || (passed_on[i16](300) catch 0) != 300 {
+		return 52
+	}
+	if (passed_on[i64](-1) catch 5) != 5 {
+		return 53
+	}
+	var c = Counter{n: 0}
+	if c.peek() != none {
+		return 54
+	}
+	if (c.bump(2) catch 0) != 1 {
+		return 55
+	}
+	let second = c.bump(2) catch 0
+	let third = c.bump(2) catch 9
+	if second != 2 || third != 9 {
+		return 57
+	}
+	if c.peek() ?? 0 != 2 {
+		return 56
+	}
+	return 0
+}
+
+fn main() -> u8 {
+	// `errdefer` runs only on the way out with an error.
+	deferred(true) catch _ {}
+	io.print(" ")
+	let five = deferred(false) catch 0
+	io.print(" ")
+	io.print_int(five +| 2)
+	io.print(" ")
+	io.print_int(signed(-5) catch 0)
+	io.print(" ")
+	io.print_int(byte(1) catch 0)
+	io.print(" ")
+	if flag(2) catch false {
+		io.print("true")
+	}
+	io.print(" ")
+	if yes(0) == none {
+		io.print("none")
+	}
+	io.print(" ")
+	io.print_int(half(84) ?? 0)
+	io.print(" ")
+	io.print_int(i16(delta(false)))
+	io.print(" ")
+	match small(3) {
+		word(w) => io.print("c")
+		nothing => io.print("x")
+		byte(x) => io.print("x")
+		two(x, f) => io.print("x")
+	}
+	io.print(" ")
+	io.print_int(nested(3) catch 0)
+	io.print(" ")
+	io.print_int(half(-14) ?? 0)
+	io.print(" ")
+	if (maybe(9) catch none) == 9 {
+		io.print("true")
+	}
+	io.print("\n")
+	let r = results()
+	if r != 0 {
+		return r
+	}
+	let m = mixed()
+	if m != 0 {
+		return m
+	}
+	let o = optionals()
+	if o != 0 {
+		return o
+	}
+	let e = enums()
+	if e != 0 {
+		return e
+	}
+	return generic()
+}
