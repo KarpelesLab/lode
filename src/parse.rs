@@ -419,12 +419,17 @@ impl Parser {
                 name = member;
             }
         }
-        if self.at_p(P::LBracket) {
-            return self.error(
-                self.span(),
-                "generic functions are not supported by the compiler yet",
-            );
-        }
+        let generics = if self.at_p(P::LBracket) {
+            if owner.is_some() {
+                return self.error(
+                    self.span(),
+                    "generic methods are not supported by the compiler yet",
+                );
+            }
+            self.generic_params()?
+        } else {
+            Vec::new()
+        };
         self.expect_p(P::LParen)?;
         let mut params = Vec::new();
         loop {
@@ -488,12 +493,75 @@ impl Parser {
             is_unsafe,
             owner,
             name,
+            generics,
             params,
             throws,
             ret,
             span: start.to(body.span),
             body,
         })
+    }
+
+    /// The type parameters of a generic function: `[T: Ordered + Copy, U]`.
+    fn generic_params(&mut self) -> PResult<Vec<GenericParam>> {
+        let open = self.bump().span; // [
+        let mut params = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBracket) {
+                break;
+            }
+            let name = self.ident("a type parameter name")?;
+            let mut bounds = Vec::new();
+            if self.eat_p(P::Colon) {
+                loop {
+                    bounds.push(self.ident("a trait")?);
+                    if !self.eat_p(P::Plus) {
+                        break;
+                    }
+                }
+            }
+            params.push(GenericParam { name, bounds });
+            self.skip_newlines();
+            if !self.eat_p(P::Comma) {
+                break;
+            }
+        }
+        self.skip_newlines();
+        let close = self.expect_p(P::RBracket)?;
+        if params.is_empty() {
+            return self.error(
+                open.to(close),
+                "a generic function needs a type parameter in its brackets",
+            );
+        }
+        Ok(params)
+    }
+
+    /// An item in brackets after an expression. It's a type when it starts
+    /// with a token only a type starts with (`?`, `??`, `*`), or with a `[`
+    /// that parses as a slice or an array type followed by `,` or `]`
+    /// (`[]u8`, `[4]u8`); otherwise an expression, which the checker reads
+    /// as an index or as a type name.
+    fn bracket_item(&mut self) -> PResult<TypeArg> {
+        match self.peek() {
+            Tok::P(P::Question | P::Coalesce | P::Star) => {
+                return Ok(TypeArg::Type(self.type_expr()?));
+            }
+            Tok::P(P::LBracket) => {
+                let (pos, diags) = (self.pos, self.diags.len());
+                if let Ok(t) = self.type_expr() {
+                    self.skip_newlines();
+                    if self.at_p(P::Comma) || self.at_p(P::RBracket) {
+                        return Ok(TypeArg::Type(t));
+                    }
+                }
+                self.pos = pos;
+                self.diags.truncate(diags);
+            }
+            _ => {}
+        }
+        Ok(TypeArg::Expr(self.nested_expr()?))
     }
 
     /// A parameter. `owner` is the type of a method (`fn Type.name`), whose
@@ -1193,34 +1261,55 @@ impl Parser {
             } else if self.eat_p(P::LBracket) {
                 let start = e.span;
                 self.skip_newlines();
-                // `a[i]`, or a slice `a[i..j]` with either bound left out.
+                // `a[i]`, generic arguments `f[u32, T]`, or a slice
+                // `a[i..j]` with either bound left out.
                 let first = if self.at_p(P::DotDot) {
                     None
                 } else {
-                    Some(self.nested_expr()?)
+                    Some(self.bracket_item()?)
                 };
                 self.skip_newlines();
-                let kind = if self.eat_p(P::DotDot) {
+                let kind = if self.at_p(P::DotDot) || self.at_p(P::DotDotEq) {
+                    let first = match first {
+                        None => None,
+                        Some(TypeArg::Expr(x)) => Some(Box::new(x)),
+                        Some(TypeArg::Type(t)) => {
+                            return self.error(t.span(), "a slice's start must be an integer");
+                        }
+                    };
+                    if self.at_p(P::DotDotEq) {
+                        let at = self.span();
+                        self.diags.push(
+                            Diagnostic::error(
+                                at,
+                                "a slice's end is exclusive: `a[i..j]` ends before `j`",
+                            )
+                            .with_help("for an inclusive end, write `a[i..j + 1]`"),
+                        );
+                        return Err(Failed);
+                    }
+                    self.bump(); // ..
                     self.skip_newlines();
                     let end = if self.at_p(P::RBracket) {
                         None
                     } else {
                         Some(Box::new(self.nested_expr()?))
                     };
-                    ExprKind::Slice(Box::new(e), first.map(Box::new), end)
-                } else if self.at_p(P::DotDotEq) {
-                    let at = self.span();
-                    self.diags.push(
-                        Diagnostic::error(
-                            at,
-                            "a slice's end is exclusive: `a[i..j]` ends before `j`",
-                        )
-                        .with_help("for an inclusive end, write `a[i..j + 1]`"),
-                    );
-                    return Err(Failed);
+                    ExprKind::Slice(Box::new(e), first, end)
                 } else {
-                    let index = first.expect("an index before `]`");
-                    ExprKind::Index(Box::new(e), Box::new(index))
+                    let mut items = vec![first.expect("an item before `]`")];
+                    while self.eat_p(P::Comma) {
+                        self.skip_newlines();
+                        items.push(self.bracket_item()?);
+                        self.skip_newlines();
+                    }
+                    // One expression is an index (or a generic argument,
+                    // which the checker tells from what `e` names).
+                    match <[TypeArg; 1]>::try_from(items) {
+                        Ok([TypeArg::Expr(index)]) => ExprKind::Index(Box::new(e), Box::new(index)),
+                        Ok(items) => ExprKind::TypeArgs(Box::new(e), items.into()),
+                        Err(items) => ExprKind::TypeArgs(Box::new(e), items),
+                    }
                 };
                 self.skip_newlines();
                 self.expect_p(P::RBracket)?;

@@ -503,6 +503,11 @@ impl Env {
         !self.dead && self.uninit.contains(&local)
     }
 
+    /// The locals that may not be assigned on some path to here.
+    pub fn uninit_locals(&self) -> impl Iterator<Item = LocalId> + '_ {
+        self.uninit.iter().copied()
+    }
+
     /// Whether every fact of `self` about the locals `about` picks out also
     /// holds in `other` (a range end if `other`'s range, or its type's range
     /// `full` when `other` has none, is within it; a relation if

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use crate::ast::{self, BinOp, ExprKind, UnOp};
 use crate::diag::Diagnostic;
 use crate::source::Span;
-use crate::types::{IntTy, Primitive, Range, Ty, primitive};
+use crate::types::{IntTy, Primitive, Range, Trait, Ty, primitive};
 
 use super::facts::{self, CondFacts, Env, Linear, Side, Term};
+use super::generic::{GenericEdge, Inference, ORDERED_METHODS, num, param_help, show_range};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
 
@@ -511,15 +512,23 @@ impl Checker<'_> {
 
     /// Check that `c` can be used where `target` is expected, inserting a
     /// lossless widening conversion if needed, or making a value of `T` an
-    /// optional `?T` that holds it.
-    pub(super) fn coerce(&mut self, c: Checked, target: Ty, span: Span) -> Option<Checked> {
+    /// optional `?T` that holds it (which keeps the value: see
+    /// [`Checker::consume`]).
+    pub(super) fn coerce(
+        &mut self,
+        cx: &mut FnCx,
+        c: Checked,
+        target: Ty,
+        span: Span,
+    ) -> Option<Checked> {
         if c.ty() == target {
             return Some(c);
         }
         if let Some(inner) = target.as_optional()
             && coercible(c.ty(), inner)
         {
-            let value = self.coerce(c, inner, span)?;
+            let value = self.coerce(cx, c, inner, span)?;
+            self.consume(cx, &value.expr, span)?;
             return Some(Checked::new(
                 TExprKind::Variant(1, vec![value.expr]),
                 target,
@@ -662,15 +671,15 @@ impl Checker<'_> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(cx, *op, lhs, rhs, e.span, expected),
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Dot(name) => self.dot_variant(name, Some(args), e.span, expected, cx),
-                _ => self.call(cx, callee, args, e.span, false),
+                _ => self.call(cx, callee, args, e.span, false, expected),
             },
             ExprKind::Dot(name) => self.dot_variant(name, None, e.span, expected, cx),
-            ExprKind::Try(call) => self.try_call(cx, call, e.span),
+            ExprKind::Try(call) => self.try_call(cx, call, e.span, expected),
             ExprKind::Catch {
                 value,
                 binding,
                 handler,
-            } => self.catch(cx, value, binding.as_ref(), handler, true),
+            } => self.catch(cx, value, binding.as_ref(), handler, true, expected),
             ExprKind::Ref(_) => {
                 self.diags.push(
                     Diagnostic::error(
@@ -696,9 +705,32 @@ impl Checker<'_> {
             ExprKind::ArrayRepeat(value, count) => {
                 self.array_repeat(cx, value, count, e.span, expected.map(under_optionals))
             }
+            ExprKind::Index(base, _) | ExprKind::TypeArgs(base, _)
+                if self.names_function(cx, base) =>
+            {
+                let name = callee_name(base);
+                self.diags.push(
+                    Diagnostic::error(e.span, format!("`{name}` is a function; call it"))
+                        .with_help(format!("as in `{name}[u32](...)`")),
+                );
+                None
+            }
             ExprKind::Index(base, index) => self.index(cx, base, index),
             ExprKind::Slice(base, start, end) => {
                 self.slice(cx, base, start.as_deref(), end.as_deref(), e.span)
+            }
+            ExprKind::TypeArgs(base, _) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        e.span,
+                        format!(
+                            "`{}` is not a generic function, so these brackets would be an index, which is one integer",
+                            callee_name(base)
+                        ),
+                    )
+                    .with_help("several items, or a type, in brackets are the type arguments of a generic function: `max[u32](a, b)`"),
+                );
+                None
             }
             ExprKind::StructLit(ty, fields) => self.struct_literal(cx, ty, fields, e.span),
             ExprKind::None => match expected {
@@ -731,6 +763,7 @@ impl Checker<'_> {
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Type(ty)) => Some(Some(ty)),
+                    None if name == "Ordering" => Some(Some(Ty::ordering())),
                     _ => None,
                 }
             }
@@ -810,7 +843,8 @@ impl Checker<'_> {
         for (arg, f) in args.iter().zip(fields) {
             match self
                 .expr(cx, arg, Some(f.ty))
-                .and_then(|c| self.coerce(c, f.ty, arg.span))
+                .and_then(|c| self.coerce(cx, c, f.ty, arg.span))
+                .filter(|c| self.consume(cx, &c.expr, arg.span).is_some())
             {
                 Some(c) => values.push(c.expr),
                 None => ok = false,
@@ -853,7 +887,13 @@ impl Checker<'_> {
 
     /// The call `e` (in parentheses or not) to a function that throws, for
     /// `what` (`try` or `catch`): its result, of a result type.
-    fn throwing_call(&mut self, cx: &mut FnCx, e: &ast::Expr, what: &str) -> Option<Checked> {
+    fn throwing_call(
+        &mut self,
+        cx: &mut FnCx,
+        e: &ast::Expr,
+        what: &str,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
         let mut inner = e;
         while let ExprKind::Paren(x) = &inner.kind {
             inner = x;
@@ -868,7 +908,7 @@ impl Checker<'_> {
             );
             return None;
         };
-        let c = self.call(cx, callee, args, inner.span, true)?;
+        let c = self.call(cx, callee, args, inner.span, true, expected)?;
         if c.ty().as_result().is_none() {
             self.diags.push(
                 Diagnostic::error(
@@ -888,9 +928,15 @@ impl Checker<'_> {
     }
 
     /// `try call`: the call's value, or its error passed on to the caller.
-    fn try_call(&mut self, cx: &mut FnCx, call: &ast::Expr, span: Span) -> Option<Checked> {
+    fn try_call(
+        &mut self,
+        cx: &mut FnCx,
+        call: &ast::Expr,
+        span: Span,
+        expected: Option<Ty>,
+    ) -> Option<Checked> {
         self.check_not_in_defer(cx, span, "`try`")?;
-        let c = self.throwing_call(cx, call, "try")?;
+        let c = self.throwing_call(cx, call, "try", expected)?;
         let (value, err) = c.ty().as_result().expect("a result");
         match cx.throws {
             None => {
@@ -933,8 +979,9 @@ impl Checker<'_> {
         binding: Option<&ast::Ident>,
         handler: &ast::CatchHandler,
         used: bool,
+        expected: Option<Ty>,
     ) -> Option<Checked> {
-        let c = self.throwing_call(cx, value, "catch")?;
+        let c = self.throwing_call(cx, value, "catch", expected)?;
         let (ty, err) = c.ty().as_result().expect("a result");
         let entry = cx.env.clone();
         // When the call fails, the variables it was to assign (`set`) aren't.
@@ -944,7 +991,8 @@ impl Checker<'_> {
         let (local, handler) = match handler {
             ast::CatchHandler::Value(v) => {
                 let d = self.expr(cx, v, Some(ty));
-                let d = self.coerce(d?, ty, v.span)?;
+                let d = self.coerce(cx, d?, ty, v.span)?;
+                self.consume(cx, &d.expr, v.span)?;
                 cx.env = Env::join(entry, std::mem::take(&mut cx.env));
                 (None, Handler::Value(Box::new(d.expr)))
             }
@@ -1002,7 +1050,7 @@ impl Checker<'_> {
             return None;
         };
         let c = self.expr(cx, value, Some(err))?;
-        Some(self.coerce(c, err, value.span)?.expr)
+        Some(self.coerce(cx, c, err, value.span)?.expr)
     }
 
     /// `E(x)` for a C-style enum `E`: the variant whose value is the integer
@@ -1080,7 +1128,8 @@ impl Checker<'_> {
             given[i] = true;
             match self
                 .expr(cx, &init.value, Some(fty))
-                .and_then(|c| self.coerce(c, fty, init.value.span))
+                .and_then(|c| self.coerce(cx, c, fty, init.value.span))
+                .filter(|c| self.consume(cx, &c.expr, init.value.span).is_some())
             {
                 Some(c) => out.push((i as u32, c.expr)),
                 None => ok = false,
@@ -1180,7 +1229,10 @@ impl Checker<'_> {
                 Some(c) => Some(c),
                 None => self.expr(cx, e, Some(elem)),
             };
-            match c.and_then(|c| self.coerce(c, elem, e.span)) {
+            match c
+                .and_then(|c| self.coerce(cx, c, elem, e.span))
+                .filter(|c| self.consume(cx, &c.expr, e.span).is_some())
+            {
                 Some(c) => out.push(c.expr),
                 None => ok = false,
             }
@@ -1202,12 +1254,25 @@ impl Checker<'_> {
         let v = self.expr(cx, value, want_elem);
         let (n, v) = (n?, v?);
         let v = match want_elem {
-            Some(t) => self.coerce(v, t, value.span)?,
+            Some(t) => self.coerce(cx, v, t, value.span)?,
             None => v,
         };
         let elem = v.ty();
         self.check_elem(elem, "arrays", value.span)?;
         self.check_literal_len(n, want_len, expected, span)?;
+        if !elem.is_copy() {
+            let mut params = Vec::new();
+            elem.params(&mut params);
+            let param = params.into_iter().find(|p| !p.is_copy()).unwrap_or(elem);
+            self.diags.push(
+                Diagnostic::error(
+                    value.span,
+                    format!("`[value; {n}]` copies its value, but `{param}` isn't `Copy`"),
+                )
+                .with_help(format!("add the bound `[{param}: Copy]`")),
+            );
+            return None;
+        }
         Some(Checked::new(
             TExprKind::ArrayRepeat(Box::new(v.expr), n),
             Ty::array(elem, n),
@@ -1279,7 +1344,7 @@ impl Checker<'_> {
                 return None;
             }
         };
-        if i.ty().as_int().is_none() {
+        if num(i.ty()).is_none() {
             self.error(
                 index.span,
                 format!("an index must be an integer, found `{}`", i.ty()),
@@ -1636,6 +1701,9 @@ impl Checker<'_> {
                 return None;
             }
             if cx.env.is_uninit(local) {
+                if self.moved_error(cx, local, span) {
+                    return None;
+                }
                 let help = if cx.set_params.contains(&local) {
                     "a `set` parameter starts unassigned: the function assigns it"
                 } else {
@@ -1658,6 +1726,8 @@ impl Checker<'_> {
         }
         let msg = if self.imported(cx, name).is_some() {
             format!("`{name}` is a package; use one of its members, like `{name}.something`")
+        } else if Self::type_param(cx, name).is_some() || primitive(name, self.ptr_bits).is_some() {
+            format!("`{name}` is a type, not a value")
         } else {
             format!("cannot find `{name}` in this scope")
         };
@@ -1872,6 +1942,29 @@ impl Checker<'_> {
 
     fn literal(&mut self, v: i128, span: Span, expected: Option<Ty>) -> Option<Checked> {
         match expected {
+            Some(ty @ Ty::Param(_)) => {
+                let Some(n) = num(ty) else {
+                    self.diags.push(
+                        Diagnostic::error(span, format!("expected `{ty}`, found an integer"))
+                            .with_help(format!(
+                                "only a type parameter with a numeric bound takes integer literals: `[{ty}: Integer]`"
+                            )),
+                    );
+                    return None;
+                };
+                if !n.fits.contains(v) {
+                    let mut d = Diagnostic::error(
+                        span,
+                        format!("`{v}` does not fit in every type `{ty}` can be"),
+                    );
+                    if let Some(h) = param_help(ty) {
+                        d = d.with_help(h);
+                    }
+                    self.diags.push(d);
+                    return None;
+                }
+                Some(Checked::new(TExprKind::Int(v), ty, Some(Range::exact(v))))
+            }
             Some(Ty::Int(t)) => {
                 if t.range().contains(v) {
                     Some(Checked::new(
@@ -1909,7 +2002,7 @@ impl Checker<'_> {
         match op {
             UnOp::Not => {
                 let c = self.expr(cx, operand, Some(Ty::Bool))?;
-                let c = self.coerce(c, Ty::Bool, operand.span)?;
+                let c = self.coerce(cx, c, Ty::Bool, operand.span)?;
                 let facts = c.facts.map(|f| Box::new(f.negated()));
                 let mut out = Checked::new(
                     TExprKind::Unary(TUnOp::Not, Box::new(c.expr)),
@@ -1921,7 +2014,7 @@ impl Checker<'_> {
             }
             UnOp::BitNot => {
                 let c = self.expr(cx, operand, expected)?;
-                if c.ty().as_int().is_none() {
+                if num(c.ty()).is_none() {
                     self.error(span, format!("`~` needs an integer, found `{}`", c.ty()));
                     return None;
                 }
@@ -1934,29 +2027,52 @@ impl Checker<'_> {
             }
             UnOp::Neg => {
                 let c = self.expr(cx, operand, expected)?;
-                let Some(t) = c.ty().as_int() else {
-                    self.error(span, format!("`-` needs an integer, found `{}`", c.ty()));
+                let t = c.ty();
+                let Some(n) = num(t) else {
+                    self.error(span, format!("`-` needs an integer, found `{t}`"));
                     return None;
                 };
-                if !t.signed {
-                    self.error(
-                        span,
-                        format!("cannot negate a value of the unsigned type `{t}`"),
-                    );
-                    return None;
+                match n.signed {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.error(
+                            span,
+                            format!("cannot negate a value of the unsigned type `{t}`"),
+                        );
+                        return None;
+                    }
+                    None => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                span,
+                                format!("cannot negate a value of `{t}`, which may be unsigned"),
+                            )
+                            .with_help(format!(
+                                "add the bound `[{t}: Signed]`, or subtract from 0: `0 -| x`"
+                            )),
+                        );
+                        return None;
+                    }
                 }
                 let r = c.int_range();
-                if r.lo == t.min() {
-                    self.diags.push(
-                        Diagnostic::error(
-                            span,
-                            format!("cannot prove that this negation does not overflow `{t}`"),
-                        )
-                        .with_help(format!(
-                            "the operand can be {r}, and `-({})` doesn't fit",
-                            t.min()
-                        )),
-                    );
+                let min = n.min.expect("a signed type");
+                // For a type parameter, above every signed type's smallest
+                // value.
+                if (n.param && r.lo <= min) || r.lo == min {
+                    let mut d = Diagnostic::error(
+                        span,
+                        format!("cannot prove that this negation does not overflow `{t}`"),
+                    )
+                    .with_help(format!(
+                        "the operand can be {}, and `-({min})` doesn't fit",
+                        show_range(r, t)
+                    ));
+                    if n.param {
+                        d = d.with_help(format!(
+                            "`{t}` can be `i8`: the operand must be above {min}"
+                        ));
+                    }
+                    self.diags.push(d);
                     return None;
                 }
                 let range = Range {
@@ -1965,7 +2081,7 @@ impl Checker<'_> {
                 };
                 Some(Checked::new(
                     TExprKind::Unary(TUnOp::Neg, Box::new(c.expr)),
-                    Ty::Int(t),
+                    t,
                     Some(range),
                 ))
             }
@@ -2018,8 +2134,12 @@ impl Checker<'_> {
         }
         match (l.ty(), r.ty()) {
             // A widening, or a value compared with an optional.
-            (a, b) if coercible(a, b) && !b.is_view() => Some((self.coerce(l, b, lhs.span)?, r)),
-            (a, b) if coercible(b, a) && !a.is_view() => Some((l, self.coerce(r, a, rhs.span)?)),
+            (a, b) if coercible(a, b) && !b.is_view() => {
+                Some((self.coerce(cx, l, b, lhs.span)?, r))
+            }
+            (a, b) if coercible(b, a) && !a.is_view() => {
+                Some((l, self.coerce(cx, r, a, rhs.span)?))
+            }
             (a, b) => {
                 self.error(
                     lhs.span.to(rhs.span),
@@ -2043,7 +2163,7 @@ impl Checker<'_> {
             BinOp::And | BinOp::Or => {
                 let l = self
                     .expr(cx, lhs, Some(Ty::Bool))
-                    .and_then(|l| self.coerce(l, Ty::Bool, lhs.span));
+                    .and_then(|l| self.coerce(cx, l, Ty::Bool, lhs.span));
                 // The right side is only evaluated when the left side is true
                 // (`&&`) or false (`||`), so it's checked with those facts.
                 let lf = l
@@ -2058,8 +2178,15 @@ impl Checker<'_> {
                 });
                 let r = self
                     .expr(cx, rhs, Some(Ty::Bool))
-                    .and_then(|r| self.coerce(r, Ty::Bool, rhs.span));
-                cx.env = saved;
+                    .and_then(|r| self.coerce(cx, r, Ty::Bool, rhs.span));
+                let after = std::mem::replace(&mut cx.env, saved);
+                // A value the right side may have moved out of a variable
+                // is gone whether it ran or not.
+                for l in after.uninit_locals() {
+                    if cx.moved.contains(&l) && !cx.env.is_uninit(l) {
+                        cx.env.declare_uninit(l);
+                    }
+                }
                 // What the right side changes, it may have changed.
                 if let Some(r) = &r {
                     forget_changed(cx, &r.expr);
@@ -2079,24 +2206,34 @@ impl Checker<'_> {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, r) = self.operands(cx, lhs, rhs, None)?;
                 let ordered = !matches!(op, BinOp::Eq | BinOp::Ne);
-                match l.ty() {
-                    Ty::Int(_) => {}
-                    // Arrays and structs compare element by element, field
-                    // by field: every type they can hold has `==`.
-                    Ty::Bool
-                    | Ty::Ptr(_)
-                    | Ty::Array(_)
-                    | Ty::Struct(_)
-                    | Ty::Enum(_)
-                    | Ty::Optional(_)
-                        if !ordered => {}
-                    other => {
-                        self.error(
-                            span,
-                            format!("`{}` can't compare values of type `{other}`", op.as_str()),
-                        );
-                        return None;
+                let ty = l.ty();
+                // Integers are ordered; arrays and structs compare element
+                // by element, field by field.
+                let ok = if ordered {
+                    num(ty).is_some()
+                } else {
+                    ty.satisfies(Trait::Eq)
+                };
+                if !ok {
+                    let mut d = Diagnostic::error(
+                        span,
+                        format!("`{}` can't compare values of type `{ty}`", op.as_str()),
+                    );
+                    if ty.as_param().is_some() {
+                        d = if !ordered {
+                            d.with_help(format!("add the bound `[{ty}: Eq]`"))
+                        } else if ty.satisfies(Trait::Ordered) {
+                            d.with_help(format!(
+                                "`{ty}: Ordered` gives methods, not operators: `a.lt(b)`, `a.le(b)`, `a.gt(b)`, `a.ge(b)`, `a.cmp(b)`"
+                            ))
+                        } else {
+                            d.with_help(format!(
+                                "add the bound `[{ty}: Ordered]` and compare with `a.lt(b)`, or a numeric bound (`Integer`) for `<`"
+                            ))
+                        };
                     }
+                    self.diags.push(d);
+                    return None;
                 }
                 let cmp = match op {
                     BinOp::Eq => CmpOp::Eq,
@@ -2106,22 +2243,32 @@ impl Checker<'_> {
                     BinOp::Gt => CmpOp::Gt,
                     _ => CmpOp::Ge,
                 };
-                if l.ty().as_int().is_some() {
-                    super::note_thresholds(cx, l.side(), r.side());
-                }
-                let facts = l
-                    .ty()
-                    .as_int()
-                    .map(|_| Box::new(facts::comparison(cmp, l.side(), r.side())));
-                let kind = TExprKind::Binary(TBinOp::Cmp(cmp), Box::new(l.expr), Box::new(r.expr));
-                let mut out = Checked::new(kind, Ty::Bool, None);
-                out.facts = facts;
-                Some(out)
+                Some(self.comparison(cx, cmp, l, r))
             }
             BinOp::Shl | BinOp::ShlWrap | BinOp::Shr => self.shift(cx, op, lhs, rhs, expected),
             BinOp::Coalesce => self.coalesce(cx, lhs, rhs, expected),
             _ => self.arith(cx, op, lhs, rhs, span, expected),
         }
+    }
+
+    /// The comparison `l op r` of two values of the same type, with the
+    /// facts it gives if they're integers.
+    pub(super) fn comparison(
+        &mut self,
+        cx: &mut FnCx,
+        cmp: CmpOp,
+        l: Checked,
+        r: Checked,
+    ) -> Checked {
+        let numeric = type_range(l.ty()).is_some();
+        if numeric {
+            super::note_thresholds(cx, l.side(), r.side());
+        }
+        let facts = numeric.then(|| Box::new(facts::comparison(cmp, l.side(), r.side())));
+        let kind = TExprKind::Binary(TBinOp::Cmp(cmp), Box::new(l.expr), Box::new(r.expr));
+        let mut out = Checked::new(kind, Ty::Bool, None);
+        out.facts = facts;
+        out
     }
 
     /// `opt ?? default`: the value in `opt`, or `default` if it's `none`.
@@ -2140,6 +2287,8 @@ impl Checker<'_> {
             );
             return None;
         };
+        // The value is taken out of the optional.
+        self.consume(cx, &l.expr, lhs.span)?;
         // `opt ?? throw value` leaves the function when `opt` is `none`.
         // The right side runs only then: after it, what's known is what
         // holds whether it ran or not.
@@ -2151,7 +2300,9 @@ impl Checker<'_> {
             },
             _ => {
                 let r = self.expr(cx, rhs, Some(inner))?;
-                self.coerce(r, inner, rhs.span)?.expr
+                let r = self.coerce(cx, r, inner, rhs.span)?;
+                self.consume(cx, &r.expr, rhs.span)?;
+                r.expr
             }
         };
         cx.env = Env::join(before, std::mem::take(&mut cx.env));
@@ -2173,7 +2324,7 @@ impl Checker<'_> {
         self.require_unsafe(cx, span, "pointer arithmetic");
         let usize_ty = self.usize_ty();
         let n = self.expr(cx, rhs, Some(usize_ty))?;
-        let n = self.coerce(n, usize_ty, rhs.span)?;
+        let n = self.coerce(cx, n, usize_ty, rhs.span)?;
         let ty = p.ty();
         Some(Checked::new(
             TExprKind::PtrAdd(Box::new(p.expr), Box::new(n.expr)),
@@ -2210,15 +2361,23 @@ impl Checker<'_> {
             }
         }
         let (l, r) = self.operands(cx, lhs, rhs, expected)?;
-        let Some(t) = l.ty().as_int() else {
-            self.error(
+        let t = l.ty();
+        let Some(n) = num(t) else {
+            let mut d = Diagnostic::error(
                 span,
-                format!("`{}` needs integers, found `{}`", op.as_str(), l.ty()),
+                format!("`{}` needs integers, found `{t}`", op.as_str()),
             );
+            if t.as_param().is_some() {
+                d = d.with_help(format!(
+                    "only a numeric bound gives `{t}` operators: `[{t}: Integer]` (or `Unsigned`, `Signed`)"
+                ));
+            }
+            self.diags.push(d);
             return None;
         };
         let (a, b) = (l.int_range(), r.int_range());
-        let full = t.range();
+        // The values a result can have, whatever the type is.
+        let full = n.values;
         // A proven `x + k` or `x - k` of a term `x` and a constant `k` is
         // that term plus a constant, which the facts can relate to others.
         let exact = |r: Range| (r.lo == r.hi).then_some(r.lo);
@@ -2250,14 +2409,27 @@ impl Checker<'_> {
                     let hi = cx.env.diff_bound(x, y).map_or(res.hi, |c| res.hi.min(c));
                     result = Some(Range { lo, hi });
                 }
+                // For a type parameter, each end of the result also fits
+                // when it's past an operand, which is a value of the type:
+                // `x + y` is at least `x` when `y >= 0`, at most `x` when
+                // `y <= 0`; `x - y` is at most `x` when `y >= 0`.
+                let side = match op {
+                    BinOp::Add => (a.lo >= 0 || b.lo >= 0, a.hi <= 0 || b.hi <= 0),
+                    BinOp::Sub => (b.hi <= 0, b.lo >= 0),
+                    _ => (false, false),
+                };
+                let fits = |res: Range| {
+                    res.within(n.fits) || (n.param && Self::fits_param(cx, t, n, res, linear, side))
+                };
                 match result {
-                    Some(res) if res.within(full) => {
+                    Some(res) if fits(res) => {
                         let top = match op {
                             BinOp::Add => TBinOp::Add(Mode::Proven),
                             BinOp::Sub => TBinOp::Sub(Mode::Proven),
                             _ => TBinOp::Mul(Mode::Proven),
                         };
-                        (top, res)
+                        // A value of the type: within the values it can have.
+                        (top, res.intersect(full).unwrap_or(res))
                     }
                     _ => {
                         let (wrap, sat) = match op {
@@ -2265,16 +2437,24 @@ impl Checker<'_> {
                             BinOp::Sub => ("-%", "-|"),
                             _ => ("*%", "*|"),
                         };
-                        self.diags.push(
-                            Diagnostic::error(
-                                span,
-                                format!("cannot prove that this {} does not overflow `{t}`", op_name(op)),
-                            )
-                            .with_help(format!("the operands can be {a} and {b}"))
-                            .with_help(format!(
-                                "use `{wrap}` to wrap around, `{sat}` to saturate, or check the values first"
-                            )),
-                        );
+                        let mut d = Diagnostic::error(
+                            span,
+                            format!(
+                                "cannot prove that this {} does not overflow `{t}`",
+                                op_name(op)
+                            ),
+                        )
+                        .with_help(format!(
+                            "the operands can be {} and {}",
+                            show_range(a, t),
+                            show_range(b, t)
+                        ));
+                        if let Some(h) = param_help(t) {
+                            d = d.with_help(h);
+                        }
+                        self.diags.push(d.with_help(format!(
+                            "use `{wrap}` to wrap around, `{sat}` to saturate, or check the values first"
+                        )));
                         return None;
                     }
                 }
@@ -2295,17 +2475,33 @@ impl Checker<'_> {
                     );
                     return None;
                 }
-                if t.signed
-                    && !cx.env.excludes_value(a_term, a, t.min())
+                // For a type parameter, `a` must be above the smallest
+                // value of every signed type it can be.
+                let min_ruled_out = |min: i128| {
+                    if n.param {
+                        a.lo > min
+                    } else {
+                        cx.env.excludes_value(a_term, a, min)
+                    }
+                };
+                if let Some(min) = n.min
+                    && !min_ruled_out(min)
                     && !cx.env.excludes_value(b_term, b, -1)
                 {
+                    let what = if n.param {
+                        format!("the smallest `{t}`")
+                    } else {
+                        format!("`{min}`")
+                    };
                     self.diags.push(
                         Diagnostic::error(
                             span,
-                            format!("cannot prove that this is not `{}` divided by -1", t.min()),
+                            format!("cannot prove that this is not {what} divided by -1"),
                         )
                         .with_help(format!(
-                            "the operands can be {a} and {b}; that one result doesn't fit in `{t}`"
+                            "the operands can be {} and {}; that one result doesn't fit in `{t}`",
+                            show_range(a, t),
+                            show_range(b, t)
                         ))
                         .with_help(
                             "handle a divisor of -1 first: in `if b == -1 { ... } else { a / b }`, \
@@ -2371,7 +2567,7 @@ impl Checker<'_> {
             None
         };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
-        let mut out = Checked::new(kind, Ty::Int(t), Some(range));
+        let mut out = Checked::new(kind, t, Some(range));
         out.term = linear;
         out.upper = upper;
         Some(out)
@@ -2386,15 +2582,16 @@ impl Checker<'_> {
         expected: Option<Ty>,
     ) -> Option<Checked> {
         let l = self.expr(cx, lhs, expected)?;
-        let Some(t) = l.ty().as_int() else {
+        let t = l.ty();
+        let Some(n) = num(t) else {
             self.error(
                 lhs.span,
-                format!("`{}` needs an integer, found `{}`", op.as_str(), l.ty()),
+                format!("`{}` needs an integer, found `{t}`", op.as_str()),
             );
             return None;
         };
         let r = self.expr(cx, rhs, Some(l.ty()))?;
-        if r.ty().as_int().is_none() {
+        if num(r.ty()).is_none() {
             self.error(
                 rhs.span,
                 format!("the shift amount must be an integer, found `{}`", r.ty()),
@@ -2405,26 +2602,28 @@ impl Checker<'_> {
         if op != BinOp::ShlWrap
             && !amount.within(Range {
                 lo: 0,
-                hi: i128::from(t.bits) - 1,
+                hi: i128::from(n.bits) - 1,
             })
         {
-            self.diags.push(
-                Diagnostic::error(
-                    rhs.span,
-                    format!(
-                        "cannot prove that this shift amount is less than {}",
-                        t.bits
-                    ),
-                )
-                .with_help(format!("the amount can be {amount}"))
-                .with_help("use `<<%` to take the amount modulo the width"),
-            );
+            let mut d = Diagnostic::error(
+                rhs.span,
+                format!(
+                    "cannot prove that this shift amount is less than {}",
+                    n.bits
+                ),
+            )
+            .with_help(format!("the amount can be {}", show_range(amount, r.ty())));
+            if n.param {
+                d = d.with_help(format!("`{t}` can be 8 bits wide"));
+            }
+            self.diags
+                .push(d.with_help("use `<<%` to take the amount modulo the width"));
             return None;
         }
         let a = l.int_range();
         let (top, range) = match op {
-            BinOp::Shl => (TBinOp::Shl, t.range()),
-            BinOp::ShlWrap => (TBinOp::ShlWrap, t.range()),
+            BinOp::Shl => (TBinOp::Shl, n.values),
+            BinOp::ShlWrap => (TBinOp::ShlWrap, n.values),
             // `a >> n` is `a` divided by `2^n`, rounded down (an arithmetic
             // shift for signed types): its extremes are at the corners.
             _ => {
@@ -2447,7 +2646,7 @@ impl Checker<'_> {
             None
         };
         let kind = TExprKind::Binary(top, Box::new(l.expr), Box::new(r.expr));
-        let mut out = Checked::new(kind, Ty::Int(t), Some(range));
+        let mut out = Checked::new(kind, t, Some(range));
         out.upper = upper;
         Some(out)
     }
@@ -2464,7 +2663,20 @@ impl Checker<'_> {
         args: &[ast::Expr],
         span: Span,
         handled: bool,
+        expected: Option<Ty>,
     ) -> Option<Checked> {
+        // `f[u32](...)`: type arguments, when the brackets follow the name
+        // of a function (docs/generics.md, `[T]` and indexing).
+        let (callee, explicit) = match &callee.kind {
+            ExprKind::Index(base, item) if self.names_function(cx, base) => (
+                &**base,
+                Some((vec![ast::TypeArg::Expr((**item).clone())], callee.span)),
+            ),
+            ExprKind::TypeArgs(base, items) if self.names_function(cx, base) => {
+                (&**base, Some((items.clone(), callee.span)))
+            }
+            _ => (callee, None),
+        };
         // The receiver of a method call, with its span.
         let mut receiver: Option<(Checked, Span)> = None;
         let type_of = match &callee.kind {
@@ -2517,6 +2729,9 @@ impl Checker<'_> {
                 }
             }
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
+                if let Some(ty) = Self::type_param(cx, name) {
+                    return self.param_conversion(cx, ty, args, span);
+                }
                 if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
                     (id, name.clone())
                 } else if let Some(&Item::Type(ty)) = self.pkgs[cx.pkg].items.get(name) {
@@ -2532,6 +2747,8 @@ impl Checker<'_> {
                     return self.conversion(cx, name, callee.span, args, span);
                 } else if name == SYSCALL {
                     return self.syscall(cx, args, span);
+                } else if name == "Ordering" {
+                    return self.enum_from(cx, Ty::ordering(), args, span);
                 } else {
                     self.error(callee.span, format!("cannot find function `{name}`"));
                     return None;
@@ -2563,6 +2780,24 @@ impl Checker<'_> {
                 let ty = recv.ty();
                 if ty == Ty::Str && member.name == "bytes" {
                     return self.str_bytes(recv, args, span);
+                }
+                // The methods of the built-in trait `Ordered`.
+                if matches!(ty, Ty::Int(_) | Ty::Bool | Ty::Param(_))
+                    && ORDERED_METHODS.contains(&member.name.as_str())
+                {
+                    return self.ordered_method(cx, recv, member, args, span);
+                }
+                if ty.as_param().is_some() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            member.span,
+                            format!("`{ty}` has no method `{}`", member.name),
+                        )
+                        .with_help(
+                            "a type parameter has the methods of its bounds: `Ordered` gives `cmp`, `lt`, `le`, `gt` and `ge`",
+                        ),
+                    );
+                    return None;
                 }
                 let id = match self.find_method(cx, ty, member)? {
                     Some(id) => id,
@@ -2598,6 +2833,17 @@ impl Checker<'_> {
                 return None;
             }
         };
+        let type_params = self.sigs[id].type_params.clone();
+        let generic = !type_params.is_empty();
+        if let Some((_, bspan)) = &explicit
+            && !generic
+        {
+            self.error(
+                *bspan,
+                format!("`{name}` is not generic: it takes no type arguments"),
+            );
+            return None;
+        }
         if self.sigs[id].is_unsafe {
             self.require_unsafe(
                 cx,
@@ -2605,22 +2851,19 @@ impl Checker<'_> {
                 &format!("calling the `unsafe fn` `{name}`"),
             );
         }
-        let (params, mut ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
-        if let Some(err) = self.sigs[id].throws {
-            if handled {
-                ret = Ty::result(ret, err);
-            } else {
-                // Reported, then checked as if passed on, to go on checking.
-                self.diags.push(
-                    Diagnostic::error(
-                        span,
-                        format!("`{name}` can throw, and its error must be handled"),
-                    )
-                    .with_help(format!(
-                        "pass it on with `try {name}(...)`, handle it with `catch`, or `match` on `ok` and `err`"
-                    )),
-                );
-            }
+        let (params, sig_ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
+        let throws = self.sigs[id].throws;
+        if throws.is_some() && !handled {
+            // Reported, then checked as if passed on, to go on checking.
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("`{name}` can throw, and its error must be handled"),
+                )
+                .with_help(format!(
+                    "pass it on with `try {name}(...)`, handle it with `catch`, or `match` on `ok` and `err`"
+                )),
+            );
         }
         let skip = usize::from(receiver.is_some());
         if args.len() + skip != params.len() {
@@ -2633,6 +2876,24 @@ impl Checker<'_> {
                 ),
             );
             return None;
+        }
+        let mut inf = Inference::new(type_params.clone());
+        if let Some((items, bspan)) = &explicit {
+            if items.len() != type_params.len() {
+                self.error(
+                    *bspan,
+                    format!(
+                        "`{name}` takes {} type argument(s), but {} were given",
+                        type_params.len(),
+                        items.len()
+                    ),
+                );
+                return None;
+            }
+            for (k, item) in items.iter().enumerate() {
+                let ty = self.type_arg(cx, item)?;
+                inf.fix(k, ty, item.span());
+            }
         }
         let mut targs = Vec::new();
         // The places passed `inout` or `set`, which the call may change.
@@ -2653,68 +2914,73 @@ impl Checker<'_> {
                         None => None,
                     }
                 }
+                Convention::Sink => self.consume(cx, &recv.expr, rspan).map(|()| recv.expr),
                 _ => Some(recv.expr),
             };
+            ok &= e.is_some();
+            targs.push(e);
+        }
+        // The arguments, in order. One whose parameter's type has a type
+        // argument not known yet fixes it, unless it takes its type from
+        // the context (a literal, `none`, `.name`, an array literal): that
+        // one is checked once the others and the expected type are.
+        let mut deferred = Vec::new();
+        for (k, (arg, (pty, conv, pname))) in args.iter().zip(&params[skip..]).enumerate() {
+            let (pty, conv) = (*pty, *conv);
+            targs.push(None);
+            let e = if inf.known(pty) {
+                self.call_arg(cx, arg, inf.apply(pty), conv, pname, &name, &mut changed)
+            } else if self.untyped_int(cx, arg).is_some() || needs_context(arg) {
+                deferred.push(k);
+                continue;
+            } else {
+                self.infer_arg(cx, arg, pty, conv, pname, &name, &mut inf, &mut changed)
+            };
             match e {
-                Some(e) => targs.push(e),
+                Some(e) => targs[skip + k] = Some(e),
                 None => ok = false,
             }
         }
-        for (arg, (pty, conv, pname)) in args.iter().zip(&params[skip..]) {
-            let (pty, conv) = (*pty, *conv);
-            let e = match (&arg.kind, conv) {
-                (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
-                    let place = self.ref_arg(cx, inner, pty, conv, arg.span);
-                    place.map(|p| {
-                        changed.push((p.clone(), conv));
-                        TExpr {
-                            kind: TExprKind::Ref(Box::new(p)),
-                            ty: pty,
-                        }
-                    })
-                }
-                (ExprKind::Ref(_), _) => {
-                    let how = match conv {
-                        Convention::Sink => "passed `sink`, which moves a value in",
-                        _ => "read-only",
-                    };
-                    self.diags.push(
-                        Diagnostic::error(
-                            arg.span,
-                            format!(
-                                "`&` marks an argument passed `inout` or `set`, but `{pname}` of `{name}` is {how}"
-                            ),
-                        )
-                        .with_help("remove the `&`"),
-                    );
-                    None
-                }
-                (_, Convention::Inout | Convention::Set) => {
-                    let kw = if conv == Convention::Inout {
-                        "inout"
-                    } else {
-                        "set"
-                    };
-                    self.diags.push(
-                        Diagnostic::error(
-                            arg.span,
-                            format!("`{name}` takes `{pname}` as `{kw}`, so the argument needs `&`"),
-                        )
-                        .with_help(
-                            "pass a variable (or a field or an element of one) with `&`, as in `&x`: the call may change it",
-                        ),
-                    );
-                    None
-                }
-                _ => self
-                    .expr(cx, arg, Some(pty))
-                    .and_then(|c| self.coerce(c, pty, arg.span))
-                    .map(|c| c.expr),
-            };
-            match e {
-                Some(e) => targs.push(e),
+        if !inf.all_known()
+            && let Some(t) = expected
+        {
+            inf.unify(sig_ret, t, span);
+        }
+        for k in deferred {
+            let (pty, conv, pname) = &params[skip + k];
+            if !inf.known(*pty) {
+                continue;
+            }
+            match self.call_arg(
+                cx,
+                &args[k],
+                inf.apply(*pty),
+                *conv,
+                pname,
+                &name,
+                &mut changed,
+            ) {
+                Some(e) => targs[skip + k] = Some(e),
                 None => ok = false,
             }
+        }
+        if let Some(p) = inf.unknown() {
+            if ok {
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("cannot tell what `{p}` is in this call of `{name}`"),
+                    )
+                    .with_help(format!(
+                        "write the type arguments, as in `{name}[u32](...)`, or give the result a type, as in `let x: u32 = {name}(...)`"
+                    ))
+                    .with_help("an integer literal doesn't fix a type argument"),
+                );
+            }
+            return None;
+        }
+        if generic && !self.check_bounds(id, &name, &inf) {
+            ok = false;
         }
         // What the call may have changed: facts about it are forgotten, and
         // a variable passed `set` is assigned (if the call succeeds).
@@ -2731,7 +2997,154 @@ impl Checker<'_> {
             }
         }
         cx.call_sets = sets;
-        ok.then(|| Checked::new(TExprKind::Call(id, targs), ret, None))
+        if !ok {
+            return None;
+        }
+        let targs: Vec<TExpr> = targs.into_iter().map(|a| a.expect("checked")).collect();
+        let mut ret = inf.apply(sig_ret);
+        if let Some(err) = throws
+            && handled
+        {
+            ret = Ty::result(ret, err);
+        }
+        if !generic {
+            return Some(Checked::new(TExprKind::Call(id, targs), ret, None));
+        }
+        let types = inf.types();
+        if let Some(caller) = cx.func
+            && !cx.type_params.is_empty()
+        {
+            self.generic_calls.push(GenericEdge {
+                caller,
+                callee: id,
+                args: types.clone(),
+                span,
+            });
+        }
+        Some(Checked::new(
+            TExprKind::GenericCall(id, types, targs),
+            ret,
+            None,
+        ))
+    }
+
+    /// The argument `arg` of a call of `name`, for its parameter `pname` of
+    /// type `pty` passed `conv`. A place passed `inout` or `set` is added
+    /// to `changed`; a value passed `sink` is kept (see
+    /// [`Checker::consume`]).
+    #[allow(clippy::too_many_arguments)]
+    fn call_arg(
+        &mut self,
+        cx: &mut FnCx,
+        arg: &ast::Expr,
+        pty: Ty,
+        conv: Convention,
+        pname: &str,
+        name: &str,
+        changed: &mut Vec<(TExpr, Convention)>,
+    ) -> Option<TExpr> {
+        match (&arg.kind, conv) {
+            (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
+                let place = self.ref_arg(cx, inner, pty, conv, arg.span)?;
+                changed.push((place.clone(), conv));
+                Some(TExpr {
+                    kind: TExprKind::Ref(Box::new(place)),
+                    ty: pty,
+                })
+            }
+            (ExprKind::Ref(_), _) => {
+                let how = match conv {
+                    Convention::Sink => "passed `sink`, which moves a value in",
+                    _ => "read-only",
+                };
+                self.diags.push(
+                    Diagnostic::error(
+                        arg.span,
+                        format!(
+                            "`&` marks an argument passed `inout` or `set`, but `{pname}` of `{name}` is {how}"
+                        ),
+                    )
+                    .with_help("remove the `&`"),
+                );
+                None
+            }
+            (_, Convention::Inout | Convention::Set) => {
+                let kw = if conv == Convention::Inout {
+                    "inout"
+                } else {
+                    "set"
+                };
+                self.diags.push(
+                    Diagnostic::error(
+                        arg.span,
+                        format!("`{name}` takes `{pname}` as `{kw}`, so the argument needs `&`"),
+                    )
+                    .with_help(
+                        "pass a variable (or a field or an element of one) with `&`, as in `&x`: the call may change it",
+                    ),
+                );
+                None
+            }
+            _ => {
+                let c = self.expr(cx, arg, Some(pty))?;
+                let c = self.coerce(cx, c, pty, arg.span)?;
+                if conv == Convention::Sink {
+                    self.consume(cx, &c.expr, arg.span)?;
+                }
+                Some(c.expr)
+            }
+        }
+    }
+
+    /// Like [`Checker::call_arg`], for a parameter whose type has type
+    /// arguments not known yet: the argument is checked on its own first,
+    /// and its type fixes them (see [`Inference::unify`]).
+    #[allow(clippy::too_many_arguments)]
+    fn infer_arg(
+        &mut self,
+        cx: &mut FnCx,
+        arg: &ast::Expr,
+        pty: Ty,
+        conv: Convention,
+        pname: &str,
+        name: &str,
+        inf: &mut Inference,
+        changed: &mut Vec<(TExpr, Convention)>,
+    ) -> Option<TExpr> {
+        match (&arg.kind, conv) {
+            (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
+                let place = self.ref_place(cx, inner, None, conv)?;
+                inf.unify(pty, place.ty, arg.span);
+                if !inf.known(pty) {
+                    self.error(arg.span, format!("expected `{pty}`, found `{}`", place.ty));
+                    return None;
+                }
+                let pty = inf.apply(pty);
+                let place = self.ref_check(cx, place, pty, arg.span)?;
+                changed.push((place.clone(), conv));
+                Some(TExpr {
+                    kind: TExprKind::Ref(Box::new(place)),
+                    ty: pty,
+                })
+            }
+            (ExprKind::Ref(_), _) | (_, Convention::Inout | Convention::Set) => {
+                self.call_arg(cx, arg, pty, conv, pname, name, changed)
+            }
+            _ => {
+                let c = self.expr(cx, arg, None)?;
+                inf.unify(pty, c.ty(), arg.span);
+                if !inf.known(pty) {
+                    self.error(arg.span, format!("expected `{pty}`, found `{}`", c.ty()));
+                    return None;
+                }
+                let pty = inf.apply(pty);
+                let c = self.coerce(cx, c, pty, arg.span)?;
+                if conv == Convention::Sink {
+                    self.consume(cx, &c.expr, arg.span)?;
+                }
+                Some(c.expr)
+            }
+        }
     }
 
     /// `s.bytes()`: the bytes of the `str` `s`, a `[]u8` view of the same
@@ -2781,18 +3194,35 @@ impl Checker<'_> {
         conv: Convention,
         span: Span,
     ) -> Option<TExpr> {
+        let place = self.ref_place(cx, inner, Some(pty), conv)?;
+        self.ref_check(cx, place, pty, span)
+    }
+
+    /// The place `&inner` names, for a parameter passed `conv`, checked
+    /// with the parameter's type `pty` as the expected type if it's known.
+    fn ref_place(
+        &mut self,
+        cx: &mut FnCx,
+        inner: &ast::Expr,
+        pty: Option<Ty>,
+        conv: Convention,
+    ) -> Option<TExpr> {
         // A variable passed `set` may be unassigned: it's written, not read.
         let bare = match &inner.kind {
             ExprKind::Name(n) if conv == Convention::Set => cx.lookup(n),
             _ => None,
         };
-        let place = match bare {
+        Some(match bare {
             Some(l) => TExpr {
                 kind: TExprKind::Local(l),
                 ty: cx.locals[l].ty,
             },
-            None => self.expr(cx, inner, Some(pty))?.expr,
-        };
+            None => self.expr(cx, inner, pty)?.expr,
+        })
+    }
+
+    /// Check that `place` can be passed `&` to a parameter of type `pty`.
+    fn ref_check(&mut self, cx: &FnCx, place: TExpr, pty: Ty, span: Span) -> Option<TExpr> {
         let changer = Changer::Ref;
         if place.ty == pty {
             return self.mutable_place(cx, place, span, changer);
@@ -2982,20 +3412,21 @@ impl Checker<'_> {
                 Some(Range { lo, hi }),
             );
         }
-        let Some(from) = c.ty().as_int() else {
-            self.error(arg.span, format!("cannot convert `{}` to `{to}`", c.ty()));
+        let from = c.ty();
+        if num(from).is_none() {
+            self.error(arg.span, format!("cannot convert `{from}` to `{to}`"));
             return None;
-        };
+        }
         let r = c.int_range();
         if !r.within(to.range()) {
             self.diags.push(
                 Diagnostic::error(span, format!("cannot prove that this `{from}` value fits in `{to}`"))
-                    .with_help(format!("the value can be {r}, and `{to}` holds {}", to.range()))
+                    .with_help(format!("the value can be {}, and `{to}` holds {}", show_range(r, from), to.range()))
                     .with_help("check the value first; wrapping and saturating conversions are not supported by the compiler yet"),
             );
             return None;
         }
-        if from == to {
+        if from == Ty::Int(to) {
             return Some(c);
         }
         let term = c.term;

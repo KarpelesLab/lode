@@ -89,6 +89,10 @@ pub enum Ty {
     /// Only the checker's hidden locals and temporaries hold one: the
     /// program handles a call's result right away (`try`, `catch`, `match`).
     Result(CompoundId),
+    /// A type parameter of a generic function (`T` in `fn max[T: Ordered]`),
+    /// with its bounds: a [`ParamDef`] in the interner. Only the checker
+    /// sees it; instantiation replaces it with a concrete type.
+    Param(ParamId),
 }
 
 impl Ty {
@@ -96,6 +100,176 @@ impl Ty {
         match self {
             Ty::Int(t) => Some(t),
             _ => None,
+        }
+    }
+
+    /// The declaration of a type parameter.
+    pub fn as_param(self) -> Option<Arc<ParamDef>> {
+        match self {
+            Ty::Param(id) => Some(param_def(id)),
+            _ => None,
+        }
+    }
+
+    /// Declare a new type parameter named `name` with `bounds` (already
+    /// closed under supertraits, see [`Bounds::new`]). `ptr_bits` is the
+    /// target's address width: it sizes `usize` and `isize`, which a
+    /// numeric bound admits.
+    pub fn new_param(name: String, bounds: Bounds, ptr_bits: u32) -> Ty {
+        let admitted: Vec<IntTy> = int_types(ptr_bits)
+            .into_iter()
+            .filter(|t| bounds.admits_int(*t))
+            .collect();
+        let numeric = bounds.has(Trait::Integer) && !admitted.is_empty();
+        let values = numeric.then(|| {
+            admitted
+                .iter()
+                .map(|t| t.range())
+                .reduce(Range::hull)
+                .expect("admitted types")
+        });
+        let fits = numeric.then(|| {
+            admitted
+                .iter()
+                .map(|t| t.range())
+                .reduce(|a, b| a.intersect(b).expect("every integer type holds 0"))
+                .expect("admitted types")
+        });
+        let signed_min = admitted.iter().filter(|t| t.signed).map(|t| t.min()).max();
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let id = ParamId(u32::try_from(tables.params.len()).expect("too many type parameters"));
+        tables.params.push(Arc::new(ParamDef {
+            name,
+            bounds,
+            values,
+            fits,
+            signed_min,
+        }));
+        Ty::Param(id)
+    }
+
+    /// The built-in enum `Ordering`, what `a.cmp(b)` returns:
+    /// `less = -1`, `equal = 0`, `greater = 1` (an `i8` C-style enum).
+    pub fn ordering() -> Ty {
+        static ORDERING: OnceLock<Ty> = OnceLock::new();
+        *ORDERING.get_or_init(|| {
+            let ty = Ty::new_enum("Ordering".to_owned(), usize::MAX, true);
+            let variant = |name: &str, value| Variant {
+                name: name.to_owned(),
+                fields: Vec::new(),
+                value,
+            };
+            ty.set_variants(
+                IntTy::new(true, 8),
+                true,
+                vec![
+                    variant("less", -1),
+                    variant("equal", 0),
+                    variant("greater", 1),
+                ],
+            );
+            ty
+        })
+    }
+
+    /// Whether a value of this type can be copied implicitly (the built-in
+    /// trait `Copy`). Every type the compiler has is plain data, so every
+    /// type is, except a type parameter without the bound `Copy` and the
+    /// arrays, optionals and results that hold one. A view is `Copy`:
+    /// copying it doesn't copy what it views.
+    pub fn is_copy(self) -> bool {
+        match self {
+            Ty::Param(_) => self
+                .as_param()
+                .expect("a parameter")
+                .bounds
+                .has(Trait::Copy),
+            Ty::Array(_) => self.as_array().expect("an array").0.is_copy(),
+            Ty::Optional(_) => self.as_optional().expect("an optional").is_copy(),
+            Ty::Result(_) => {
+                let (ok, err) = self.as_result().expect("a result");
+                ok.is_copy() && err.is_copy()
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether this type implements the built-in trait `t`
+    /// (docs/generics.md, Built-in traits).
+    pub fn satisfies(self, t: Trait) -> bool {
+        if let Some(def) = self.as_param() {
+            return def.bounds.has(t);
+        }
+        match t {
+            Trait::Copy => self.is_copy(),
+            Trait::Eq => match self {
+                Ty::Int(_) | Ty::Bool | Ty::Ptr(_) => true,
+                Ty::Array(_) => self.as_array().expect("an array").0.satisfies(t),
+                Ty::Optional(_) => self.as_optional().expect("an optional").satisfies(t),
+                Ty::Struct(_) => self
+                    .as_struct()
+                    .expect("a struct")
+                    .fields
+                    .iter()
+                    .all(|f| f.ty.satisfies(t)),
+                Ty::Enum(_) => self
+                    .as_enum()
+                    .expect("an enum")
+                    .variants
+                    .iter()
+                    .all(|v| v.fields.iter().all(|f| f.ty.satisfies(t))),
+                _ => false,
+            },
+            Trait::Ordered => matches!(self, Ty::Int(_) | Ty::Bool),
+            Trait::Integer => matches!(self, Ty::Int(_)),
+            Trait::Unsigned => matches!(self, Ty::Int(it) if !it.signed),
+            Trait::Signed => matches!(self, Ty::Int(it) if it.signed),
+        }
+    }
+
+    /// The type parameters this type mentions, added to `out` (once each).
+    pub fn params(self, out: &mut Vec<Ty>) {
+        match self {
+            Ty::Param(_) => {
+                if !out.contains(&self) {
+                    out.push(self);
+                }
+            }
+            Ty::Array(_) => self.as_array().expect("an array").0.params(out),
+            Ty::Slice(_) => self.as_slice().expect("a slice").params(out),
+            Ty::Optional(_) => self.as_optional().expect("an optional").params(out),
+            Ty::Result(_) => {
+                let (ok, err) = self.as_result().expect("a result");
+                ok.params(out);
+                err.params(out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this type mentions a type parameter.
+    pub fn is_generic(self) -> bool {
+        let mut found = Vec::new();
+        self.params(&mut found);
+        !found.is_empty()
+    }
+
+    /// This type with each type parameter `p` replaced by `with(p)` (or
+    /// kept, where it gives `None`).
+    pub fn subst(self, with: &impl Fn(Ty) -> Option<Ty>) -> Ty {
+        match self {
+            Ty::Param(_) => with(self).unwrap_or(self),
+            Ty::Array(_) => {
+                let (elem, len) = self.as_array().expect("an array");
+                Ty::array(elem.subst(with), len)
+            }
+            Ty::Slice(_) => Ty::slice(self.as_slice().expect("a slice").subst(with)),
+            Ty::Optional(_) => Ty::optional(self.as_optional().expect("an optional").subst(with)),
+            Ty::Result(_) => {
+                let (ok, err) = self.as_result().expect("a result");
+                Ty::result(ok.subst(with), err.subst(with))
+            }
+            _ => self,
         }
     }
 
@@ -404,6 +578,142 @@ impl EnumDef {
     }
 }
 
+/// A built-in trait (docs/generics.md, Built-in traits). User traits come
+/// with M7c; until then, these are the only bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Trait {
+    /// `==` and `!=`.
+    Eq,
+    /// A total order: `a.cmp(b)`, `a.lt(b)` and the like.
+    Ordered,
+    /// Values are copied implicitly.
+    Copy,
+    /// The integer types, with their operators. Sealed.
+    Integer,
+    /// The unsigned integer types. Sealed.
+    Unsigned,
+    /// The signed integer types. Sealed.
+    Signed,
+}
+
+impl Trait {
+    pub const ALL: [Trait; 6] = [
+        Trait::Eq,
+        Trait::Ordered,
+        Trait::Copy,
+        Trait::Integer,
+        Trait::Unsigned,
+        Trait::Signed,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Trait::Eq => "Eq",
+            Trait::Ordered => "Ordered",
+            Trait::Copy => "Copy",
+            Trait::Integer => "Integer",
+            Trait::Unsigned => "Unsigned",
+            Trait::Signed => "Signed",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Trait> {
+        Trait::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+
+    /// The trait and its supertraits: `Ordered: Eq`, `Integer: Ordered +
+    /// Copy`, `Unsigned: Integer`, `Signed: Integer`.
+    fn closure(self) -> u8 {
+        let integer =
+            Trait::Integer.bit() | Trait::Ordered.bit() | Trait::Eq.bit() | Trait::Copy.bit();
+        match self {
+            Trait::Eq | Trait::Copy => self.bit(),
+            Trait::Ordered => self.bit() | Trait::Eq.bit(),
+            Trait::Integer => integer,
+            Trait::Unsigned | Trait::Signed => self.bit() | integer,
+        }
+    }
+}
+
+impl fmt::Display for Trait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The bounds of a type parameter: a set of built-in traits, closed under
+/// supertraits (`T: Integer` is also `Ordered`, `Eq` and `Copy`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Bounds(u8);
+
+impl Bounds {
+    /// The traits, with their supertraits.
+    pub fn new(traits: &[Trait]) -> Bounds {
+        Bounds(traits.iter().fold(0, |acc, t| acc | t.closure()))
+    }
+
+    pub fn has(self, t: Trait) -> bool {
+        self.0 & t.bit() != 0
+    }
+
+    /// Whether the integer type `t` satisfies these bounds (an integer
+    /// type satisfies every bound but the other sign).
+    fn admits_int(self, t: IntTy) -> bool {
+        !(self.has(Trait::Unsigned) && t.signed || self.has(Trait::Signed) && !t.signed)
+    }
+
+    /// The most precise numeric bound: `Unsigned`, `Signed` or `Integer`.
+    pub fn numeric(self) -> Option<Trait> {
+        [Trait::Unsigned, Trait::Signed, Trait::Integer]
+            .into_iter()
+            .find(|&t| self.has(t))
+    }
+}
+
+/// The integer types of a target whose address width is `ptr_bits`.
+pub fn int_types(ptr_bits: u32) -> Vec<IntTy> {
+    let mut out = Vec::new();
+    for signed in [false, true] {
+        for bits in [8, 16, 32, 64] {
+            out.push(IntTy::new(signed, bits));
+        }
+        out.push(IntTy {
+            signed,
+            bits: ptr_bits,
+            size: true,
+        });
+    }
+    out
+}
+
+/// A type parameter's declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParamDef {
+    /// Its name, as written: `T`.
+    pub name: String,
+    pub bounds: Bounds,
+    /// With a numeric bound: every value of every type the bound admits,
+    /// the hull of their ranges (for `Integer`, the smallest `i64` to the
+    /// largest `u64`). A value of the parameter's type lies in it.
+    pub values: Option<Range>,
+    /// With a numeric bound: the values every type the bound admits holds,
+    /// the intersection of their ranges (`0..=127` for `Integer`). A value
+    /// in it fits in the parameter's type, whatever the type is.
+    pub fits: Option<Range>,
+    /// The largest of the smallest values of the signed types the bound
+    /// admits (-128 for `i8`), if it admits any: a value above it is no
+    /// signed type's smallest.
+    pub signed_min: Option<i128>,
+}
+
+/// The index of a type parameter in the global type interner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ParamId(u32);
+
 /// The index of a compound type in the global type interner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CompoundId(u32);
@@ -448,6 +758,7 @@ struct Interner {
     ids: HashMap<Compound, CompoundId>,
     structs: Vec<Arc<StructDef>>,
     enums: Vec<Arc<EnumDef>>,
+    params: Vec<Arc<ParamDef>>,
 }
 
 fn interner() -> &'static Mutex<Interner> {
@@ -478,6 +789,11 @@ fn struct_def(def: u32) -> Arc<StructDef> {
     Arc::clone(&tables.structs[def as usize])
 }
 
+fn param_def(id: ParamId) -> Arc<ParamDef> {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(&tables.params[id.0 as usize])
+}
+
 fn enum_def(def: u32) -> Arc<EnumDef> {
     let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
     Arc::clone(&tables.enums[def as usize])
@@ -491,6 +807,7 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
+            Ty::Param(id) => f.write_str(&param_def(*id).name),
             Ty::Array(id)
             | Ty::Slice(id)
             | Ty::Struct(id)

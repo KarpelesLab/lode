@@ -77,6 +77,8 @@ pub struct FnDecl {
     /// type it belongs to (`Type`, or `pkg.Type`, which is an error).
     pub owner: Option<TypeExpr>,
     pub name: Ident,
+    /// The type parameters of a generic function, `[T: Ordered, U]`.
+    pub generics: Vec<GenericParam>,
     /// The parameters. A method's first is `self`, whose type is the
     /// owner's.
     pub params: Vec<Param>,
@@ -85,6 +87,14 @@ pub struct FnDecl {
     pub ret: Option<TypeExpr>,
     pub body: Block,
     pub span: Span,
+}
+
+/// A type parameter, `T` or `T: Ordered + Copy`: its name and the traits
+/// bounding it.
+#[derive(Debug)]
+pub struct GenericParam {
+    pub name: Ident,
+    pub bounds: Vec<Ident>,
 }
 
 /// The `throws` clause of a function: `throws(E)` names the error type,
@@ -333,11 +343,16 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// `[value; count]`; the count must be a constant.
     ArrayRepeat(Box<Expr>, Box<Expr>),
-    /// `base[index]`
+    /// `base[index]`: an index, or a generic argument when `base` names a
+    /// generic function (the checker decides).
     Index(Box<Expr>, Box<Expr>),
     /// `base[start..end]`, where either bound may be left out (`a[i..]`,
     /// `a[..j]`, `a[..]`).
     Slice(Box<Expr>, Option<Box<Expr>>, Option<Box<Expr>>),
+    /// `base[a, b]`: brackets with several items, or with an item only a
+    /// type can be (`?u8`, `[]u8`, `[4]u8`). The generic arguments of
+    /// `base`, which must name a generic function.
+    TypeArgs(Box<Expr>, Vec<TypeArg>),
     /// `Point{x: 1, y: 2}`: a struct literal, with its fields in source order.
     StructLit(TypeExpr, Vec<FieldInit>),
     /// `none`: the empty optional.
@@ -360,6 +375,23 @@ pub enum ExprKind {
     /// `&place`: an argument passed `inout` or `set` (only in a call's
     /// arguments).
     Ref(Box<Expr>),
+}
+
+/// An item in the brackets of [`ExprKind::TypeArgs`]: a type, or an
+/// expression that should name one (`u32`, `geo.Point`).
+#[derive(Clone, Debug)]
+pub enum TypeArg {
+    Type(TypeExpr),
+    Expr(Expr),
+}
+
+impl TypeArg {
+    pub fn span(&self) -> Span {
+        match self {
+            TypeArg::Type(t) => t.span(),
+            TypeArg::Expr(e) => e.span,
+        }
+    }
 }
 
 /// What a `catch` does with an error.

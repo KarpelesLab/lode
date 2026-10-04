@@ -75,7 +75,7 @@ use latticefoundry::ir::{
 };
 use latticefoundry::support::StrInterner;
 
-use crate::reach::Reach;
+use crate::mono;
 use crate::sema::{
     CmpOp, Convention, Func, Handler, Local, Mode, Program, TBinOp, TExpr, TExprKind, TStmt, TUnOp,
 };
@@ -140,6 +140,7 @@ impl Types {
             Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) | Ty::Result(_) => {
                 unreachable!("{ty} lives in memory")
             }
+            Ty::Param(_) => unreachable!("instances have concrete types"),
         }
     }
 
@@ -265,12 +266,9 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             i64: types.int(64),
         }
     };
-    let reach = match program.main {
-        Some(main) => Reach::from(program, main),
-        None => Reach::all(program),
-    };
+    let reach = mono::instantiate(program);
     // `main` is the entry itself unless Lode code calls it.
-    let direct_entry = program.main.filter(|_| !reach.root_called);
+    let direct_entry = reach.main.filter(|_| !reach.root_called);
 
     let mut strings = Vec::new();
     let mut string_globals = Vec::new();
@@ -317,14 +315,11 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
     }
 
     let internal = FuncAttrs::new(Linkage::Internal, Visibility::Default);
-    let ids: Vec<Option<IrFunc>> = program
+    let ids: Vec<Option<IrFunc>> = reach
         .funcs
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            if !reach.reached[i] {
-                return None;
-            }
             let (params, ret) = t.signature(f);
             let is_entry = direct_entry == Some(i);
             let ret = if is_entry { t.i64 } else { ret };
@@ -337,7 +332,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         })
         .collect();
 
-    for (i, f) in program.funcs.iter().enumerate() {
+    for (i, f) in reach.funcs.iter().enumerate() {
         let Some(id) = ids[i] else { continue };
         let b = module.build(id);
         FnLower {
@@ -359,11 +354,11 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         .function(f);
     }
 
-    let entry = match (program.main, direct_entry) {
+    let entry = match (reach.main, direct_entry) {
         (Some(main), None) => {
             let sig = module.types_mut().func(Vec::new(), t.i64, false);
             let entry = module.declare_function(syms.intern(ENTRY_WRAPPER), sig);
-            let ret = program.funcs[main].ret;
+            let ret = reach.funcs[main].ret;
             let mut b = module.build(entry);
             b.create_entry_block();
             let callee = b.func_ref(ids[main].expect("main is reached"));
@@ -372,7 +367,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             b.ret(Some(status));
             Some(ENTRY_WRAPPER.to_owned())
         }
-        (Some(main), Some(_)) => Some(program.funcs[main].symbol.clone()),
+        (Some(main), Some(_)) => Some(reach.funcs[main].symbol.clone()),
         (None, _) => None,
     };
 
@@ -1005,6 +1000,7 @@ impl FnLower<'_> {
                 return Val::Mem(tmp);
             }
             TExprKind::Call(f, args) => return self.call(*f, args, e.ty, None),
+            TExprKind::GenericCall(..) => unreachable!("instances call instances"),
             TExprKind::Syscall(args) => {
                 let ops: Vec<ValueId> = args.iter().map(|a| self.syscall_operand(a)).collect();
                 self.b.syscall(ops[0], &ops[1..])
@@ -1028,7 +1024,8 @@ impl FnLower<'_> {
             | TExprKind::ArrayRepeat(..)
             | TExprKind::StructLit(_)
             | TExprKind::Variant(..)
-            | TExprKind::EnumFrom(_) => {
+            | TExprKind::EnumFrom(_)
+            | TExprKind::Compare(..) => {
                 let ir_ty = self.ir_ty(e.ty);
                 let tmp = self.b.alloca(ir_ty);
                 self.fill(tmp, e);
@@ -1434,6 +1431,22 @@ impl FnLower<'_> {
         self.start_block(join);
     }
 
+    /// Write `a.cmp(b)` (an `Ordering`, a C-style enum whose tag is its
+    /// value: -1, 0 or 1) to `dst`: `(a > b) - (a < b)`.
+    fn compare(&mut self, dst: ValueId, ordering: Ty, a: &TExpr, b: &TExpr) {
+        let l = self.expr(a).one();
+        let r = self.expr(b).one();
+        let lt = self.binary(TBinOp::Cmp(CmpOp::Lt), a.ty, Ty::Bool, l, r, b.ty);
+        let gt = self.binary(TBinOp::Cmp(CmpOp::Gt), a.ty, Ty::Bool, l, r, b.ty);
+        let sum = self.sum_ir(ordering);
+        let tag = self.t.int(sum.tag);
+        let lt = self.b.cast(CastOp::ZExt, lt, tag);
+        let gt = self.b.cast(CastOp::ZExt, gt, tag);
+        let v = self.b.sub(gt, lt, Flags::NONE);
+        let addr = self.b.struct_field(dst, sum.ty, 0);
+        self.b.store(tag, addr, v, align_of(Ty::Int(sum.tag)));
+    }
+
     /// The storage of an expression whose value lives in memory.
     fn place(&mut self, e: &TExpr) -> ValueId {
         match self.expr(e) {
@@ -1668,6 +1681,7 @@ impl FnLower<'_> {
                 }
             }
             TExprKind::EnumFrom(x) => self.enum_from(dst, e.ty, x),
+            TExprKind::Compare(a, b) => self.compare(dst, e.ty, a, b),
             TExprKind::ArrayRepeat(value, n) => {
                 let (elem, _) = e.ty.as_array().expect("an array");
                 let v = self.expr(value);
@@ -1781,6 +1795,13 @@ impl FnLower<'_> {
                     _ => IrOp::Shl,
                 };
                 self.b.bin(ir_op, l, amount, Flags::NONE)
+            }
+            // `false < true`, as unsigned integers.
+            TBinOp::Cmp(c) if operand == Ty::Bool && !matches!(c, CmpOp::Eq | CmpOp::Ne) => {
+                let l = self.b.cast(CastOp::ZExt, l, self.t.i8);
+                let r = self.b.cast(CastOp::ZExt, r, self.t.i8);
+                let i8_ty = Ty::Int(IntTy::new(false, 8));
+                self.binary(op, i8_ty, result, l, r, rhs_ty)
             }
             TBinOp::Cmp(c) => {
                 let pred = match (c, signed) {

@@ -22,6 +22,9 @@ pub struct Program {
     pub tables: Vec<Table>,
     /// The root package's `main` function, if it has one.
     pub main: Option<FuncId>,
+    /// The path of every package, by index (`std/io`), for the symbols of
+    /// generic instances.
+    pub packages: Vec<String>,
     /// Warnings about the program (it has no errors). They don't stop it
     /// from compiling.
     pub warnings: Vec<crate::diag::Diagnostic>,
@@ -42,8 +45,14 @@ pub struct Table {
 #[derive(Debug)]
 pub struct Func {
     pub name: String,
-    /// The linker symbol: `<package path>.<name>`, e.g. `std/io.print`.
+    /// The linker symbol: `<package path>.<name>`, e.g. `std/io.print`. An
+    /// instance of a generic function adds its type arguments:
+    /// `std/math.max[u32]`.
     pub symbol: String,
+    /// The type parameters of a generic function ([`Ty::Param`]s), which
+    /// its types mention; empty for a function that isn't generic. Only
+    /// instances of it, made by `crate::mono`, are lowered.
+    pub type_params: Vec<Ty>,
     pub params: Vec<LocalId>,
     /// The type of the value it returns (`T` in `throws(E) -> T`).
     pub ret: Ty,
@@ -165,6 +174,13 @@ pub enum TExprKind {
     Table(usize),
     Local(LocalId),
     Call(FuncId, Vec<TExpr>),
+    /// A call of a generic function, with its type arguments, which may
+    /// mention the caller's own type parameters. `crate::mono` turns it
+    /// into a [`TExprKind::Call`] of an instance.
+    GenericCall(FuncId, Vec<Ty>, Vec<TExpr>),
+    /// `a.cmp(b)` of two values of an `Ordered` type (an integer or
+    /// `bool`, once instantiated): the `Ordering` of `a` to `b`.
+    Compare(Box<TExpr>, Box<TExpr>),
     Unary(TUnOp, Box<TExpr>),
     Binary(TBinOp, Box<TExpr>, Box<TExpr>),
     /// Short-circuit `&&`.
@@ -337,6 +353,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Table(_)
         | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
+        | TExprKind::GenericCall(_, _, items)
         | TExprKind::ArrayLit(items)
         | TExprKind::Syscall(items)
         | TExprKind::Variant(_, items) => items.iter().collect(),
@@ -344,12 +361,101 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::And(l, r)
         | TExprKind::Or(l, r)
         | TExprKind::Index(l, r)
+        | TExprKind::Compare(l, r)
         | TExprKind::PtrAdd(l, r)
         | TExprKind::Coalesce(l, r) => vec![l, r],
         TExprKind::StructLit(fields) => fields.iter().map(|(_, v)| v).collect(),
         TExprKind::Slice(base, start, end) => std::iter::once(&**base)
             .chain(start.as_deref())
             .chain(end.as_deref())
+            .collect(),
+        TExprKind::Unary(_, inner)
+        | TExprKind::Field(inner, _)
+        | TExprKind::Convert(inner)
+        | TExprKind::ViewLen(inner)
+        | TExprKind::ArrayLen(inner)
+        | TExprKind::ArrayRepeat(inner, _)
+        | TExprKind::ToSlice(inner)
+        | TExprKind::StrPtr(inner)
+        | TExprKind::Bytes(inner)
+        | TExprKind::Payload(inner, ..)
+        | TExprKind::EnumValue(inner)
+        | TExprKind::EnumFrom(inner)
+        | TExprKind::Try(inner)
+        | TExprKind::Throw(inner)
+        | TExprKind::Ref(inner) => vec![inner],
+        TExprKind::Catch { call, handler, .. } => match handler {
+            Handler::Value(v) => vec![call, v],
+            Handler::Block(_) => vec![call],
+        },
+    }
+}
+
+/// [`stmt_exprs`], mutably.
+pub fn stmt_exprs_mut(s: &mut TStmt) -> Vec<&mut TExpr> {
+    match s {
+        TStmt::Init(_, e)
+        | TStmt::Assign(_, e)
+        | TStmt::Expr(e)
+        | TStmt::Throw(e)
+        | TStmt::If(e, ..)
+        | TStmt::While(e, _)
+        | TStmt::Match { value: e, .. } => vec![e],
+        TStmt::Store(place, e) => vec![place, e],
+        TStmt::Return(e) => e.iter_mut().collect(),
+        TStmt::For { start, end, .. } => vec![start, end],
+        TStmt::Loop(_) | TStmt::Break | TStmt::Continue | TStmt::Block(_) | TStmt::Defer { .. } => {
+            Vec::new()
+        }
+    }
+}
+
+/// The statement lists nested in a statement: its branches, bodies and
+/// arms (not the blocks of the `catch`es in its expressions).
+pub fn stmt_blocks_mut(s: &mut TStmt) -> Vec<&mut Vec<TStmt>> {
+    match s {
+        TStmt::If(_, then, otherwise) => vec![then, otherwise],
+        TStmt::While(_, body)
+        | TStmt::For { body, .. }
+        | TStmt::Loop(body)
+        | TStmt::Block(body)
+        | TStmt::Defer { body, .. } => vec![body],
+        TStmt::Match { arms, .. } => arms.iter_mut().map(|a| &mut a.body).collect(),
+        TStmt::Init(..)
+        | TStmt::Assign(..)
+        | TStmt::Store(..)
+        | TStmt::Expr(_)
+        | TStmt::Return(_)
+        | TStmt::Throw(_)
+        | TStmt::Break
+        | TStmt::Continue => Vec::new(),
+    }
+}
+
+/// [`subexprs`], mutably.
+pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
+    match &mut e.kind {
+        TExprKind::Int(_)
+        | TExprKind::Bool(_)
+        | TExprKind::Str(_)
+        | TExprKind::Table(_)
+        | TExprKind::Local(_) => Vec::new(),
+        TExprKind::Call(_, items)
+        | TExprKind::GenericCall(_, _, items)
+        | TExprKind::ArrayLit(items)
+        | TExprKind::Syscall(items)
+        | TExprKind::Variant(_, items) => items.iter_mut().collect(),
+        TExprKind::Binary(_, l, r)
+        | TExprKind::And(l, r)
+        | TExprKind::Or(l, r)
+        | TExprKind::Index(l, r)
+        | TExprKind::Compare(l, r)
+        | TExprKind::PtrAdd(l, r)
+        | TExprKind::Coalesce(l, r) => vec![l, r],
+        TExprKind::StructLit(fields) => fields.iter_mut().map(|(_, v)| v).collect(),
+        TExprKind::Slice(base, start, end) => std::iter::once(&mut **base)
+            .chain(start.as_deref_mut())
+            .chain(end.as_deref_mut())
             .collect(),
         TExprKind::Unary(_, inner)
         | TExprKind::Field(inner, _)

@@ -6,6 +6,7 @@
 
 mod expr;
 pub mod facts;
+mod generic;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use crate::ast::{self, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
-use crate::types::{Field, IntTy, Primitive, Range, Ty, Variant, primitive};
+use crate::types::{Field, IntTy, Primitive, Range, Trait, Ty, Variant, primitive};
 
 use facts::{Env, Linear, Term};
 pub use tree::*;
@@ -32,6 +33,7 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         strings: Vec::new(),
         tables: Vec::new(),
         string_ids: HashMap::new(),
+        generic_calls: Vec::new(),
         ptr_bits,
     };
     ck.collect(packages);
@@ -75,13 +77,18 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
         if !matches!(ret, Ty::Unit | Ty::Int(_)) {
             ck.error(span, "`main` must return nothing or an integer exit status");
         }
+        if !ck.sigs[id].type_params.is_empty() {
+            ck.error(span, "`main` can't be generic");
+        }
     }
+    ck.check_generic_recursion();
 
     let program = Program {
         funcs,
         strings: ck.strings,
         tables: ck.tables,
         main,
+        packages: packages.iter().map(|p| p.path.clone()).collect(),
         warnings: Vec::new(),
     };
     (program, ck.diags)
@@ -118,6 +125,10 @@ struct Sig {
     throws: Option<Ty>,
     /// The function name's span.
     span: Span,
+    /// The type parameters of a generic function, and the traits each
+    /// declares as its bounds.
+    type_params: Vec<Ty>,
+    bounds: Vec<Vec<Trait>>,
 }
 
 /// The value of a checked constant.
@@ -161,6 +172,9 @@ struct Checker<'a> {
     string_ids: HashMap<Vec<u8>, usize>,
     /// The array constants checked so far.
     tables: Vec<Table>,
+    /// The calls from generic functions to generic functions, for
+    /// [`Checker::check_generic_recursion`].
+    generic_calls: Vec<generic::GenericEdge>,
     ptr_bits: u32,
 }
 
@@ -205,6 +219,13 @@ struct FnCx {
     loops: Vec<LoopEdges>,
     /// Where the `str` locals' values come from, for `-> str`.
     strs: StrOrigins,
+    /// The function being checked (`None` for a constant or a declaration).
+    func: Option<FuncId>,
+    /// The type parameters of a generic function.
+    type_params: Vec<Ty>,
+    /// The locals a value was moved out of somewhere (see
+    /// [`Checker::consume`]), for the message when one is used unassigned.
+    moved: HashSet<LocalId>,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -236,6 +257,7 @@ struct Mark {
     locals: usize,
     consts: Vec<ConstState>,
     strs: StrOrigins,
+    moved: HashSet<LocalId>,
 }
 
 impl FnCx {
@@ -259,6 +281,9 @@ impl FnCx {
             call_sets: Vec::new(),
             expr_depth: 0,
             strs: StrOrigins::default(),
+            func: None,
+            type_params: Vec::new(),
+            moved: HashSet::new(),
         }
     }
 
@@ -290,6 +315,7 @@ fn catch_blocks<'e>(e: &'e ast::Expr, out: &mut Vec<&'e ast::Block>) {
         | ExprKind::Dot(_) => {}
         ExprKind::Unary(_, a)
         | ExprKind::Field(a, _)
+        | ExprKind::TypeArgs(a, _)
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
         | ExprKind::Throw(a)
@@ -368,6 +394,7 @@ fn changed_names(e: &ast::Expr, out: &mut HashSet<String>) {
         | ExprKind::Dot(_) => {}
         ExprKind::Unary(_, a)
         | ExprKind::Field(a, _)
+        | ExprKind::TypeArgs(a, _)
         | ExprKind::Paren(a)
         | ExprKind::Try(a)
         | ExprKind::Throw(a)
@@ -451,6 +478,22 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// Names assigned whole anywhere in `stmts`, by `name = v` or `name op= v`
+/// (not through a field, an element, `&` or a method call). A view can
+/// change only this way: `&` and a method's receiver change elements.
+fn whole_assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        if let Stmt::Assign { target, .. } = s
+            && let ExprKind::Name(n) = &target.kind
+        {
+            out.insert(n.clone());
+        }
+        for b in child_blocks(s) {
+            whole_assigned_names(&b.stmts, out);
+        }
+    }
+}
+
 /// The height of the loops in `stmts`: 0 without loops, otherwise one more
 /// than the height of the loops in the body of the highest one (loops at
 /// any depth in blocks count, as do loops in `catch` blocks).
@@ -486,12 +529,19 @@ const SEARCH_HEIGHT: u32 = 4;
 fn assigned_locals(cx: &FnCx, body: &[Stmt]) -> HashSet<LocalId> {
     let mut names = HashSet::new();
     assigned_names(body, &mut names);
+    let mut whole = HashSet::new();
+    whole_assigned_names(body, &mut whole);
     // An `inout` slice is never assigned itself, only its elements, which
-    // have no facts: its length stays.
+    // have no facts: its length stays. Another view keeps its length unless
+    // it's assigned whole.
     names
         .iter()
-        .filter_map(|n| cx.lookup(n))
-        .filter(|&l| !cx.locals[l].mutable_view())
+        .filter_map(|n| cx.lookup(n).map(|l| (n, l)))
+        .filter(|&(n, l)| {
+            let local = &cx.locals[l];
+            !local.mutable_view() && (!local.ty.is_view() || whole.contains(n))
+        })
+        .map(|(_, l)| l)
         .collect()
 }
 
@@ -695,9 +745,13 @@ fn clear_member(ty: Ty, k: usize) {
 /// store yet.
 fn storable(ty: Ty) -> Result<(), Option<()>> {
     match ty {
-        Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Optional(_) => {
-            Ok(())
-        }
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Array(_)
+        | Ty::Struct(_)
+        | Ty::Enum(_)
+        | Ty::Optional(_)
+        | Ty::Param(_) => Ok(()),
         Ty::Str | Ty::Slice(_) => Err(Some(())),
         Ty::Ptr(_) | Ty::Unit | Ty::Result(_) => Err(None),
     }
@@ -1184,7 +1238,7 @@ impl<'a> Checker<'a> {
         earlier: &[Variant],
     ) -> Option<i128> {
         let c = self.expr(cx, e, Some(Ty::Int(tag)))?;
-        let c = self.coerce(c, Ty::Int(tag), e.span)?;
+        let c = self.coerce(cx, c, Ty::Int(tag), e.span)?;
         let v = match c.range {
             Some(r) if r.lo == r.hi => r.lo,
             _ => {
@@ -1326,6 +1380,9 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            TypeExpr::Named(id) if Self::type_param(cx, &id.name).is_some() => {
+                Self::type_param(cx, &id.name)
+            }
             TypeExpr::Named(id) => match primitive(&id.name, self.ptr_bits) {
                 Some(Primitive::Ty(ty)) => Some(ty),
                 Some(Primitive::Unsupported) => {
@@ -1342,6 +1399,17 @@ impl<'a> Checker<'a> {
                     Some(Item::Type(ty)) => Some(*ty),
                     Some(_) => {
                         self.error(id.span, format!("`{}` is not a type", id.name));
+                        None
+                    }
+                    None if id.name == "Ordering" => Some(Ty::ordering()),
+                    None if Trait::from_name(&id.name).is_some() => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                id.span,
+                                format!("`{}` is a trait, not a type", id.name),
+                            )
+                            .with_help(format!("use it as a bound: `fn f[T: {}](x: T)`", id.name)),
+                        );
                         None
                     }
                     None => {
@@ -1361,7 +1429,8 @@ impl<'a> Checker<'a> {
             | Ty::Array(_)
             | Ty::Struct(_)
             | Ty::Enum(_)
-            | Ty::Optional(_) => Some(()),
+            | Ty::Optional(_)
+            | Ty::Param(_) => Some(()),
             other => {
                 self.error(
                     span,
@@ -1400,6 +1469,7 @@ impl<'a> Checker<'a> {
     /// The signature of `f`, whose owner type is `owner` for a method or an
     /// associated function (`None` if it's in error).
     fn signature(&mut self, cx: &mut FnCx, f: &ast::FnDecl, owner: Option<Ty>) -> Sig {
+        let (type_params, bounds) = self.declare_generics(cx, &f.generics);
         let mut params = Vec::new();
         let has_self = f.params.first().is_some_and(ast::Param::is_self);
         for p in &f.params {
@@ -1460,6 +1530,8 @@ impl<'a> Checker<'a> {
             ret,
             throws,
             span: f.name.span,
+            type_params,
+            bounds,
         }
     }
 
@@ -1579,7 +1651,7 @@ impl<'a> Checker<'a> {
                 match ty {
                     Some(ty @ Ty::Int(_)) => self
                         .expr(&mut cx, &decl.value, Some(ty))
-                        .and_then(|c| self.coerce(c, ty, decl.value.span))
+                        .and_then(|c| self.coerce(&mut cx, c, ty, decl.value.span))
                         .and_then(|c| match c.range {
                             Some(r) if r.lo == r.hi => Some(ConstVal::Typed(ty, r.lo)),
                             _ => {
@@ -1638,7 +1710,7 @@ impl<'a> Checker<'a> {
     ) -> Option<()> {
         let Some((elem, n)) = ty.as_array() else {
             let c = self.expr(cx, e, Some(ty))?;
-            let c = self.coerce(c, ty, e.span)?;
+            let c = self.coerce(cx, c, ty, e.span)?;
             let v = match (&c.expr.kind, c.range) {
                 (TExprKind::Bool(b), _) => i128::from(*b),
                 (_, Some(r)) if r.lo == r.hi && ty.as_int().is_some() => r.lo,
@@ -1683,7 +1755,7 @@ impl<'a> Checker<'a> {
             }
             _ => {
                 let c = self.expr(cx, e, Some(ty))?;
-                let c = self.coerce(c, ty, e.span)?;
+                let c = self.coerce(cx, c, ty, e.span)?;
                 let TExprKind::Table(id) = c.expr.kind else {
                     self.error(
                         e.span,
@@ -1702,6 +1774,8 @@ impl<'a> Checker<'a> {
         let throws = self.sigs[id].throws;
         let mut cx = FnCx::new(pkg, file, ret, is_unsafe);
         cx.throws = throws;
+        cx.func = Some(id);
+        cx.type_params = self.sigs[id].type_params.clone();
         let mut params = Vec::new();
         let param_tys = self.sigs[id].params.clone();
         for (p, (ty, convention, _)) in f.params.iter().zip(param_tys) {
@@ -1754,6 +1828,7 @@ impl<'a> Checker<'a> {
         Func {
             symbol: format!("{}.{name}", self.pkgs[pkg].path),
             name,
+            type_params: cx.type_params.clone(),
             params,
             ret,
             throws,
@@ -2208,7 +2283,7 @@ impl<'a> Checker<'a> {
                 }
                 let value = self.expr(cx, init, annotated);
                 let value = match (value, annotated) {
-                    (Some(v), Some(t)) => self.coerce(v, t, init.span),
+                    (Some(v), Some(t)) => self.coerce(cx, v, t, init.span),
                     (v, _) => v,
                 };
                 let Some(value) = value else {
@@ -2222,6 +2297,7 @@ impl<'a> Checker<'a> {
                     self.error(init.span, "this expression has no value to store");
                     return None;
                 }
+                self.consume(cx, &value.expr, init.span)?;
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
                 self.check_kept_view(cx, &value, init.span)?;
                 self.record_value(cx, local, &value);
@@ -2287,7 +2363,8 @@ impl<'a> Checker<'a> {
                         self.expr(cx, &combined, Some(ty))
                     }
                 };
-                let checked = checked.and_then(|c| self.coerce(c, ty, value.span));
+                let checked = checked.and_then(|c| self.coerce(cx, c, ty, value.span));
+                let checked = checked.filter(|c| self.consume(cx, &c.expr, value.span).is_some());
                 let Some(checked) = checked else {
                     // As for a place above: the variable is still assigned.
                     cx.env.forget(local);
@@ -2308,7 +2385,7 @@ impl<'a> Checker<'a> {
                     handler,
                 } => Some(TStmt::Expr(
                     self.whole(cx, e.span, |ck, cx| {
-                        ck.catch(cx, value, binding.as_ref(), handler, false)
+                        ck.catch(cx, value, binding.as_ref(), handler, false, None)
                     })?
                     .expr,
                 )),
@@ -2348,7 +2425,8 @@ impl<'a> Checker<'a> {
                     }
                     (Some(v), ret) => self
                         .expr(cx, v, Some(ret))
-                        .and_then(|checked| self.coerce(checked, ret, v.span))
+                        .and_then(|checked| self.coerce(cx, checked, ret, v.span))
+                        .filter(|c| self.consume(cx, &c.expr, v.span).is_some())
                         .map(|c| c.expr),
                 };
                 if let (Some(e), Ty::Str) = (&value, cx.ret) {
@@ -2458,7 +2536,7 @@ impl<'a> Checker<'a> {
         // A call that throws gives its result, to match `ok` and `err`.
         let checked = match &value.kind {
             ExprKind::Call(callee, args) => self.whole(cx, value.span, |ck, cx| {
-                ck.call(cx, callee, args, value.span, true)
+                ck.call(cx, callee, args, value.span, true, None)
             })?,
             _ => self.expr(cx, value, None)?,
         };
@@ -2479,6 +2557,9 @@ impl<'a> Checker<'a> {
             return None;
         };
         let mut before = Vec::new();
+        if !matches!(checked.expr.kind, TExprKind::Local(_)) {
+            self.consume(cx, &checked.expr, value.span)?;
+        }
         let matched = matched_local(cx, checked, &mut before);
         let entry = cx.env.clone();
         let mut covered = vec![false; def.variants.len()];
@@ -2615,6 +2696,10 @@ impl<'a> Checker<'a> {
                         fty,
                         None,
                     );
+                    if self.consume(cx, &value.expr, b.span).is_none() {
+                        cx.failed.insert(local);
+                        continue;
+                    }
                     self.record_value(cx, local, &value);
                     body.push(TStmt::Init(local, value.expr));
                 }
@@ -2861,7 +2946,7 @@ impl<'a> Checker<'a> {
     /// (`bool`s as 0 and 1).
     fn pattern_value(&mut self, cx: &mut FnCx, e: &ast::Expr, ty: Ty) -> Option<i128> {
         let c = self.expr(cx, e, Some(ty))?;
-        let c = self.coerce(c, ty, e.span)?;
+        let c = self.coerce(cx, c, ty, e.span)?;
         match (&c.expr.kind, c.range) {
             (TExprKind::Bool(b), _) => Some(i128::from(*b)),
             (_, Some(r)) if r.lo == r.hi && ty != Ty::Bool => Some(r.lo),
@@ -2933,6 +3018,10 @@ impl<'a> Checker<'a> {
         };
         let mut before = Vec::new();
         cx.scopes.push(HashMap::new());
+        let checked = checked.filter(|c| {
+            matches!(c.expr.kind, TExprKind::Local(_))
+                || self.consume(cx, &c.expr, i.cond.span).is_some()
+        });
         let matched = match (checked, inner) {
             (Some(c), Some(_)) => Some(matched_local(cx, c, &mut before)),
             _ => None,
@@ -2945,7 +3034,12 @@ impl<'a> Checker<'a> {
         cx.env.assign(local, None);
         let mut then = Vec::new();
         if let (Some(m), Some(t)) = (&matched, inner) {
-            then.push(TStmt::Init(local, payload(m, 1, 0, t)));
+            let value = payload(m, 1, 0, t);
+            if self.consume(cx, &value, name.span).is_some() {
+                then.push(TStmt::Init(local, value));
+            } else {
+                cx.failed.insert(local);
+            }
         }
         then.extend(self.block(cx, &i.then.stmts));
         cx.scopes.pop();
@@ -3018,6 +3112,9 @@ impl<'a> Checker<'a> {
             return None;
         }
         let mut before = Vec::new();
+        if !matches!(checked.expr.kind, TExprKind::Local(_)) {
+            self.consume(cx, &checked.expr, init.span)?;
+        }
         let matched = matched_local(cx, checked, &mut before);
         let entry = cx.env.clone();
         let else_body = self.block(cx, &otherwise.stmts);
@@ -3043,12 +3140,13 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let local = self.declare(cx, &name.name, inner, mutable);
         let value = expr::Checked::new(
             TExprKind::Payload(Box::new(matched.clone()), 1, 0),
             inner,
             None,
         );
+        self.consume(cx, &value.expr, name.span)?;
+        let local = self.declare(cx, &name.name, inner, mutable);
         self.record_value(cx, local, &value);
         before.push(TStmt::Match {
             value: matched,
@@ -3093,6 +3191,10 @@ impl<'a> Checker<'a> {
     ///
     /// A loop higher than [`SEARCH_HEIGHT`] doesn't search: its head is `E`
     /// with everything about the variables forgotten.
+    ///
+    /// A variable a value is moved out of in the body (see
+    /// [`Checker::consume`]) is unassigned at a back-edge: it's unassigned
+    /// at the head too, and the body is checked again from it.
     fn loop_body<T>(
         &mut self,
         cx: &mut FnCx,
@@ -3100,6 +3202,37 @@ impl<'a> Checker<'a> {
         index: Option<&ForIndex>,
         mut check: impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
     ) -> (T, Env, Vec<Env>) {
+        let mark = self.mark(cx);
+        let index_local = index.map(|ix| ix.local);
+        let (mut out, mut head, mut edges) = self.loop_search(cx, body, index, &mut check);
+        loop {
+            let moved: Vec<LocalId> = edges
+                .next
+                .iter()
+                .filter(|e| !e.dead)
+                .flat_map(Env::uninit_locals)
+                .filter(|&l| l < mark.locals && !head.dead && !head.is_uninit(l))
+                .collect();
+            if moved.is_empty() {
+                return (out, head, edges.exits);
+            }
+            for l in moved {
+                head.declare_uninit(l);
+            }
+            self.rollback(cx, &mark);
+            (out, edges) = self.loop_pass(cx, head.clone(), index_local, &mut check);
+        }
+    }
+
+    /// The search for a loop's head (see [`Checker::loop_body`]): what
+    /// `check` gave, the head, and where the body left an iteration.
+    fn loop_search<T>(
+        &mut self,
+        cx: &mut FnCx,
+        body: &[Stmt],
+        index: Option<&ForIndex>,
+        check: &mut impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
+    ) -> (T, Env, LoopEdges) {
         use facts::Loosen::{Cover, Drop};
         let mut assigned = assigned_locals(cx, body);
         if let Some(ix) = index {
@@ -3125,31 +3258,31 @@ impl<'a> Checker<'a> {
         };
         if 1 + loop_height(body) > SEARCH_HEIGHT {
             let base = forget_all(entry);
-            let (out, edges) = self.loop_pass(cx, base.clone(), index, &mut check);
-            return (out, base, edges.exits);
+            let (out, edges) = self.loop_pass(cx, base.clone(), index, check);
+            return (out, base, edges);
         }
 
         // 1. E
-        let (out, edges) = self.loop_pass(cx, entry.clone(), index, &mut check);
+        let (out, edges) = self.loop_pass(cx, entry.clone(), index, check);
         if holds(&entry, &edges) {
-            return (out, entry, edges.exits);
+            return (out, entry, edges);
         }
         // 2. C
         self.rollback(cx, &mark);
         let c = entry.loosen(about, full, &edges.next, Cover);
-        let (out, edges) = self.loop_pass(cx, c.clone(), index, &mut check);
+        let (out, edges) = self.loop_pass(cx, c.clone(), index, check);
         if holds(&c, &edges) {
-            return (out, c, edges.exits);
+            return (out, c, edges);
         }
         // 3. W
         self.rollback(cx, &mark);
         let w = c.loosen(about, full, &edges.next, Drop);
-        let (out, edges) = self.loop_pass(cx, w.clone(), index, &mut check);
+        let (out, edges) = self.loop_pass(cx, w.clone(), index, check);
         if !holds(&w, &edges) {
             self.rollback(cx, &mark);
             let base = forget_all(entry);
-            let (out, edges) = self.loop_pass(cx, base.clone(), index, &mut check);
-            return (out, base, edges.exits);
+            let (out, edges) = self.loop_pass(cx, base.clone(), index, check);
+            return (out, base, edges);
         }
         // 4. T, from N
         let n = entry.loosen(about, full, &edges.next, Cover);
@@ -3158,17 +3291,17 @@ impl<'a> Checker<'a> {
         if !t.same(&n) {
             self.rollback(cx, &mark);
             w_checked = None;
-            let (out, edges) = self.loop_pass(cx, t.clone(), index, &mut check);
+            let (out, edges) = self.loop_pass(cx, t.clone(), index, check);
             if holds(&t, &edges) {
-                return (out, t, edges.exits);
+                return (out, t, edges);
             }
         }
         // 5. N
         if !n.same(&w) {
             self.rollback(cx, &mark);
-            let (out, edges) = self.loop_pass(cx, n.clone(), index, &mut check);
+            let (out, edges) = self.loop_pass(cx, n.clone(), index, check);
             if holds(&n, &edges) {
-                return (out, n, edges.exits);
+                return (out, n, edges);
             }
             w_checked = None;
         }
@@ -3176,10 +3309,10 @@ impl<'a> Checker<'a> {
             Some(checked) => checked,
             None => {
                 self.rollback(cx, &mark);
-                self.loop_pass(cx, w.clone(), index, &mut check)
+                self.loop_pass(cx, w.clone(), index, check)
             }
         };
-        (out, w, edges.exits)
+        (out, w, edges)
     }
 
     /// Check a loop's body once, from the facts `head`. For a `for` loop,
@@ -3220,6 +3353,7 @@ impl<'a> Checker<'a> {
             locals: cx.locals.len(),
             consts: self.consts.iter().map(|c| c.state).collect(),
             strs: cx.strs.clone(),
+            moved: cx.moved.clone(),
         }
     }
 
@@ -3228,6 +3362,7 @@ impl<'a> Checker<'a> {
         cx.locals.truncate(mark.locals);
         cx.failed.retain(|&l| l < mark.locals);
         cx.strs = mark.strs.clone();
+        cx.moved = mark.moved.clone();
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
             c.state = state;
         }
@@ -3253,6 +3388,8 @@ impl<'a> Checker<'a> {
     ) -> Option<TStmt> {
         let mut assigned = HashSet::new();
         assigned_names(&body.stmts, &mut assigned);
+        let mut whole = HashSet::new();
+        whole_assigned_names(&body.stmts, &mut whole);
         let usize_ty = self.usize_ty();
         let mut before = Vec::new();
         // The range, and for `for x in xs`, the name of the sequence.
@@ -3340,7 +3477,9 @@ impl<'a> Checker<'a> {
         // the whole loop, so the index can be related to it.
         let unassigned = |cx: &FnCx, t: Term| {
             let local = &cx.locals[t.local()];
-            local.mutable_view() || !assigned.contains(&local.name)
+            local.mutable_view()
+                || !assigned.contains(&local.name)
+                || (local.ty.is_view() && !whole.contains(&local.name))
         };
         let (stmts, head, exits) = self.loop_body(cx, &body.stmts, Some(&for_index), |ck, cx| {
             // What the body knows about the loop variable.
@@ -3406,10 +3545,16 @@ impl<'a> Checker<'a> {
                 } else {
                     ck.expr(cx, &element, Some(*elem))
                 };
+                let value = value.filter(|v| ck.consume(cx, &v.expr, var.span).is_some());
                 let x = ck.declare(cx, &var.name, *elem, false);
-                if let Some(value) = value {
-                    ck.record_value(cx, x, &value);
-                    stmts.push(TStmt::Init(x, value.expr));
+                match value {
+                    Some(value) => {
+                        ck.record_value(cx, x, &value);
+                        stmts.push(TStmt::Init(x, value.expr));
+                    }
+                    None => {
+                        cx.failed.insert(x);
+                    }
                 }
             }
             stmts.extend(ck.block(cx, &body.stmts));
@@ -3668,7 +3813,8 @@ impl<'a> Checker<'a> {
                 self.expr(cx, &combined, Some(ty))?
             }
         };
-        let checked = self.coerce(checked, ty, value.span)?;
+        let checked = self.coerce(cx, checked, ty, value.span)?;
+        self.consume(cx, &checked.expr, value.span)?;
         // A field reached through fields only is a term, or a struct of them:
         // forget what was known about them, then learn their new values.
         // Anything under an index is in an array, which has no facts.
@@ -3743,7 +3889,7 @@ impl<'a> Checker<'a> {
     fn condition(&mut self, cx: &mut FnCx, e: &ast::Expr) -> (Option<TExpr>, facts::CondFacts) {
         match self
             .expr(cx, e, Some(Ty::Bool))
-            .and_then(|c| self.coerce(c, Ty::Bool, e.span))
+            .and_then(|c| self.coerce(cx, c, Ty::Bool, e.span))
         {
             Some(c) => {
                 let facts = c.facts.map(|f| *f).unwrap_or_default();
@@ -3904,6 +4050,11 @@ fn table_scalars(ty: Ty) -> u64 {
 }
 
 /// The range of values a type's integers can hold (`None` for non-integers).
+/// For a type parameter with a numeric bound, the values of every type
+/// the bound admits (see [`crate::types::ParamDef::values`]).
 fn type_range(ty: Ty) -> Option<Range> {
-    ty.as_int().map(|t| t.range())
+    match ty {
+        Ty::Param(_) => ty.as_param()?.values,
+        _ => ty.as_int().map(|t| t.range()),
+    }
 }

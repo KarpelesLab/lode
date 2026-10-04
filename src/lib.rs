@@ -2,11 +2,13 @@
 //!
 //! The pipeline: [`load`] (the root file and the packages it imports, each
 //! [`lex`]ed and [`parse`]d) → [`sema`] (types, `unsafe`, and proof
-//! obligations, over all the code) → [`lower`] (to LatticeFoundry IR, only the
-//! code `main` [`reach`]es) → LatticeFoundry's verify, optimize, codegen and
-//! link. The design of the language is in `docs/`.
+//! obligations, over all the code, generic bodies once) → [`lower`] (to
+//! LatticeFoundry IR, only the code `main` reaches: the instances [`mono`]
+//! makes) → LatticeFoundry's verify, optimize, codegen and link. The design
+//! of the language is in `docs/`.
 //!
-//! This is an early compiler: it supports functions, integers, `bool`, `str`,
+//! This is an early compiler: it supports functions, generic functions over
+//! the built-in traits, integers, `bool`, `str`,
 //! arrays and slices, structs, enums and `match`, optionals, raw pointers in
 //! `unsafe` code, constants, local variables, arithmetic, control flow
 //! (including `for` loops) and packages. Everything else in the design is
@@ -18,8 +20,8 @@ pub mod fmt;
 pub mod lex;
 pub mod load;
 pub mod lower;
+pub mod mono;
 pub mod parse;
-pub mod reach;
 pub mod sema;
 pub mod source;
 pub mod stack;
