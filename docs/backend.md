@@ -110,6 +110,14 @@ Lode is now Lode's own work.
 - **6502 and Z80** targets, for the legacy goal. Not started in LF; file an
   issue when Lode needs them.
 - **AArch64 position-independent code**: in progress in LF.
+- **Returning two registers.** Lode returns an enum, an optional or a
+  result of at most 64 bits packed in an `i64`: the tag in the low bits,
+  then the payload (the exact rule is at the top of `src/lower.rs`).
+  Larger ones, such as `throws(E) -> usize` or `?u64`, go through a slot
+  the caller passes. In LF `0.0.2` a struct return is memory on both
+  sides, and x86-64 has no `i128`, so neither returns two registers yet.
+  A slot isn't promoted to registers after inlining either
+  ([LF #13](https://github.com/KarpelesLab/latticefoundry/issues/13)).
 
 ### Resolved open questions in LF, from Lode's side
 - **Exceptions / unwinding:** Lode doesn't need unwinding. Errors are return
