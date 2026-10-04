@@ -1,0 +1,148 @@
+// stdout: (1, 9) (2, 1) (2, 5) (3, 0)\n
+// stdout: sorted true\n
+// stdout: low mid high\n
+// stdout: less greater equal\n
+// stdout: (1, 2) (3, 4)\n
+// stdout: 1 2\n
+package main
+
+import "std/io"
+import "std/math"
+import "std/slices"
+
+struct Point {
+	x: u8
+	y: u8
+}
+
+/// Points by `x`, then by `y`.
+impl Ordered for Point {
+	fn cmp(self, other: Point) -> Ordering {
+		let c = self.x.cmp(other.x)
+		if c != .equal {
+			return c
+		}
+		return self.y.cmp(other.y)
+	}
+}
+
+enum Level {
+	high
+	low
+	mid
+}
+
+fn Level.rank(self) -> u8 {
+	match self {
+		low => return 0
+		mid => return 1
+		high => return 2
+	}
+}
+
+/// `Ordered` with its own `lt`: the other comparisons come from `cmp`.
+impl Ordered for Level {
+	fn cmp(self, other: Self) -> Ordering {
+		return self.rank().cmp(other.rank())
+	}
+
+	fn lt(self, other: Self) -> bool {
+		return self.rank() < other.rank()
+	}
+}
+
+fn Level.name(self) -> str {
+	match self {
+		low => return "low"
+		mid => return "mid"
+		high => return "high"
+	}
+}
+
+/// A generic struct, `Ordered` when its parameter is.
+struct Pair[A] {
+	first: A
+	second: A
+}
+
+impl[A: Ordered] Ordered for Pair[A] {
+	fn cmp(self, other: Self) -> Ordering {
+		let c = self.first.cmp(other.first)
+		if c != .equal {
+			return c
+		}
+		return self.second.cmp(other.second)
+	}
+}
+
+fn show(p: Point) {
+	io.print("(")
+	io.print_int(p.x)
+	io.print(", ")
+	io.print_int(p.y)
+	io.print(")")
+}
+
+fn order_name(o: Ordering) -> str {
+	match o {
+		less => return "less"
+		equal => return "equal"
+		greater => return "greater"
+	}
+}
+
+fn main() {
+	var ps = [Point{x: 2, y: 5}, Point{x: 3, y: 0}, Point{x: 1, y: 9}, Point{x: 2, y: 1}]
+	slices.sort(&ps)
+	for i in 0..ps.len {
+		if i > 0 {
+			io.print(" ")
+		}
+		show(ps[i])
+	}
+	io.print("\n")
+	io.print("sorted ")
+	if slices.is_sorted(ps) {
+		io.print("true\n")
+	} else {
+		io.print("false\n")
+	}
+
+	var ls = [Level.high, Level.low, Level.mid]
+	slices.sort(&ls)
+	io.print(ls[0].name())
+	io.print(" ")
+	io.print(ls[1].name())
+	io.print(" ")
+	io.print(ls[2].name())
+	io.print("\n")
+
+	let a = Point{x: 1, y: 2}
+	let b = Point{x: 1, y: 3}
+	io.print(order_name(a.cmp(b)))
+	io.print(" ")
+	io.print(order_name(Ordered.cmp(b, a)))
+	io.print(" ")
+	io.print(order_name(a.cmp(a)))
+	io.print("\n")
+
+	show(math.min(b, a))
+	io.print(" ")
+	show(math.max(a, Point{x: 3, y: 4}))
+	io.print("\n")
+
+	let p = Pair{first: Point{x: 1, y: 1}, second: Point{x: 0, y: 0}}
+	let q = Pair{first: Point{x: 1, y: 1}, second: Point{x: 0, y: 1}}
+	var n: u8 = 0
+	if p.lt(q) {
+		n = n + 1
+	}
+	if q.ge(p) && !q.le(p) {
+		n = n + 1
+	}
+	let lo = math.min(Pair{first: 9, second: 9}, Pair[u8]{first: 1, second: 200})
+	io.print_int(lo.first)
+	io.print(" ")
+	io.print_int(n)
+	io.print("\n")
+}

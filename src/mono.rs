@@ -182,12 +182,18 @@ impl Mono<'_> {
         };
         // A method of a generic type has the type's arguments after the
         // type's name: `std/buf.StackBuf[64].push`.
+        // A method of an `impl` names its trait after the method:
+        // `main.Pair[u8].cmp<Ordered>`.
         let (owner, own) = args.split_at(f.owner_params);
         let mut symbol = f.symbol.clone();
+        let (base, suffix) = match f.symbol.find('<') {
+            Some(k) => f.symbol.split_at(k),
+            None => (f.symbol.as_str(), ""),
+        };
         if !owner.is_empty()
-            && let Some((ty, method)) = f.symbol.rsplit_once('.')
+            && let Some((ty, method)) = base.rsplit_once('.')
         {
-            symbol = format!("{ty}[{}].{method}", names(owner));
+            symbol = format!("{ty}[{}].{method}{suffix}", names(owner));
         }
         if !own.is_empty() {
             symbol = format!("{symbol}[{}]", names(own));
@@ -208,8 +214,12 @@ impl Mono<'_> {
             .iter()
             .map(|&(p, local)| {
                 let ty = f.locals[local].ty;
-                let v = map(p)
-                    .and_then(Ty::as_value)
+                // A value parameter, or an associated constant of a type
+                // parameter (`E.MAX_LEN`), which the type argument's impl
+                // gives.
+                let v = p
+                    .subst(&map)
+                    .as_value()
                     .expect("a value argument for each value parameter");
                 TStmt::Init(
                     local,
@@ -252,10 +262,18 @@ impl Mono<'_> {
 
     fn expr(&mut self, e: &mut TExpr, map: &impl Fn(Ty) -> Option<Ty>) {
         e.ty = e.ty.subst(map);
+        // `a.lt(b)` of a type that implements `Ordered` with an `impl`.
+        if let TExprKind::Compare(a, _) | TExprKind::Binary(_, a, _) = &e.kind
+            && let Some(call) = self.program.dispatch.ordered_expr(e, a.ty.subst(map))
+        {
+            *e = call;
+        }
         match &mut e.kind {
             TExprKind::GenericCall(f, types, args) => {
-                let types = types.iter().map(|t| t.subst(map)).collect();
-                let id = self.instance(*f, types);
+                let types: Vec<Ty> = types.iter().map(|t| t.subst(map)).collect();
+                // A trait's method runs the method of `Self`'s impl.
+                let (f, types) = self.program.dispatch.resolve(*f, &types);
+                let id = self.instance(f, types);
                 self.root_called |= Some(id) == self.root;
                 e.kind = TExprKind::Call(id, std::mem::take(args));
             }

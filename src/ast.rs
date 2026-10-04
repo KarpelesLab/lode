@@ -37,6 +37,82 @@ pub enum Item {
     /// declarations around it are compiled (in a taken branch of an
     /// `if comptime`, or at all). The call expression.
     CompileError(Expr),
+    /// `trait Name: Super { ... }`
+    Trait(TraitDecl),
+    /// `impl Trait for Type { ... }`
+    Impl(ImplDecl),
+}
+
+/// A trait named in a bound or an `impl`: `Ordered`, or `io.Writer` for a
+/// trait of another package.
+#[derive(Clone, Debug)]
+pub struct Bound {
+    pub pkg: Option<Ident>,
+    pub name: Ident,
+}
+
+impl Bound {
+    pub fn span(&self) -> Span {
+        match &self.pkg {
+            Some(p) => p.span.to(self.name.span),
+            None => self.name.span,
+        }
+    }
+
+    /// How it's written: `Ordered`, `io.Writer`.
+    pub fn text(&self) -> String {
+        match &self.pkg {
+            Some(p) => format!("{}.{}", p.name, self.name.name),
+            None => self.name.name.clone(),
+        }
+    }
+}
+
+/// `trait Name: Super + Other { item ... }`, one item per line.
+#[derive(Debug)]
+pub struct TraitDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub supers: Vec<Bound>,
+    pub items: Vec<TraitItem>,
+    pub span: Span,
+}
+
+/// An item of a trait.
+#[derive(Debug)]
+pub enum TraitItem {
+    /// `fn name(self, ...) -> T`: a required method (or associated
+    /// function, without `self`); with a body, a default one. Without a
+    /// body, the declaration's body is empty and `default` is false.
+    Method { decl: Box<FnDecl>, default: bool },
+    /// `type Name: Bound + Other`: an associated type.
+    Type { name: Ident, bounds: Vec<Bound> },
+    /// `const NAME: T`: an associated constant.
+    Const { name: Ident, ty: TypeExpr },
+}
+
+/// `impl[A: Bound] Trait for Type[A] { item ... }`.
+#[derive(Debug)]
+pub struct ImplDecl {
+    /// The generic parameters: one per parameter of a generic type.
+    pub generics: Vec<GenericParam>,
+    pub trait_: Bound,
+    pub ty: TypeExpr,
+    pub items: Vec<ImplItem>,
+    pub span: Span,
+}
+
+/// An item of an `impl`.
+#[derive(Debug)]
+pub enum ImplItem {
+    Method(FnDecl),
+    /// `type Name = T`.
+    Type {
+        name: Ident,
+        ty: TypeExpr,
+    },
+    /// `const NAME: T = value`.
+    Const(ConstDecl),
 }
 
 /// `if comptime cond { ... } else ...` at package level.
@@ -128,7 +204,7 @@ pub struct FnDecl {
 #[derive(Debug)]
 pub struct GenericParam {
     pub name: Ident,
-    pub bounds: Vec<Ident>,
+    pub bounds: Vec<Bound>,
 }
 
 /// The `throws` clause of a function: `throws(E)` names the error type,

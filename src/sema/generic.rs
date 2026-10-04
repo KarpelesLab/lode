@@ -288,7 +288,7 @@ impl Checker<'_> {
                 declared.push(Vec::new());
                 continue;
             }
-            let traits = self.bound_traits(g);
+            let traits = self.bound_traits(cx, g);
             let ty = Ty::new_param(name.clone(), Bounds::new(&traits), self.ptr_bits);
             self.declared_bounds.insert(ty, traits.clone());
             out.push(ty);
@@ -306,6 +306,7 @@ impl Checker<'_> {
     /// declaration (reported).
     pub(super) fn declare_owner_generics(
         &mut self,
+        cx: &FnCx,
         owner: Ty,
         generics: &[ast::GenericParam],
         span: Span,
@@ -355,7 +356,7 @@ impl Checker<'_> {
                 let written = match &g.bounds[..] {
                     [] => true,
                     [b] => matches!(
-                        primitive(&b.name, self.ptr_bits),
+                        primitive(&b.name.name, self.ptr_bits),
                         Some(Primitive::Ty(Ty::Int(t))) if t == it
                     ),
                     _ => false,
@@ -376,7 +377,7 @@ impl Checker<'_> {
                 continue;
             }
             let mut traits = self.declared_bounds.get(&p).cloned().unwrap_or_default();
-            for t in self.bound_traits(g) {
+            for t in self.bound_traits(cx, g) {
                 if !traits.contains(&t) {
                     traits.push(t);
                 }
@@ -417,7 +418,12 @@ impl Checker<'_> {
     /// `Some` with its type, or `Some(None)` if it's in error (reported).
     /// `None` for a type parameter.
     fn value_param_type(&mut self, g: &ast::GenericParam) -> Option<Option<IntTy>> {
-        let prim = |b: &ast::Ident| primitive(&b.name, self.ptr_bits);
+        let prim = |b: &ast::Bound| {
+            b.pkg
+                .is_none()
+                .then(|| primitive(&b.name.name, self.ptr_bits))
+                .flatten()
+        };
         let first = g.bounds.iter().position(|b| prim(b).is_some())?;
         let b = &g.bounds[first];
         let name = &g.name.name;
@@ -426,7 +432,7 @@ impl Checker<'_> {
             Some(Primitive::Ty(Ty::Int(it))) => {
                 self.diags.push(
                     Diagnostic::error(
-                        b.span,
+                        b.span(),
                         format!("the value parameter `{name}` has a type, not bounds"),
                     )
                     .with_help(format!("write `{name}: {it}`")),
@@ -436,10 +442,10 @@ impl Checker<'_> {
             _ => {
                 self.diags.push(
                     Diagnostic::error(
-                        b.span,
+                        b.span(),
                         format!(
                             "a value parameter of type `{}` is not supported by the compiler yet",
-                            b.name
+                            b.name.name
                         ),
                     )
                     .with_help("a value parameter is an integer: `[N: usize]`"),
@@ -451,19 +457,13 @@ impl Checker<'_> {
 
     /// The traits a type parameter's bounds name (each unknown one is
     /// reported), without both `Unsigned` and `Signed`.
-    fn bound_traits(&mut self, g: &ast::GenericParam) -> Vec<Trait> {
+    fn bound_traits(&mut self, cx: &FnCx, g: &ast::GenericParam) -> Vec<Trait> {
         let mut traits = Vec::new();
         for b in &g.bounds {
-            match Trait::from_name(&b.name) {
-                Some(t) => traits.push(t),
-                None => {
-                    self.diags.push(
-                        Diagnostic::error(b.span, format!("`{}` is not a built-in trait", b.name))
-                            .with_help(
-                                "the bounds are `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and `Signed`; traits declared in Lode come later (docs/generics.md, M7c)",
-                            ),
-                    );
-                }
+            if let Some(t) = self.resolve_bound(cx.pkg, cx.file, b)
+                && !traits.contains(&t)
+            {
+                traits.push(t);
             }
         }
         if traits.contains(&Trait::Unsigned) && traits.contains(&Trait::Signed) {
@@ -718,6 +718,13 @@ impl Checker<'_> {
     ) -> bool {
         let def = p.as_param().expect("a type parameter");
         let missing = declared.iter().find(|&&t| !arg.satisfies(t)).copied();
+        let missing = missing.or_else(|| {
+            // A supertrait the argument lacks (its own impl is reported).
+            declared
+                .iter()
+                .flat_map(|t| t.with_supers())
+                .find(|&t| !arg.satisfies(t))
+        });
         let Some(t) = missing else {
             return true;
         };
@@ -735,10 +742,21 @@ impl Checker<'_> {
             ));
         } else if t == Trait::Copy {
             d = d.with_help(format!("`{arg}` holds a value that isn't `Copy`"));
-        } else if t == Trait::Ordered && matches!(arg, Ty::Struct(_) | Ty::Enum(_)) {
+        } else if t == Trait::Eq {
             d = d.with_help(format!(
-                "`impl Ordered for {arg}` is not supported by the compiler yet (docs/generics.md, M7c)"
+                "`{arg}` holds a value that isn't `Eq`: equality is derived from the fields"
             ));
+        } else if matches!(t, Trait::Integer | Trait::Unsigned | Trait::Signed) {
+            d = d.with_help(format!("only integer types implement `{t}`"));
+        } else if matches!(arg, Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool) {
+            let decl = arg.decl();
+            d = d.with_help(match crate::types::find_impl(t, arg) {
+                Some(_) => format!(
+                    "`impl {t} for {}` requires bounds of `{arg}`'s arguments that they don't satisfy",
+                    super::expr::nominal_name(decl)
+                ),
+                None => format!("add `impl {t} for {arg}`"),
+            });
         }
         self.diags.push(d);
         false

@@ -1,0 +1,141 @@
+// stdout: 12 6 3\n
+// stdout: square 4 circle 3\n
+// stdout: 14 9\n
+// stdout: 2 1 2\n
+package main
+
+import "std/io"
+
+trait Shape {
+	fn area(self) -> u32
+
+	fn name(self) -> str {
+		return "shape"
+	}
+
+	/// A default method calls the required one.
+	fn double_area(self) -> u32 {
+		return self.area() *| 2
+	}
+}
+
+struct Rect {
+	w: u32
+	h: u32
+}
+
+enum Figure {
+	square(side: u32)
+	circle(r: u32)
+}
+
+impl Shape for Rect {
+	fn area(self) -> u32 {
+		return self.w *| self.h
+	}
+}
+
+impl Shape for Figure {
+	fn area(self) -> u32 {
+		match self {
+			square(s) => return s *| s
+			circle(r) => return r *| r *| 3
+		}
+	}
+
+	fn name(self) -> str {
+		match self {
+			square(_) => return "square"
+			circle(_) => return "circle"
+		}
+	}
+}
+
+/// A generic function bounded by a user trait.
+fn total[T: Shape](xs: []T) -> u32 {
+	var sum: u32 = 0
+	for i in 0..xs.len {
+		sum = sum +| xs[i].area()
+	}
+	return sum
+}
+
+fn describe[T: Shape](x: T) {
+	io.print(x.name())
+	io.print(" ")
+	io.print_int(x.area())
+}
+
+/// An associated function and a supertrait.
+trait Named {
+	fn label(self) -> u8
+}
+
+trait Counter: Named {
+	fn zero() -> Self
+	fn bump(inout self)
+}
+
+struct Tally {
+	n: u8
+}
+
+impl Named for Tally {
+	fn label(self) -> u8 {
+		return self.n
+	}
+}
+
+impl Counter for Tally {
+	fn zero() -> Tally {
+		return Tally{n: 0}
+	}
+
+	fn bump(inout self) {
+		self.n = self.n +| 1
+	}
+}
+
+fn count_to[C: Counter + Copy](n: u8) -> C {
+	var c = C.zero()
+	for _ in 0..n {
+		c.bump()
+	}
+	return c
+}
+
+fn show_label[C: Counter](c: C) {
+	io.print_int(c.label())
+}
+
+fn main() {
+	let r = Rect{w: 3, h: 2}
+	io.print_int(r.double_area())
+	io.print(" ")
+	io.print_int(r.area())
+	io.print(" ")
+	let rs = [Rect{w: 1, h: 1}, Rect{w: 1, h: 2}]
+	io.print_int(total(rs))
+	io.print("\n")
+
+	describe(Figure.square(2))
+	io.print(" ")
+	describe(Figure.circle(1))
+	io.print("\n")
+
+	let fs = [Figure.square(2), Figure.circle(1), Figure.square(1), Figure.circle(1)]
+	io.print_int(total(fs) +| total(rs))
+	io.print(" ")
+	io.print_int(Shape.area(Figure.circle(1)) +| Shape.area(r))
+	io.print("\n")
+
+	let c: Tally = count_to(2)
+	show_label(c)
+	io.print(" ")
+	var t = Tally.zero()
+	t.bump()
+	show_label(t)
+	io.print(" ")
+	io.print_int(count_to[Tally](2).label())
+	io.print("\n")
+}

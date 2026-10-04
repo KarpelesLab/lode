@@ -26,6 +26,15 @@ struct Failed;
 
 type PResult<T> = Result<T, Failed>;
 
+/// Where a function is declared: at package level, or in a trait or an
+/// `impl`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Member {
+    No,
+    Trait,
+    Impl,
+}
+
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -274,9 +283,13 @@ impl Parser {
             Tok::Kw(Kw::Const) => self.const_decl(is_pub, start).map(Item::Const),
             Tok::Kw(Kw::Struct) => self.struct_decl(is_pub, start).map(Item::Struct),
             Tok::Kw(Kw::Enum) => self.enum_decl(is_pub, start).map(Item::Enum),
-            Tok::Kw(
-                kw @ (Kw::Trait | Kw::Impl | Kw::Type | Kw::Alias | Kw::Static | Kw::Unsafe),
-            ) => self.error(
+            Tok::Kw(Kw::Trait) => self.trait_decl(is_pub, start).map(Item::Trait),
+            Tok::Kw(Kw::Impl) if is_pub => self.error(
+                start,
+                "an `impl` is not marked `pub`: it's visible wherever its trait and type are",
+            ),
+            Tok::Kw(Kw::Impl) => self.impl_decl(start).map(Item::Impl),
+            Tok::Kw(kw @ (Kw::Type | Kw::Alias | Kw::Static | Kw::Unsafe)) => self.error(
                 self.span(),
                 format!(
                     "`{}` declarations are not supported by the compiler yet",
@@ -495,6 +508,20 @@ impl Parser {
     }
 
     fn fn_decl(&mut self, is_pub: bool, is_unsafe: bool, start: Span) -> PResult<FnDecl> {
+        self.fn_decl_in(is_pub, is_unsafe, start, Member::No)
+            .map(|(f, _)| f)
+    }
+
+    /// A function declaration, at package level or as a `member` of a
+    /// trait or an `impl` (`fn name(self, ...)`, whose `self` is `Self`).
+    /// In a trait, the body may be left out: the result says if it's there.
+    fn fn_decl_in(
+        &mut self,
+        is_pub: bool,
+        is_unsafe: bool,
+        start: Span,
+        member: Member,
+    ) -> PResult<(FnDecl, bool)> {
         self.bump(); // fn
         let mut name = self.ident("a function name")?;
         let mut generics = if self.at_p(P::LBracket) {
@@ -507,7 +534,27 @@ impl Parser {
         // which the checker rejects.
         let mut owner = None;
         let mut owner_generics = Vec::new();
-        if self.eat_p(P::Dot) {
+        if member != Member::No && self.at_p(P::Dot) {
+            return self.error(
+                self.span(),
+                format!(
+                    "a method in {} is declared without its type: `fn {}(self, ...)`",
+                    if member == Member::Trait {
+                        "a trait"
+                    } else {
+                        "an `impl`"
+                    },
+                    name.name
+                ),
+            );
+        }
+        let self_ty = TypeExpr::Named(Ident {
+            name: "Self".to_owned(),
+            span: name.span,
+        });
+        if member != Member::No {
+            owner = Some(self_ty);
+        } else if self.eat_p(P::Dot) {
             let member = self.ident("a method name")?;
             if generics.is_empty() && self.eat_p(P::Dot) {
                 let method = self.ident("a method name")?;
@@ -579,20 +626,193 @@ impl Parser {
                 );
             }
         }
-        let body = self.block()?;
-        Ok(FnDecl {
+        // A trait's required method has no body.
+        let has_body = member != Member::Trait || self.at_p(P::LBrace);
+        let body = if has_body {
+            self.block()?
+        } else {
+            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                return self.expected("a body `{ ... }` or a new line after the method");
+            }
+            Block {
+                stmts: Vec::new(),
+                span: self.prev_span(),
+            }
+        };
+        Ok((
+            FnDecl {
+                is_pub,
+                is_unsafe,
+                owner: if member == Member::No { owner } else { None },
+                owner_generics,
+                name,
+                generics,
+                params,
+                throws,
+                ret,
+                span: start.to(body.span),
+                body,
+            },
+            has_body,
+        ))
+    }
+
+    /// `trait Name: Super + Other { item ... }`: methods (with or without
+    /// a body), `type Name: Bounds` and `const NAME: T`, one per line.
+    fn trait_decl(&mut self, is_pub: bool, start: Span) -> PResult<TraitDecl> {
+        self.bump(); // trait
+        let name = self.ident("a trait name")?;
+        if self.at_p(P::LBracket) {
+            return self.error(
+                self.span(),
+                "generic traits are not supported by the compiler yet",
+            );
+        }
+        let supers = if self.eat_p(P::Colon) {
+            self.bounds()?
+        } else {
+            Vec::new()
+        };
+        self.expect_p(P::LBrace)?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBrace) {
+                break;
+            }
+            let istart = self.span();
+            if self.at_kw(Kw::Pub) {
+                return self.error(
+                    self.span(),
+                    "the items of a trait are as visible as the trait: they're not marked `pub`",
+                );
+            }
+            let item = match self.peek() {
+                Tok::Kw(Kw::Fn) => {
+                    let (decl, default) = self.fn_decl_in(false, false, istart, Member::Trait)?;
+                    TraitItem::Method {
+                        decl: Box::new(decl),
+                        default,
+                    }
+                }
+                Tok::Kw(Kw::Type) => {
+                    self.bump();
+                    let name = self.ident("an associated type name")?;
+                    let bounds = if self.eat_p(P::Colon) {
+                        self.bounds()?
+                    } else {
+                        Vec::new()
+                    };
+                    TraitItem::Type { name, bounds }
+                }
+                Tok::Kw(Kw::Const) => {
+                    self.bump();
+                    let name = self.ident("an associated constant name")?;
+                    self.expect_p(P::Colon)?;
+                    let ty = self.type_expr()?;
+                    TraitItem::Const { name, ty }
+                }
+                _ => return self.expected("`fn`, `type`, `const` or `}`"),
+            };
+            items.push(item);
+            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                return self.expected("a new line after the item");
+            }
+        }
+        let end = self.bump().span;
+        Ok(TraitDecl {
             is_pub,
-            is_unsafe,
-            owner,
-            owner_generics,
             name,
-            generics,
-            params,
-            throws,
-            ret,
-            span: start.to(body.span),
-            body,
+            supers,
+            items,
+            span: start.to(end),
         })
+    }
+
+    /// `impl[A: Bound] Trait for Type[A] { item ... }`: methods, `type Name
+    /// = T` and `const NAME: T = value`, one per line.
+    fn impl_decl(&mut self, start: Span) -> PResult<ImplDecl> {
+        self.bump(); // impl
+        let generics = if self.at_p(P::LBracket) {
+            self.generic_params()?
+        } else {
+            Vec::new()
+        };
+        let trait_ = self.bound()?;
+        if !self.eat_kw(Kw::For) {
+            return self.expected("`for` and the type: `impl Trait for Type`");
+        }
+        let ty = self.type_expr()?;
+        self.expect_p(P::LBrace)?;
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBrace) {
+                break;
+            }
+            let istart = self.span();
+            if self.at_kw(Kw::Pub) {
+                return self.error(
+                    self.span(),
+                    "the items of an `impl` are as visible as the trait: they're not marked `pub`",
+                );
+            }
+            let item = match self.peek() {
+                Tok::Kw(Kw::Fn) => {
+                    let (decl, _) = self.fn_decl_in(false, false, istart, Member::Impl)?;
+                    ImplItem::Method(decl)
+                }
+                Tok::Kw(Kw::Type) => {
+                    self.bump();
+                    let name = self.ident("an associated type name")?;
+                    self.expect_p(P::Eq)?;
+                    let ty = self.type_expr()?;
+                    ImplItem::Type { name, ty }
+                }
+                Tok::Kw(Kw::Const) => ImplItem::Const(self.const_decl(false, istart)?),
+                _ => return self.expected("`fn`, `type`, `const` or `}`"),
+            };
+            items.push(item);
+            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                return self.expected("a new line after the item");
+            }
+        }
+        let end = self.bump().span;
+        Ok(ImplDecl {
+            generics,
+            trait_,
+            ty,
+            items,
+            span: start.to(end),
+        })
+    }
+
+    /// A trait in a bound: `Ordered` or `io.Writer`.
+    fn bound(&mut self) -> PResult<Bound> {
+        let first = self.ident("a trait")?;
+        if self.eat_p(P::Dot) {
+            let name = self.ident("a trait name")?;
+            return Ok(Bound {
+                pkg: Some(first),
+                name,
+            });
+        }
+        Ok(Bound {
+            pkg: None,
+            name: first,
+        })
+    }
+
+    /// Traits joined with `+`: `Ordered + Copy`.
+    fn bounds(&mut self) -> PResult<Vec<Bound>> {
+        let mut bounds = Vec::new();
+        loop {
+            bounds.push(self.bound()?);
+            if !self.eat_p(P::Plus) {
+                break;
+            }
+        }
+        Ok(bounds)
     }
 
     /// The type parameters of a generic function: `[T: Ordered + Copy, U]`.
@@ -605,15 +825,11 @@ impl Parser {
                 break;
             }
             let name = self.ident("a type parameter name")?;
-            let mut bounds = Vec::new();
-            if self.eat_p(P::Colon) {
-                loop {
-                    bounds.push(self.ident("a trait")?);
-                    if !self.eat_p(P::Plus) {
-                        break;
-                    }
-                }
-            }
+            let bounds = if self.eat_p(P::Colon) {
+                self.bounds()?
+            } else {
+                Vec::new()
+            };
             params.push(GenericParam { name, bounds });
             self.skip_newlines();
             if !self.eat_p(P::Comma) {
@@ -2019,7 +2235,7 @@ mod tests {
         let bounds: Vec<&str> = max.generics[0]
             .bounds
             .iter()
-            .map(|b| b.name.as_str())
+            .map(|b| b.name.name.as_str())
             .collect();
         assert_eq!(bounds, ["Ordered", "Copy"]);
         assert!(max.generics[1].bounds.is_empty());
@@ -2148,7 +2364,7 @@ mod tests {
 
     #[test]
     fn reports_and_recovers() {
-        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntrait S {}\n");
+        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntype S = u8\n");
         assert_eq!(errs.len(), 3, "{errs:?}");
         assert!(errs[1].contains("chained"));
         assert!(errs[2].contains("not supported"));

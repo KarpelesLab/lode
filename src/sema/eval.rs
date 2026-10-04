@@ -445,6 +445,12 @@ impl Eval<'_, '_> {
     }
 
     fn expr(&mut self, frame: &mut Frame, e: &TExpr) -> R<Value> {
+        // `a.lt(b)` of a type that implements `Ordered` with an `impl`.
+        if let TExprKind::Compare(a, _) | TExprKind::Binary(_, a, _) = &e.kind
+            && let Some(call) = self.ck.dispatch.ordered_expr(e, frame.ty(a.ty))
+        {
+            return self.expr(frame, &call);
+        }
         Ok(match &e.kind {
             TExprKind::Int(v) => Value::Int(*v),
             TExprKind::Bool(b) => Value::Bool(*b),
@@ -462,8 +468,10 @@ impl Eval<'_, '_> {
             },
             TExprKind::Call(f, args) => self.call(frame, *f, Vec::new(), args)?,
             TExprKind::GenericCall(f, types, args) => {
-                let types = types.iter().map(|&t| frame.ty(t)).collect();
-                self.call(frame, *f, types, args)?
+                let types: Vec<Ty> = types.iter().map(|&t| frame.ty(t)).collect();
+                // A trait's method runs the method of `Self`'s impl.
+                let (f, types) = self.ck.dispatch.resolve(*f, &types);
+                self.call(frame, f, types, args)?
             }
             TExprKind::Compare(a, b) => {
                 let (a, b) = (self.expr(frame, a)?.int(), self.expr(frame, b)?.int());

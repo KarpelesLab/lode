@@ -1,10 +1,8 @@
-// error: `trait` declarations are not supported by the compiler yet
+// error: `type` declarations are not supported by the compiler yet
 // error: `uses` clauses are not supported by the compiler yet
 package main
 
-trait Shape {
-	area
-}
+type Meters = u32
 
 fn parse() uses alloc -> u32 {
 	return 0

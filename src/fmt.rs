@@ -569,9 +569,10 @@ fn space_before(prev: &Prev, cur: &TokInfo<'_>, cur_unary: bool) -> bool {
             );
         }
         Tok::P(P::LBracket) => {
+            // `impl[T: Ordered]`: an impl's generic parameters.
             return !matches!(
                 prev.tok,
-                Tok::Ident(_) | Tok::Str(_) | Tok::P(P::RParen | P::RBracket)
+                Tok::Ident(_) | Tok::Str(_) | Tok::Kw(Kw::Impl) | Tok::P(P::RParen | P::RBracket)
             );
         }
         Tok::P(P::LBrace) => return !cur.literal,

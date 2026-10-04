@@ -8,6 +8,7 @@ mod eval;
 mod expr;
 pub mod facts;
 mod generic;
+mod traits;
 pub mod tree;
 
 use std::collections::{HashMap, HashSet};
@@ -48,6 +49,12 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         const_exprs: Vec::new(),
         declaring: true,
         package_error: false,
+        traits: Vec::new(),
+        trait_index: HashMap::new(),
+        impls: Vec::new(),
+        impl_methods: HashMap::new(),
+        members: HashMap::new(),
+        dispatch: Dispatch::default(),
     };
     ck.collect(packages);
     ck.declaring = false;
@@ -59,6 +66,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
             main: None,
             packages: packages.iter().map(|p| p.path.clone()).collect(),
             warnings: Vec::new(),
+            dispatch: Dispatch::default(),
         };
         return (program, ck.diags);
     }
@@ -119,6 +127,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         main,
         packages: packages.iter().map(|p| p.path.clone()).collect(),
         warnings: Vec::new(),
+        dispatch: ck.dispatch,
     };
     (program, ck.diags)
 }
@@ -129,6 +138,8 @@ enum Item {
     Const(usize),
     /// A struct or an enum type.
     Type(Ty),
+    /// A trait declared in Lode.
+    Trait(Trait),
 }
 
 struct PkgInfo {
@@ -161,6 +172,12 @@ struct Sig {
     type_params: Vec<Ty>,
     bounds: Vec<Vec<Trait>>,
     owner_params: usize,
+    /// For a method of a trait or an `impl`: what `Self` is in it (the
+    /// trait's type parameter, or the impl's type).
+    self_ty: Option<Ty>,
+    /// The name in its symbol, after the package's path, when it's not
+    /// `name`: a method of an `impl` names its trait (`Point.area<main.Shape>`).
+    symbol_name: Option<String>,
 }
 
 /// The value of a checked constant.
@@ -244,6 +261,18 @@ struct Checker<'a> {
     /// Whether a package-level `compile_error` was reached: the program
     /// isn't checked further.
     package_error: bool,
+    /// The traits declared in Lode, and the index of each by trait.
+    traits: Vec<traits::TraitInfo<'a>>,
+    trait_index: HashMap<Trait, usize>,
+    /// The `impl` blocks.
+    impls: Vec<traits::ImplInfo<'a>>,
+    /// The methods the impls give each named type (in its declared form),
+    /// by name, with their traits: an impl's own, or a trait's default.
+    impl_methods: HashMap<(Ty, String), Vec<(Trait, FuncId)>>,
+    /// The functions declared in traits and impls.
+    members: HashMap<FuncId, traits::Member>,
+    /// What calls of trait methods run (see [`Dispatch`]).
+    dispatch: Dispatch,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -303,6 +332,12 @@ struct FnCx {
     /// compile-time code): an operation that isn't proven is wrapped in an
     /// [`TExprKind::Unproven`] instead of being an error.
     comptime: bool,
+    /// In a trait or an `impl`: what `Self` names.
+    self_ty: Option<Ty>,
+    /// While a trait's or an impl's method's signature is resolved: the
+    /// generic parameters it gets from the trait (`Self`) or the impl, and
+    /// their bounds.
+    member: Option<(Vec<Ty>, Vec<Vec<Trait>>)>,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -367,6 +402,8 @@ impl FnCx {
             value_locals: Vec::new(),
             moved: HashSet::new(),
             comptime: false,
+            self_ty: None,
+            member: None,
         }
     }
 
@@ -396,6 +433,9 @@ const MATCHED: &str = "$match";
 
 /// The return type of a function that doesn't return.
 const NEVER: &str = "never";
+
+/// The type implementing the trait, in a trait or an `impl`.
+const SELF: &str = "Self";
 
 /// `compile_error("message")`: an error where it's reached.
 const COMPILE_ERROR: &str = "compile_error";
@@ -1093,6 +1133,7 @@ impl<'a> Checker<'a> {
         let mut fns = Vec::new();
         let mut structs = Vec::new();
         let mut enums = Vec::new();
+        let mut file_items = Vec::new();
         for (pkg, package) in packages.iter().enumerate() {
             self.pkgs.push(PkgInfo {
                 path: package.path.clone(),
@@ -1120,8 +1161,76 @@ impl<'a> Checker<'a> {
 
                 let mut items = Vec::new();
                 self.active_items(&file.items, &mut items);
+                // Traits first, so every bound can name them.
+                self.declare_trait_names(&items, pkg, file.id, |n| {
+                    Self::shown_name(packages, pkg, n)
+                });
+                file_items.push((pkg, file, items));
+            }
+        }
+        if !self.package_error {
+            self.declare_trait_items();
+        }
+        for (pkg, file, items) in file_items {
+            {
                 for item in items {
                     let (name, entry) = match item {
+                        ast::Item::Trait(t) => {
+                            let k = self
+                                .traits
+                                .iter()
+                                .position(|i| std::ptr::eq(i.decl, t))
+                                .expect("a declared trait");
+                            for item in &t.items {
+                                if let ast::TraitItem::Method { decl, default } = item {
+                                    let id = fns.len();
+                                    fns.push((&**decl, pkg, file.id));
+                                    self.members.insert(id, traits::Member::Trait(k, *default));
+                                    self.traits[k].methods.push((
+                                        decl.name.name.clone(),
+                                        id,
+                                        *default,
+                                    ));
+                                    self.dispatch.trait_fns.insert(
+                                        id,
+                                        (self.traits[k].trait_, decl.name.name.clone()),
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                        ast::Item::Impl(i) => {
+                            let k = self.impls.len();
+                            let mut methods = Vec::new();
+                            for item in &i.items {
+                                if let ast::ImplItem::Method(decl) = item {
+                                    let id = fns.len();
+                                    fns.push((decl, pkg, file.id));
+                                    self.members.insert(id, traits::Member::Impl(k));
+                                    if methods.iter().any(|(n, _)| *n == decl.name.name) {
+                                        self.error(
+                                            decl.name.span,
+                                            format!(
+                                                "`{}` is defined more than once in this `impl`",
+                                                decl.name.name
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                    methods.push((decl.name.name.clone(), id));
+                                }
+                            }
+                            self.impls.push(traits::ImplInfo {
+                                decl: i,
+                                pkg,
+                                file: file.id,
+                                head: None,
+                                params: Vec::new(),
+                                bounds: Vec::new(),
+                                methods,
+                            });
+                            continue;
+                        }
                         // Methods and associated functions are found
                         // through their type, once types are known.
                         ast::Item::Fn(f) if f.owner.is_some() => {
@@ -1199,6 +1308,9 @@ impl<'a> Checker<'a> {
             .chain(enums.iter().map(|&(e, _, _, ty)| (&e.name, "enum", ty)))
             .collect();
         self.check_recursion(&nominal);
+        // The impls are registered before the bounds are checked: an impl
+        // can make a type satisfy one.
+        self.declare_impls();
         for (ty, span) in self.pending_bounds.take().unwrap_or_default() {
             self.check_type_bounds(ty, span);
         }
@@ -1210,11 +1322,18 @@ impl<'a> Checker<'a> {
                 .and_then(|o| self.method_owner(o, &f.name, id, pkg, file));
             owners.push(owner);
         }
-        for (&(f, pkg, file), owner) in fns.iter().zip(owners) {
-            let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
-            let sig = self.signature(&mut cx, f, owner);
+        for (id, (&(f, pkg, file), owner)) in fns.iter().zip(owners).enumerate() {
+            let sig = match self.members.get(&id) {
+                Some(&traits::Member::Trait(k, _)) => self.trait_method_sig(f, k),
+                Some(&traits::Member::Impl(k)) => self.impl_method_sig(f, k),
+                None => {
+                    let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+                    self.signature(&mut cx, f, owner)
+                }
+            };
             self.sigs.push(sig);
         }
+        self.check_impls();
         self.func_states = fns.iter().map(|_| FuncState::Unchecked).collect();
         self.fn_decls = fns;
     }
@@ -1923,6 +2042,10 @@ impl<'a> Checker<'a> {
                 }
             },
             TypeExpr::Qualified(pkg_name, name) => {
+                // `E.Rune`, `Self.Rune`: an associated type.
+                if let Some(base) = self.type_base(cx, &pkg_name.name) {
+                    return self.assoc_type(base, name);
+                }
                 let Some(pkg) = self
                     .imports
                     .get(&cx.file)
@@ -1946,6 +2069,16 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            TypeExpr::Named(id) if id.name == SELF => match cx.self_ty {
+                Some(ty) => Some(ty),
+                None => {
+                    self.diags.push(
+                        Diagnostic::error(id.span, "`Self` is only used in a trait or an `impl`")
+                            .with_help("there, it's the type implementing the trait"),
+                    );
+                    None
+                }
+            },
             TypeExpr::Named(id) if id.name == NEVER => {
                 self.diags.push(
                     Diagnostic::error(id.span, "`never` is only a function's return type")
@@ -1981,11 +2114,30 @@ impl<'a> Checker<'a> {
                 }
                 None => match self.pkgs[cx.pkg].items.get(&id.name) {
                     Some(Item::Type(ty)) => Some(*ty),
+                    Some(Item::Trait(_)) => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                id.span,
+                                format!("`{}` is a trait, not a type", id.name),
+                            )
+                            .with_help(format!("use it as a bound: `fn f[T: {}](x: T)`", id.name)),
+                        );
+                        None
+                    }
                     Some(_) => {
                         self.error(id.span, format!("`{}` is not a type", id.name));
                         None
                     }
                     None if id.name == "Ordering" => Some(Ty::ordering()),
+                    // In a trait, its associated types: `Rune` is
+                    // `Self.Rune`.
+                    None if cx.self_ty.is_some_and(|s| {
+                        s.as_param().is_some() && self.assoc_trait(s, &id.name).is_ok()
+                    }) =>
+                    {
+                        self.assoc_type(cx.self_ty.expect("checked"), id)
+                    }
+
                     None if Trait::from_name(&id.name).is_some() => {
                         self.diags.push(
                             Diagnostic::error(
@@ -2046,6 +2198,50 @@ impl<'a> Checker<'a> {
                 }
             };
         }
+        // `[E.MAX_LEN]u8`, or `[MAX_LEN]u8` in a trait: an associated
+        // constant.
+        let assoc = match &e.kind {
+            ExprKind::Field(base, member) => match &base.kind {
+                ExprKind::Name(b) => self.type_base(cx, b).map(|t| (t, member.clone())),
+                _ => None,
+            },
+            ExprKind::Name(n)
+                if !self.pkgs[cx.pkg].items.contains_key(n)
+                    && cx.self_ty.is_some_and(|s| self.assoc_const(s, n).is_some()) =>
+            {
+                cx.self_ty.map(|s| {
+                    (
+                        s,
+                        ast::Ident {
+                            name: n.clone(),
+                            span: e.span,
+                        },
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some((base, member)) = assoc {
+            let Some((ty, it)) = self.assoc_const(base, &member.name) else {
+                let found = self
+                    .assoc_trait(base, &member.name)
+                    .err()
+                    .unwrap_or_default();
+                self.assoc_error(base, &member, &found);
+                return None;
+            };
+            if Ty::Int(it) != self.usize_ty() {
+                self.error(
+                    e.span,
+                    format!("an array's length is a `usize`, but `{ty}` is a `{it}`"),
+                );
+                return None;
+            }
+            return match ty.as_value() {
+                Some(v) => Some(Len::Known(v as u64)),
+                None => Some(Len::Param(ty)),
+            };
+        }
         self.const_count(cx, e).map(Len::Known)
     }
 
@@ -2081,11 +2277,18 @@ impl<'a> Checker<'a> {
         // `self` is the type with them as arguments.
         let mut owner = owner;
         let (mut type_params, mut bounds) = (Vec::new(), Vec::new());
-        if let Some(o) = owner
+        let member = cx.member.take();
+        let is_member = member.is_some();
+        if let Some((ps, bs)) = member {
+            // A trait's or an impl's method: its parameters are the
+            // trait's `Self` or the impl's.
+            type_params = ps;
+            bounds = bs;
+        } else if let Some(o) = owner
             && (!o.decl_params().is_empty() || !f.owner_generics.is_empty())
         {
             let span = f.owner.as_ref().map_or(f.name.span, TypeExpr::span);
-            match self.declare_owner_generics(o, &f.owner_generics, span) {
+            match self.declare_owner_generics(cx, o, &f.owner_generics, span) {
                 Some((ps, bs)) => {
                     owner = Some(o.instantiate(&ps));
                     type_params = ps;
@@ -2095,7 +2298,20 @@ impl<'a> Checker<'a> {
             }
         }
         let owner_params = type_params.len();
-        let (own, own_bounds) = self.declare_generics(cx, &f.generics);
+        if is_member && let Some(g) = f.generics.first() {
+            self.diags.push(
+                Diagnostic::error(
+                    g.name.span,
+                    "a method of a trait or an `impl` with generic parameters of its own is not supported by the compiler yet",
+                )
+                .with_help("make it a generic function that takes the value: `fn f[T: Trait, U](x: T, ...)`"),
+            );
+        }
+        let (own, own_bounds) = if is_member {
+            (Vec::new(), Vec::new())
+        } else {
+            self.declare_generics(cx, &f.generics)
+        };
         for p in &own {
             if type_params.iter().any(|q| q.to_string() == p.to_string()) {
                 self.error(
@@ -2180,6 +2396,8 @@ impl<'a> Checker<'a> {
             type_params,
             bounds,
             owner_params,
+            self_ty: cx.self_ty,
+            symbol_name: None,
         }
     }
 
@@ -2238,6 +2456,7 @@ impl<'a> Checker<'a> {
                 Some(def) => def.is_pub,
                 None => ty.as_enum().expect("a struct or an enum").is_pub,
             },
+            Item::Trait(t) => self.traits[self.trait_index[&t]].decl.is_pub,
         };
         if pkg != cx.pkg && !is_pub {
             let path = self.pkgs[pkg].path.clone();
@@ -2428,10 +2647,34 @@ impl<'a> Checker<'a> {
     fn function(&mut self, f: &ast::FnDecl, id: FuncId, pkg: usize, file: FileId) -> Func {
         let (ret, is_unsafe) = (self.sigs[id].ret, self.sigs[id].is_unsafe);
         let throws = self.sigs[id].throws;
+        let name = self.sigs[id].name.clone();
+        let symbol = format!(
+            "{}.{}",
+            self.pkgs[pkg].path,
+            self.sigs[id].symbol_name.as_ref().unwrap_or(&name)
+        );
         let mut cx = FnCx::new(pkg, file, ret, is_unsafe);
         cx.throws = throws;
         cx.func = Some(id);
         cx.type_params = self.sigs[id].type_params.clone();
+        cx.self_ty = self.sigs[id].self_ty;
+        // A trait's required method has no body: an impl's replaces it in
+        // every call.
+        if let Some(traits::Member::Trait(_, false)) = self.members.get(&id) {
+            return Func {
+                symbol,
+                name,
+                type_params: cx.type_params.clone(),
+                owner_params: self.sigs[id].owner_params,
+                value_params: Vec::new(),
+                params: Vec::new(),
+                ret,
+                throws,
+                locals: Vec::new(),
+                body: Vec::new(),
+                span: f.span,
+            };
+        }
         let mut params = Vec::new();
         let param_tys = self.sigs[id].params.clone();
         for (p, (ty, convention, _)) in f.params.iter().zip(param_tys) {
@@ -2477,6 +2720,12 @@ impl<'a> Checker<'a> {
             let local = Self::declare_local(&mut cx, &name, Ty::Int(it), false, None);
             cx.value_locals.push((p, local));
         }
+        // So is an associated constant of a type parameter (`E.MAX_LEN`),
+        // in a hidden local.
+        for (p, it) in self.assoc_value_params(&cx.type_params.clone()) {
+            let local = Self::declare_local(&mut cx, &format!("${p}"), Ty::Int(it), false, None);
+            cx.value_locals.push((p, local));
+        }
         let body = self.block(&mut cx, &f.body.stmts);
         self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
@@ -2508,9 +2757,8 @@ impl<'a> Checker<'a> {
             };
             self.check_set_params(&cx, end);
         }
-        let name = self.sigs[id].name.clone();
         Func {
-            symbol: format!("{}.{name}", self.pkgs[pkg].path),
+            symbol,
             name,
             type_params: cx.type_params.clone(),
             owner_params: self.sigs[id].owner_params,

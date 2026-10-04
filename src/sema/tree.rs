@@ -5,9 +5,11 @@
 //! never needs a run-time check. That includes indexing: every
 //! [`TExprKind::Index`] is proven to be in bounds.
 
+use std::collections::HashMap;
+
 pub use crate::ast::Convention;
 use crate::source::Span;
-use crate::types::Ty;
+use crate::types::{Trait, Ty};
 
 pub type LocalId = usize;
 pub type FuncId = usize;
@@ -28,6 +30,21 @@ pub struct Program {
     /// Warnings about the program (it has no errors). They don't stop it
     /// from compiling.
     pub warnings: Vec<crate::diag::Diagnostic>,
+    /// Which function a call of a trait's method runs, by `Self`.
+    pub dispatch: Dispatch,
+}
+
+/// The methods declared in traits, and those each `impl` gives: what a call
+/// of a trait's method runs once `Self` is known (see
+/// [`Dispatch::resolve`]).
+#[derive(Clone, Debug, Default)]
+pub struct Dispatch {
+    /// The functions declared in traits (with a default body or not): their
+    /// trait and name.
+    pub trait_fns: HashMap<FuncId, (Trait, String)>,
+    /// The methods each `impl` declares, by trait and named type (in its
+    /// declared form), by name.
+    pub impls: HashMap<(Trait, Ty), HashMap<String, FuncId>>,
 }
 
 /// An array constant (`const DAYS: [12]u8 = [31, 28, ...]`), placed in

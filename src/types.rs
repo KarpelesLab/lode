@@ -182,6 +182,7 @@ impl Ty {
             fits,
             signed_min,
             value: None,
+            projection: None,
         })
     }
 
@@ -195,7 +196,69 @@ impl Ty {
             fits: None,
             signed_min: None,
             value: Some(ty),
+            projection: None,
         })
+    }
+
+    /// The associated type or constant `name` of trait `t` for the type
+    /// `base` (`E.Rune`, `E.MAX_LEN`). For a type parameter, a type
+    /// parameter that stands for it (always the same one), bounded as the
+    /// trait declares, or a value parameter for a constant; instantiating
+    /// `base` resolves it. For any other type, what `base`'s
+    /// implementation of `t` gives: a type, or a [`Ty::Value`] for a
+    /// constant. `Ty::Unit` if `t` declares no such item or `base` doesn't
+    /// implement it (an error the checker reports).
+    pub fn project(base: Ty, t: Trait, name: &str) -> Ty {
+        if base.as_param().is_none() {
+            let Some(imp) = find_impl(t, base) else {
+                return Ty::Unit;
+            };
+            let args = base.type_args();
+            let map = |p: Ty| imp.params.iter().position(|&q| q == p).map(|k| args[k]);
+            if let Some((_, ty)) = imp.types.iter().find(|(n, _)| n == name) {
+                return ty.subst(&map);
+            }
+            return match imp.consts.iter().find(|(n, _)| n == name) {
+                Some(&(_, v)) => Ty::value(v),
+                None => Ty::Unit,
+            };
+        }
+        let key = (base, t, name.to_owned());
+        {
+            let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(&p) = tables.projections.get(&key) {
+                return p;
+            }
+        }
+        let Some(def) = t.def() else {
+            return Ty::Unit;
+        };
+        let shown = format!("{base}.{name}");
+        let p = if let Some(a) = def.types.iter().find(|a| a.name == name) {
+            let p = Ty::new_param(shown, Bounds::new(&a.bounds), def.ptr_bits);
+            Ty::set_projection(p, key.clone());
+            p
+        } else if let Some(&(_, it)) = def.consts.iter().find(|(n, _)| n == name) {
+            let p = Ty::new_value_param(shown, it);
+            Ty::set_projection(p, key.clone());
+            p
+        } else {
+            return Ty::Unit;
+        };
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        *tables.projections.entry(key).or_insert(p)
+    }
+
+    fn set_projection(p: Ty, key: (Ty, Trait, String)) {
+        let Ty::Param(id) = p else {
+            unreachable!("a parameter")
+        };
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut tables.params[id.0 as usize];
+        *entry = Arc::new(ParamDef {
+            projection: Some(key),
+            ..ParamDef::clone(entry)
+        });
     }
 
     fn push_param(def: ParamDef) -> Ty {
@@ -304,18 +367,40 @@ impl Ty {
                 Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|m| m.satisfies(t)),
                 _ => false,
             },
-            Trait::Ordered => matches!(self, Ty::Int(_) | Ty::Bool),
+            Trait::Ordered => matches!(self, Ty::Int(_) | Ty::Bool) || self.has_impl(t),
             Trait::Integer => matches!(self, Ty::Int(_)),
             Trait::Unsigned => matches!(self, Ty::Int(it) if !it.signed),
             Trait::Signed => matches!(self, Ty::Int(it) if it.signed),
+            Trait::User(_) => self.has_impl(t),
         }
     }
 
+    /// Whether an `impl` of `t` covers this type: one for its named type,
+    /// whose bounds its type arguments satisfy (`impl[A: Ordered] Ordered
+    /// for Box[A]` covers `Box[u8]`, not `Box[Point]` unless `Point` is
+    /// `Ordered`).
+    fn has_impl(self, t: Trait) -> bool {
+        if !matches!(self, Ty::Struct(_) | Ty::Enum(_) | Ty::Int(_) | Ty::Bool) {
+            return false;
+        }
+        let Some(imp) = find_impl(t, self) else {
+            return false;
+        };
+        let args = self.type_args();
+        imp.params.iter().zip(args.iter()).all(|(p, &a)| {
+            p.as_param()
+                .is_none_or(|d| d.bounds.traits().into_iter().all(|b| a.satisfies(b)))
+        })
+    }
+
     /// The type parameters this type mentions, added to `out` (once each).
+    /// An associated type of a parameter (`E.Rune`) mentions the parameter.
     pub fn params(self, out: &mut Vec<Ty>) {
         match self {
             Ty::Param(_) => {
-                if !out.contains(&self) {
+                if let Some((base, ..)) = self.as_param().and_then(|d| d.projection.clone()) {
+                    base.params(out);
+                } else if !out.contains(&self) {
                     out.push(self);
                 }
             }
@@ -353,7 +438,23 @@ impl Ty {
     /// kept, where it gives `None`).
     pub fn subst(self, with: &impl Fn(Ty) -> Option<Ty>) -> Ty {
         match self {
-            Ty::Param(_) => with(self).unwrap_or(self),
+            Ty::Param(_) => {
+                if let Some(t) = with(self) {
+                    return t;
+                }
+                // `E.Rune` with `E` replaced: the new type's `Rune`.
+                match self.as_param().and_then(|d| d.projection.clone()) {
+                    Some((base, t, name)) => {
+                        let b = base.subst(with);
+                        if b == base {
+                            self
+                        } else {
+                            Ty::project(b, t, &name)
+                        }
+                    }
+                    None => self,
+                }
+            }
             Ty::Array(_) => {
                 let (elem, len) = self.as_array().expect("an array");
                 let len = match len {
@@ -882,15 +983,18 @@ impl EnumDef {
     }
 }
 
-/// A built-in trait (docs/generics.md, Built-in traits). User traits come
-/// with M7c; until then, these are the only bounds.
+/// A trait (docs/generics.md, Traits): one of the six built into the
+/// compiler, or one declared in Lode (`trait Shape { ... }`), by its index
+/// in the interner's table of traits (see [`Trait::declare`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Trait {
-    /// `==` and `!=`.
+    /// `==` and `!=`. Derived, never implemented by hand.
     Eq,
-    /// A total order: `a.cmp(b)`, `a.lt(b)` and the like.
+    /// A total order: `a.cmp(b)`, `a.lt(b)` and the like. Built in for the
+    /// integers and `bool`; a struct or an enum implements it with
+    /// `impl Ordered for T`.
     Ordered,
-    /// Values are copied implicitly.
+    /// Values are copied implicitly. Automatic.
     Copy,
     /// The integer types, with their operators. Sealed.
     Integer,
@@ -898,9 +1002,12 @@ pub enum Trait {
     Unsigned,
     /// The signed integer types. Sealed.
     Signed,
+    /// A trait declared in Lode.
+    User(u32),
 }
 
 impl Trait {
+    /// The traits built into the compiler.
     pub const ALL: [Trait; 6] = [
         Trait::Eq,
         Trait::Ordered,
@@ -910,27 +1017,39 @@ impl Trait {
         Trait::Signed,
     ];
 
-    pub fn name(self) -> &'static str {
+    /// Its name as shown in messages: `Ordered`, or `io.Writer` for a trait
+    /// of an imported package.
+    pub fn name(self) -> String {
         match self {
-            Trait::Eq => "Eq",
-            Trait::Ordered => "Ordered",
-            Trait::Copy => "Copy",
-            Trait::Integer => "Integer",
-            Trait::Unsigned => "Unsigned",
-            Trait::Signed => "Signed",
+            Trait::Eq => "Eq".to_owned(),
+            Trait::Ordered => "Ordered".to_owned(),
+            Trait::Copy => "Copy".to_owned(),
+            Trait::Integer => "Integer".to_owned(),
+            Trait::Unsigned => "Unsigned".to_owned(),
+            Trait::Signed => "Signed".to_owned(),
+            Trait::User(_) => self.def().expect("a declared trait").name.clone(),
         }
     }
 
+    /// The built-in trait called `name`.
     pub fn from_name(name: &str) -> Option<Trait> {
         Trait::ALL.into_iter().find(|t| t.name() == name)
     }
 
     fn bit(self) -> u8 {
-        1 << (self as u8)
+        match self {
+            Trait::Eq => 1,
+            Trait::Ordered => 2,
+            Trait::Copy => 4,
+            Trait::Integer => 8,
+            Trait::Unsigned => 16,
+            Trait::Signed => 32,
+            Trait::User(_) => 0,
+        }
     }
 
-    /// The trait and its supertraits: `Ordered: Eq`, `Integer: Ordered +
-    /// Copy`, `Unsigned: Integer`, `Signed: Integer`.
+    /// A built-in trait and its supertraits: `Ordered: Eq`, `Integer:
+    /// Ordered + Copy`, `Unsigned: Integer`, `Signed: Integer`.
     fn closure(self) -> u8 {
         let integer =
             Trait::Integer.bit() | Trait::Ordered.bit() | Trait::Eq.bit() | Trait::Copy.bit();
@@ -939,39 +1058,209 @@ impl Trait {
             Trait::Ordered => self.bit() | Trait::Eq.bit(),
             Trait::Integer => integer,
             Trait::Unsigned | Trait::Signed => self.bit() | integer,
+            Trait::User(_) => 0,
         }
+    }
+
+    /// Declare a new trait named `name` (as shown in messages), from
+    /// package `pkg`. Its supertraits and associated items are set once
+    /// they're resolved, with [`Trait::set_def`]. `ptr_bits` is the
+    /// target's address width, for the type parameters that stand for its
+    /// associated types.
+    pub fn declare(name: String, pkg: usize, ptr_bits: u32) -> Trait {
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let id = u32::try_from(tables.traits.len()).expect("too many traits");
+        tables.traits.push(Arc::new(TraitDef {
+            name,
+            pkg,
+            ptr_bits,
+            supers: Vec::new(),
+            types: Vec::new(),
+            consts: Vec::new(),
+        }));
+        Trait::User(id)
+    }
+
+    /// The declaration of a trait declared in Lode.
+    pub fn def(self) -> Option<Arc<TraitDef>> {
+        let Trait::User(id) = self else {
+            return None;
+        };
+        let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        Some(Arc::clone(&tables.traits[id as usize]))
+    }
+
+    /// Set the supertraits and the associated items of a trait declared
+    /// with [`Trait::declare`].
+    pub fn set_def(self, supers: Vec<Trait>, types: Vec<AssocType>, consts: Vec<(String, IntTy)>) {
+        let Trait::User(id) = self else {
+            unreachable!("only a trait declared in Lode has a declaration")
+        };
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut tables.traits[id as usize];
+        *entry = Arc::new(TraitDef {
+            supers,
+            types,
+            consts,
+            ..TraitDef::clone(entry)
+        });
+    }
+
+    /// The trait and its supertraits, transitively: itself first.
+    pub fn with_supers(self) -> Vec<Trait> {
+        let mut out = vec![self];
+        let mut k = 0;
+        while k < out.len() {
+            let supers = match out[k] {
+                Trait::User(_) => out[k].def().map(|d| d.supers.clone()).unwrap_or_default(),
+                t => Trait::ALL
+                    .into_iter()
+                    .filter(|&s| s != t && t.closure() & s.bit() != 0)
+                    .collect(),
+            };
+            for s in supers {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+            k += 1;
+        }
+        out
     }
 }
 
 impl fmt::Display for Trait {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
+        f.write_str(&self.name())
     }
 }
 
-/// The bounds of a type parameter: a set of built-in traits, closed under
+/// A trait declared in Lode: its name, its supertraits, and its associated
+/// types and constants (its methods are the checker's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraitDef {
+    /// The name shown in messages: `Shape`, or `io.Writer`.
+    pub name: String,
+    /// The index of the declaring package.
+    pub pkg: usize,
+    /// The target's address width.
+    pub ptr_bits: u32,
+    pub supers: Vec<Trait>,
+    pub types: Vec<AssocType>,
+    /// The associated constants, all integers: `const MAX_LEN: usize`.
+    pub consts: Vec<(String, IntTy)>,
+}
+
+/// An associated type of a trait, `type Rune: Copy + Eq`: its name and
+/// the traits it must implement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssocType {
+    pub name: String,
+    pub bounds: Vec<Trait>,
+}
+
+/// An implementation of a trait for a named type (`impl[A: Ordered, B]
+/// Ordered for Pair[A, B]`), as the types need it: the generic parameters
+/// it declares, one per parameter of the type and in its order, with their
+/// bounds; and its associated types and constants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImplDef {
+    pub params: Vec<Ty>,
+    /// The associated types, which may mention `params`.
+    pub types: Vec<(String, Ty)>,
+    pub consts: Vec<(String, i128)>,
+}
+
+/// Register `def` as the implementation of `t` for `ty` (a named type, in
+/// its declared form if it's generic): false if there's one already.
+pub fn add_impl(t: Trait, ty: Ty, def: ImplDef) -> bool {
+    let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    if tables.impls.contains_key(&(t, ty)) {
+        return false;
+    }
+    tables.impls.insert((t, ty), Arc::new(def));
+    true
+}
+
+/// Set the associated types and constants of the implementation of `t`
+/// for `ty`, once they're resolved.
+pub fn set_impl_items(t: Trait, ty: Ty, types: Vec<(String, Ty)>, consts: Vec<(String, i128)>) {
+    let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = tables.impls.get_mut(&(t, ty)) {
+        *entry = Arc::new(ImplDef {
+            types,
+            consts,
+            params: entry.params.clone(),
+        });
+    }
+}
+
+/// The implementation of `t` for the named type of `ty` (for any of its
+/// instances), if there's one.
+pub fn find_impl(t: Trait, ty: Ty) -> Option<Arc<ImplDef>> {
+    let decl = ty.decl();
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    tables.impls.get(&(t, decl)).cloned()
+}
+
+/// The bounds of a type parameter: a set of traits, closed under
 /// supertraits (`T: Integer` is also `Ordered`, `Eq` and `Copy`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Bounds(u8);
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Bounds {
+    /// The built-in traits, one bit each.
+    bits: u8,
+    /// The traits declared in Lode.
+    user: Vec<u32>,
+}
 
 impl Bounds {
     /// The traits, with their supertraits.
     pub fn new(traits: &[Trait]) -> Bounds {
-        Bounds(traits.iter().fold(0, |acc, t| acc | t.closure()))
+        let mut b = Bounds::default();
+        for t in traits {
+            for s in t.with_supers() {
+                match s {
+                    Trait::User(id) => {
+                        if !b.user.contains(&id) {
+                            b.user.push(id);
+                        }
+                    }
+                    s => b.bits |= s.closure(),
+                }
+            }
+        }
+        b
     }
 
-    pub fn has(self, t: Trait) -> bool {
-        self.0 & t.bit() != 0
+    pub fn has(&self, t: Trait) -> bool {
+        match t {
+            Trait::User(id) => self.user.contains(&id),
+            t => self.bits & t.bit() != 0,
+        }
+    }
+
+    /// Every trait in the bounds.
+    pub fn traits(&self) -> Vec<Trait> {
+        Trait::ALL
+            .into_iter()
+            .filter(|&t| self.has(t))
+            .chain(self.user.iter().map(|&id| Trait::User(id)))
+            .collect()
+    }
+
+    /// The traits declared in Lode in the bounds.
+    pub fn user(&self) -> Vec<Trait> {
+        self.user.iter().map(|&id| Trait::User(id)).collect()
     }
 
     /// Whether the integer type `t` satisfies these bounds (an integer
     /// type satisfies every bound but the other sign).
-    fn admits_int(self, t: IntTy) -> bool {
+    fn admits_int(&self, t: IntTy) -> bool {
         !(self.has(Trait::Unsigned) && t.signed || self.has(Trait::Signed) && !t.signed)
     }
 
     /// The most precise numeric bound: `Unsigned`, `Signed` or `Integer`.
-    pub fn numeric(self) -> Option<Trait> {
+    pub fn numeric(&self) -> Option<Trait> {
         [Trait::Unsigned, Trait::Signed, Trait::Integer]
             .into_iter()
             .find(|&t| self.has(t))
@@ -1015,6 +1304,10 @@ pub struct ParamDef {
     /// For a value parameter (`N: usize`), its integer type; `None` for a
     /// type parameter.
     pub value: Option<IntTy>,
+    /// For an associated type or constant of a type parameter (`E.Rune`,
+    /// `E.MAX_LEN`, see [`Ty::project`]): the parameter, the trait that
+    /// declares it, and its name.
+    pub projection: Option<(Ty, Trait, String)>,
 }
 
 /// The index of a type parameter in the global type interner.
@@ -1096,6 +1389,14 @@ struct Interner {
     /// The declarations of the instances of generic types, with their
     /// fields' types substituted; cleared when a declaration changes.
     instances: HashMap<CompoundId, Def>,
+    /// The traits declared in Lode.
+    traits: Vec<Arc<TraitDef>>,
+    /// The implementations of traits, by trait and named type (in its
+    /// declared form).
+    impls: HashMap<(Trait, Ty), Arc<ImplDef>>,
+    /// The type parameters standing for associated types and constants of
+    /// type parameters, by parameter, trait and name.
+    projections: HashMap<(Ty, Trait, String), Ty>,
 }
 
 impl Default for Interner {
@@ -1110,6 +1411,9 @@ impl Default for Interner {
             arg_ids: HashMap::from([(Arc::clone(&empty), ArgsId::EMPTY)]),
             arg_lists: vec![empty],
             instances: HashMap::new(),
+            traits: Vec::new(),
+            impls: HashMap::new(),
+            projections: HashMap::new(),
         }
     }
 }

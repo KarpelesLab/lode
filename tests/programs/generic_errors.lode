@@ -22,14 +22,14 @@
 // error: a type argument can't be a view (`str`)
 // error: `largest` is a function; call it
 // error: this calls `nest[?T]`, which calls back here: its instances would never end
-// error: `Sortable` is not a built-in trait
+// error: unknown trait `Sortable`
 // error: `T` can't be both `Unsigned` and `Signed`: no type is
 // error: `Ordered` is a trait, not a type
 // error: the type parameter `T` is declared twice
 // help: `T: Ordered` gives methods, not operators
 // help: add the bound `[T: Eq]`
 // help: add the bound to `U`: `[U: Integer]`
-// help: `impl Ordered for Point` is not supported by the compiler yet
+// help: add `impl Ordered for Point`
 // help: write the type arguments, as in `largest[u32](...)`
 // help: `T` can be any `Integer` type: a value fits in all of them when it's in 0..=127
 package main

@@ -832,6 +832,16 @@ impl Checker<'_> {
                 Some(self.resolve_type(cx, &t))
             }
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
+                // `Self` and type parameters: for their associated
+                // functions and constants.
+                if name == super::SELF {
+                    return cx.self_ty.map(Some);
+                }
+                if let Some(p) = Self::type_param(cx, name)
+                    && p.value_param().is_none()
+                {
+                    return Some(Some(p));
+                }
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Type(ty)) => Some(Some(ty)),
                     None if name == "Ordering" => Some(Some(Ty::ordering())),
@@ -1538,6 +1548,40 @@ impl Checker<'_> {
         c
     }
 
+    /// The value of an associated constant, `p` (see
+    /// [`Checker::assoc_const`]), of type `it`: a number, or for a type
+    /// parameter's (`E.MAX_LEN`), the local an instance assigns it, a term.
+    pub(super) fn assoc_const_expr(
+        &mut self,
+        cx: &FnCx,
+        p: Ty,
+        it: IntTy,
+        span: Span,
+    ) -> Option<Checked> {
+        if let Some(v) = p.as_value() {
+            return Some(Checked::new(
+                TExprKind::Int(v),
+                Ty::Int(it),
+                Some(Range::exact(v)),
+            ));
+        }
+        let Some(local) = cx.value_local(p) else {
+            self.error(
+                span,
+                format!("`{p}` isn't known here: it's known in a function's body"),
+            );
+            return None;
+        };
+        let term = Term::Local(local);
+        let mut c = Checked::new(
+            TExprKind::Local(local),
+            Ty::Int(it),
+            super::read_range(cx, term),
+        );
+        c.term = Some(Linear::of(term));
+        Some(c)
+    }
+
     /// `a.len` of an array: the constant length of its type, or the value
     /// parameter that's its length (`[N]T`).
     fn array_len(&self, cx: &FnCx, array: TExpr) -> Checked {
@@ -2041,6 +2085,12 @@ impl Checker<'_> {
             let e = self.target_value();
             return Some(Checked::new(e.kind, e.ty, None));
         }
+        // In a trait or an `impl`, `MAX_LEN` is `Self.MAX_LEN`.
+        if let Some(s) = cx.self_ty
+            && let Some((p, it)) = self.assoc_const(s, name)
+        {
+            return self.assoc_const_expr(cx, p, it, span);
+        }
         let msg = if self.imported(cx, name).is_some() {
             format!("`{name}` is a package; use one of its members, like `{name}.something`")
         } else if Self::type_param(cx, name).is_some() || primitive(name, self.ptr_bits).is_some() {
@@ -2114,6 +2164,15 @@ impl Checker<'_> {
                 );
                 None
             }
+            Item::Trait(_) => {
+                self.error(
+                    span,
+                    format!(
+                        "`{name}` is a trait; call one of its methods, like `{name}.method(x)`"
+                    ),
+                );
+                None
+            }
             Item::Type(ty) => {
                 match ty.as_enum() {
                     Some(def) => self.error(
@@ -2143,7 +2202,23 @@ impl Checker<'_> {
     ) -> Option<Checked> {
         if let Some(ty) = self.type_path(cx, base) {
             let ty = ty?;
-            if self.methods.contains_key(&(ty.decl(), member.name.clone())) {
+            // `E.MAX_LEN`: an associated constant.
+            let variant = ty
+                .as_enum()
+                .is_some_and(|d| d.variant(&member.name).is_some());
+            if !variant && let Some((p, it)) = self.assoc_const(ty, &member.name) {
+                return self.assoc_const_expr(cx, p, it, span);
+            }
+            if ty.as_param().is_some() {
+                let found = self.assoc_trait(ty, &member.name).err().unwrap_or_default();
+                self.assoc_error(ty, member, &found);
+                return None;
+            }
+            if self.methods.contains_key(&(ty.decl(), member.name.clone()))
+                || self
+                    .impl_methods
+                    .contains_key(&(ty.decl(), member.name.clone()))
+            {
                 self.error(
                     span,
                     format!(
@@ -2178,7 +2253,13 @@ impl Checker<'_> {
         match (b.ty(), member.name.as_str()) {
             (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len_of(cx, &b)),
             (Ty::Array(_), "len") => Some(self.array_len(cx, b.expr)),
-            (ty, name) if self.methods.contains_key(&(ty.decl(), name.to_owned())) => {
+            (ty, name)
+                if self.methods.contains_key(&(ty.decl(), name.to_owned()))
+                    || (self
+                        .impl_methods
+                        .contains_key(&(ty.decl(), name.to_owned()))
+                        && ty.as_struct().is_none_or(|d| d.field(name).is_none())) =>
+            {
                 self.error(
                     span,
                     format!("`{name}` is a method of `{ty}`; call it with `.{name}(...)`"),
@@ -3088,17 +3169,43 @@ impl Checker<'_> {
         let mut owner_args: Vec<Ty> = Vec::new();
         // The receiver of a method call, with its span.
         let mut receiver: Option<(Checked, Span)> = None;
+        // `Trait.method(x, ...)`: a trait's method, called through the
+        // trait, with `self` as the first argument.
+        let mut via_trait = None;
+        if let ExprKind::Field(base, member) = &callee.kind
+            && let Some(t) = self.names_trait(cx, base)
+        {
+            if t == Trait::Ordered && ORDERED_METHODS.contains(&member.name.as_str()) {
+                let [first, rest @ ..] = args else {
+                    self.error(span, format!("`Ordered.{}` takes 2 arguments", member.name));
+                    return None;
+                };
+                let recv = self.expr(cx, first, None)?;
+                return self.ordered_method(cx, recv, member, rest, span);
+            }
+            let Some(id) = self.trait_fn(t, &member.name) else {
+                self.error(
+                    member.span,
+                    format!("`{t}` has no method `{}`", member.name),
+                );
+                return None;
+            };
+            via_trait = Some((id, format!("{t}.{}", member.name)));
+        }
         let type_of = match &callee.kind {
+            _ if via_trait.is_some() => None,
             ExprKind::Field(base, _) => self.type_path(cx, base),
             _ => None,
         };
         if type_of.is_none()
+            && via_trait.is_none()
             && let ExprKind::Field(base, _) = &callee.kind
             && self.unknown_receiver(cx, base)
         {
             return None;
         }
         let (id, name) = match &callee.kind {
+            _ if via_trait.is_some() => via_trait.take().expect("checked"),
             ExprKind::Field(_, member) if type_of.is_some() => {
                 // `T.name(...)`: a variant, or an associated function.
                 let ty = type_of.expect("checked")?;
@@ -3113,13 +3220,38 @@ impl Checker<'_> {
                 }
                 let is_enum = ty.as_enum().is_some();
                 let decl = ty.decl();
+                let self_ty = ty;
                 let ty = if ty.is_decl_form() {
                     nominal_name(ty)
                 } else {
                     ty.to_string()
                 };
                 let name = format!("{ty}.{}", member.name);
-                match self.find_method(cx, decl, member)? {
+                // An associated function of a trait: of a type parameter's
+                // bounds, or of a type's impls when it has no function of
+                // its own of that name.
+                let own = self.methods.contains_key(&(decl, member.name.clone()));
+                let from_trait = if own {
+                    None
+                } else {
+                    self.trait_method(self_ty, &member.name, member.span)?
+                };
+                let found = match from_trait {
+                    Some(id) => {
+                        // A trait's own function takes `Self` first.
+                        if self.is_trait_fn(id) {
+                            owner_args = if self_ty.is_decl_form() {
+                                Vec::new()
+                            } else {
+                                vec![self_ty]
+                            };
+                        }
+                        Some(id)
+                    }
+                    None if self_ty.as_param().is_some() => None,
+                    None => self.find_method(cx, decl, member)?,
+                };
+                match found {
                     Some(id) if self.sigs[id].has_self => {
                         self.diags.push(
                             Diagnostic::error(
@@ -3189,7 +3321,7 @@ impl Checker<'_> {
                     Item::Type(ty) if ty.as_enum().is_some() => {
                         return self.enum_from(cx, ty, args, span);
                     }
-                    Item::Const(_) | Item::Type(_) => {
+                    Item::Const(_) | Item::Type(_) | Item::Trait(_) => {
                         self.error(
                             callee.span,
                             format!("`{pkg_name}.{}` is not a function", member.name),
@@ -3205,25 +3337,41 @@ impl Checker<'_> {
                 if ty == Ty::Str && member.name == "bytes" {
                     return self.str_bytes(recv, args, span);
                 }
-                // The methods of the built-in trait `Ordered`.
-                if matches!(ty, Ty::Int(_) | Ty::Bool | Ty::Param(_))
-                    && ORDERED_METHODS.contains(&member.name.as_str())
+                let ordered = ORDERED_METHODS.contains(&member.name.as_str());
+                // On a type parameter, the methods of the built-in trait
+                // `Ordered` come first, then those of its other bounds; on
+                // a type, its own methods, then its traits'.
+                if ordered && ty.as_param().is_some() && ty.satisfies(Trait::Ordered) {
+                    return self.ordered_method(cx, recv, member, args, span);
+                }
+                let found = match ty.as_param() {
+                    Some(_) => None,
+                    None => self.find_method(cx, ty.decl(), member)?,
+                };
+                let found = match found {
+                    Some(id) => Some(id),
+                    None => self.trait_method(ty, &member.name, member.span)?,
+                };
+                if found.is_none()
+                    && ordered
+                    && (ty.as_param().is_some() || ty.satisfies(Trait::Ordered))
                 {
                     return self.ordered_method(cx, recv, member, args, span);
                 }
-                if ty.as_param().is_some() {
+                if found.is_none() && ty.as_param().is_some() {
                     self.diags.push(
                         Diagnostic::error(
                             member.span,
                             format!("`{ty}` has no method `{}`", member.name),
                         )
-                        .with_help(
-                            "a type parameter has the methods of its bounds: `Ordered` gives `cmp`, `lt`, `le`, `gt` and `ge`",
-                        ),
+                        .with_help(format!(
+                            "a type parameter has the methods of its bounds: add a trait that has `{}`, as in `[{ty}: Trait]`",
+                            member.name
+                        )),
                     );
                     return None;
                 }
-                let id = match self.find_method(cx, ty.decl(), member)? {
+                let id = match found {
                     Some(id) => id,
                     None => {
                         let msg = match ty.as_struct() {
