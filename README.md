@@ -1,5 +1,7 @@
 # Lode
 
+[![CI](https://github.com/KarpelesLab/lode/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/lode/actions/workflows/ci.yml)
+
 Lode is a programming language, in early development: the best of Rust, Zig and
 Go, each pushed to its limit.
 
@@ -100,6 +102,14 @@ The canonical format is described in
 
 `cargo test` runs unit tests and the programs in `tests/programs/`; each one
 declares its expected exit status or errors in its first comment lines.
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs on x86-64
+Linux for every push to `master` and every pull request: `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, `cargo test`, and
+`lode fmt --check` over `std/` and `tests/programs/` (except
+`unsupported.lode`, which the parser rejects on purpose). It also builds
+`tests/programs/hello_world.lode` at `-O2`, checks it prints `hello world` in
+exactly two system calls, and reports its size in the job summary.
 
 The compiler depends on released versions of
 [LatticeFoundry from crates.io](https://crates.io/crates/latticefoundry). It's

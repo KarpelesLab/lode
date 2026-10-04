@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The compiler targets x86-64 Linux, and the tests run the executables it
+# produces, so everything runs on an x86-64 Linux runner.
+jobs:
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same as rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: lode fmt --check
+        # tests/programs/unsupported.lode uses syntax the parser rejects on
+        # purpose, so the formatter refuses it. Exclude any other such file
+        # the same way.
+        run: |
+          cargo run --quiet -- fmt --check std
+          find tests/programs -name '*.lode' ! -name unsupported.lode -print0 \
+            | sort -z | xargs -0 cargo run --quiet -- fmt --check
+
+  hello:
+    name: hello world
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y strace
+      - name: Build, run and trace tests/programs/hello_world.lode
+        run: |
+          cargo run --quiet -- build tests/programs/hello_world.lode -O2 -o hello
+          ./hello > out
+          printf 'hello world\n' | cmp - out
+          # System calls after execve, counted as in bench/hello/run.sh.
+          strace -o trace ./hello > /dev/null
+          cat trace
+          calls=$(grep -v -e '^+++' -e '^---' -e 'execve(' trace | grep -c .)
+          size=$(stat -c %s hello)
+          {
+            echo '### hello world (`-O2`)'
+            echo
+            echo '| bytes | syscalls |'
+            echo '| ---: | ---: |'
+            echo "| $size | $calls |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$calls" -ne 2 ]; then
+            echo "::error::hello world made $calls system calls, expected 2"
+            exit 1
+          fi
