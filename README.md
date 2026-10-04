@@ -48,8 +48,10 @@ What works:
   with value semantics: `let q = p` copies, and structs and arrays are passed
   and returned by value; `==` compares structs and arrays field by field
 - packages: `import "std/..."`, `pub`, `pkg.name`
-- `unsafe` blocks and functions, raw pointers (`*u8`), the `syscall`
-  intrinsic
+- `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
+  array or slice), the `syscall` intrinsic
+- output: `io.print` for strings, `io.print_u64` and `io.print_i64` for
+  integers (and `io.eprint...` for standard error)
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe. The checker follows value ranges and relations between variables,

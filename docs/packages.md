@@ -35,7 +35,15 @@ Go's vocabulary, which is proven:
 - Linker symbols are `<import path>.<name>` (`std/io.print`); the program's
   own package uses its name (`main.main`).
 - So far there are two packages: `std/os` (Linux x86-64 system calls,
-  `write` and `write_all`) and `std/io` (`print` and `eprint`).
+  `write` and `write_all`) and `std/io`:
+  - `print(s: str)` and `eprint(s: str)` write a string to standard output
+    and standard error.
+  - `print_u64(n: u64)` and `print_i64(n: i64)` write an integer in decimal
+    to standard output, and `eprint_u64` and `eprint_i64` to standard error.
+    Smaller integer types convert implicitly. Each call makes one `write`
+    system call. They're a stopgap until `print("{}", n)`
+    ([comptime.md](comptime.md#format-strings)).
+  - All of them ignore output errors.
 
 ## Imports
 

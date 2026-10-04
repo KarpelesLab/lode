@@ -17,3 +17,64 @@ pub fn print(s: str) {
 pub fn eprint(s: str) {
 	os.write_all(os.STDERR, s)
 }
+
+// Integer output. `print("{}", n)` will replace these once the compiler has
+// `comptime` (docs/comptime.md, "Format strings"), so the set stays small:
+// decimal `u64` and `i64`, which every other integer type converts to.
+
+/// Write `n` to standard output in decimal, ignoring errors like `print`.
+pub fn print_u64(n: u64) {
+	write_decimal(os.STDOUT, n, false)
+}
+
+/// Write `n` to standard output in decimal, with a `-` if it's negative,
+/// ignoring errors like `print`.
+pub fn print_i64(n: i64) {
+	write_decimal(os.STDOUT, magnitude(n), n < 0)
+}
+
+/// `print_u64` to standard error.
+pub fn eprint_u64(n: u64) {
+	write_decimal(os.STDERR, n, false)
+}
+
+/// `print_i64` to standard error.
+pub fn eprint_i64(n: i64) {
+	write_decimal(os.STDERR, magnitude(n), n < 0)
+}
+
+/// The absolute value of `n`. `-n` overflows for the smallest `i64`, so a
+/// negative `n` goes through `n + 1`, which can be negated.
+fn magnitude(n: i64) -> u64 {
+	if n < 0 {
+		return u64(-(n + 1)) + 1
+	}
+	return u64(n)
+}
+
+/// Write `n` in decimal to `fd`, after a `-` if `negative`, in one `write`.
+///
+/// The digits go into a buffer from the end. 20 digits hold the largest
+/// `u64`, and element 0 is kept for the sign. The output is at most 21 bytes,
+/// which the kernel writes whole (and Lode installs no signal handlers, so
+/// there's no `EINTR`), so one `os.write` is enough.
+fn write_decimal(fd: i32, n: u64, negative: bool) {
+	var buf: [21]u8 = [0; 21]
+	var v = n
+	for k in 1..buf.len {
+		let i = buf.len - k
+		buf[i] = '0' + u8(v % 10)
+		v = v / 10
+		if v == 0 {
+			var start = i
+			if negative {
+				start = i - 1
+				buf[start] = '-'
+			}
+			unsafe {
+				os.write(fd, buf.ptr + start, buf.len - start)
+			}
+			return
+		}
+	}
+}
