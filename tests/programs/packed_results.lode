@@ -396,6 +396,80 @@ fn generic() -> u8 {
 	return 0
 }
 
+fn wrap(d: Delta) -> ?Delta {
+	return d
+}
+
+fn same(a: Small, b: Small) -> bool {
+	return a == b
+}
+
+// Locals of such types are kept packed when they're only matched,
+// compared, assigned and read through their payload; others stay in
+// memory.
+fn locals() -> u8 {
+	var state: Small = .nothing
+	var steps: u32 = 0
+	for k in 0..4 {
+		match state {
+			nothing => state = small(1)
+			byte(x) => state = .two(i16(x) - 80, k == 1)
+			two(x, f) => {
+				if !f || x != -3 {
+					return 60
+				}
+				state = .word(u32(k))
+			}
+			word(w) => steps = w
+		}
+	}
+	if steps != 2 || state != .word(2) || state == .nothing {
+		return 61
+	}
+	// A payload that is itself an enum.
+	let o = wrap(.down)
+	if let d = o {
+		if d != .down {
+			return 62
+		}
+	} else {
+		return 63
+	}
+	if o == none || o != wrap(.down) || wrap(.up) == o {
+		return 64
+	}
+	// Bound by `catch`, then compared and matched.
+	var code: i32 = 0
+	word(2) catch e {
+		if e == .small(1) {
+			return 65
+		}
+		match e {
+			pair(a, b) => code = i32(a) + i32(b)
+			none_ => code = 1
+			small(v) => code = 2
+		}
+	}
+	if code != -45 {
+		return 66
+	}
+	// Passed whole: stays in memory.
+	let s = small(2)
+	if !same(s, .two(-2, true)) || same(s, small(3)) {
+		return 67
+	}
+	// A packed local compared with one in memory.
+	var t = small(3)
+	if t != s && !same(t, small(3)) {
+		return 68
+	}
+	t = s
+	if t != small(2) {
+		return 69
+	}
+	return 0
+}
+
 fn main() -> u8 {
 	// `errdefer` runs only on the way out with an error.
 	deferred(true) catch _ {}
@@ -451,5 +525,9 @@ fn main() -> u8 {
 	if e != 0 {
 		return e
 	}
-	return generic()
+	let g = generic()
+	if g != 0 {
+		return g
+	}
+	return locals()
 }

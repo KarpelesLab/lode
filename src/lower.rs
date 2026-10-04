@@ -78,10 +78,15 @@
 //! `-> u32`, `-> bool` and `-> ?u16` are packed when `E` is an enum whose
 //! payloads fit, as is a C-style enum, `?u8` or `?u32`; `throws(E) ->
 //! u64`, `-> usize` and `?usize` are not (72 bits), nor is any result with
-//! a struct inside. Values in packed form are only ever returned, never
-//! passed or stored: the caller tests and takes apart the `i64` itself for
-//! `try`, `catch` and `??`, and unpacks it into memory for anything else
-//! (a `match` on a hidden local, a `let`, a temporary).
+//! a struct inside. Values in packed form are never passed: the caller
+//! tests and takes apart the `i64` itself for `try`, `catch`, `??` and
+//! `==`, and unpacks it into memory where a value in memory is needed.
+//!
+//! A local of such a type is kept in packed form, in an `i64` slot that
+//! mem2reg promotes, when it's only matched, compared and assigned
+//! ([`packed_locals`]). That covers the hidden local a `match`, an `if
+//! let` or a `let ... else` on a call stores its value in. The packed form
+//! of a value is unique, so `==` compares two packed values as integers.
 //!
 //! `defer` bodies are emitted at each exit of their block, in reverse
 //! order: at its end, and at every `return`, `throw`, failing `try`,
@@ -290,6 +295,9 @@ enum Slot {
     },
     /// An array's or a struct's storage.
     Mem(ValueId),
+    /// An `i64` slot holding a value in packed form (see
+    /// [`packed_locals`]), of this type.
+    Packed(ValueId, Ty),
 }
 
 /// Lower a checked program to an IR module named `name`.
@@ -567,6 +575,136 @@ fn returns_packed(ty: Ty) -> bool {
     ty.sum().is_some() && packed_bits(ty).is_some()
 }
 
+/// Which locals of `f` are kept in packed form, in an `i64` slot that LF's
+/// mem2reg promotes to a register: those of a type a function would return
+/// packed ([`returns_packed`]), not parameters, that are only initialized,
+/// assigned, bound by `catch`, compared with `==` or `!=`, and read through
+/// their tag or payload (by `match`, `if let`, `let ... else`, `??` or a
+/// payload field). That's the hidden local a `match` on a call's result is
+/// stored in. A local used in any other way (passed to a function, copied
+/// whole, written through a field) stays in memory.
+fn packed_locals(f: &Func) -> Vec<bool> {
+    let mut packed: Vec<bool> = f
+        .locals
+        .iter()
+        .map(|l| l.convention.is_none() && returns_packed(l.ty))
+        .collect();
+    for &p in &f.params {
+        packed[p] = false;
+    }
+    uses_in_stmts(&f.body, &mut packed);
+    packed
+}
+
+/// Clear `packed` for the locals `stmts` use other than as
+/// [`packed_locals`] allows.
+fn uses_in_stmts(stmts: &[TStmt], packed: &mut [bool]) {
+    for s in stmts {
+        match s {
+            TStmt::Init(_, e) | TStmt::Assign(_, e) | TStmt::Expr(e) | TStmt::Throw(e) => {
+                uses_in_expr(e, packed)
+            }
+            TStmt::Store(place, e) => {
+                uses_in_place(place, packed);
+                uses_in_expr(e, packed);
+            }
+            TStmt::Return(e) => {
+                if let Some(e) = e {
+                    uses_in_expr(e, packed);
+                }
+            }
+            TStmt::If(c, then, otherwise) => {
+                uses_in_expr(c, packed);
+                uses_in_stmts(then, packed);
+                uses_in_stmts(otherwise, packed);
+            }
+            TStmt::While(c, body) => {
+                uses_in_expr(c, packed);
+                uses_in_stmts(body, packed);
+            }
+            TStmt::For {
+                start, end, body, ..
+            } => {
+                uses_in_expr(start, packed);
+                uses_in_expr(end, packed);
+                uses_in_stmts(body, packed);
+            }
+            TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
+                uses_in_stmts(body, packed)
+            }
+            TStmt::Match { value, arms } => {
+                if !matches!(value.kind, TExprKind::Local(_)) {
+                    uses_in_expr(value, packed);
+                }
+                for arm in arms {
+                    uses_in_stmts(&arm.body, packed);
+                }
+            }
+            TStmt::Break | TStmt::Continue => {}
+        }
+    }
+}
+
+/// [`uses_in_stmts`] for an expression whose value is read.
+fn uses_in_expr(e: &TExpr, packed: &mut [bool]) {
+    match &e.kind {
+        TExprKind::Local(l) => packed[*l] = false,
+        TExprKind::Payload(inner, ..) | TExprKind::EnumValue(inner)
+            if matches!(inner.kind, TExprKind::Local(_)) => {}
+        TExprKind::Coalesce(inner, default) if matches!(inner.kind, TExprKind::Local(_)) => {
+            uses_in_expr(default, packed)
+        }
+        // Compared whole: read, unpacked into a temporary if the other side
+        // isn't packed.
+        TExprKind::Binary(TBinOp::Cmp(CmpOp::Eq | CmpOp::Ne), l, r) if l.ty.in_memory() => {
+            for side in [l, r] {
+                if !matches!(side.kind, TExprKind::Local(_)) {
+                    uses_in_expr(side, packed);
+                }
+            }
+        }
+        TExprKind::Ref(place) => uses_in_place(place, packed),
+        TExprKind::Catch { call, handler, .. } => {
+            uses_in_expr(call, packed);
+            match handler {
+                Handler::Value(v) => uses_in_expr(v, packed),
+                Handler::Block(body) => uses_in_stmts(body, packed),
+            }
+        }
+        _ => {
+            for sub in crate::sema::subexprs(e) {
+                uses_in_expr(sub, packed);
+            }
+        }
+    }
+}
+
+/// [`uses_in_stmts`] for a place that's written or whose address is
+/// taken: the local it's part of stays in memory.
+fn uses_in_place(place: &TExpr, packed: &mut [bool]) {
+    match &place.kind {
+        TExprKind::Local(l) => packed[*l] = false,
+        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) => uses_in_place(base, packed),
+        TExprKind::Index(base, index) => {
+            uses_in_place(base, packed);
+            uses_in_expr(index, packed);
+        }
+        _ => uses_in_expr(place, packed),
+    }
+}
+
+/// Where payload field `field` of variant `variant` starts in the packed
+/// form of a value of type `ty`: after the tag and the fields before it.
+fn payload_shift(ty: Ty, variant: u32, field: u32) -> u32 {
+    let def = ty.sum().expect("an enum, an optional or a result");
+    let before = &def.variants[variant as usize].fields[..field as usize];
+    def.tag.bits
+        + before
+            .iter()
+            .map(|f| packed_bits(f.ty).expect("a packed payload"))
+            .sum::<u32>()
+}
+
 /// The low `bits` bits of `v`.
 fn mask(v: u64, bits: u32) -> u64 {
     if bits >= 64 { v } else { v & ((1 << bits) - 1) }
@@ -605,6 +743,7 @@ impl FnLower<'_> {
                 _ => Val::One(part()),
             });
         }
+        let packed = packed_locals(f);
         for (local, param) in f.locals.iter().zip(&params) {
             match *param {
                 // A parameter in memory is the caller's value, read (or for
@@ -627,6 +766,7 @@ impl FnLower<'_> {
                 _ => {}
             }
             let slot = match local.ty {
+                ty if packed[self.slots.len()] => Slot::Packed(self.b.alloca(self.t.i64), ty),
                 Ty::Str | Ty::Slice(_) => Slot::View {
                     ptr: self.b.alloca(self.t.ptr),
                     len: self.b.alloca(self.t.i64),
@@ -695,6 +835,15 @@ impl FnLower<'_> {
                 Val::View(p, n)
             }
             Slot::Mem(ptr) => Val::Mem(ptr),
+            // Only when it's read whole, which `packed_locals` rules out:
+            // unpacked into a temporary.
+            Slot::Packed(slot, ty) => {
+                let p = self.b.load(self.t.i64, slot, 8);
+                let ir_ty = self.ir_ty(ty);
+                let tmp = self.b.alloca(ir_ty);
+                self.unpack(tmp, ty, p, 0);
+                Val::Mem(tmp)
+            }
         }
     }
 
@@ -908,15 +1057,23 @@ impl FnLower<'_> {
 
         self.start_block(err_bb);
         if let Some(local) = binding {
-            let Slot::Mem(dst) = self.slots[local] else {
-                unreachable!("an error is an enum, in memory")
-            };
-            match result {
-                Outcome::Mem(tmp) => {
+            match (self.slots[local], result) {
+                (Slot::Mem(dst), Outcome::Mem(tmp)) => {
                     let src = self.payload_at(tmp, call.ty, 1, 0);
                     self.copy(dst, src, err);
                 }
-                Outcome::Packed(p) => self.unpack(dst, err, p, RESULT_TAG_BITS),
+                (Slot::Mem(dst), Outcome::Packed(p)) => self.unpack(dst, err, p, RESULT_TAG_BITS),
+                (Slot::Packed(slot, _), Outcome::Mem(tmp)) => {
+                    let src = self.payload_at(tmp, call.ty, 1, 0);
+                    let p = self.pack_mem(src, err);
+                    self.b.store(self.t.i64, slot, p, 8);
+                }
+                (Slot::Packed(slot, _), Outcome::Packed(p)) => {
+                    let amount = self.b.const_i64(self.t.i64, i64::from(RESULT_TAG_BITS));
+                    let e = self.b.bin(IrOp::LShr, p, amount, Flags::NONE);
+                    self.b.store(self.t.i64, slot, e, 8);
+                }
+                (slot, _) => unreachable!("an error in {slot:?}"),
             }
         }
         match handler {
@@ -958,6 +1115,10 @@ impl FnLower<'_> {
                 // A new local can't appear in its own initializer, so a
                 // literal is written straight into its storage.
                 Slot::Mem(dst) => self.fill(dst, e),
+                Slot::Packed(slot, _) => {
+                    let p = self.pack(e);
+                    self.b.store(self.t.i64, slot, p, 8);
+                }
                 _ => {
                     let v = self.expr(e);
                     self.store(*local, v);
@@ -965,6 +1126,10 @@ impl FnLower<'_> {
             },
             TStmt::Assign(local, e) => match self.slots[*local] {
                 Slot::Mem(dst) => self.assign_into(dst, e),
+                Slot::Packed(slot, _) => {
+                    let p = self.pack(e);
+                    self.b.store(self.t.i64, slot, p, 8);
+                }
                 _ => {
                     let v = self.expr(e);
                     self.store(*local, v);
@@ -1064,8 +1229,7 @@ impl FnLower<'_> {
             }
             TStmt::Block(body) => self.stmts(body),
             TStmt::Match { value, arms } => {
-                let base = self.place(value);
-                let tag = self.load_tag(base, value.ty);
+                let tag = self.tag_of(value);
                 let blocks: Vec<BlockId> = arms.iter().map(|_| self.b.create_block(&[])).collect();
                 let join = self.b.create_block(&[]);
                 let targets: Vec<(Vec<u32>, BlockId)> = arms
@@ -1180,6 +1344,10 @@ impl FnLower<'_> {
                 self.fill(tmp, e);
                 return Val::Mem(tmp);
             }
+            TExprKind::Payload(base, v, k) if self.packed_slot(base).is_some() => {
+                let p = self.packed_local(base).expect("a packed local");
+                return self.packed_field(p, base.ty, *v, *k);
+            }
             TExprKind::Index(..) | TExprKind::Field(..) | TExprKind::Payload(..) => {
                 let addr = self.address(e);
                 return self.read(addr, e.ty);
@@ -1219,10 +1387,7 @@ impl FnLower<'_> {
                 return self.no_value(e.ty);
             }
             TExprKind::Unproven(..) => unreachable!("only in code run at compile time"),
-            TExprKind::EnumValue(inner) => {
-                let base = self.place(inner);
-                self.load_tag(base, inner.ty)
-            }
+            TExprKind::EnumValue(inner) => self.tag_of(inner),
             // A view of part of the base's storage: proven in bounds, so
             // no check.
             TExprKind::Slice(base, start, end) => {
@@ -1285,9 +1450,20 @@ impl FnLower<'_> {
             TExprKind::Binary(TBinOp::Cmp(op @ (CmpOp::Eq | CmpOp::Ne)), lhs, rhs)
                 if lhs.ty.in_memory() =>
             {
-                let l = self.place(lhs);
-                let r = self.place(rhs);
-                let eq = self.equal(l, r, lhs.ty);
+                // The packed form of a value is unique (the bits above the
+                // active variant's fields are 0), so two values are equal
+                // when their packed forms are.
+                let eq =
+                    if returns_packed(lhs.ty) && self.packs_cheaply(lhs) && self.packs_cheaply(rhs)
+                    {
+                        let l = self.pack(lhs);
+                        let r = self.pack(rhs);
+                        self.b.icmp(IntPred::Eq, l, r)
+                    } else {
+                        let l = self.place(lhs);
+                        let r = self.place(rhs);
+                        self.equal(l, r, lhs.ty)
+                    };
                 if *op == CmpOp::Eq {
                     eq
                 } else {
@@ -1554,7 +1730,9 @@ impl FnLower<'_> {
 
     /// `opt ?? default`, of type `ty`.
     fn coalesce(&mut self, opt: &TExpr, default: &TExpr, ty: Ty) -> Val {
-        if returns_packed(opt.ty) && matches!(opt.kind, TExprKind::Call(..)) {
+        if returns_packed(opt.ty)
+            && (matches!(opt.kind, TExprKind::Call(..)) || self.packed_slot(opt).is_some())
+        {
             return self.coalesce_packed(opt, default, ty);
         }
         let base = self.place(opt);
@@ -1675,9 +1853,29 @@ impl FnLower<'_> {
     /// an `i64`. A call that returns it packed, and a variant, are packed
     /// without going through memory.
     fn pack(&mut self, e: &TExpr) -> ValueId {
+        if let Some(p) = self.packed_local(e) {
+            return p;
+        }
         match &e.kind {
             TExprKind::Call(f, args) if returns_packed(e.ty) => {
                 self.call(*f, args, e.ty, None).one()
+            }
+            // A payload field of a packed local: its bits, without those
+            // of the fields above it.
+            TExprKind::Payload(base, v, k) if self.packed_slot(base).is_some() => {
+                let p = self.packed_local(base).expect("a packed local");
+                let shift = payload_shift(base.ty, *v, *k);
+                let bits = packed_bits(e.ty).expect("a packed payload");
+                let mut v = p;
+                if shift > 0 {
+                    let amount = self.b.const_i64(self.t.i64, i64::from(shift));
+                    v = self.b.bin(IrOp::LShr, v, amount, Flags::NONE);
+                }
+                if shift + bits < 64 {
+                    let m = self.b.const_i64(self.t.i64, mask(u64::MAX, bits) as i64);
+                    v = self.b.bin(IrOp::And, v, m, Flags::NONE);
+                }
+                v
             }
             TExprKind::Variant(v, values) => {
                 let def = e.ty.sum().expect("an enum or an optional");
@@ -1708,6 +1906,69 @@ impl FnLower<'_> {
                 self.pack_mem(addr, e.ty)
             }
         }
+    }
+
+    /// Whether [`pack`](Self::pack) gets the packed form of `e` without
+    /// reading it from memory: a call returning it packed, a local kept
+    /// packed, or a variant whose payload packs cheaply too.
+    fn packs_cheaply(&self, e: &TExpr) -> bool {
+        match &e.kind {
+            TExprKind::Call(..) => returns_packed(e.ty),
+            TExprKind::Local(_) => self.packed_slot(e).is_some(),
+            TExprKind::Variant(_, values) => values
+                .iter()
+                .all(|v| !v.ty.in_memory() || self.packs_cheaply(v)),
+            _ => false,
+        }
+    }
+
+    /// The `i64` slot of `e`, if it's a local kept in packed form.
+    fn packed_slot(&self, e: &TExpr) -> Option<ValueId> {
+        match e.kind {
+            TExprKind::Local(l) => match self.slots[l] {
+                Slot::Packed(slot, _) => Some(slot),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The value of `e`, if it's a local kept in packed form.
+    fn packed_local(&mut self, e: &TExpr) -> Option<ValueId> {
+        let slot = self.packed_slot(e)?;
+        Some(self.b.load(self.t.i64, slot, 8))
+    }
+
+    /// The tag of `e`, an enum, an optional or a result.
+    fn tag_of(&mut self, e: &TExpr) -> ValueId {
+        match self.packed_local(e) {
+            Some(p) => {
+                let def = e.ty.sum().expect("an enum, an optional or a result");
+                self.unpack_scalar(p, 0, Ty::Int(def.tag))
+            }
+            None => {
+                let base = self.place(e);
+                self.load_tag(base, e.ty)
+            }
+        }
+    }
+
+    /// Payload field `field` of variant `variant` of the value of type
+    /// `ty` whose packed form is `p`.
+    fn packed_field(&mut self, p: ValueId, ty: Ty, variant: u32, field: u32) -> Val {
+        let def = ty.sum().expect("an enum, an optional or a result");
+        let shift = payload_shift(ty, variant, field);
+        let fty = def.variants[variant as usize].fields[field as usize].ty;
+        if fty == Ty::Unit {
+            return Val::Unit;
+        }
+        if fty.in_memory() {
+            let ir_ty = self.ir_ty(fty);
+            let tmp = self.b.alloca(ir_ty);
+            self.unpack(tmp, fty, p, shift);
+            return Val::Mem(tmp);
+        }
+        Val::One(self.unpack_scalar(p, shift, fty))
     }
 
     /// The packed form of variant `variant` of the enum, optional or
