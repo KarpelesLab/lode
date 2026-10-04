@@ -573,16 +573,27 @@ impl Env {
                 out.rels.push(*rel);
                 continue;
             }
+            // What the types alone give: a relation that weak is no fact.
+            let (fa, fb) = (full(rel.a), full(rel.b));
+            let by_types = fa.hi.checked_sub(fb.lo);
             let mut c = Some(rel.c);
             for e in &live {
-                let ec = e.diff(rel.a, rel.b);
+                // As for ranges, a term with no known range has its type's.
+                let ea = e.range(rel.a).unwrap_or(fa);
+                let eb = e.range(rel.b).unwrap_or(fb);
+                let ec = match (e.rel_through(rel.a, rel.b), ea.hi.checked_sub(eb.lo)) {
+                    (Some(x), Some(y)) => Some(x.min(y)),
+                    (x, y) => x.or(y),
+                };
                 c = match (how, c, ec) {
                     (Loosen::Drop, Some(c), Some(ec)) if ec <= c => Some(c),
                     (Loosen::Cover, Some(c), Some(ec)) => Some(c.max(ec)),
                     _ => None,
                 };
             }
-            if let Some(c) = c {
+            if let Some(c) = c
+                && by_types.is_none_or(|t| c < t)
+            {
                 out.rels.push(Rel { c, ..*rel });
             }
         }

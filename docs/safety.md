@@ -204,7 +204,8 @@ body from a few candidate heads, in a fixed order, and taking the first that
 a range end holds if the back-edge's range for the term (or its type's range,
 if none is known) is within it, and a relation `a - b <= c` holds if the
 back-edge gives `a - b <= c'` with `c' <= c` (directly or through one other
-term, or from both ranges, as above), and a hole at `k` holds if the back-edge's range doesn't
+term, or from both ranges as above, where a term with no known range has its
+type's), and a hole at `k` holds if the back-edge's range doesn't
 contain `k` or has a hole there. A back-edge that can't be reached holds
 everything.
 
@@ -236,8 +237,12 @@ range are separate facts):
   them (a range end goes to its type's limit);
 - **cover** some back-edges: widen each range just enough to include the
   back-edges' ranges (a term with no range has its type's), and raise each
-  relation's `c` to the largest the back-edges give (and forget it if one
-  gives none). A hole can't be widened: it's forgotten as when dropping.
+  relation's `c` to the largest the back-edges give. A hole can't be
+  widened: it's forgotten as when dropping.
+
+Either way, a relation no tighter than what the types of its terms give
+(`c` at least `a`'s type's largest value minus `b`'s type's smallest) is no
+fact, as a range as wide as its type is none.
 
 The **thresholds** of a term of `A` are the constants it's compared with in
 the body: each comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) between the
