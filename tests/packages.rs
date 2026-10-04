@@ -121,9 +121,18 @@ fn run(program: &lode::sema::Program, name: &str) -> i32 {
         std::env::temp_dir().join(format!("lode-packages-{}-{name}.exe", std::process::id()));
     let path_str = path.to_str().expect("utf-8 temp path");
     link::write_executable(path_str, &image).expect("write executable");
-    let status = std::process::Command::new(Path::new(&path))
-        .status()
-        .expect("runs");
+    // A freshly written executable can briefly be busy (ETXTBSY) while
+    // another test thread forks; retry a few times, as tests/programs.rs does.
+    let status = (0..50)
+        .find_map(|_| match std::process::Command::new(Path::new(&path)).status() {
+            Ok(s) => Some(s),
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                None
+            }
+            Err(e) => panic!("running {name}: {e}"),
+        })
+        .expect("executable stayed busy");
     let _ = std::fs::remove_file(&path);
     status.code().expect("exited normally")
 }
