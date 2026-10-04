@@ -48,7 +48,7 @@ fn next_token(src: []u8, pos: usize) -> Lexed {
 	var i = pos
 	var state = State.start
 	var value: u64 = 0
-	var start = i // WORKAROUND: `= 0` or `= pos` loses `start <= i`
+	var start = pos
 	while i < src.len {
 		let c = src[i]
 		match state {

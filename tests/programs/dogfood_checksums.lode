@@ -12,7 +12,7 @@ fn adler32(data: []u8) -> u32 {
 	var a: u32 = 1
 	var b: u32 = 0
 	for x in data {
-		a = (a + u32(x)) % MOD_ADLER // WORKAROUND: implicit u8->u32 widening loses 0..=255
+		a = (a + x) % MOD_ADLER
 		b = (b + a) % MOD_ADLER
 	}
 	return (b << 16) | a
@@ -47,7 +47,7 @@ fn fletcher16(data: []u8) -> u16 {
 	var s1: u16 = 0
 	var s2: u16 = 0
 	for x in data {
-		s1 = (s1 + u16(x)) % 255 // WORKAROUND, as above
+		s1 = (s1 + x) % 255
 		s2 = (s2 + s1) % 255
 	}
 	return (s2 << 8) | s1
