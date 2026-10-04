@@ -11,12 +11,15 @@ lode: the Lode compiler
 
 usage:
   lode build <file.lode> [-o <output>] [-O0|-O1|-O2|-O3] [--emit=ir]
+             [--stack-usage]
   lode run <file.lode> [-O0|-O1|-O2|-O3]
   lode check <file.lode>
   lode version | help
 
   build   compile to a static x86-64 Linux executable
-          (--emit=ir prints the LatticeFoundry IR instead)
+          (--emit=ir prints the LatticeFoundry IR instead;
+          --stack-usage prints each function's stack frame and the
+          worst-case stack depth, or why there is no bound)
   run     build to a temporary file, run it, exit with its status
   check   check the program without generating code
 ";
@@ -57,6 +60,22 @@ struct Options {
     output: Option<String>,
     opt: OptLevel,
     emit_ir: bool,
+    stack_usage: bool,
+}
+
+/// Reject the options only `lode build` takes.
+fn build_only(opts: &Options, command: &str) -> Result<(), String> {
+    for (set, flag) in [
+        (opts.emit_ir, "--emit=ir"),
+        (opts.stack_usage, "--stack-usage"),
+    ] {
+        if set {
+            return Err(format!(
+                "`{flag}` is for `lode build`, not `lode {command}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_options(args: &[String]) -> Result<Options, String> {
@@ -64,11 +83,13 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut output = None;
     let mut opt = OptLevel::O0;
     let mut emit_ir = false;
+    let mut stack_usage = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "-o" => output = Some(it.next().ok_or("`-o` needs a path")?.clone()),
             "--emit=ir" => emit_ir = true,
+            "--stack-usage" => stack_usage = true,
             flag if OptLevel::parse_flag(flag).is_some() => {
                 opt = OptLevel::parse_flag(flag).expect("checked")
             }
@@ -83,6 +104,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         output,
         opt,
         emit_ir,
+        stack_usage,
     })
 }
 
@@ -110,6 +132,7 @@ fn report(files: &SourceMap, err: lode::Error) -> ExitCode {
 
 fn check(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
+    build_only(&opts, "check")?;
     let (mut files, root) = load(&opts.input)?;
     Ok(match lode::check(&mut files, root) {
         Ok(_) => ExitCode::SUCCESS,
@@ -119,6 +142,9 @@ fn check(args: &[String]) -> Result<ExitCode, String> {
 
 fn build(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
+    if opts.emit_ir && opts.stack_usage {
+        return Err("`--stack-usage` needs machine code, not `--emit=ir`".to_owned());
+    }
     let (mut files, root) = load(&opts.input)?;
     if opts.emit_ir {
         return Ok(match lode::ir_text(&mut files, root, opts.opt) {
@@ -129,17 +155,22 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
             Err(e) => report(&files, e),
         });
     }
-    let image = match lode::build_executable(&mut files, root, opts.opt) {
-        Ok(image) => image,
+    let build_options = lode::BuildOptions { opt: opts.opt };
+    let exe = match lode::build(&mut files, root, &build_options) {
+        Ok(exe) => exe,
         Err(e) => return Ok(report(&files, e)),
     };
     let output = opts.output.unwrap_or_else(|| default_output(&opts.input));
-    latticefoundry::link::write_executable(&output, &image)?;
+    latticefoundry::link::write_executable(&output, &exe.image)?;
+    if opts.stack_usage {
+        print!("{}", exe.stack);
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 fn run(args: &[String]) -> Result<ExitCode, String> {
     let opts = parse_options(args)?;
+    build_only(&opts, "run")?;
     let (mut files, root) = load(&opts.input)?;
     let image = match lode::build_executable(&mut files, root, opts.opt) {
         Ok(image) => image,

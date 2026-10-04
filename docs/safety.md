@@ -177,7 +177,7 @@ A verification language is not "easy to read".
 
 ## Stack bounds
 
-**Status:** Proposed
+**Status:** Proposed. Reporting is implemented (below).
 
 The compiler computes the worst-case stack usage of the call graph from each
 entry point (`main`, thread entries, interrupt handlers).
@@ -193,6 +193,20 @@ entry point (`main`, thread entries, interrupt handlers).
 
 This matches what embedded developers already do by hand, and it follows from
 LatticeFoundry's cost/resource lattice (bet B9).
+
+**Implemented now:** `lode build --stack-usage` prints each function's frame
+size and the worst-case depth from `main`, along the deepest call path. If
+there is no bound, it names the cause: the recursive functions, or the
+function making an indirect call or a runtime-sized allocation. The numbers
+come from LatticeFoundry's frame layout, the same one the prologue uses. A
+frame includes the return address. The library returns the same report from
+`lode::build` (`Executable::stack`).
+
+**Still proposed:** other entry points (thread entries, interrupt handlers),
+the bound in the binary's metadata, and a profile that requires a bound.
+Today there is only `main`, and Lode has no indirect calls or runtime-sized
+allocations yet, so recursion is the only cause of a missing bound. Overflow
+already hits a guard page: LatticeFoundry's stack probes are on.
 
 ## The trusted boundary
 

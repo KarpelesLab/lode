@@ -91,7 +91,7 @@ Lode is now Lode's own work.
 | Correct `i8`/`i16` comparisons, `switch`, division, `cond_br` | `0.0.0` | Used (found by Lode's tests) |
 | Packed segments: no page padding in the file ([LF #2](https://github.com/KarpelesLab/latticefoundry/issues/2)) | `0.0.1` | Hello world went from 4,108 to 1,049 bytes |
 | Volatile loads/stores, atomics (`atomic_rmw`, `cmpxchg`), fences with C11 orderings | `0.0.2` | Next: `Atomic[T]`, `Mutex[T]` globals, MMIO |
-| Stack usage per function and call-graph worst case (`StackReport::worst_case_depth`) | `0.0.2` | Next: [stack bounds](safety.md#stack-bounds) |
+| Stack usage per function and call-graph worst case (`StackReport::worst_case_depth`) | `0.0.2` | Used: `lode build --stack-usage` ([stack bounds](safety.md#stack-bounds)) |
 | Stack probes (on by default) | `0.0.2` | Overflow reliably hits the guard page |
 | `secret` values, `declassify`, constant-time verifier | `0.0.2` | [`secret[T]`](types.md#secret-types) |
 | Context save/restore/switch with full register state, signal preemption (`lf_ctx_preempt`), opt-in yield points | `0.0.2` | [Green threads](concurrency.md#preemption) |

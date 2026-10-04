@@ -74,6 +74,7 @@ cargo build
 target/debug/lode run program.lode        # build, run, exit with its status
 target/debug/lode build program.lode -O2  # write ./program
 target/debug/lode build program.lode --emit=ir
+target/debug/lode build program.lode --stack-usage  # frames, worst-case stack
 target/debug/lode check program.lode
 ```
 

@@ -18,11 +18,13 @@ pub mod lower;
 pub mod parse;
 pub mod sema;
 pub mod source;
+pub mod stack;
 pub mod types;
 
 use std::path::PathBuf;
 
 use latticefoundry::Module;
+use latticefoundry::codegen::CodegenOptions;
 use latticefoundry::ir::text;
 use latticefoundry::link::{self, ImageOptions};
 use latticefoundry::mc::object::{
@@ -35,6 +37,7 @@ use latticefoundry::verify;
 use crate::diag::{Diagnostic, has_errors};
 use crate::lower::Lowered;
 use crate::source::{FileId, SourceMap, Span};
+use crate::stack::StackReport;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -92,13 +95,29 @@ pub fn ir_text(files: &mut SourceMap, root: FileId, opt: OptLevel) -> Result<Str
     Ok(text::print_module(&lowered.module, &lowered.syms))
 }
 
-/// Compile a program to a static x86-64 Linux executable, returning the ELF
-/// image bytes. The program's `main` return value is its exit status.
-pub fn build_executable(
+/// How to build an executable.
+#[derive(Clone, Debug, Default)]
+pub struct BuildOptions {
+    /// The optimization level.
+    pub opt: OptLevel,
+}
+
+/// A built program.
+#[derive(Debug)]
+pub struct Executable {
+    /// The static x86-64 Linux ELF image.
+    pub image: Vec<u8>,
+    /// Every function's stack frame, and the program's worst-case stack depth.
+    pub stack: StackReport,
+}
+
+/// Compile a program to a static x86-64 Linux executable, with its stack
+/// usage. The program's `main` return value is its exit status.
+pub fn build(
     files: &mut SourceMap,
     root: FileId,
-    opt: OptLevel,
-) -> Result<Vec<u8>, Error> {
+    options: &BuildOptions,
+) -> Result<Executable, Error> {
     let program = check(files, root)?;
     if program.main.is_none() {
         let end = files.get(root).text.len();
@@ -107,15 +126,31 @@ pub fn build_executable(
             "this program has no `main` function",
         )]));
     }
-    let lowered = compile_ir(files, root, opt)?;
-    let mut object = x86_64::compile_module(&lowered.module, &lowered.syms);
+    let lowered = compile_ir(files, root, options.opt)?;
+    let compiled =
+        x86_64::compile_module_with(&lowered.module, &lowered.syms, &CodegenOptions::default());
+    let mut object = compiled.object;
     emit_strings(&mut object, &lowered.strings);
-    let options = ImageOptions {
+    let link_options = ImageOptions {
         entry: lower::ENTRY_SYMBOL.to_owned(),
         ..ImageOptions::default()
     };
-    link::link_executable(vec![object], &options)
-        .map_err(|e| Error::Backend(format!("link error: {e}")))
+    let image = link::link_executable(vec![object], &link_options)
+        .map_err(|e| Error::Backend(format!("link error: {e}")))?;
+    Ok(Executable {
+        image,
+        stack: StackReport::new(compiled.stack, lower::ENTRY_SYMBOL),
+    })
+}
+
+/// Compile a program to a static x86-64 Linux executable, returning the ELF
+/// image bytes. [`build`] also returns its stack usage.
+pub fn build_executable(
+    files: &mut SourceMap,
+    root: FileId,
+    opt: OptLevel,
+) -> Result<Vec<u8>, Error> {
+    build(files, root, &BuildOptions { opt }).map(|e| e.image)
 }
 
 /// Define the string literals' symbols in a read-only data section (the code
