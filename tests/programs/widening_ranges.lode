@@ -1,0 +1,40 @@
+// exit: 0
+package main
+
+// An implicit widening keeps the value's range: `x` is 0..=255 as a `u32`.
+fn add(x: u8) -> u32 {
+	let a: u32 = 1
+	return a + x
+}
+
+fn widened(x: u8) -> u32 {
+	let y: u32 = x
+	return y + 1
+}
+
+fn checksum(xs: []u8) -> u32 {
+	var a: u32 = 1
+	for x in xs {
+		a = (a + x) % 65521
+	}
+	return a
+}
+
+fn signed(x: i8) -> i16 {
+	let b: i16 = 32000
+	return b + x
+}
+
+fn main() -> u8 {
+	if add(255) != 256 || widened(255) != 256 {
+		return 1
+	}
+	let xs: [3]u8 = [1, 2, 3]
+	if checksum(xs) != 7 {
+		return 2
+	}
+	if signed(-128) != 31872 {
+		return 3
+	}
+	return 0
+}

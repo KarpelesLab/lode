@@ -220,7 +220,9 @@ impl Checker<'_> {
         if let (Ty::Int(from), Ty::Int(to)) = (c.ty(), target)
             && from.range().within(to.range())
         {
-            let (range, term) = (c.range, c.term);
+            // The value keeps its range: with none known, its own type's,
+            // not the wider target's.
+            let (range, term) = (Some(c.int_range()), c.term);
             let mut out = Checked::new(TExprKind::Convert(Box::new(c.expr)), target, range);
             out.term = term;
             return Some(out);
