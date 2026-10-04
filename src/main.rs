@@ -14,6 +14,7 @@ usage:
              [--stack-usage]
   lode run <file.lode> [-O0|-O1|-O2|-O3]
   lode check <file.lode>
+  lode fmt [--check] <files or directories...>
   lode version | help
 
   build   compile to a static x86-64 Linux executable
@@ -22,6 +23,9 @@ usage:
           worst-case stack depth, or why there is no bound)
   run     build to a temporary file, run it, exit with its status
   check   check the program without generating code
+  fmt     rewrite files in the canonical format (directories are searched
+          for .lode files); --check changes nothing, lists the files that
+          aren't canonical and fails if there are any
 ";
 
 fn main() -> ExitCode {
@@ -35,7 +39,7 @@ fn main() -> ExitCode {
         "build" => build(rest),
         "run" => run(rest),
         "check" => check(rest),
-        "fmt" => Err("`lode fmt` is not implemented yet".to_owned()),
+        "fmt" => fmt(rest),
         "version" | "--version" | "-V" => {
             println!("lode {}", lode::VERSION);
             Ok(ExitCode::SUCCESS)
@@ -203,4 +207,80 @@ fn default_output(input: &str) -> String {
 fn temp_path(input: &str) -> PathBuf {
     let stem = default_output(input);
     std::env::temp_dir().join(format!("lode-run-{}-{stem}", std::process::id()))
+}
+
+fn fmt(args: &[String]) -> Result<ExitCode, String> {
+    let mut check = false;
+    let mut paths = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--check" => check = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown option `{flag}`")),
+            path => paths.push(PathBuf::from(path)),
+        }
+    }
+    if paths.is_empty() {
+        return Err("no files or directories to format (see `lode help`)".to_owned());
+    }
+    let mut files = Vec::new();
+    for path in &paths {
+        if path.is_dir() {
+            lode_files(path, &mut files)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        } else {
+            files.push(path.clone());
+        }
+    }
+    let mut failed = false;
+    for path in &files {
+        let name = path.display().to_string();
+        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+        let mut map = SourceMap::new();
+        let id = map.add(SourceFile::new(name.clone(), text));
+        let text = &map.get(id).text;
+        match lode::fmt::format(text, id) {
+            Ok(formatted) if formatted == *text => {}
+            Ok(_) if check => {
+                println!("{name}");
+                failed = true;
+            }
+            Ok(formatted) => {
+                std::fs::write(path, formatted).map_err(|e| format!("cannot write {name}: {e}"))?
+            }
+            Err(diags) => {
+                for d in &diags {
+                    eprint!("{}", d.render(&map));
+                }
+                eprintln!("lode: {name} is left unchanged");
+                failed = true;
+            }
+        }
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Every `.lode` file under `dir`, sorted, skipping hidden directories.
+fn lode_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+    for path in entries {
+        let hidden = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if path.is_dir() {
+            if !hidden {
+                lode_files(&path, out)?;
+            }
+        } else if path.extension().is_some_and(|e| e == "lode") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }

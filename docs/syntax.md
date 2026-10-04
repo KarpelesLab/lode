@@ -33,6 +33,40 @@ settle.
 There is a single canonical format, produced by `lode fmt`, which is part of
 the compiler and not a separate tool.
 
+`lode fmt <files or directories>` rewrites files in place. Directories are
+searched for `.lode` files. `lode fmt --check` changes nothing: it lists the
+files that aren't canonical and exits with status 1 if there are any (for CI).
+A file that doesn't lex or parse is left unchanged, with its errors.
+
+The canonical form:
+
+- Each line is indented with one tab per open `{`. A line that continues a
+  statement, or follows a `(` or `[` left open, gets one more tab.
+- Inside a line, tokens are separated by one space, except:
+  - none after `(`, `[` and `.`, and none before `)`, `]`, `,`, `:` and `.`
+  - none around `..`: `0..n`
+  - none after a unary operator: `-x`, `!ok`, `*u8`
+  - none before a call's `(` or an index's `[`: `f(x)`, `a[i]`
+  - none inside a type prefix: `[4]u8`, `[]*u8`
+- One statement per line. A `;` between statements becomes a line break, and
+  a block written on one line (`if a { return 1 }`) is split into lines.
+- `else` goes on the line of the `}` before it: `} else {`.
+- A `{` glued to a name, as in `Point{x: 1}`, is a literal and keeps its
+  lines. After `if`, `while`, `for`, `fn` and the like, `{` always starts a
+  block.
+- Blank lines between statements and items are kept, at most one in a row.
+  There are none at the start or end of a block or file.
+- `package` comes first. One blank line follows it, and one follows the
+  imports.
+- Comments stay where they are. Trailing comments on consecutive lines at the
+  same indentation are aligned with spaces.
+- No trailing whitespace, and the file ends with exactly one newline.
+
+The formatter works on tokens, not on the syntax tree, so comments are kept and
+most new syntax needs no formatter changes. It only changes whitespace: it
+lexes its own output again and leaves the file alone if the tokens or comments
+differ.
+
 **Open:** how "enforced" should it be?
 - **A.** `build` warns on non-canonical files and `build --strict` (CI) rejects
   them.

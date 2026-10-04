@@ -76,7 +76,12 @@ target/debug/lode build program.lode -O2  # write ./program
 target/debug/lode build program.lode --emit=ir
 target/debug/lode build program.lode --stack-usage  # frames, worst-case stack
 target/debug/lode check program.lode
+target/debug/lode fmt src/                 # rewrite .lode files in canonical form
+target/debug/lode fmt --check src/         # list non-canonical files, exit 1 if any
 ```
+
+The canonical format is described in
+[docs/syntax.md](docs/syntax.md#formatting).
 
 ## Working on the compiler
 

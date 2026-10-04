@@ -182,16 +182,25 @@ pub struct Token {
 /// error so that several problems can be reported at once; the token stream
 /// always ends with `Eof`.
 pub fn lex(src: &str, file: FileId) -> (Vec<Token>, Vec<Diagnostic>) {
+    let (toks, _, diags) = lex_with_comments(src, file);
+    (toks, diags)
+}
+
+/// Like [`lex`], but also return the span of every `//` comment (including
+/// `///` doc comments), without its newline, for the formatter. The tokens are
+/// exactly those [`lex`] returns.
+pub fn lex_with_comments(src: &str, file: FileId) -> (Vec<Token>, Vec<Span>, Vec<Diagnostic>) {
     let mut lx = Lexer {
         file,
         src,
         bytes: src.as_bytes(),
         pos: 0,
         toks: Vec::new(),
+        comments: Vec::new(),
         diags: Vec::new(),
     };
     lx.run();
-    (lx.toks, lx.diags)
+    (lx.toks, lx.comments, lx.diags)
 }
 
 struct Lexer<'a> {
@@ -200,6 +209,7 @@ struct Lexer<'a> {
     bytes: &'a [u8],
     pos: usize,
     toks: Vec<Token>,
+    comments: Vec<Span>,
     diags: Vec<Diagnostic>,
 }
 
@@ -219,6 +229,7 @@ impl Lexer<'_> {
                     while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
                         self.pos += 1;
                     }
+                    self.comments.push(Span::new(self.file, start, self.pos));
                 }
                 b'0'..=b'9' => self.number(),
                 b'"' => self.string(),

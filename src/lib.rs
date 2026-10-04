@@ -12,6 +12,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod fmt;
 pub mod lex;
 pub mod load;
 pub mod lower;
