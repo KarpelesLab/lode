@@ -3,10 +3,13 @@ package main
 
 // Results small enough to be returned packed in a register (see
 // src/lower.rs): every shape of them, through `try`, `catch`, `match`,
-// `??`, `if let`, `let ... else`, `==`, generic functions and methods, and
-// mixed with results that are returned in memory.
+// `??`, `if let`, `let ... else`, `==`, generic functions, methods, trait
+// methods and `io.Writer`, and mixed with results that are returned in
+// memory.
 
+import "std/buf"
 import "std/io"
+import "std/os"
 
 enum E {
 	empty
@@ -470,6 +473,150 @@ fn locals() -> u8 {
 	return 0
 }
 
+// Trait methods: dispatched statically, so they return packed results like
+// any function.
+trait Source {
+	fn next(inout self) throws(E) -> u8
+
+	fn peek(self) -> ?u16
+
+	/// A default method passing on the error of a required one.
+	fn next_two(inout self) throws(E) -> u16 {
+		let a = try self.next()
+		let b = try self.next()
+		return u16(a) * 256 + u16(b)
+	}
+}
+
+struct Countdown {
+	left: u8
+}
+
+impl Source for Countdown {
+	fn next(inout self) throws(E) -> u8 {
+		if self.left == 0 {
+			throw .empty
+		}
+		self.left -= 1
+		return self.left
+	}
+
+	fn peek(self) -> ?u16 {
+		if self.left == 0 {
+			return none
+		}
+		return u16(self.left) *| 1000
+	}
+}
+
+fn drain[S: Source](inout s: S) throws(E) -> u32 {
+	var sum: u32 = 0
+	loop {
+		let v = s.next() catch e {
+			if e == .empty {
+				return sum
+			}
+			throw e
+		}
+		sum +|= u32(v)
+	}
+}
+
+// A writer that fails with an error that has a payload.
+struct Failing {
+	calls: u8
+}
+
+impl io.Writer for Failing {
+	fn write_bytes(inout self, b: []u8) throws(os.Error) {
+		self.calls +|= 1
+		if self.calls > 2 {
+			if b.len > 9 {
+				throw .other(9)
+			}
+			throw .other(u16(b.len))
+		}
+	}
+}
+
+fn greet[W: io.Writer](inout w: W, who: str) throws(os.Error) {
+	try w.write("hi ")
+	try w.write(who)
+	try w.write_bytes("!".bytes())
+}
+
+fn traits() -> u8 {
+	var c = Countdown{left: 3}
+	if c.peek() ?? 0 != 3000 {
+		return 70
+	}
+	if (c.next_two() catch 0) != 513 {
+		return 71
+	}
+	if (drain(&c) catch 99) != 0 {
+		return 72
+	}
+	if c.peek() != none {
+		return 81
+	}
+	if (c.next_two() catch 7) != 7 {
+		return 73
+	}
+	var d = Countdown{left: 5}
+	if (drain(&d) catch 0) != 10 {
+		return 74
+	}
+	// A full buffer: `no_space`.
+	var b = buf.StackBuf[4].new()
+	var err: u8 = 0
+	greet(&b, "you") catch e {
+		match e {
+			no_space => err = 1
+			other(n) => err = 2
+			bad_fd => err = 3
+			broken_pipe => err = 4
+			io => err = 5
+		}
+	}
+	if err != 1 || b.len() != 4 {
+		return 75
+	}
+	// A payload in the error, through `try` in a default method.
+	var f = Failing{calls: 0}
+	greet(&f, "four") catch e {
+		if e != .other(1) {
+			return 76
+		}
+		err = 6
+	}
+	if err != 6 {
+		return 77
+	}
+	match io.Writer.write(&f, "abc") {
+		ok => return 78
+		err(e) => {
+			if let n = os_errno(e) {
+				if n != 3 {
+					return 79
+				}
+			} else {
+				return 80
+			}
+		}
+	}
+	return 0
+}
+
+fn os_errno(e: os.Error) -> ?u16 {
+	match e {
+		other(n) => return n
+		bad_fd => return none
+		broken_pipe => return none
+		no_space => return none
+		io => return none
+	}
+}
+
 fn main() -> u8 {
 	// `errdefer` runs only on the way out with an error.
 	deferred(true) catch _ {}
@@ -529,5 +676,9 @@ fn main() -> u8 {
 	if g != 0 {
 		return g
 	}
-	return locals()
+	let l = locals()
+	if l != 0 {
+		return l
+	}
+	return traits()
 }
