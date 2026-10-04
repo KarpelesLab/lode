@@ -15,7 +15,7 @@ fn sum(xs: []u32) -> u32 {
 
 fn print_all(xs: []u32) {
 	for x in xs {
-		io.print_u64(x)
+		io.print_int(x)
 		io.print(" ")
 	}
 	io.print("\n")
