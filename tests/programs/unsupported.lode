@@ -1,9 +1,9 @@
-// error: `struct` declarations are not supported by the compiler yet
+// error: `enum` declarations are not supported by the compiler yet
 // error: `match` is not supported by the compiler yet
 package main
 
-struct Point {
-	x: u32
+enum Shape {
+	circle
 }
 
 fn main() {

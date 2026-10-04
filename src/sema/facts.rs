@@ -5,8 +5,9 @@
 //! - **ranges**: a term's value lies in `lo..=hi`;
 //! - **relations**: for two terms `a` and `b`, `a - b <= c`.
 //!
-//! A [`Term`] is an integer local, or the length of a view local (a slice or a
-//! `str`), so `i < xs.len` relates `i` to the length of `xs`.
+//! A [`Term`] is an integer local, the length of a view local (a slice or a
+//! `str`), so `i < xs.len` relates `i` to the length of `xs`, or an integer
+//! field of a struct local (`p.x`, `p.a.b`).
 //!
 //! Facts come from literals and constants, from assignments, from the
 //! conditions of `if` and `while` (narrowing), and from `for` loops. They flow
@@ -26,13 +27,18 @@ pub enum Term {
     Local(LocalId),
     /// The length of a view local (`xs.len` of a slice or `str`).
     Len(LocalId),
+    /// An integer field of a struct local, reached through fields only
+    /// (`p.x`, `p.a.b`, not `p.a[i].b`). The number tells the fields of the
+    /// local's struct apart: it's the field's position when the struct and
+    /// the structs in it are flattened, each non-struct field counting one.
+    Field(LocalId, u32),
 }
 
 impl Term {
     /// The local the term is about.
-    fn local(self) -> LocalId {
+    pub fn local(self) -> LocalId {
         match self {
-            Term::Local(l) | Term::Len(l) => l,
+            Term::Local(l) | Term::Len(l) | Term::Field(l, _) => l,
         }
     }
 }
@@ -298,8 +304,9 @@ impl Env {
     }
 
     /// `local` was assigned a value: an integer in `range` (`None`: anything
-    /// its type allows), or a view whose length is unknown. Every relation
-    /// involving the local or its length is forgotten.
+    /// its type allows), a view whose length is unknown, or a struct whose
+    /// fields are unknown. Every relation involving the local, its length or
+    /// its fields is forgotten.
     pub fn assign(&mut self, local: LocalId, range: Option<Range>) {
         match range {
             Some(r) => {
@@ -310,8 +317,19 @@ impl Env {
             }
         }
         self.ranges.remove(&Term::Len(local));
+        self.ranges
+            .retain(|t, _| !matches!(t, Term::Field(l, _) if *l == local));
         self.rels
             .retain(|r| r.a.local() != local && r.b.local() != local);
+    }
+
+    /// Forget everything about the fields of the struct local `local`
+    /// numbered `fields` (a field, or the fields of a struct in it, was
+    /// assigned).
+    pub fn forget_fields(&mut self, local: LocalId, fields: std::ops::Range<u32>) {
+        let hit = |t: &Term| matches!(*t, Term::Field(l, k) if l == local && fields.contains(&k));
+        self.ranges.retain(|t, _| !hit(t));
+        self.rels.retain(|r| !hit(&r.a) && !hit(&r.b));
     }
 
     /// Forget everything about `local` (at the head of a loop that assigns it).

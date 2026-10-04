@@ -1,0 +1,85 @@
+// error: a struct field can't be a view (`str`)
+// error: a struct field can't be a view (`[]u8`)
+// error: `Twice` has more than one field `a`
+// error: the struct `Node` contains itself
+// error: the struct `Left` contains itself
+// error: missing field `y` in this `Point`
+// error: missing fields `x`, `y` in this `Point`
+// error: the field `x` is given more than once
+// error: `Point` has no field `z`
+// error: `Point` has no field `z`
+// error: cannot assign to a field of `p`, which is immutable
+// error: cannot assign to a field of `ps`, which is immutable
+// error: expected `Point`, found `Pair`
+// error: mismatched types: `Point` and `Pair`
+// error: `<` can't compare values of type `Point`
+// error: `u32` is not a struct
+// error: `Point` is a type; build a value with `Point{...}`
+// error: `Point` is a struct; build one with `Point{...}`
+package main
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+// The same fields, but another type: structs are nominal.
+struct Pair {
+	x: u32
+	y: u32
+}
+
+struct Named {
+	name: str
+	bytes: []u8
+}
+
+struct Twice {
+	a: u8
+	a: u16
+}
+
+struct Node {
+	value: u32
+	next: [2]Node
+}
+
+struct Left {
+	right: Right
+}
+
+struct Right {
+	left: Left
+}
+
+fn literals() {
+	let a = Point{x: 1}
+	let b = Point{}
+	let c = Point{x: 1, x: 2, y: 3}
+	let d = Point{x: 1, y: 2, z: 3}
+}
+
+fn access(p: Point) -> u32 {
+	return p.z
+}
+
+fn immutable(p: Point) {
+	p.x = 1
+	let ps: [2]Point = [Point{x: 1, y: 2}; 2]
+	ps[0].y += 1
+}
+
+fn nominal(p: Point, q: Pair) -> bool {
+	let r: Point = q
+	let lt = p < p
+	return p == q
+}
+
+fn not_values() {
+	let a = u32{x: 1}
+	let b = Point
+	let c = Point(1, 2)
+}
+
+fn main() {
+}

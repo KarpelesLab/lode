@@ -51,6 +51,48 @@ impl Checked {
     }
 }
 
+fn is_array_literal(e: &ast::Expr) -> bool {
+    match &e.kind {
+        ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => true,
+        ExprKind::Paren(inner) => is_array_literal(inner),
+        _ => false,
+    }
+}
+
+/// The term for a place made of fields only, like `p.a.b`, whatever its
+/// type: for a struct, the first number of its fields.
+pub(super) fn place_term(place: &TExpr) -> Option<Term> {
+    match &place.kind {
+        TExprKind::Field(base, i) => field_term(base, *i as usize),
+        _ => None,
+    }
+}
+
+/// The term for field `i` of `base`, when `base` is a struct local or a
+/// struct field of one, reached through fields only.
+fn field_term(base: &TExpr, i: usize) -> Option<Term> {
+    let (local, offset) = match &base.kind {
+        TExprKind::Local(l) => (*l, 0),
+        TExprKind::Field(inner, j) => match field_term(inner, *j as usize)? {
+            Term::Field(l, off) => (l, off),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let def = base.ty.as_struct()?;
+    let before: u32 = def.fields[..i].iter().map(|f| flat_size(f.ty)).sum();
+    Some(Term::Field(local, offset + before))
+}
+
+/// How many numbers [`field_term`] gives a value of type `ty`: one for
+/// anything but a struct, the sum of its fields' for a struct.
+pub(super) fn flat_size(ty: Ty) -> u32 {
+    match ty.as_struct() {
+        Some(def) => def.fields.iter().map(|f| flat_size(f.ty)).sum(),
+        None => 1,
+    }
+}
+
 fn op_name(op: BinOp) -> &'static str {
     match op {
         BinOp::Add | BinOp::AddWrap | BinOp::AddSat => "addition",
@@ -178,7 +220,69 @@ impl Checker<'_> {
                 self.array_repeat(cx, value, count, e.span, expected)
             }
             ExprKind::Index(base, index) => self.index(cx, base, index),
+            ExprKind::StructLit(ty, fields) => self.struct_literal(cx, ty, fields, e.span),
         }
+    }
+
+    /// `T{name: value, ...}`: every field exactly once, in any order.
+    fn struct_literal(
+        &mut self,
+        cx: &mut FnCx,
+        ty: &ast::TypeExpr,
+        inits: &[ast::FieldInit],
+        span: Span,
+    ) -> Option<Checked> {
+        let sty = self.resolve_type(cx, ty)?;
+        let Some(def) = sty.as_struct() else {
+            self.error(ty.span(), format!("`{sty}` is not a struct"));
+            return None;
+        };
+        let mut given = vec![false; def.fields.len()];
+        let mut out = Vec::new();
+        let mut ok = true;
+        for init in inits {
+            let name = &init.name.name;
+            let Some((i, fty)) = def.field(name) else {
+                self.error(init.name.span, format!("`{sty}` has no field `{name}`"));
+                ok = false;
+                continue;
+            };
+            if given[i] {
+                self.error(
+                    init.name.span,
+                    format!("the field `{name}` is given more than once"),
+                );
+                ok = false;
+                continue;
+            }
+            given[i] = true;
+            match self
+                .expr(cx, &init.value, Some(fty))
+                .and_then(|c| self.coerce(c, fty, init.value.span))
+            {
+                Some(c) => out.push((i as u32, c.expr)),
+                None => ok = false,
+            }
+        }
+        let missing: Vec<String> = def
+            .fields
+            .iter()
+            .zip(&given)
+            .filter(|&(_, &g)| !g)
+            .map(|(f, _)| format!("`{}`", f.name))
+            .collect();
+        if !missing.is_empty() {
+            let s = if missing.len() == 1 { "" } else { "s" };
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("missing field{s} {} in this `{sty}`", missing.join(", ")),
+                )
+                .with_help("every field must be given a value; there are no defaults"),
+            );
+            ok = false;
+        }
+        ok.then(|| Checked::new(TExprKind::StructLit(out), sty, None))
     }
 
     /// The element type and length (`None` for a slice) that an array literal
@@ -434,6 +538,13 @@ impl Checker<'_> {
                 );
                 None
             }
+            Item::Struct(_) => {
+                self.error(
+                    span,
+                    format!("`{name}` is a type; build a value with `{name}{{...}}`"),
+                );
+                None
+            }
         }
     }
 
@@ -462,6 +573,25 @@ impl Checker<'_> {
                     usize_ty,
                     Some(Range::exact(n)),
                 ))
+            }
+            (Ty::Struct(_), name) => {
+                let def = b.ty().as_struct().expect("a struct");
+                let Some((i, fty)) = def.field(name) else {
+                    self.error(member.span, format!("`{}` has no field `{name}`", b.ty()));
+                    return None;
+                };
+                // An integer field of a local, through fields only, is a term.
+                let term = match type_range(fty) {
+                    Some(_) => field_term(&b.expr, i),
+                    None => None,
+                };
+                let mut c = Checked::new(
+                    TExprKind::Field(Box::new(b.expr), i as u32),
+                    fty,
+                    term.and_then(|t| cx.env.range(t)),
+                );
+                c.term = term.map(Linear::of);
+                Some(c)
             }
             (Ty::Str, "ptr") => {
                 self.require_unsafe(cx, span, "taking a string's raw pointer");
@@ -619,6 +749,18 @@ impl Checker<'_> {
                 let r = self.expr(cx, rhs, Some(l.ty()))?;
                 (l, r)
             }
+            // An array literal takes its type from the other side, as in
+            // `xs == [1, 2, 3]`.
+            _ if is_array_literal(rhs) && !is_array_literal(lhs) => {
+                let l = self.expr(cx, lhs, expected)?;
+                let r = self.expr(cx, rhs, Some(l.ty()))?;
+                (l, r)
+            }
+            _ if is_array_literal(lhs) && !is_array_literal(rhs) => {
+                let r = self.expr(cx, rhs, expected)?;
+                let l = self.expr(cx, lhs, Some(r.ty()))?;
+                (l, r)
+            }
             _ => {
                 let l = self.expr(cx, lhs, expected);
                 let r = self.expr(cx, rhs, expected);
@@ -694,7 +836,9 @@ impl Checker<'_> {
                 let ordered = !matches!(op, BinOp::Eq | BinOp::Ne);
                 match l.ty() {
                     Ty::Int(_) => {}
-                    Ty::Bool | Ty::Ptr(_) if !ordered => {}
+                    // Arrays and structs compare element by element, field
+                    // by field: every type they can hold has `==`.
+                    Ty::Bool | Ty::Ptr(_) | Ty::Array(_) | Ty::Struct(_) if !ordered => {}
                     other => {
                         self.error(
                             span,
@@ -992,6 +1136,12 @@ impl Checker<'_> {
             ExprKind::Name(name) if cx.lookup(name).is_none() => {
                 if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
                     (id, name.clone())
+                } else if let Some(Item::Struct(_)) = self.pkgs[cx.pkg].items.get(name) {
+                    self.error(
+                        callee.span,
+                        format!("`{name}` is a struct; build one with `{name}{{...}}`"),
+                    );
+                    return None;
                 } else if primitive(name, self.ptr_bits).is_some() {
                     return self.conversion(cx, name, callee.span, args, span);
                 } else if name == SYSCALL {
@@ -1009,10 +1159,10 @@ impl Checker<'_> {
                 let pkg = self.imported(cx, pkg_name).expect("checked");
                 match self.package_item(cx, pkg, &member.name, member.span)? {
                     Item::Func(id) => (id, format!("{pkg_name}.{}", member.name)),
-                    Item::Const(_) => {
+                    Item::Const(_) | Item::Struct(_) => {
                         self.error(
                             callee.span,
-                            format!("`{pkg_name}.{}` is a constant, not a function", member.name),
+                            format!("`{pkg_name}.{}` is not a function", member.name),
                         );
                         return None;
                     }

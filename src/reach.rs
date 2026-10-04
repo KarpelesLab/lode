@@ -133,7 +133,13 @@ impl Uses {
                 self.expr(l);
                 self.expr(r);
             }
+            TExprKind::StructLit(fields) => {
+                for (_, v) in fields {
+                    self.expr(v);
+                }
+            }
             TExprKind::Unary(_, inner)
+            | TExprKind::Field(inner, _)
             | TExprKind::Convert(inner)
             | TExprKind::ViewLen(inner)
             | TExprKind::ArrayLen(inner)

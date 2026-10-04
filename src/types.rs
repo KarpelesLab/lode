@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// A fixed-width integer type. `size` marks `usize`/`isize`, which are distinct
 /// types from the same-width `u64`/`i64` even though they share a layout.
@@ -74,6 +74,9 @@ pub enum Ty {
     /// A slice `[]T`, a read-only view like `str`: a [`Compound::Slice`] in
     /// the interner.
     Slice(CompoundId),
+    /// A struct: a [`Compound::Struct`] in the interner. Structs are nominal,
+    /// so each declaration is a type of its own.
+    Struct(CompoundId),
 }
 
 impl Ty {
@@ -99,7 +102,7 @@ impl Ty {
         match self {
             Ty::Array(id) => match compound(id) {
                 Compound::Array { elem, len } => Some((elem, len)),
-                Compound::Slice { .. } => unreachable!("an array id names a slice"),
+                _ => unreachable!("an array id names another type"),
             },
             _ => None,
         }
@@ -110,7 +113,7 @@ impl Ty {
         match self {
             Ty::Slice(id) => match compound(id) {
                 Compound::Slice { elem } => Some(elem),
-                Compound::Array { .. } => unreachable!("a slice id names an array"),
+                _ => unreachable!("a slice id names another type"),
             },
             _ => None,
         }
@@ -126,6 +129,84 @@ impl Ty {
     pub fn is_view(self) -> bool {
         matches!(self, Ty::Str | Ty::Slice(_))
     }
+
+    /// Whether values of this type live in memory, as places (arrays and
+    /// structs), rather than in registers.
+    pub fn in_memory(self) -> bool {
+        matches!(self, Ty::Array(_) | Ty::Struct(_))
+    }
+
+    /// The declaration of a struct type.
+    pub fn as_struct(self) -> Option<Arc<StructDef>> {
+        match self {
+            Ty::Struct(id) => match compound(id) {
+                Compound::Struct { def } => Some(struct_def(def)),
+                _ => unreachable!("a struct id names another type"),
+            },
+            _ => None,
+        }
+    }
+
+    /// Declare a new struct type named `name` (as shown in messages), from
+    /// package `pkg`. Its fields are set once they're resolved, with
+    /// [`Ty::set_fields`].
+    pub fn new_struct(name: String, pkg: usize, is_pub: bool) -> Ty {
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let def = u32::try_from(tables.structs.len()).expect("too many structs");
+        tables.structs.push(Arc::new(StructDef {
+            name,
+            pkg,
+            is_pub,
+            fields: Vec::new(),
+        }));
+        drop(tables);
+        Ty::Struct(intern(Compound::Struct { def }))
+    }
+
+    /// Set the fields of a struct type declared with [`Ty::new_struct`].
+    pub fn set_fields(self, fields: Vec<Field>) {
+        let Ty::Struct(id) = self else {
+            unreachable!("not a struct: {self}")
+        };
+        let Compound::Struct { def } = compound(id) else {
+            unreachable!("a struct id names another type")
+        };
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut tables.structs[def as usize];
+        *entry = Arc::new(StructDef {
+            fields,
+            ..StructDef::clone(entry)
+        });
+    }
+}
+
+/// A struct declaration: its name, where it's declared and its fields, in
+/// declaration order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructDef {
+    /// The name shown in messages: `Point`, or `os.Stat` for a struct of an
+    /// imported package.
+    pub name: String,
+    /// The index of the declaring package (in the checker's package list).
+    pub pkg: usize,
+    pub is_pub: bool,
+    pub fields: Vec<Field>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
+}
+
+impl StructDef {
+    /// The index and type of the field called `name`.
+    pub fn field(&self, name: &str) -> Option<(usize, Ty)> {
+        self.fields
+            .iter()
+            .position(|f| f.name == name)
+            .map(|i| (i, self.fields[i].ty))
+    }
 }
 
 /// The index of a compound type in the global type interner.
@@ -137,8 +218,18 @@ pub struct CompoundId(u32);
 /// same [`CompoundId`], so comparing ids compares the types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Compound {
-    Array { elem: Ty, len: u64 },
-    Slice { elem: Ty },
+    Array {
+        elem: Ty,
+        len: u64,
+    },
+    Slice {
+        elem: Ty,
+    },
+    /// A struct, by the index of its declaration: two declarations are two
+    /// types, even with the same fields.
+    Struct {
+        def: u32,
+    },
 }
 
 /// The interner's tables. Entries are only ever appended, so an id stays
@@ -147,6 +238,7 @@ pub enum Compound {
 struct Interner {
     entries: Vec<Compound>,
     ids: HashMap<Compound, CompoundId>,
+    structs: Vec<Arc<StructDef>>,
 }
 
 fn interner() -> &'static Mutex<Interner> {
@@ -172,6 +264,11 @@ pub fn compound(id: CompoundId) -> Compound {
     tables.entries[id.0 as usize]
 }
 
+fn struct_def(def: u32) -> Arc<StructDef> {
+    let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(&tables.structs[def as usize])
+}
+
 impl fmt::Display for Ty {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -180,9 +277,10 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Str => f.write_str("str"),
             Ty::Ptr(t) => write!(f, "*{t}"),
-            Ty::Array(id) | Ty::Slice(id) => match compound(*id) {
+            Ty::Array(id) | Ty::Slice(id) | Ty::Struct(id) => match compound(*id) {
                 Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
                 Compound::Slice { elem } => write!(f, "[]{elem}"),
+                Compound::Struct { def } => f.write_str(&struct_def(def).name),
             },
         }
     }
@@ -352,5 +450,24 @@ mod tests {
         let id = intern(Compound::Slice { elem: u8_ });
         assert_eq!(Ty::Slice(id), Ty::slice(u8_));
         assert_eq!(compound(id), Compound::Slice { elem: u8_ });
+    }
+
+    #[test]
+    fn structs_are_nominal() {
+        let u8_ = Ty::Int(IntTy::new(false, 8));
+        let a = Ty::new_struct("P".into(), 0, false);
+        let b = Ty::new_struct("P".into(), 1, true);
+        let fields = vec![Field {
+            name: "x".into(),
+            ty: u8_,
+        }];
+        a.set_fields(fields.clone());
+        b.set_fields(fields);
+        assert_ne!(a, b);
+        assert_eq!(a.to_string(), "P");
+        let def = b.as_struct().expect("a struct");
+        assert!(def.is_pub && def.pkg == 1);
+        assert_eq!(def.field("x"), Some((0, u8_)));
+        assert!(a.in_memory() && !a.is_view() && Ty::array(a, 2).in_memory());
     }
 }

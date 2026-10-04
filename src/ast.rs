@@ -28,6 +28,22 @@ pub struct Import {
 pub enum Item {
     Fn(FnDecl),
     Const(ConstDecl),
+    Struct(StructDecl),
+}
+
+/// `struct Name { field: T ... }`, one field per line.
+#[derive(Debug)]
+pub struct StructDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub fields: Vec<FieldDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug)]
+pub struct FieldDecl {
+    pub name: Ident,
+    pub ty: TypeExpr,
 }
 
 #[derive(Debug)]
@@ -72,8 +88,10 @@ pub struct Param {
 
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
-    /// A named type such as `u32` or `bool`.
+    /// A named type such as `u32`, `bool` or `Point`.
     Named(Ident),
+    /// A type of another package: `pkg.Name`.
+    Qualified(Ident, Ident),
     /// `()`
     Unit(Span),
     /// A raw pointer `*T`.
@@ -88,6 +106,7 @@ impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
             TypeExpr::Named(id) => id.span,
+            TypeExpr::Qualified(pkg, name) => pkg.span.to(name.span),
             TypeExpr::Unit(span)
             | TypeExpr::Ptr(_, span)
             | TypeExpr::Array(_, _, span)
@@ -194,6 +213,15 @@ pub enum ExprKind {
     ArrayRepeat(Box<Expr>, Box<Expr>),
     /// `base[index]`
     Index(Box<Expr>, Box<Expr>),
+    /// `Point{x: 1, y: 2}`: a struct literal, with its fields in source order.
+    StructLit(TypeExpr, Vec<FieldInit>),
+}
+
+/// `name: value` in a struct literal.
+#[derive(Clone, Debug)]
+pub struct FieldInit {
+    pub name: Ident,
+    pub value: Expr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

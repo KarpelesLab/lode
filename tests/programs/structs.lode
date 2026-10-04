@@ -1,0 +1,195 @@
+// exit: 0
+package main
+
+struct Point {
+	x: i32
+	y: i32
+}
+
+/// A rectangle, by two corners.
+struct Rect {
+	min: Point
+	max: Point
+}
+
+// Large enough that copies and comparisons loop over the elements.
+struct Buffer {
+	used: usize
+	flag: bool
+	bytes: [64]u8
+}
+
+struct Path {
+	len: u8
+	steps: [4]Point
+}
+
+// Fields in any order; reading them back.
+fn construct() -> bool {
+	let p = Point{y: 2, x: 1}
+	return p.x == 1 && p.y == 2
+}
+
+// Nested fields, read and assigned, with `op=`.
+fn nested() -> bool {
+	var r = Rect{
+		min: Point{x: 0, y: 0},
+		max: Point{x: 10, y: 20},
+	}
+	r.max.x = 30
+	r.min.y += 5
+	r.min = Point{x: r.min.y, y: r.min.x}
+	return r.min.x == 5 && r.min.y == 0 && r.max.x == 30 && r.max.y == 20
+}
+
+// A copy is independent of the original, both ways.
+fn copies() -> bool {
+	var a = Point{x: 1, y: 2}
+	var b = a
+	b.x = 10
+	a.y = 20
+	let r = Rect{min: a, max: b}
+	a.x = 100
+	return a.x == 100 && b.x == 10 && b.y == 2 && r.min.x == 1 && r.min.y == 20
+}
+
+fn add(a: Point, b: Point) -> Point {
+	return Point{x: a.x +% b.x, y: a.y +% b.y}
+}
+
+fn swap(p: Point) -> Point {
+	return Point{x: p.y, y: p.x}
+}
+
+fn corner(r: Rect) -> Point {
+	return r.max
+}
+
+// Passing and returning by value, including into the argument itself.
+fn calls() -> bool {
+	var p = Point{x: 1, y: 2}
+	p = swap(p)
+	let q = add(p, Point{x: 10, y: 20})
+	let r = Rect{min: q, max: swap(q)}
+	return p.x == 2 && p.y == 1 && q.x == 12 && q.y == 21 && corner(r).x == 21 && swap(p).y == 2
+}
+
+// Arrays inside structs and structs inside arrays.
+fn arrays() -> bool {
+	var path = Path{len: 0, steps: [Point{x: 0, y: 0}; 4]}
+	for i in 0..path.steps.len {
+		path.steps[i].x = 1
+		path.steps[i].y = path.steps[i].y +% 2
+		path.len = path.len +% 1
+	}
+	path.steps[3] = Point{x: 7, y: 8}
+	var ps: [3]Point = [Point{x: 1, y: 1}, Point{x: 2, y: 2}, Point{x: 3, y: 3}]
+	ps[1].y = 20
+	var sum: i32 = 0
+	for p in ps {
+		sum = sum +% p.x +% p.y
+	}
+	let copy = path
+	path.steps[0].x = 99
+	return path.len == 4 && path.steps[2].y == 2 && path.steps[3].x == 7 && sum == 30 && copy.steps[0].x == 1
+}
+
+fn longest(paths: []Path) -> u8 {
+	var best: u8 = 0
+	for p in paths {
+		if p.len > best {
+			best = p.len
+		}
+	}
+	return best
+}
+
+fn first_row(m: [2][2]u8) -> [2]u8 {
+	return m[0]
+}
+
+// Arrays are passed and returned by value too.
+fn arrays_by_value() -> bool {
+	let zero = Point{x: 0, y: 0}
+	let a = Path{len: 3, steps: [zero; 4]}
+	let b = Path{len: 5, steps: [zero; 4]}
+	let ps: [2]Path = [a, b]
+	let row = first_row([[1, 2], [3, 4]])
+	return longest(ps) == 5 && row[1] == 2
+}
+
+// Structural equality.
+fn equality() -> bool {
+	let a = Rect{min: Point{x: 1, y: 2}, max: Point{x: 3, y: 4}}
+	var b = a
+	let same = a == b
+	b.max.y = 5
+	let path = Path{len: 1, steps: [Point{x: 1, y: 2}; 4]}
+	var other = path
+	other.steps[3].y = 0
+	let xs: [3]u8 = [1, 2, 3]
+	let ys: [3]u8 = [1, 2, 3]
+	return same && a != b && a.min == (Point{x: 1, y: 2}) && path != other && xs == ys && [1, 2, 4] != xs
+}
+
+fn filled(b: Buffer, v: u8) -> Buffer {
+	var out = b
+	for i in 0..out.bytes.len {
+		out.bytes[i] = v
+	}
+	out.used = out.bytes.len
+	return out
+}
+
+// Copying and comparing large values.
+fn large() -> bool {
+	let empty = Buffer{used: 0, flag: true, bytes: [0; 64]}
+	var a = filled(empty, 7)
+	let b = a
+	a.bytes[63] = 8
+	var bs: [2]Buffer = [empty; 2]
+	bs[1] = filled(bs[1], 1)
+	let same = filled(empty, 7) == b
+	return a != b && same && b.bytes[63] == 7 && b.used == 64 && empty.used == 0 && bs[1].bytes[5] == 1 && bs[0] == empty
+}
+
+// Field facts: a checked field proves a later operation.
+fn field_facts(p: Point) -> i32 {
+	if p.x > 0 && p.x < 100 {
+		return p.x * 2
+	}
+	var q = p
+	q.y = 5
+	return q.y * 3
+}
+
+fn main() -> u8 {
+	if !construct() {
+		return 1
+	}
+	if !nested() {
+		return 2
+	}
+	if !copies() {
+		return 3
+	}
+	if !calls() {
+		return 4
+	}
+	if !arrays() {
+		return 5
+	}
+	if !arrays_by_value() {
+		return 6
+	}
+	if !equality() {
+		return 7
+	}
+	if !large() {
+		return 9
+	}
+	if field_facts(Point{x: 21, y: 0}) != 42 || field_facts(Point{x: -1, y: 0}) != 15 {
+		return 8
+	}
+	return 0
+}

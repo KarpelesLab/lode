@@ -10,11 +10,24 @@
 //! become read-only data symbols ([`Lowered::strings`]) that the object
 //! writer emits.
 //!
-//! Arrays live in memory. An array-typed expression lowers to a pointer to
-//! its storage ([`Val::Mem`]): a local's slot, an element of another array,
-//! or a temporary slot that a literal is written into. Copying an array
-//! copies its elements, one by one or in a loop for longer arrays. Array
-//! slots and temporaries are `alloca`s, which LF gives static frame slots.
+//! Arrays and structs live in memory. Such an expression lowers to a
+//! pointer to its storage ([`Val::Mem`]): a local's slot, an element or a
+//! field of another value, or a temporary slot that a literal is written
+//! into. Copying one copies its scalars, field by field and element by
+//! element (in a loop for longer arrays). Slots and temporaries are
+//! `alloca`s, which LF gives static frame slots. A struct's IR type is an LF
+//! struct of its fields in declaration order, so its layout is LF's: each
+//! field at the next offset aligned for it, the size rounded up to the
+//! largest alignment.
+//!
+//! Calls pass a value in memory as a pointer to it. Parameters are read-only
+//! for the duration of the call (docs/memory.md), and nothing can change the
+//! argument while the callee runs, so the pointer is to the caller's own
+//! value, not to a copy. A function returning a value in memory takes a
+//! pointer to the caller's storage for the result as its first IR parameter
+//! and returns nothing. The caller passes fresh storage: a new local's slot
+//! for `let x = f()`, otherwise a temporary that's then copied, so the
+//! callee never writes to something it can also read through a parameter.
 
 use latticefoundry::Module;
 use latticefoundry::ir::builder::FunctionBuilder;
@@ -68,7 +81,7 @@ impl Types {
             Ty::Int(t) => self.int(t),
             Ty::Ptr(_) => self.ptr,
             Ty::Str | Ty::Slice(_) => unreachable!("a view is two values"),
-            Ty::Array(_) => unreachable!("an array lives in memory"),
+            Ty::Array(_) | Ty::Struct(_) => unreachable!("{ty} lives in memory"),
         }
     }
 
@@ -77,8 +90,23 @@ impl Types {
         match ty {
             Ty::Unit => Vec::new(),
             Ty::Str | Ty::Slice(_) => vec![self.ptr, self.i64],
+            Ty::Array(_) | Ty::Struct(_) => vec![self.ptr],
             _ => vec![self.of(ty)],
         }
+    }
+
+    /// A function's IR parameter and return types. A result in memory is
+    /// written through a pointer passed first (see the module docs).
+    fn signature(&self, f: &Func) -> (Vec<TypeId>, TypeId) {
+        let mut params = Vec::new();
+        let ret = if f.ret.in_memory() {
+            params.push(self.ptr);
+            self.void
+        } else {
+            self.of(f.ret)
+        };
+        params.extend(f.params.iter().flat_map(|&p| self.parts(f.locals[p].ty)));
+        (params, ret)
     }
 
     fn int(&self, t: IntTy) -> TypeId {
@@ -98,7 +126,7 @@ enum Val {
     One(ValueId),
     /// A view (`str` or slice): pointer and length.
     View(ValueId, ValueId),
-    /// An array: a pointer to its storage.
+    /// An array or a struct: a pointer to its storage.
     Mem(ValueId),
 }
 
@@ -115,7 +143,7 @@ impl Val {
             Val::Unit => Vec::new(),
             Val::One(v) => vec![v],
             Val::View(p, n) => vec![p, n],
-            Val::Mem(_) => unreachable!("arrays aren't passed by value"),
+            Val::Mem(p) => vec![p],
         }
     }
 }
@@ -132,7 +160,7 @@ enum Slot {
         ptr: ValueId,
         len: ValueId,
     },
-    /// An array's storage.
+    /// An array's or a struct's storage.
     Mem(ValueId),
 }
 
@@ -199,13 +227,9 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             if !reach.reached[i] {
                 return None;
             }
-            let params = f
-                .params
-                .iter()
-                .flat_map(|&p| t.parts(f.locals[p].ty))
-                .collect();
+            let (params, ret) = t.signature(f);
             let is_entry = direct_entry == Some(i);
-            let ret = if is_entry { t.i64 } else { t.of(f.ret) };
+            let ret = if is_entry { t.i64 } else { ret };
             let sig = module.types_mut().func(params, ret, false);
             let id = module.declare_function(syms.intern(&f.symbol), sig);
             if !is_entry {
@@ -228,6 +252,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             loops: Vec::new(),
             terminated: false,
             exit_status: (direct_entry == Some(i)).then_some(f.ret),
+            result: None,
         }
         .function(f);
     }
@@ -289,6 +314,8 @@ struct FnLower<'a> {
     /// For the entry function, `main`'s return type: its returns become
     /// `i64` exit statuses.
     exit_status: Option<Ty>,
+    /// Where to write the result, for a function returning a value in memory.
+    result: Option<ValueId>,
 }
 
 /// The most scalar copies an array copy or fill is unrolled into; longer
@@ -297,8 +324,14 @@ const UNROLL_LIMIT: u64 = 16;
 
 /// The number of scalars in a value of type `ty`.
 fn scalars(ty: Ty) -> u64 {
-    match ty.as_array() {
-        Some((elem, n)) => n.saturating_mul(scalars(elem)),
+    if let Some((elem, n)) = ty.as_array() {
+        return n.saturating_mul(scalars(elem));
+    }
+    match ty.as_struct() {
+        Some(def) => def
+            .fields
+            .iter()
+            .fold(0, |n, f| n.saturating_add(scalars(f.ty))),
         None => 1,
     }
 }
@@ -321,13 +354,41 @@ fn const_bits(v: i128, t: IntTy) -> i64 {
 impl FnLower<'_> {
     fn function(mut self, f: &Func) {
         let entry = self.b.create_entry_block();
-        for local in &f.locals {
+        // The IR parameters: the result's storage first, if it's in memory,
+        // then each parameter's parts.
+        let mut next = 0;
+        if f.ret.in_memory() {
+            self.result = Some(self.b.param(entry, 0));
+            next = 1;
+        }
+        let mut params: Vec<Option<Val>> = vec![None; f.locals.len()];
+        for &p in &f.params {
+            let ty = f.locals[p].ty;
+            let mut part = || {
+                next += 1;
+                self.b.param(entry, next - 1)
+            };
+            params[p] = Some(match ty {
+                Ty::Str | Ty::Slice(_) => {
+                    let ptr = part();
+                    Val::View(ptr, part())
+                }
+                _ if ty.in_memory() => Val::Mem(part()),
+                _ => Val::One(part()),
+            });
+        }
+        for (local, param) in f.locals.iter().zip(&params) {
+            // A parameter in memory is the caller's value, read in place.
+            if let Some(Val::Mem(p)) = *param {
+                self.slots.push(Slot::Mem(p));
+                continue;
+            }
             let slot = match local.ty {
                 Ty::Str | Ty::Slice(_) => Slot::View {
                     ptr: self.b.alloca(self.t.ptr),
                     len: self.b.alloca(self.t.i64),
                 },
-                ty @ Ty::Array(_) => {
+                ty @ (Ty::Array(_) | Ty::Struct(_)) => {
                     let ir_ty = self.ir_ty(ty);
                     Slot::Mem(self.b.alloca(ir_ty))
                 }
@@ -342,20 +403,11 @@ impl FnLower<'_> {
             };
             self.slots.push(slot);
         }
-        let mut next = 0;
-        for &p in &f.params {
-            let val = match f.locals[p].ty {
-                Ty::Str | Ty::Slice(_) => {
-                    let v = Val::View(self.b.param(entry, next), self.b.param(entry, next + 1));
-                    next += 2;
-                    v
-                }
-                _ => {
-                    next += 1;
-                    Val::One(self.b.param(entry, next - 1))
-                }
-            };
-            self.store(p, val);
+        for (local, param) in params.into_iter().enumerate() {
+            match param {
+                Some(Val::Mem(_)) | None => {}
+                Some(val) => self.store(local, val),
+            }
         }
         self.stmts(&f.body);
         if !self.terminated {
@@ -442,7 +494,14 @@ impl FnLower<'_> {
                 self.expr(e);
             }
             TStmt::Return(value) => {
-                let v = value.as_ref().map(|e| self.expr(e).one());
+                let v = match (value, self.result) {
+                    (Some(e), Some(dst)) => {
+                        self.fill(dst, e);
+                        None
+                    }
+                    (Some(e), None) => Some(self.expr(e).one()),
+                    (None, _) => None,
+                };
                 self.ret(v);
                 self.terminated = true;
             }
@@ -570,15 +629,13 @@ impl FnLower<'_> {
                 return Val::View(p, n);
             }
             TExprKind::Local(local) => return self.load(*local),
-            TExprKind::Call(f, args) => {
-                let args: Vec<ValueId> = args.iter().flat_map(|a| self.expr(a).parts()).collect();
-                let callee = self.b.func_ref(self.ids[*f].expect("a reached function"));
-                let ret_ty = self.t.of(e.ty);
-                return match self.b.call(callee, &args, ret_ty) {
-                    Some(v) => Val::One(v),
-                    None => Val::Unit,
-                };
+            TExprKind::Call(..) if e.ty.in_memory() => {
+                let ir_ty = self.ir_ty(e.ty);
+                let tmp = self.b.alloca(ir_ty);
+                self.fill(tmp, e);
+                return Val::Mem(tmp);
             }
+            TExprKind::Call(f, args) => return self.call(*f, args, e.ty, None),
             TExprKind::Syscall(args) => {
                 let ops: Vec<ValueId> = args.iter().map(|a| self.syscall_operand(a)).collect();
                 self.b.syscall(ops[0], &ops[1..])
@@ -596,13 +653,13 @@ impl FnLower<'_> {
                 let (_, n) = a.ty.as_array().expect("an array");
                 self.b.const_i64(self.t.i64, n as i64)
             }
-            TExprKind::ArrayLit(_) | TExprKind::ArrayRepeat(..) => {
+            TExprKind::ArrayLit(_) | TExprKind::ArrayRepeat(..) | TExprKind::StructLit(_) => {
                 let ir_ty = self.ir_ty(e.ty);
                 let tmp = self.b.alloca(ir_ty);
                 self.fill(tmp, e);
                 return Val::Mem(tmp);
             }
-            TExprKind::Index(..) => {
+            TExprKind::Index(..) | TExprKind::Field(..) => {
                 let addr = self.address(e);
                 return self.read(addr, e.ty);
             }
@@ -645,6 +702,19 @@ impl FnLower<'_> {
                     }
                 }
             }
+            TExprKind::Binary(TBinOp::Cmp(op @ (CmpOp::Eq | CmpOp::Ne)), lhs, rhs)
+                if lhs.ty.in_memory() =>
+            {
+                let l = self.place(lhs);
+                let r = self.place(rhs);
+                let eq = self.equal(l, r, lhs.ty);
+                if *op == CmpOp::Eq {
+                    eq
+                } else {
+                    let one = self.b.const_bool(true);
+                    self.b.bin(IrOp::Xor, eq, one, Flags::NONE)
+                }
+            }
             TExprKind::Binary(op, lhs, rhs) => {
                 let l = self.expr(lhs).one();
                 let r = self.expr(rhs).one();
@@ -677,29 +747,66 @@ impl FnLower<'_> {
         Val::One(v)
     }
 
-    /// The IR type of a value stored in memory: a scalar, or an array of them.
+    /// A call. A result in memory is written to `dst`, which must be fresh
+    /// storage (see the module docs).
+    fn call(&mut self, f: usize, args: &[TExpr], ret: Ty, dst: Option<ValueId>) -> Val {
+        let mut values: Vec<ValueId> = dst.into_iter().collect();
+        for a in args {
+            let v = self.expr(a).parts();
+            values.extend(v);
+        }
+        let callee = self.b.func_ref(self.ids[f].expect("a reached function"));
+        let ret_ty = if dst.is_some() {
+            self.t.void
+        } else {
+            self.t.of(ret)
+        };
+        match (self.b.call(callee, &values, ret_ty), dst) {
+            (_, Some(p)) => Val::Mem(p),
+            (Some(v), None) => Val::One(v),
+            (None, None) => Val::Unit,
+        }
+    }
+
+    /// The IR type of a value stored in memory: a scalar, or an array or a
+    /// struct of them.
     fn ir_ty(&mut self, ty: Ty) -> TypeId {
-        match ty.as_array() {
-            Some((elem, n)) => {
-                let elem = self.ir_ty(elem);
-                self.b.types_mut().array(elem, n)
+        if let Some((elem, n)) = ty.as_array() {
+            let elem = self.ir_ty(elem);
+            return self.b.types_mut().array(elem, n);
+        }
+        match ty.as_struct() {
+            Some(def) => {
+                let fields = def.fields.iter().map(|f| self.ir_ty(f.ty)).collect();
+                self.b.types_mut().struct_(fields)
             }
             None => self.t.of(ty),
         }
     }
 
-    /// The storage of an array-typed expression.
+    /// The storage of an expression whose value lives in memory.
     fn place(&mut self, e: &TExpr) -> ValueId {
         match self.expr(e) {
             Val::Mem(p) => p,
-            other => unreachable!("an array lowered to {other:?}"),
+            other => unreachable!("{} lowered to {other:?}", e.ty),
         }
     }
 
-    /// The address of the element an [`TExprKind::Index`] names.
+    /// The address of field `i` of the struct of type `ty` at `base`.
+    fn field_at(&mut self, base: ValueId, ty: Ty, i: u32) -> ValueId {
+        let ir_ty = self.ir_ty(ty);
+        self.b.struct_field(base, ir_ty, i)
+    }
+
+    /// The address of the element or field an [`TExprKind::Index`] or a
+    /// [`TExprKind::Field`] names.
     fn address(&mut self, e: &TExpr) -> ValueId {
+        if let TExprKind::Field(base, i) = &e.kind {
+            let p = self.place(base);
+            return self.field_at(p, base.ty, *i);
+        }
         let TExprKind::Index(base, index) = &e.kind else {
-            unreachable!("not an element: {e:?}")
+            unreachable!("not an element or a field: {e:?}")
         };
         let base = match self.expr(base) {
             Val::Mem(p) | Val::View(p, _) => p,
@@ -718,7 +825,7 @@ impl FnLower<'_> {
 
     /// The value of type `ty` stored at `addr`.
     fn read(&mut self, addr: ValueId, ty: Ty) -> Val {
-        if ty.as_array().is_some() {
+        if ty.in_memory() {
             return Val::Mem(addr);
         }
         let ir_ty = self.t.of(ty);
@@ -771,36 +878,88 @@ impl FnLower<'_> {
         self.start_block(exit);
     }
 
-    /// Copy the array of type `ty` at `src` to `dst`, element by element.
-    /// The two are the same array or don't overlap.
+    /// Copy the array or struct of type `ty` at `src` to `dst`, element by
+    /// element and field by field. The two are the same value or don't
+    /// overlap.
     fn copy(&mut self, dst: ValueId, src: ValueId, ty: Ty) {
-        let (elem, n) = ty.as_array().expect("copying an array");
-        self.each_elem(n, elem, |this, k| {
-            let s = this.elem_at(src, elem, k);
-            let d = this.elem_at(dst, elem, k);
-            let v = this.read(s, elem);
-            this.write(d, v, elem);
-        });
+        if let Some((elem, n)) = ty.as_array() {
+            self.each_elem(n, elem, |this, k| {
+                let s = this.elem_at(src, elem, k);
+                let d = this.elem_at(dst, elem, k);
+                let v = this.read(s, elem);
+                this.write(d, v, elem);
+            });
+            return;
+        }
+        let def = ty.as_struct().expect("copying an array or a struct");
+        for (i, f) in def.fields.iter().enumerate() {
+            let s = self.field_at(src, ty, i as u32);
+            let d = self.field_at(dst, ty, i as u32);
+            let v = self.read(s, f.ty);
+            self.write(d, v, f.ty);
+        }
     }
 
-    /// Write the array value `e` into the (fresh) storage at `dst`. A literal
-    /// is written element by element.
+    /// Whether the arrays or structs of type `ty` at `a` and `b` are equal:
+    /// every scalar in one equals the one at the same place in the other.
+    fn equal(&mut self, a: ValueId, b: ValueId, ty: Ty) -> ValueId {
+        // The result so far, in a slot (promoted to a register from `-O1`),
+        // so long arrays can be compared in a loop.
+        let acc = self.b.alloca(self.t.bool);
+        let yes = self.b.const_bool(true);
+        self.b.store(self.t.bool, acc, yes, 1);
+        self.equal_into(acc, a, b, ty);
+        self.b.load(self.t.bool, acc, 1)
+    }
+
+    fn equal_into(&mut self, acc: ValueId, a: ValueId, b: ValueId, ty: Ty) {
+        if let Some((elem, n)) = ty.as_array() {
+            self.each_elem(n, elem, |this, k| {
+                let x = this.elem_at(a, elem, k);
+                let y = this.elem_at(b, elem, k);
+                this.equal_into(acc, x, y, elem);
+            });
+        } else if let Some(def) = ty.as_struct() {
+            for (i, f) in def.fields.iter().enumerate() {
+                let x = self.field_at(a, ty, i as u32);
+                let y = self.field_at(b, ty, i as u32);
+                self.equal_into(acc, x, y, f.ty);
+            }
+        } else {
+            let ir_ty = self.t.of(ty);
+            let x = self.b.load(ir_ty, a, align_of(ty));
+            let y = self.b.load(ir_ty, b, align_of(ty));
+            let same = self.b.icmp(IntPred::Eq, x, y);
+            let so_far = self.b.load(self.t.bool, acc, 1);
+            let both = self.b.bin(IrOp::And, so_far, same, Flags::NONE);
+            self.b.store(self.t.bool, acc, both, 1);
+        }
+    }
+
+    /// Write the value `e`, of an array or struct type, into the (fresh)
+    /// storage at `dst`. A literal is written element by element or field by
+    /// field, and a call writes its result there directly.
     fn fill(&mut self, dst: ValueId, e: &TExpr) {
-        let (elem, _) = e.ty.as_array().expect("filling an array");
         match &e.kind {
             TExprKind::ArrayLit(elems) => {
+                let (elem, _) = e.ty.as_array().expect("an array");
                 for (k, el) in elems.iter().enumerate() {
                     let k = self.b.const_i64(self.t.i64, k as i64);
                     let d = self.elem_at(dst, elem, k);
-                    if el.ty.as_array().is_some() {
-                        self.fill(d, el);
-                    } else {
-                        let v = self.expr(el);
-                        self.write(d, v, elem);
-                    }
+                    self.fill_or_write(d, el);
                 }
             }
+            TExprKind::StructLit(fields) => {
+                for (i, value) in fields {
+                    let d = self.field_at(dst, e.ty, *i);
+                    self.fill_or_write(d, value);
+                }
+            }
+            TExprKind::Call(f, args) => {
+                self.call(*f, args, e.ty, Some(dst));
+            }
             TExprKind::ArrayRepeat(value, n) => {
+                let (elem, _) = e.ty.as_array().expect("an array");
                 let v = self.expr(value);
                 self.each_elem(*n, elem, |this, k| {
                     let d = this.elem_at(dst, elem, k);
@@ -814,11 +973,21 @@ impl FnLower<'_> {
         }
     }
 
+    /// Write `e` into the fresh storage at `dst`, whatever its type.
+    fn fill_or_write(&mut self, dst: ValueId, e: &TExpr) {
+        if e.ty.in_memory() {
+            self.fill(dst, e);
+        } else {
+            let v = self.expr(e);
+            self.write(dst, v, e.ty);
+        }
+    }
+
     /// `dst = e`, for an existing value at `dst` of `e`'s type. A literal
-    /// may read `dst` (`a = [a[1], a[0]]`), so it's built in a temporary
-    /// first.
+    /// may read `dst` (`a = [a[1], a[0]]`), and a call may read it through
+    /// a parameter, so they're built in a temporary first.
     fn assign_into(&mut self, dst: ValueId, e: &TExpr) {
-        if e.ty.as_array().is_none() {
+        if !e.ty.in_memory() {
             let v = self.expr(e);
             self.write(dst, v, e.ty);
             return;

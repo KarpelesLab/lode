@@ -14,9 +14,9 @@ use crate::ast::{self, Convention, ExprKind, Stmt, TypeExpr};
 use crate::diag::Diagnostic;
 use crate::load::Package;
 use crate::source::{FileId, Span};
-use crate::types::{Primitive, Range, Ty, primitive};
+use crate::types::{Field, Primitive, Range, Ty, primitive};
 
-use facts::{Env, Term};
+use facts::{Env, Linear, Term};
 pub use tree::*;
 
 /// Check every loaded package (dependencies first, the root package last).
@@ -79,6 +79,8 @@ pub fn check(packages: &[Package], ptr_bits: u32) -> (Program, Vec<Diagnostic>) 
 enum Item {
     Func(FuncId),
     Const(usize),
+    /// A struct type.
+    Struct(Ty),
 }
 
 struct PkgInfo {
@@ -177,11 +179,8 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign { target, .. } => {
-                // `a[i] = v` assigns (part of) `a`.
-                let mut root = target;
-                while let ExprKind::Index(base, _) = &root.kind {
-                    root = base;
-                }
+                // `a[i] = v` and `p.x = v` assign (part of) `a` and `p`.
+                let root = place_root(target);
                 if let ExprKind::Name(n) = &root.kind {
                     out.insert(n.clone());
                 }
@@ -211,6 +210,25 @@ fn assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// The variable a place like `a[i].x` is part of: the expression under its
+/// indexes and fields.
+fn place_root(mut e: &ast::Expr) -> &ast::Expr {
+    while let ExprKind::Index(base, _) | ExprKind::Field(base, _) = &e.kind {
+        e = base;
+    }
+    e
+}
+
+/// The struct types a value of type `ty` holds directly (not behind a view):
+/// itself if it's a struct, or its element type's.
+fn held_struct(ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Struct(_) => Some(ty),
+        Ty::Array(_) => held_struct(ty.as_array()?.0),
+        _ => None,
+    }
+}
+
 /// Stands in for a condition that failed to check, so the statement around it
 /// is kept for control-flow analysis. Only used when the program has errors.
 fn placeholder_bool() -> TExpr {
@@ -229,6 +247,8 @@ impl<'a> Checker<'a> {
     /// function's signature.
     fn collect(&mut self, packages: &'a [Package]) {
         let mut fns = Vec::new();
+        let mut structs = Vec::new();
+        let root = packages.len().saturating_sub(1);
         for (pkg, package) in packages.iter().enumerate() {
             self.pkgs.push(PkgInfo {
                 path: package.path.clone(),
@@ -269,6 +289,25 @@ impl<'a> Checker<'a> {
                             });
                             (&c.name, Item::Const(self.consts.len() - 1))
                         }
+                        ast::Item::Struct(s) => {
+                            // Messages name another package's struct the
+                            // way code does: `os.Stat`.
+                            let shown = if pkg == root {
+                                s.name.name.clone()
+                            } else {
+                                let last = package.path.rsplit('/').next().unwrap_or_default();
+                                format!("{last}.{}", s.name.name)
+                            };
+                            let ty = Ty::new_struct(shown, pkg, s.is_pub);
+                            if primitive(&s.name.name, self.ptr_bits).is_some() {
+                                self.error(
+                                    s.name.span,
+                                    format!("`{}` is the name of a built-in type", s.name.name),
+                                );
+                            }
+                            structs.push((s, pkg, file.id, ty));
+                            (&s.name, Item::Struct(ty))
+                        }
                     };
                     if self.pkgs[pkg].items.contains_key(&name.name) {
                         self.error(
@@ -280,13 +319,129 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        // Signatures come once every item is known: an array length in a
-        // parameter's type can name a constant declared further down.
+        // Field types and signatures come once every item is known: an array
+        // length in a type can name a constant declared further down, and a
+        // field's type a struct declared further down.
+        for &(s, pkg, file, ty) in &structs {
+            let fields = self.struct_fields(s, pkg, file);
+            ty.set_fields(fields);
+        }
+        for &(s, _, _, ty) in &structs {
+            self.check_recursion(s, ty);
+        }
         for (f, pkg, file) in fns {
             let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
             let sig = self.signature(&mut cx, f);
             self.sigs.push(sig);
         }
+    }
+
+    /// The fields of a struct declaration. A field whose type is in error
+    /// gets the type `()`, so later checks see no more problems with it.
+    fn struct_fields(&mut self, s: &ast::StructDecl, pkg: usize, file: FileId) -> Vec<Field> {
+        let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+        let mut fields: Vec<Field> = Vec::new();
+        if s.fields.is_empty() {
+            self.error(
+                s.name.span,
+                "structs without fields are not supported by the compiler yet",
+            );
+        }
+        for f in &s.fields {
+            if fields.iter().any(|g| g.name == f.name.name) {
+                self.error(
+                    f.name.span,
+                    format!(
+                        "`{}` has more than one field `{}`",
+                        s.name.name, f.name.name
+                    ),
+                );
+                continue;
+            }
+            let ty = self.resolve_type(&mut cx, &f.ty).unwrap_or(Ty::Unit);
+            let ok = match ty {
+                Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) | Ty::Unit => true,
+                Ty::Str | Ty::Slice(_) => {
+                    self.diags.push(
+                        Diagnostic::error(
+                            f.ty.span(),
+                            format!("a struct field can't be a view (`{ty}`)"),
+                        )
+                        .with_help(
+                            "views are never stored in structs, so they can't outlive what they view (docs/memory.md, Views)",
+                        )
+                        .with_help("store the data itself, for example in an array"),
+                    );
+                    false
+                }
+                Ty::Ptr(_) => {
+                    self.error(
+                        f.ty.span(),
+                        format!(
+                            "struct fields of type `{ty}` are not supported by the compiler yet"
+                        ),
+                    );
+                    false
+                }
+            };
+            fields.push(Field {
+                name: f.name.name.clone(),
+                ty: if ok { ty } else { Ty::Unit },
+            });
+        }
+        fields
+    }
+
+    /// Report a struct that holds a value of its own type, directly or
+    /// through other structs and arrays: it would be infinitely large. Each
+    /// cycle is reported once, at the first of its structs, and broken (the
+    /// field closing it becomes `()`) so later checks terminate.
+    fn check_recursion(&mut self, s: &ast::StructDecl, ty: Ty) {
+        // The fields leading from `from` back to `ty`, as (struct, field index).
+        fn path_back(from: Ty, ty: Ty, seen: &mut Vec<Ty>, path: &mut Vec<(Ty, usize)>) -> bool {
+            if seen.contains(&from) {
+                return false;
+            }
+            seen.push(from);
+            let def = from.as_struct().expect("a struct");
+            for (i, f) in def.fields.iter().enumerate() {
+                let Some(inner) = held_struct(f.ty) else {
+                    continue;
+                };
+                path.push((from, i));
+                if inner == ty || path_back(inner, ty, seen, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        loop {
+            let mut path = Vec::new();
+            if !path_back(ty, ty, &mut Vec::new(), &mut path) {
+                return;
+            }
+            self.report_cycle(s, &path);
+        }
+    }
+
+    fn report_cycle(&mut self, s: &ast::StructDecl, path: &[(Ty, usize)]) {
+        let through: Vec<String> = path
+            .iter()
+            .map(|&(t, i)| format!("`{t}.{}`", t.as_struct().expect("a struct").fields[i].name))
+            .collect();
+        self.diags.push(
+            Diagnostic::error(
+                s.name.span,
+                format!("the struct `{}` contains itself", s.name.name),
+            )
+            .with_help(format!("through {}", through.join(", then ")))
+            .with_help("a struct holds its fields by value, so it would be infinitely large"),
+        );
+        let &(last, i) = path.last().expect("a field");
+        let mut fields = last.as_struct().expect("a struct").fields.clone();
+        fields[i].ty = Ty::Unit;
+        last.set_fields(fields);
     }
 
     /// The Lode type a type expression names. `cx` is where it appears: array
@@ -315,6 +470,30 @@ impl<'a> Checker<'a> {
                     None
                 }
             },
+            TypeExpr::Qualified(pkg_name, name) => {
+                let Some(pkg) = self
+                    .imports
+                    .get(&cx.file)
+                    .and_then(|m| m.get(&pkg_name.name))
+                    .copied()
+                else {
+                    self.error(
+                        pkg_name.span,
+                        format!("unknown package `{}`", pkg_name.name),
+                    );
+                    return None;
+                };
+                match self.package_item(cx, pkg, &name.name, name.span)? {
+                    Item::Struct(ty) => Some(ty),
+                    _ => {
+                        self.error(
+                            t.span(),
+                            format!("`{}.{}` is not a type", pkg_name.name, name.name),
+                        );
+                        None
+                    }
+                }
+            }
             TypeExpr::Named(id) => match primitive(&id.name, self.ptr_bits) {
                 Some(Primitive::Ty(ty)) => Some(ty),
                 Some(Primitive::Unsupported) => {
@@ -327,10 +506,17 @@ impl<'a> Checker<'a> {
                     );
                     None
                 }
-                None => {
-                    self.error(id.span, format!("unknown type `{}`", id.name));
-                    None
-                }
+                None => match self.pkgs[cx.pkg].items.get(&id.name) {
+                    Some(Item::Struct(ty)) => Some(*ty),
+                    Some(_) => {
+                        self.error(id.span, format!("`{}` is not a type", id.name));
+                        None
+                    }
+                    None => {
+                        self.error(id.span, format!("unknown type `{}`", id.name));
+                        None
+                    }
+                },
             },
         }
     }
@@ -338,7 +524,7 @@ impl<'a> Checker<'a> {
     /// Whether `elem` can be the element type of an array or slice (`what`).
     fn check_elem(&mut self, elem: Ty, what: &str, span: Span) -> Option<()> {
         match elem {
-            Ty::Int(_) | Ty::Bool | Ty::Array(_) => Some(()),
+            Ty::Int(_) | Ty::Bool | Ty::Array(_) | Ty::Struct(_) => Some(()),
             other => {
                 self.error(
                     span,
@@ -384,25 +570,14 @@ impl<'a> Checker<'a> {
                 );
             }
             let ty = self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit);
-            if let Some((elem, _)) = ty.as_array() {
-                // The type is kept, so the body is still checked.
-                self.diags.push(
-                    Diagnostic::error(
-                        p.ty.span(),
-                        "passing an array by value is not supported by the compiler yet",
-                    )
-                    .with_help(format!("take a slice instead: `{}: []{elem}`", p.name.name)),
-                );
-            }
             params.push(ty);
         }
         let ret = match &f.ret {
             Some(t) => match self.resolve_type(cx, t) {
-                Some(ty @ (Ty::Str | Ty::Slice(_) | Ty::Array(_))) => {
+                Some(ty @ (Ty::Str | Ty::Slice(_))) => {
                     let what = match ty {
                         Ty::Str => "a `str`",
-                        Ty::Slice(_) => "a slice",
-                        _ => "an array",
+                        _ => "a slice",
                     };
                     self.error(
                         t.span(),
@@ -436,6 +611,7 @@ impl<'a> Checker<'a> {
         let is_pub = match item {
             Item::Func(id) => self.sigs[id].is_pub,
             Item::Const(id) => self.consts[id].decl.is_pub,
+            Item::Struct(ty) => ty.as_struct().expect("a struct").is_pub,
         };
         if pkg != cx.pkg && !is_pub {
             let path = self.pkgs[pkg].path.clone();
@@ -596,6 +772,9 @@ impl<'a> Checker<'a> {
     /// A local was given a new value: record what's known about it.
     fn record_value(cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
         cx.env.assign(local, value.range);
+        if let TExprKind::StructLit(_) = value.expr.kind {
+            Self::record_fields(cx, local, &value.expr, 0);
+        }
         // a == b + k
         let equal = |a: Term, b: Term, k: i128| {
             [
@@ -633,6 +812,33 @@ impl<'a> Checker<'a> {
                         bound: Range::exact(n),
                         full: Range { lo: n, hi: n },
                     }]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A struct local was given the value of a literal: its integer fields
+    /// given as constants have known values. `base` numbers the literal's
+    /// fields among the local's (see [`Term::Field`]).
+    fn record_fields(cx: &mut FnCx, local: LocalId, lit: &TExpr, base: u32) {
+        let (TExprKind::StructLit(fields), Some(def)) = (&lit.kind, lit.ty.as_struct()) else {
+            return;
+        };
+        for (i, value) in fields {
+            let before: u32 = def.fields[..*i as usize]
+                .iter()
+                .map(|f| expr::flat_size(f.ty))
+                .sum();
+            let term = Term::Field(local, base + before);
+            match (&value.kind, type_range(value.ty)) {
+                (TExprKind::Int(v), Some(full)) => cx.env.apply(&[facts::Fact::Narrow {
+                    term,
+                    bound: Range::exact(*v),
+                    full,
+                }]),
+                (TExprKind::StructLit(_), _) => {
+                    Self::record_fields(cx, local, value, base + before);
                 }
                 _ => {}
             }
@@ -695,13 +901,13 @@ impl<'a> Checker<'a> {
                 value,
                 span,
             } => {
-                if let ExprKind::Index(..) = target.kind {
-                    return self.element_assign(cx, target, *op, value, *span);
+                if let ExprKind::Index(..) | ExprKind::Field(..) = target.kind {
+                    return self.place_assign(cx, target, *op, value, *span);
                 }
                 let ExprKind::Name(name) = &target.kind else {
                     self.error(
                         target.span,
-                        "only variables and their elements can be assigned to",
+                        "only variables, their elements and their fields can be assigned to",
                     );
                     return None;
                 };
@@ -934,10 +1140,7 @@ impl<'a> Checker<'a> {
         cx.env.assign(index, Some(Range { lo, hi: hi.max(lo) }));
         // A bound that's a term the body doesn't assign keeps its value for
         // the whole loop, so the index can be related to it.
-        let unassigned = |cx: &FnCx, t: Term| {
-            let (Term::Local(l) | Term::Len(l)) = t;
-            !assigned.contains(&cx.locals[l].name)
-        };
+        let unassigned = |cx: &FnCx, t: Term| !assigned.contains(&cx.locals[t.local()].name);
         let mut loop_facts = Vec::new();
         if let Some(e) = end.term
             && unassigned(cx, e.term)
@@ -1029,7 +1232,7 @@ impl<'a> Checker<'a> {
             return Some(());
         };
         let mut root = &**array;
-        while let TExprKind::Index(base, _) = &root.kind {
+        while let TExprKind::Index(base, _) | TExprKind::Field(base, _) = &root.kind {
             root = base;
         }
         let diag = match root.kind {
@@ -1054,8 +1257,9 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `a[i] = v`, `a[i][j] op= v`: assign to an element of a `var` array.
-    fn element_assign(
+    /// `a[i] = v`, `p.x = v`, `a[i].x[j] op= v`: assign to an element or
+    /// a field of a `var` array or struct.
+    fn place_assign(
         &mut self,
         cx: &mut FnCx,
         target: &ast::Expr,
@@ -1063,14 +1267,11 @@ impl<'a> Checker<'a> {
         value: &ast::Expr,
         span: Span,
     ) -> Option<TStmt> {
-        let mut root = target;
-        while let ExprKind::Index(base, _) = &root.kind {
-            root = base;
-        }
+        let root = place_root(target);
         let ExprKind::Name(name) = &root.kind else {
             self.error(
                 root.span,
-                "only variables and their elements can be assigned to",
+                "only variables, their elements and their fields can be assigned to",
             );
             return None;
         };
@@ -1089,11 +1290,15 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        if root_ty.as_array().is_some() && !cx.locals[local].mutable {
+        if root_ty.in_memory() && !cx.locals[local].mutable {
+            let part = match target.kind {
+                ExprKind::Field(..) => "a field",
+                _ => "an element",
+            };
             self.diags.push(
                 Diagnostic::error(
                     target.span,
-                    format!("cannot assign to an element of `{name}`, which is immutable"),
+                    format!("cannot assign to {part} of `{name}`, which is immutable"),
                 )
                 .with_help(format!("declare it with `var {name}` to make it mutable")),
             );
@@ -1108,7 +1313,15 @@ impl<'a> Checker<'a> {
         if op.is_some() {
             let usize_ty = self.usize_ty();
             let mut place = &mut target;
-            while let ExprKind::Index(base, index) = &mut place.kind {
+            loop {
+                let (base, index) = match &mut place.kind {
+                    ExprKind::Index(base, index) => (base, index),
+                    ExprKind::Field(base, _) => {
+                        place = base;
+                        continue;
+                    }
+                    _ => break,
+                };
                 let simple = matches!(index.kind, ExprKind::Name(_))
                     || self.untyped_int(cx, index).is_some();
                 if !simple {
@@ -1139,6 +1352,38 @@ impl<'a> Checker<'a> {
             }
         };
         let checked = self.coerce(checked, ty, value.span)?;
+        // A field reached through fields only is a term, or a struct of them:
+        // forget what was known about them, then learn their new values.
+        // Anything under an index is in an array, which has no facts.
+        if let Some(Term::Field(l, off)) = expr::place_term(&place.expr) {
+            cx.env.forget_fields(l, off..off + expr::flat_size(ty));
+            Self::record_fields(cx, l, &checked.expr, off);
+        }
+        if let Some(Linear { term, offset: 0 }) = place.term {
+            if let Some(r) = checked.range {
+                cx.env.apply(&[facts::Fact::Narrow {
+                    term,
+                    bound: r,
+                    full: type_range(ty).unwrap_or(r),
+                }]);
+            }
+            if let Some(src) = checked.term
+                && src.term != term
+            {
+                cx.env.apply(&[
+                    facts::Fact::Rel {
+                        a: term,
+                        b: src.term,
+                        c: src.offset,
+                    },
+                    facts::Fact::Rel {
+                        a: src.term,
+                        b: term,
+                        c: -src.offset,
+                    },
+                ]);
+            }
+        }
         let store = TStmt::Store(place.expr, checked.expr);
         if before.is_empty() {
             Some(store)

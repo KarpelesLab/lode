@@ -2,8 +2,6 @@
 // error: cannot assign to an element of `a`, which is immutable
 // error: expected `[3]u8`, found an array of 2 element(s)
 // error: expected `[2]u8`, found an array of 3 element(s)
-// error: passing an array by value is not supported by the compiler yet
-// error: returning an array is not supported by the compiler yet
 // error: returning a slice is not supported by the compiler yet
 // error: arrays of `str` are not supported by the compiler yet
 // error: an array length must be a constant integer
@@ -39,14 +37,6 @@ fn wrong_lengths() {
 	let a: [3]u8 = [1, 2]
 	var b: [2]u8 = [0; 2]
 	b = [1, 2, 3]
-}
-
-fn by_value(a: [4]u8) -> u8 {
-	return a[0]
-}
-
-fn returns_array() -> [4]u8 {
-	return [0; 4]
 }
 
 fn returns_slice(xs: []u8) -> []u8 {

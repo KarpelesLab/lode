@@ -15,6 +15,7 @@ pub fn parse(toks: Vec<Token>, id: FileId) -> (File, Vec<Diagnostic>) {
         toks,
         pos: 0,
         diags: Vec::new(),
+        no_struct_lit: false,
     };
     let file = p.file(id);
     (file, p.diags)
@@ -29,6 +30,10 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
+    /// In the header of `if`, `while` and `for`, where a `{` after a name
+    /// starts the block, as in Go: `if p == q {`. Parentheses and brackets
+    /// allow struct literals again.
+    no_struct_lit: bool,
 }
 
 /// Binary operator precedence, higher binds tighter.
@@ -250,9 +255,9 @@ impl Parser {
                 self.fn_decl(is_pub, true, start).map(Item::Fn)
             }
             Tok::Kw(Kw::Const) => self.const_decl(is_pub, start).map(Item::Const),
+            Tok::Kw(Kw::Struct) => self.struct_decl(is_pub, start).map(Item::Struct),
             Tok::Kw(
-                kw @ (Kw::Struct
-                | Kw::Enum
+                kw @ (Kw::Enum
                 | Kw::Trait
                 | Kw::Impl
                 | Kw::Type
@@ -286,6 +291,45 @@ impl Parser {
             ty,
             span: start.to(value.span),
             value,
+        })
+    }
+
+    fn struct_decl(&mut self, is_pub: bool, start: Span) -> PResult<StructDecl> {
+        self.bump(); // struct
+        let name = self.ident("a struct name")?;
+        if self.at_p(P::LBracket) {
+            return self.error(
+                self.span(),
+                "generic structs are not supported by the compiler yet",
+            );
+        }
+        self.expect_p(P::LBrace)?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.at_p(P::RBrace) {
+                break;
+            }
+            if self.at_kw(Kw::Pub) {
+                return self.error(
+                    self.span(),
+                    "fields can't be marked `pub`: they're visible wherever the struct is",
+                );
+            }
+            let field = self.ident("a field name or `}`")?;
+            self.expect_p(P::Colon)?;
+            let ty = self.type_expr()?;
+            fields.push(FieldDecl { name: field, ty });
+            if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
+                return self.expected("a new line after the field");
+            }
+        }
+        let end = self.bump().span;
+        Ok(StructDecl {
+            is_pub,
+            name,
+            fields,
+            span: start.to(end),
         })
     }
 
@@ -366,7 +410,14 @@ impl Parser {
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         match self.peek() {
-            Tok::Ident(_) => Ok(TypeExpr::Named(self.ident("a type")?)),
+            Tok::Ident(_) => {
+                let name = self.ident("a type")?;
+                if self.eat_p(P::Dot) {
+                    let member = self.ident("a type name")?;
+                    return Ok(TypeExpr::Qualified(name, member));
+                }
+                Ok(TypeExpr::Named(name))
+            }
             Tok::P(P::LParen) if *self.peek_at(1) == Tok::P(P::RParen) => {
                 let start = self.bump().span;
                 let end = self.bump().span;
@@ -468,7 +519,7 @@ impl Parser {
             Tok::Kw(Kw::If) => Ok(Stmt::If(self.if_stmt()?)),
             Tok::Kw(Kw::While) => {
                 self.bump();
-                let cond = self.expr()?;
+                let cond = self.header_expr()?;
                 let body = self.block()?;
                 Ok(Stmt::While {
                     cond,
@@ -496,9 +547,9 @@ impl Parser {
                 if !self.eat_kw(Kw::In) {
                     return self.expected("`in`");
                 }
-                let first = self.expr()?;
+                let first = self.header_expr()?;
                 let iter = if self.eat_p(P::DotDot) {
-                    ForIter::Range(first, self.expr()?)
+                    ForIter::Range(first, self.header_expr()?)
                 } else {
                     ForIter::Each(first)
                 };
@@ -546,7 +597,7 @@ impl Parser {
         if self.at_kw(Kw::Let) {
             return self.error(self.span(), "`if let` is not supported by the compiler yet");
         }
-        let cond = self.expr()?;
+        let cond = self.header_expr()?;
         let then = self.block()?;
         // `else` belongs on the same line as `}`, but accept it on the next one.
         if *self.peek() == Tok::Newline && *self.peek_at(1) == Tok::Kw(Kw::Else) {
@@ -578,6 +629,57 @@ impl Parser {
 
     fn expr(&mut self) -> PResult<Expr> {
         self.binary(1)
+    }
+
+    /// An expression in a header (`if`, `while`, `for`): a `{` after a name
+    /// starts the block, not a struct literal.
+    fn header_expr(&mut self) -> PResult<Expr> {
+        let saved = std::mem::replace(&mut self.no_struct_lit, true);
+        let e = self.expr();
+        self.no_struct_lit = saved;
+        e
+    }
+
+    /// An expression inside brackets, where struct literals are allowed
+    /// again.
+    fn nested_expr(&mut self) -> PResult<Expr> {
+        let saved = std::mem::replace(&mut self.no_struct_lit, false);
+        let e = self.expr();
+        self.no_struct_lit = saved;
+        e
+    }
+
+    /// Whether a `{` here starts a struct literal of the type just parsed.
+    fn at_struct_lit(&self) -> bool {
+        !self.no_struct_lit && self.at_p(P::LBrace)
+    }
+
+    /// `{name: value, ...}` after the type of a struct literal.
+    fn struct_literal(&mut self, ty: TypeExpr) -> PResult<Expr> {
+        let start = ty.span();
+        self.bump(); // {
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.eat_p(P::RBrace) {
+                break;
+            }
+            let name = self.ident("a field name")?;
+            self.expect_p(P::Colon)?;
+            self.skip_newlines();
+            let value = self.nested_expr()?;
+            fields.push(FieldInit { name, value });
+            self.skip_newlines();
+            if !self.eat_p(P::Comma) {
+                self.skip_newlines();
+                self.expect_p(P::RBrace)?;
+                break;
+            }
+        }
+        Ok(Expr {
+            kind: ExprKind::StructLit(ty, fields),
+            span: start.to(self.prev_span()),
+        })
     }
 
     fn binary(&mut self, min_prec: u8) -> PResult<Expr> {
@@ -628,7 +730,7 @@ impl Parser {
                     if self.eat_p(P::RParen) {
                         break;
                     }
-                    args.push(self.expr()?);
+                    args.push(self.nested_expr()?);
                     self.skip_newlines();
                     if !self.eat_p(P::Comma) {
                         self.skip_newlines();
@@ -643,6 +745,17 @@ impl Parser {
                 };
             } else if self.eat_p(P::Dot) {
                 let field = self.ident("a field or method name")?;
+                if let ExprKind::Name(pkg) = &e.kind
+                    && self.at_struct_lit()
+                {
+                    // `pkg.Name{...}`
+                    let pkg = Ident {
+                        name: pkg.clone(),
+                        span: e.span,
+                    };
+                    e = self.struct_literal(TypeExpr::Qualified(pkg, field))?;
+                    continue;
+                }
                 let span = e.span.to(field.span);
                 e = Expr {
                     kind: ExprKind::Field(Box::new(e), field),
@@ -650,7 +763,7 @@ impl Parser {
                 };
             } else if self.eat_p(P::LBracket) {
                 self.skip_newlines();
-                let index = self.expr()?;
+                let index = self.nested_expr()?;
                 self.skip_newlines();
                 self.expect_p(P::RBracket)?;
                 let span = e.span.to(self.prev_span());
@@ -672,11 +785,20 @@ impl Parser {
             Tok::Str(s) => ExprKind::Str(s),
             Tok::Kw(Kw::True) => ExprKind::Bool(true),
             Tok::Kw(Kw::False) => ExprKind::Bool(false),
-            Tok::Ident(name) => ExprKind::Name(name),
+            Tok::Ident(name) => {
+                let id = self.ident("a name")?;
+                if self.at_struct_lit() {
+                    return self.struct_literal(TypeExpr::Named(id));
+                }
+                return Ok(Expr {
+                    kind: ExprKind::Name(name),
+                    span,
+                });
+            }
             Tok::P(P::LParen) => {
                 self.bump();
                 self.skip_newlines();
-                let inner = self.expr()?;
+                let inner = self.nested_expr()?;
                 self.skip_newlines();
                 self.expect_p(P::RParen)?;
                 return Ok(Expr {
@@ -699,6 +821,13 @@ impl Parser {
 
     /// `[a, b, c]` or `[value; count]`.
     fn array_literal(&mut self) -> PResult<Expr> {
+        let saved = std::mem::replace(&mut self.no_struct_lit, false);
+        let e = self.array_literal_inner();
+        self.no_struct_lit = saved;
+        e
+    }
+
+    fn array_literal_inner(&mut self) -> PResult<Expr> {
         let start = self.bump().span; // [
         let mut elems = Vec::new();
         loop {
@@ -849,13 +978,45 @@ mod tests {
     }
 
     #[test]
+    fn structs() {
+        let file = parse_ok(
+            "pub struct P {\n\tx: u32\n\tq: os.Q\n}\nfn f() {\n\tlet p = P{x: 1, q: os.Q{\n\t\ta: [1],\n\t}}\n\tp.q.a[0] += 1\n}\n",
+        );
+        let Item::Struct(s) = &file.items[0] else {
+            panic!()
+        };
+        assert!(s.is_pub && s.fields.len() == 2);
+        assert!(matches!(s.fields[1].ty, TypeExpr::Qualified(..)));
+        let Item::Fn(f) = &file.items[1] else {
+            panic!()
+        };
+        let Stmt::Let {
+            init: Some(init), ..
+        } = &f.body.stmts[0]
+        else {
+            panic!()
+        };
+        let ExprKind::StructLit(TypeExpr::Named(_), fields) = &init.kind else {
+            panic!("{init:?}")
+        };
+        assert!(matches!(
+            fields[1].value.kind,
+            ExprKind::StructLit(TypeExpr::Qualified(..), _)
+        ));
+        // In an `if` header, `{` after a name starts the block.
+        let errs = parse_errors("fn f() {\n\tif p == P{x: 2} {\n\t}\n}\n");
+        assert!(!errs.is_empty());
+        parse_ok("fn f() {\n\tif p == (P{x: 2}) {\n\t}\n\tfor x in [P{x: 1}] {\n\t}\n}\n");
+    }
+
+    #[test]
     fn else_on_next_line_and_multiline_args() {
         parse_ok("fn f() {\n\tif a {\n\t\tg(1,\n\t\t\t2)\n\t}\n\telse {\n\t}\n}\n");
     }
 
     #[test]
     fn reports_and_recovers() {
-        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\nstruct S {}\n");
+        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\nenum S {}\n");
         assert_eq!(errs.len(), 3, "{errs:?}");
         assert!(errs[1].contains("chained"));
         assert!(errs[2].contains("not supported"));

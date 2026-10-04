@@ -45,8 +45,9 @@ pub enum TStmt {
     /// Initialize a local.
     Init(LocalId, TExpr),
     Assign(LocalId, TExpr),
-    /// `place = value`, where `place` is an [`TExprKind::Index`] of a `var`
-    /// array (possibly nested).
+    /// `place = value`, where `place` is an [`TExprKind::Index`] or a
+    /// [`TExprKind::Field`] of a `var` array or struct (possibly nested, as
+    /// in `a[i].x`).
     Store(TExpr, TExpr),
     Expr(TExpr),
     Return(Option<TExpr>),
@@ -102,6 +103,13 @@ pub enum TExprKind {
     /// `base[index]` of an array or slice, with the index proven to be in
     /// bounds. An array-typed element is a place, like any array value.
     Index(Box<TExpr>, Box<TExpr>),
+    /// `T{name: value, ...}`: a struct literal. Every field is given exactly
+    /// once; the values are in source order (the order they're evaluated
+    /// in), each with its field's index in the declaration.
+    StructLit(Vec<(u32, TExpr)>),
+    /// `base.name`: field number `n` (in declaration order) of a struct. Like
+    /// an element, a field that's an array or a struct is a place.
+    Field(Box<TExpr>, u32),
     /// An array viewed as a slice of all its elements.
     ToSlice(Box<TExpr>),
     /// `s.ptr` of a `str` (unsafe).
