@@ -205,6 +205,9 @@ struct FnCx {
 struct LoopEdges {
     next: Vec<Env>,
     exits: Vec<Env>,
+    /// The thresholds of the terms compared in the body (see
+    /// [`note_thresholds`]).
+    thresholds: Vec<(Term, i128)>,
 }
 
 /// The state a trial check of a loop body rolls back.
@@ -545,6 +548,25 @@ fn head_relations(
         }
     }
     out
+}
+
+/// A comparison of `l` and `r` was checked: when one side is a term plus a
+/// constant `d` and the other a single value `k`, `k - d` is a threshold
+/// of the term for every loop around (docs/safety.md, "Facts through
+/// loops").
+fn note_thresholds(cx: &mut FnCx, l: facts::Side, r: facts::Side) {
+    for (x, k) in [(l, r), (r, l)] {
+        if let Some(lin) = x.term
+            && k.range.lo == k.range.hi
+            && let Some(v) = k.range.lo.checked_sub(lin.offset)
+        {
+            for edges in &mut cx.loops {
+                if !edges.thresholds.contains(&(lin.term, v)) {
+                    edges.thresholds.push((lin.term, v));
+                }
+            }
+        }
+    }
 }
 
 /// The range of `term` where an expression reads it: its known range,
@@ -2544,7 +2566,7 @@ impl<'a> Checker<'a> {
     /// them. A candidate head holds when each of its facts about those
     /// variables holds again at every back-edge (`continue`, or the end of
     /// the body). The body is checked from each candidate in turn, at most
-    /// five times; the first that holds is the head, and only the check from
+    /// six times; the first that holds is the head, and only the check from
     /// it counts (the others are rolled back with their errors). From the
     /// facts before the loop, `E` (docs/safety.md, "Facts through loops"):
     ///
@@ -2553,7 +2575,9 @@ impl<'a> Checker<'a> {
     /// 3. `W`: `C` without the facts that failed at a back-edge of check 2
     ///    (each end of a range on its own). If `W` doesn't hold either, the
     ///    head is `E` with everything about the variables forgotten;
-    /// 4. `N`: `E` loosened to cover the back-edges of check 3. If `N` is
+    /// 4. `T`: `N` (below) with range ends moved in to the thresholds of
+    ///    check 3, if that changes it;
+    /// 5. `N`: `E` loosened to cover the back-edges of check 3. If `N` is
     ///    `W` or doesn't hold, the head is `W`.
     ///
     /// A loop higher than [`SEARCH_HEIGHT`] doesn't search: its head is `E`
@@ -2616,18 +2640,34 @@ impl<'a> Checker<'a> {
             let (out, edges) = self.loop_pass(cx, base.clone(), index, &mut check);
             return (out, base, edges.exits);
         }
-        // 4. N
+        // 4. T, from N
         let n = entry.loosen(about, full, &edges.next, Cover);
-        if n.same(&w) {
-            return (out, w, edges.exits);
+        let t = n.to_thresholds(&entry, about, full, &edges.thresholds);
+        let mut w_checked = Some((out, edges));
+        if !t.same(&n) {
+            self.rollback(cx, &mark);
+            w_checked = None;
+            let (out, edges) = self.loop_pass(cx, t.clone(), index, &mut check);
+            if holds(&t, &edges) {
+                return (out, t, edges.exits);
+            }
         }
-        self.rollback(cx, &mark);
-        let (out, edges) = self.loop_pass(cx, n.clone(), index, &mut check);
-        if holds(&n, &edges) {
-            return (out, n, edges.exits);
+        // 5. N
+        if !n.same(&w) {
+            self.rollback(cx, &mark);
+            let (out, edges) = self.loop_pass(cx, n.clone(), index, &mut check);
+            if holds(&n, &edges) {
+                return (out, n, edges.exits);
+            }
+            w_checked = None;
         }
-        self.rollback(cx, &mark);
-        let (out, edges) = self.loop_pass(cx, w.clone(), index, &mut check);
+        let (out, edges) = match w_checked {
+            Some(checked) => checked,
+            None => {
+                self.rollback(cx, &mark);
+                self.loop_pass(cx, w.clone(), index, &mut check)
+            }
+        };
         (out, w, edges.exits)
     }
 

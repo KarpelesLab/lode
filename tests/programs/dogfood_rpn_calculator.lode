@@ -37,11 +37,6 @@ struct Stack {
 fn run(prog: []Op) -> Outcome {
 	var st = Stack{sp: 0, items: [0; DEPTH]}
 	for pc in 0..prog.len {
-		// WORKAROUND: the loop head can't find `sp <= DEPTH` (it rises under a
-		// check in `push`, falls in `add`); restate it every iteration.
-		if st.sp > DEPTH {
-			return Outcome.stack_full(pc)
-		}
 		match prog[pc] {
 			push(v) => {
 				if st.sp >= DEPTH {

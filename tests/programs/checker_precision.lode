@@ -143,6 +143,34 @@ fn last_word_len(src: []u8, pos: usize) -> usize {
 	return i - start
 }
 
+const DEPTH: usize = 4
+
+// A stack pointer rises only under `sp < DEPTH` and falls elsewhere: the
+// threshold `DEPTH` it's compared with is a bound the loop head keeps.
+fn rpn(prog: []u8) -> i64 {
+	var stack: [DEPTH]i64 = [0; DEPTH]
+	var sp: usize = 0
+	for op in prog {
+		if op < 100 {
+			if sp >= DEPTH {
+				return -1
+			}
+			stack[sp] = i64(op)
+			sp = sp + 1
+		} else {
+			if sp < 2 {
+				return -2
+			}
+			stack[sp - 2] = stack[sp - 2] +% stack[sp - 1]
+			sp = sp - 1
+		}
+	}
+	if sp == 0 {
+		return -3
+	}
+	return stack[sp - 1]
+}
+
 fn main() -> u8 {
 	if half_plus_one(18446744073709551615) != 9223372036854775808 {
 		return 1
@@ -179,6 +207,12 @@ fn main() -> u8 {
 	let text: [9]u8 = ['a', 'b', ' ', 'c', 'd', 'e', ' ', 'f', 'g']
 	if last_word_len(text, 0) != 2 || last_word_len(text, 8) != 1 || last_word_len(text, 20) != 0 {
 		return 11
+	}
+	let prog: [7]u8 = [1, 2, 3, 200, 200, 4, 200]
+	let deep: [5]u8 = [1, 1, 1, 1, 1]
+	let short: [1]u8 = [200]
+	if rpn(prog) != 10 || rpn(deep) != -1 || rpn(short) != -2 {
+		return 12
 	}
 	return 0
 }

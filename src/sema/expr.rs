@@ -1700,6 +1700,9 @@ impl Checker<'_> {
                     BinOp::Gt => CmpOp::Gt,
                     _ => CmpOp::Ge,
                 };
+                if l.ty().as_int().is_some() {
+                    super::note_thresholds(cx, l.side(), r.side());
+                }
                 let facts = l
                     .ty()
                     .as_int()

@@ -239,6 +239,12 @@ range are separate facts):
   relation's `c` to the largest the back-edges give (and forget it if one
   gives none). A hole can't be widened: it's forgotten as when dropping.
 
+The **thresholds** of a term of `A` are the constants it's compared with in
+the body: each comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) between the
+term plus a constant `d` and a side whose range is a single value `k`, met
+anywhere in a check of the body (nested loops included), gives the
+threshold `k - d`.
+
 The candidates, in order:
 
 1. `E` itself.
@@ -246,11 +252,25 @@ The candidates, in order:
 3. `W`: `C` dropping for the back-edges of the check from `C`. If `W` doesn't
    hold, the head is `E` with every fact about `A` forgotten, and the search
    ends.
-4. `N`: `E` covering the back-edges of the check from `W`. If `N` doesn't
+4. `T`: `N` (below) with range ends moved in to thresholds, from those of
+   the check from `W`: for each term of `A` with thresholds, the largest
+   threshold at least `E`'s upper end (its type's limit if `E` has no
+   range) becomes the upper end if it's below `N`'s, and the smallest
+   threshold at most `E`'s lower end becomes the lower end if it's above
+   `N`'s. `T` is only checked if that changes something, and is the head if
+   it holds.
+5. `N`: `E` covering the back-edges of the check from `W`. If `N` doesn't
    hold, the head is `W`.
 
-So the body is checked at most five times, and only the check from the
+So the body is checked at most six times, and only the check from the
 chosen head counts: errors found from other candidates are not reported.
+Step 1 keeps what the loop doesn't change, step 2 one round of change (a
+variable set to a bounded value on some path), step 3 the bounds that only
+move one way (`i` counting down from `buf.len` keeps `i <= buf.len`), step
+4 the bounds a guard keeps for a variable that moves both ways (a stack
+pointer that only grows under `if sp < DEPTH` and shrinks elsewhere keeps
+`sp <= DEPTH`), and step 5 bounds that come from the loop's own tests (a
+`while i > 1` that counts down leaves `i >= 1` at the head).
 
 A nested loop is checked that often for each check of the loop around it,
 so the search is limited by the loop's **height**: a loop with no loop in
@@ -261,11 +281,6 @@ forgotten, and its body is checked once. The loops nested in it still
 search if they are low enough. The height depends only on the program text,
 so this limit never makes acceptance depend on time, and a chain of nested
 loops of any depth costs at most what four nested searches cost.
-Step 1 keeps what the loop doesn't change, step 2 one round of change (a
-variable set to a bounded value on some path), step 3 the bounds that only
-move one way (`i` counting down from `buf.len` keeps `i <= buf.len`), and
-step 4 bounds that come from the loop's own tests (a `while i > 1` that
-counts down leaves `i >= 1` at the head).
 
 ```
 var i = buf.len                  // E: i == 21

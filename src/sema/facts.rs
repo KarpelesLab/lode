@@ -595,6 +595,51 @@ impl Env {
         out
     }
 
+    /// `self` (a candidate head, `N`) with the range ends of the terms
+    /// `about` picks out moved in to their thresholds: for each `(term, k)`
+    /// of `thresholds`, the largest `k` at least `entry`'s upper end (the
+    /// facts before the loop; the type's limit `full` if none) becomes the
+    /// upper end if it's below it, and the smallest `k` at most `entry`'s
+    /// lower end the lower end if it's above it.
+    pub fn to_thresholds(
+        &self,
+        entry: &Env,
+        about: impl Fn(LocalId) -> bool,
+        full: impl Fn(Term) -> Range,
+        thresholds: &[(Term, i128)],
+    ) -> Env {
+        let mut out = self.clone();
+        let mut terms: Vec<Term> = Vec::new();
+        for &(term, _) in thresholds {
+            if !terms.contains(&term) {
+                terms.push(term);
+            }
+        }
+        for term in terms {
+            if !about(term.local()) {
+                continue;
+            }
+            let f = full(term);
+            let e = entry.range(term).unwrap_or(f);
+            let mut r = self.range(term).unwrap_or(f);
+            let ks = thresholds.iter().filter(|t| t.0 == term).map(|t| t.1);
+            if let Some(k) = ks.clone().filter(|&k| k >= e.hi).max()
+                && k < r.hi
+            {
+                r.hi = k;
+            }
+            if let Some(k) = ks.filter(|&k| k <= e.lo).min()
+                && k > r.lo
+            {
+                r.lo = k;
+            }
+            if r != f && r.lo <= r.hi {
+                out.ranges.insert(term, r);
+            }
+        }
+        out
+    }
+
     /// Whether two sets of facts are the same.
     pub fn same(&self, other: &Env) -> bool {
         self.dead == other.dead
@@ -989,6 +1034,23 @@ mod tests {
             Some(Range { lo: 0, hi: U32.hi })
         );
         assert_eq!(Env::default().range_via(Term::Local(n), full), None);
+    }
+
+    #[test]
+    fn thresholds_tighten_ends() {
+        // E: sp == 0; N: sp in 0..=MAX-1; thresholds 2 and 16 (and 0).
+        let sp = Term::Local(0);
+        let entry = exact(0, 0);
+        let mut n = Env::default();
+        n.apply(&comparison(CmpOp::Lt, var(0), konst(U32.hi)).when_true);
+        let about = |l: LocalId| l == 0;
+        let ks = [(sp, 2), (sp, 16), (sp, 0), (Term::Local(1), 5)];
+        let t = n.to_thresholds(&entry, about, full, &ks);
+        assert_eq!(t.range(sp), Some(Range { lo: 0, hi: 16 }));
+        assert_eq!(t.range(Term::Local(1)), None);
+        // No threshold at least E's upper end: nothing changes.
+        let t = n.to_thresholds(&exact(0, 20), about, full, &ks);
+        assert!(t.same(&n));
     }
 
     #[test]
