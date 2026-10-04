@@ -57,6 +57,8 @@ loop, the facts at its exits ([safety.md](safety.md#facts-through-loops)).
   options are in [memory.md](memory.md#uninitialized-buffers); the choice is
   open.
 - **M7: Generics and traits** (and `comptime`, which they're built on).
+  The proposal, split into steps M7a to M7e, is in
+  [generics.md](generics.md#implementation-plan).
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack

@@ -1,0 +1,817 @@
+# Generics, traits and `comptime` (M7 proposal)
+
+This is the design proposal for milestone M7 ([roadmap.md](roadmap.md)). It
+builds on what's already written: [types.md](types.md#generics-and-traits)
+(the `[T]` syntax, traits checked at the definition, static dispatch),
+[comptime.md](comptime.md) (one compile-time mechanism, hermetic and
+bounded), and the proof checker of [safety.md](safety.md). Each section lists
+the options, the trade-offs and a recommendation. The decisions only the user
+can make are collected at the end, in
+[Questions for the user](#questions-for-the-user).
+
+Nothing here is implemented. Every section is **Proposed** unless it says
+otherwise.
+
+## Principles
+
+**Status:** Proposed
+
+Five rules shape the whole proposal. They follow from decisions already made.
+
+1. **A generic body is checked once, at its definition.** Types, names,
+   parameter conventions, exclusivity and proof obligations are all checked
+   against the bounds, not against each use. An instantiation can't fail to
+   type-check. This is the point of difference with Zig and C++
+   ([concept.md](concept.md#positioning)).
+2. **The only errors at an instantiation are about the arguments**: a type
+   argument that doesn't satisfy a bound, a value argument that doesn't meet
+   its refinement, or a compile-time evaluation that fails (see
+   [Proof obligations in compile-time code](#proof-obligations-in-compile-time-code)).
+   Each is reported at the call site.
+3. **No operator overloading, also not through traits.** An operator in
+   generic code means what it means on the primitive types, or it isn't
+   allowed ([types.md](types.md#operators)).
+4. **Pay only for what you use.** An instantiation exists in the binary only
+   if `main` reaches it, like functions today.
+5. **The checker stays specified and decidable.** Generics add no solver and
+   no search. Bounds are checked by lookup; facts about generic values use the
+   existing fact language ([safety.md](safety.md#the-fact-language)).
+
+## Generic functions
+
+**Status:** Proposed
+
+```
+fn max[T: Ordered](sink a: T, sink b: T) -> T {
+	if a.lt(b) {
+		return b
+	}
+	return a
+}
+
+fn sum[T: Integer](xs: []T) -> T {
+	var total: T = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+let m = max(3, x)            // T inferred: the type of x
+let s = sum[u64](values)     // explicit
+```
+
+- Generic parameters come in brackets after the name: `[T]`, `[T: Ordered]`,
+  `[T: Ordered + Copy, U]`. A bound is a trait, or several joined with `+`.
+- A generic parameter can also be a **value** of an integer type or `bool`:
+  `[N: usize]`. It's known at compile time. See
+  [Value parameters](#value-parameters).
+- Bounds stay in the brackets. `where` is not used for bounds: it's taken by
+  [refinements](safety.md#refinements-in-types), which are facts about
+  values. A long parameter list wraps like any other list.
+
+### Type arguments at the call site
+
+**Options:**
+
+1. **Always explicit** (`max[u32](a, b)`). Simple, but noisy for the common
+   case.
+2. **Inferred from the arguments only.** Predictable, but `parse[u32](s)` and
+   `let x: u8 = max(1, 2)` need explicit arguments.
+3. **Inferred from the arguments, then from the expected type.** One pass
+   over the parameters in order, then the context's type for what's left.
+   No backtracking, no inference across statements.
+4. **Full bidirectional inference** (Rust, Swift). Fewer annotations, but
+   errors are harder to explain and compile time is harder to predict.
+
+**Recommendation: 3.** It covers the common cases and stays easy to
+explain: "a type argument comes from the first argument that fixes it, or
+from the type expected for the result". An untyped literal doesn't fix a type
+argument, as with `let b = 300` today: `max(3, 4)` alone is an error that
+asks for a type, and `let m: u8 = max(3, 4)` works. Explicit arguments are
+always allowed, and must be complete (all or none).
+
+### `[T]` and indexing
+
+`[` after an expression is either an index or a list of generic arguments.
+Declarations are never ambiguous (`fn max[T]`, `struct List[T]`), and neither
+are types (`List[u32]` in a type position).
+
+**Options:**
+
+1. **Decide in the checker** (Go). The parser builds one node for
+   `expr[args]`, and the checker looks at what `expr` names: a generic
+   function or type means generic arguments; a value means an index.
+2. **A different bracket for generics in expressions** (Rust's `::<>`,
+   `max.[u32]`). Unambiguous for the parser, but a second spelling of the
+   same thing.
+3. **No explicit arguments in expressions**, only inference or a typed
+   `let`. Too limiting: `List[u32].new()` has nothing to infer from.
+
+**Recommendation: 1.** The parser gains one rule: inside `[...]` after an
+expression, each comma-separated item is parsed as a type when it starts
+with a token that only a type can start with (`?`, `*`, `[]`, `fn`), or as a
+`[N]T` array type when `[N]` is directly followed by a type; otherwise as an
+expression, which the checker reinterprets as a type name (`u32`,
+`geo.Point`) when the base is generic. `a[i, j]` on an array stays an
+error, in the checker. The formatter's rule "no space before an index's `[`"
+already gives `max[u32](a, b)` and `fn max[T: Ordered]`.
+
+### Value parameters
+
+```
+struct StackBuf[N: usize] {
+	bytes: [N]u8
+	len: usize where len <= N
+}
+
+fn first_n[N: usize](xs: []u8) -> ?[N]u8 { ... }
+```
+
+- A value parameter is a term in the fact language, like a `let` of its type
+  ([safety.md](safety.md#the-fact-language)). Its range is its type's, and a
+  refinement narrows it: `[N: usize where N > 0]`.
+- `[N]T` with a value parameter `N` has length `N`, so `for i in 0..a.len`
+  proves `a[i]` once, for every `N`.
+- At an instantiation, the argument must be known at compile time, and its
+  refinement is checked there.
+
+This replaces Zig's "`comptime` parameter checked at each use" for the cases
+where a type depends on a number. It keeps rule 1: the body is checked once
+with `N` unknown.
+
+## Generic types
+
+**Status:** Proposed
+
+```
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+enum Tree[T] {
+	leaf(value: T)
+	node(left: Box[Tree[T]], right: Box[Tree[T]])
+}
+
+let p = Pair{first: b, second: true}      // b: u8, so Pair[u8, bool]
+let q = Pair[u8, u16]{first: 1, second: 2}
+```
+
+- Structs and enums take generic parameters, with bounds, like functions.
+  `Pair[u8, bool]` and `Pair[u8, u16]` are different types.
+- A literal infers the arguments from its fields when it can, with the same
+  rule as calls.
+- A generic type can't contain itself by value (as today); through `Box`
+  it can, once `Box` exists ([memory.md](memory.md#owning-pointers-are-values)).
+
+### `?T` stays built in
+
+`?T` is already an enum `none | some(value: T)` in the compiler. **Options:**
+keep it built in, or define it in the standard library as `Option[T]` with
+`?T` as sugar.
+
+**Recommendation: keep it built in.** It has syntax that a library type
+can't have (`??`, `if let`, `let ... else`, `none` from context, the
+implicit `T` to `?T`) and a layout rule (niches). Making it a library type
+gains nothing a user can see. The same goes for a call's result,
+`throws(E) -> T`. User code writes its own generic enums freely; there is no
+`Option` in the standard library, so there is one way to write an optional.
+
+### Views as type arguments
+
+A type argument can't be a view (`str`, `[]T`, later `dyn Trait`). Views are
+never stored in fields ([memory.md](memory.md#views)), and a generic type
+can put `T` in a field, so allowing `Pair[str, u8]` would need a check per
+instantiation (breaking rule 1) or a second kind of type parameter. Generic
+functions over views take the view in the signature instead:
+`fn find[T: Eq](xs: []T, v: T) -> ?usize`. A view parameter kind
+(`[T: view]`) can be added later if real code needs it.
+
+## Generic methods
+
+**Status:** Proposed
+
+```
+fn Pair[A, B].swap(self) -> Pair[B, A] {
+	return Pair{first: self.second, second: self.first}
+}
+
+fn StackBuf[N].push(inout self, b: u8) throws(Full) { ... }
+
+fn List[T].map[U](self, f: fn(T) -> U) -> List[U] { ... }
+
+fn List[T: Ordered].sort(inout self) { ... }   // only when T: Ordered
+```
+
+- `fn Pair[A, B].swap` declares the type's parameters for this method (as
+  Go's `func (p Pair[A, B])`). The names can differ from the struct's; the
+  bounds the struct declares are implied and aren't repeated.
+- A method can add bounds to the type's parameters: `List[T: Ordered].sort`
+  exists only for lists whose element type is `Ordered`. Calling it on a
+  `List[Point]` without `impl Ordered for Point` is an error at the call
+  that names the missing bound.
+- A method can have parameters of its own: `.map[U]`.
+- Methods are still declared in the type's package only
+  ([types.md](types.md#methods)).
+
+## Traits
+
+**Status:** Proposed
+
+```
+trait Ordered: Eq {
+	fn cmp(self, other: Self) -> Ordering
+
+	fn lt(self, other: Self) -> bool {      // default method
+		return self.cmp(other) == .less
+	}
+}
+
+trait Encoding {
+	type Rune: Copy + Eq
+	const MAX_LEN: usize
+
+	fn decode(bytes: []u8) -> ?(Rune, usize)
+	fn encode(r: Rune, set out: [MAX_LEN]u8) -> usize
+	fn validate(bytes: []u8) -> bool
+}
+```
+
+- A trait lists **required methods** (with `self`, `inout self` or
+  `sink self`), **associated functions** (no `self`, called `E.decode(b)` on
+  the type), **associated types** (`type Rune`, used as `E.Rune`) and
+  **associated constants** (`const MAX_LEN: usize`, used as `E.MAX_LEN`).
+  Associated constants settle the "max rune length per encoding" question in
+  [strings.md](strings.md#types).
+- `Self` is the implementing type.
+- `trait Ordered: Eq` makes `Eq` a **supertrait**: every `Ordered` type is
+  `Eq`, and a bound `T: Ordered` gives `==` too.
+- A **default method** has a body, checked once in the trait against the
+  trait's own declarations. An implementation may replace it.
+- Signatures are complete: conventions, `throws(E)` and `uses` are part of a
+  trait method, and an implementation must match them, except that it may
+  throw nothing where the trait throws, and may use fewer contexts
+  ([Contexts and errors](#contexts-and-errors)).
+
+### Implementations
+
+**Options:**
+
+1. **Explicit `impl` blocks** holding the trait's methods (Rust):
+
+   ```
+   impl Ordered for Point {
+   	fn cmp(self, other: Point) -> Ordering { ... }
+   }
+   ```
+
+2. **A conformance line plus ordinary methods**:
+
+   ```
+   impl Ordered for Point
+   fn Point.cmp(self, other: Point) -> Ordering { ... }
+   ```
+
+   Every method keeps the greppable `fn Point.cmp` form, and there's one way
+   to declare a method. But an `impl` in the trait's package (allowed, see
+   [Coherence](#coherence)) can't declare `fn Point.cmp` there, so that case
+   still needs a block, and two traits with a method of the same name can't
+   both be implemented.
+3. **Implicit satisfaction** (Go): a type that has the methods implements
+   the trait. Easy to read, but conformance can be accidental, errors are
+   worse ("does not implement" far from the cause), and associated types
+   have nowhere to be declared.
+
+**Recommendation: 1.** It's the form types.md already shows, it covers
+both packages an impl may live in with one syntax, it groups associated
+types and constants with the methods, and a missing or wrong method is
+reported on the `impl` line. `impl Ordered for Point` is the greppable
+anchor. A method in an impl is called like any method, `p.cmp(q)`. A type's
+method names are one namespace: an impl can't bring a method whose name the
+type already has (as a field, a variant, a method, or a method of another
+impl). The rare clash is resolved by calling through the trait:
+`Ordered.cmp(p, q)`.
+
+Generic and conditional implementations:
+
+```
+impl[A: Eq, B: Eq] Eq for Pair[A, B]          // derived, see below
+impl[T: Ordered] Ordered for List[T] { ... }
+```
+
+### Coherence
+
+**Options:** (1) Rust's orphan rule: an impl lives in the trait's package or
+the type's package, and there's at most one impl of a trait for a type in a
+program. (2) Only the type's package (Go-like, simplest). (3) Anywhere,
+picked by import (Scala implicits): flexible and confusing.
+
+**Recommendation: 1, without blanket impls.** The trait's package needs
+impls for types it doesn't own (a serialization package implementing its
+trait for `std` types), and the type's package needs impls for traits it
+doesn't own (`Format` for a user type). Additionally:
+
+- An impl's type is a named type (`Point`, `Pair[A, B]`, `u32`), never a
+  bare parameter (`impl[T: Ordered] Format for T` is not allowed). This
+  makes overlap trivial to check: at most one impl per trait and type name,
+  found by a table lookup. There is no specialization.
+- The primitive types belong to the standard library for this rule, so
+  `std` can implement its traits for `u32`.
+
+Blanket impls can be added later, with an overlap rule, if real code needs
+them.
+
+## Built-in traits
+
+**Status:** Proposed
+
+Some traits are known to the compiler. They are declared in the standard
+library (`std/core`, name Open) so they have documentation and a place in
+the package graph, but some of their impls come from the compiler.
+
+| Trait | Meaning | Who implements it |
+| --- | --- | --- |
+| `Eq` | `==` and `!=` are defined | Derived by the compiler only (below) |
+| `Ordered: Eq` | A total order, `cmp` and the defaults `lt`, `le`, `gt`, `ge`, `min`, `max` | Built in for integers and `bool`; user types write an impl |
+| `Integer: Ordered + Copy` | The integer operators | Sealed: only the integer primitives |
+| `Unsigned`, `Signed` | `Integer` and the sign | Sealed |
+| `Copy` | A value can be copied implicitly | Automatic, see below |
+| `Format` | Writable by `print("{}")` ([Format strings](#format-strings)) | Built in for integers, `bool`, `str`; user types write an impl |
+| `Send`, `Sync` | May cross / be shared across threads ([concurrency.md](concurrency.md#data-race-freedom)) | Automatic; opt-out and `unsafe impl`. Deferred to the concurrency milestone. |
+
+A **sealed** trait can't be implemented outside the standard library.
+
+### Operators in generic code
+
+No operator is overloaded (rule 3). So in a generic body:
+
+- `==` and `!=` need `T: Eq`, and they are the compiler's derived equality
+  of the concrete type. Users can't implement `Eq` with code: a type is `Eq`
+  when its parts are, which is what `==` already does today
+  ([types.md](types.md#operators)). For generic types the compiler derives
+  `impl[A: Eq, B: Eq] Eq for Pair[A, B]`.
+- `<`, `<=`, `>`, `>=`, arithmetic, bitwise and shifts need a **sealed**
+  numeric bound (`Integer`, `Unsigned`, `Signed`; float traits later). They
+  mean exactly what they mean on the primitive, so the body reads the same
+  whatever `T` is.
+- `T: Ordered` gives **methods**, not operators: `a.lt(b)`, `a.cmp(b)`. If
+  `<` worked on `T: Ordered`, a `Point` with a hand-written `cmp` would have
+  a user-defined `<`: operator overloading through a side door.
+
+The cost: generic sorting code reads `xs[j].lt(xs[i])` rather than
+`xs[j] < xs[i]`. We accept it, as types.md accepts `a.add(b)` for big
+integers.
+
+**Floats** are not `Ordered` (types.md) and, by the same reasoning, not
+`Eq`: `==` on floats is IEEE (`NaN != NaN`), not an equivalence. A struct
+with a float field therefore gets no derived `==` (it compares fields, or
+uses `total_cmp`). Floats aren't in the compiler yet; this only fixes the
+rule ahead of time.
+
+### `Copy` and moves in generic code
+
+memory.md says small plain types are copied implicitly and types that own
+resources move. In generic code, `T` may be either. **Options:**
+
+1. **`T` is move-only unless bounded `T: Copy`.** Using a read-only `T`
+   parameter as a value to keep (returning it, storing it, `let b = a`
+   while `a` is used later) needs `T: Copy`, or the parameter must be
+   `sink`. Every type today is `Copy`, so existing code is unaffected.
+2. **`T` is `Copy` unless it says otherwise** (`[T: move]`, like Rust's
+   `?Sized`). Shorter for the common case, but containers and most std
+   generics will opt out, and forgetting to makes a generic unusable with
+   owning types, found only when someone tries.
+
+**Recommendation: 1.** It's the honest default under value semantics, and
+it costs little: `max` takes `sink a: T, sink b: T` (callers don't mark
+`sink`, so `max(a, b)` reads the same), and returns one while the other is
+destroyed, which is exactly right for owning values. Reading a `T` in place
+(passing `xs[i]` to a default parameter, calling a method on it) never needs
+`Copy`. `Copy` is automatic: a struct, enum or array is `Copy` when its
+parts are and it has no `deinit`.
+
+## Dispatch
+
+**Status:** Proposed
+
+### Static by default: monomorphization
+
+Each instantiation that `main` reaches becomes its own function, with the
+type arguments substituted and trait calls resolved to the impl's method.
+This is decided in types.md and fits "pay only for what you use": `max[u8]`
+and `max[u32]` are two small functions, and an instantiation nothing calls
+isn't emitted.
+
+In the compiler, the checker produces one typed tree per generic function,
+with type parameters in it. A new pass between checking and lowering
+(`src/mono.rs`) walks the call graph from `main`, as `src/reach.rs` does
+today, and produces concrete functions by substitution. `src/lower.rs` then
+sees only concrete types and needs almost no change.
+
+Linker symbols include the arguments: `std/math.max[u32]`.
+
+### Sharing code between instantiations
+
+types.md allows an optimization profile to share code on small targets.
+**Options**, in order of cost:
+
+1. **Identical code folding** in LatticeFoundry: instantiations that compile
+   to the same machine code (`max[u32]` and `max[i32]` often do not, but
+   `len[u8]` and `len[i8]` do) become one. No language change.
+2. **Witness tables** (Swift): one body takes a hidden table with `T`'s size,
+   alignment and trait methods. Saves the most space, costs a call per trait
+   method, and needs the same tables as `dyn`.
+
+**Recommendation:** monomorphization only in M7. Ask LatticeFoundry for 1
+when code size on small targets is measured to need it. Do 2 after `dyn`
+exists, as a profile option that must not change behavior.
+
+### `dyn Trait`
+
+Dynamic dispatch is explicit (types.md). A sketch, so M7's traits don't
+rule it out:
+
+- `dyn Writer` is a **view**: a pointer to a value plus a pointer to the
+  impl's table of methods. Like `[]T`, it can be a parameter, a local or a
+  return value, never a field ([memory.md](memory.md#views)). An owned one
+  is `Box[dyn Writer]`, once the allocator context exists.
+- A trait can be used as `dyn` only if its methods take `self` (in any
+  convention but `sink`, which would move an unsized value), have no generic
+  parameters of their own, and don't use `Self` in arguments or results.
+  The compiler says which method breaks it.
+- [Stack bounds](safety.md#stack-bounds) survive: the program is linked
+  whole, so the set of impls of the trait is known, and a call through `dyn`
+  costs the worst of them.
+
+**Recommendation: not in M7.** Nothing M7's std needs uses it (I/O traits,
+`Format` and `select` are all static), and it brings a value layout and a
+coercion rule of its own. It's a good candidate for right after M7.
+
+## Checking generic bodies
+
+**Status:** Proposed
+
+### Against the bounds
+
+In a generic body, a value of type `T` can only be used in ways every type
+satisfying `T`'s bounds supports:
+
+- calling methods and associated functions of the bounds' traits (and their
+  supertraits);
+- the operators the bounds give ([Operators in generic code](#operators-in-generic-code));
+- passing it on to another generic whose bounds `T`'s bounds imply;
+- moving it, and copying it only with `T: Copy`.
+
+Anything else is an error in the generic function, never at an
+instantiation.
+
+### Facts about `T` values
+
+The proof checker must prove each obligation once, for every possible `T`.
+For bounds without numeric meaning (`Ordered`, `Format`), a `T` value is not
+a term: it has no facts, and nothing needs any. For the sealed numeric
+bounds:
+
+- A `T` term's **range** starts as the hull of the ranges of every type the
+  bound admits (for `Unsigned`: `0..=` the largest `u128`; for `Integer`:
+  the smallest `i128` to the largest `u128`). Every value of every
+  instantiation is inside it, so facts learned from it are true for all.
+- An obligation "the result fits in `T`" (`a + b`, `a - b`, `T(x)`) is
+  proven when the result's range is within the **intersection** of those
+  ranges (`0..=127` for `Integer` over the 8-bit and wider types), or when
+  a **relation** places it between two `T` terms: after `if i < n`, `i + 1`
+  is at most `n`, which is a `T`, so it fits. `x - y` after `y <= x` is
+  proven as today.
+- A literal converts to `T` only if it fits in the intersection: `0`, `1`
+  and `100` are fine for `T: Integer`, `200` needs `T: Unsigned`, and `-1`
+  needs `T: Signed`.
+- Relations between terms are unchanged, so `for i in 0..xs.len` still
+  proves `xs[i]` for `xs: []T`.
+
+This needs no new kind of fact, only two ranges per bound and one rule for
+"fits in `T`". Generic integer code that can't be proven uses `+%`, `+|` or
+`checked_add` as usual. Whether `u1`..`u7` count as `Integer` (they would
+shrink the intersection to `0..=0`) is settled with the arbitrary widths of
+[types.md](types.md#integers).
+
+Value parameters (`[N: usize]`) are ordinary terms, as above.
+
+### Refinements on generic code
+
+Refinements work unchanged on value parameters and on `T` terms with a
+numeric bound: `fn take[N: usize](xs: []u8, n: usize where n <= N)`. Their
+constants must fit in the bound's intersection, like literals. A refinement
+can't mention a trait method (no calls in the fact language,
+[safety.md](safety.md#refinements-in-types)).
+
+### Error messages
+
+The checking model makes errors local:
+
+- In a generic body: "`T` has no method `cmp`", with the help "add a bound:
+  `[T: Ordered]`".
+- At a call: "`Point` doesn't implement `Ordered`", pointing at the
+  argument, with a note at the bound that requires it (`max[T: Ordered]`)
+  and the help "add `impl Ordered for Point`". There is never a trace into
+  the generic body.
+- Inference: "can't tell what `T` is", with the help "write `max[u32](...)`
+  or give the result a type".
+- A failed proof in a generic body names `T`'s range as "any `Integer`"
+  instead of a 39-digit number.
+
+## `comptime`
+
+**Status:** Proposed
+
+[comptime.md](comptime.md) describes the mechanism. M7 needs a part of it.
+
+### What M7 needs
+
+1. **Constants computed by calls.** `const TABLE: [256]u32 =
+   make_table()`, where `make_table` is an ordinary function. Constants of
+   any type that can be stored (integers, `bool`, arrays, structs, enums,
+   optionals), not only integers as today.
+2. **`if comptime`** in function bodies, with `target` (`os`, `arch`,
+   `endian`, `pointer_bits`, `profile`) and constants. The untaken branch is
+   removed before checking (Decided in comptime.md).
+3. **Per-target declarations at package scope**, so `std/os` can hold
+   Linux and other implementations side by side:
+
+   ```
+   if comptime target.os == .linux {
+   	pub fn write(fd: i32, s: str) -> isize { ... }
+   } else {
+   	compile_error("std/os: unsupported target")
+   }
+   ```
+
+   **Options:** this, or Go's file suffixes (`os_linux.lode`). Suffixes are
+   simple but a second mechanism, and they can't express
+   `target.cpu.has(.avx2)`. **Recommendation:** package-scope `if comptime`,
+   with conditions limited to `target`, literals and `&&`, `||`, `!`, `==`,
+   so they're evaluated before names are resolved, with no cycles.
+4. **`compile_error("...")`**, an error at the place it's evaluated.
+5. **Compile-time parameters and packs** for format strings
+   ([Format strings](#format-strings)).
+6. **`lode check --targets=...`** checks a package once per target. It's
+   what keeps dead branches from rotting (comptime.md).
+
+### Rules
+
+As in comptime.md, unchanged:
+
+- **Hermetic**: no `syscall`, no `unsafe`, no I/O. `embed_file` comes later.
+  A call to `syscall` reached at compile time is an error that shows the
+  call chain.
+- **Bounded**: a step budget per evaluation (a step is one statement or one
+  call; proposed default one million), and a memory budget. Exceeding it is
+  an error with the chain of calls. `@comptime_budget(n)` on a declaration
+  raises it.
+- **Same semantics as runtime**: the code is the same code, already checked
+  and proven. Arithmetic is exact and host-independent; `usize` is the
+  target's.
+
+### Proof obligations in compile-time code
+
+A function called at compile time is an ordinary function: it was checked,
+and its obligations proven, like any other. So its evaluation can't
+overflow or index out of bounds.
+
+Code that runs **only** at compile time is different: a `comptime` block,
+the initializer of a `comptime let`, a `comptime for`, the evaluation of a
+package-scope `if comptime`. It never runs in the program, so there's no
+crash path to rule out. **Proposal:** its obligations are discharged by
+running it. An index out of bounds there is a compile error at the point of
+failure, with the evaluation's chain, which is what comptime.md already says
+("a failure during comptime evaluation is a compile error"). This keeps
+format-string parsing ordinary code instead of code written for the prover.
+
+### The evaluator
+
+**Options:** (1) a tree-walking interpreter over the checker's typed tree;
+(2) lowering to LatticeFoundry's IR and running its interpreter.
+
+**Recommendation: 1.** Compile-time values must be known *during* checking
+(an array length, a value argument, a branch to remove), before anything is
+lowered. The interpreter works on abstract values (integers as `i128`
+within their type, aggregates as lists), with no memory layout, so it's
+host-independent by construction. It needs function bodies checked on
+demand (a constant may call a function checked later), which changes the
+checker's order from "constants, then every function" to "on demand, with
+cycle detection", as `const_value` already does for constants.
+
+### Deferred
+
+- **Reflection** (fields and variants of a type). Open in comptime.md; the
+  leaning there (read-only, respects visibility) stands. Without it, `Format`
+  for a struct is written by hand.
+- **Code generation** (declarations built at compile time). Not planned.
+- **`embed_file`**.
+- `comptime` parameters of arbitrary types (types as values, Zig's `type`).
+  M7 has types only in brackets, where bounds check them.
+
+### Format strings
+
+`print("x = {}\n", x)` is the reason std needs comptime soon. It's built
+from three pieces.
+
+1. **A compile-time parameter in the argument list**, `comptime fmt: str`.
+   The argument must be known at compile time. Unlike a value parameter in
+   brackets, it doesn't change types, so it's passed like any argument.
+2. **A pack**: `..A: Format` is any number of type parameters, each
+   satisfying `Format`, and `args: ..A` the matching values. A pack can only
+   be used with a compile-time index: `args.len`, `args[i]` in a
+   `comptime for`. Each `args[i]` is "some `Format`", so the body is checked
+   once against the bound.
+3. **`comptime for`**: a loop over a compile-time list whose body is
+   repeated for each element, with the element known at compile time.
+
+```
+pub fn print[..A: Format](comptime fmt: str, args: ..A) {
+	comptime let parts = fmt_parse(fmt, args.len)  // ordinary Lode; errors at the call
+	if comptime parts.len == 1 && parts[0].is_text() {
+		os.write_all(os.STDOUT, parts[0].text)     // hello world: one write
+		return
+	}
+	var out = BufWriter[256].new(os.STDOUT)
+	comptime for part in parts {
+		match comptime part {
+			text(s) => out.write(s)
+			arg(i, spec) => args[i].format(&out, spec)
+		}
+	}
+	out.flush()
+}
+```
+
+- `fmt_parse` is an ordinary function, run at compile time. A `{}` without
+  an argument, an argument without a `{}`, or a bad spec is a
+  `compile_error` reported at the `print` call.
+- `{{` and `}}` are literal braces. `{}` is the only placeholder in M7;
+  specs like `{:x}` and widths come with `Format`'s `spec` parameter.
+- `print("hello world\n")` is the first branch: one `write`, no formatting
+  code linked. The hello-world benchmark must stay at 2 syscalls.
+- A runtime string is printed with `print("{}", s)`, which `Format` for
+  `str` turns into the same direct write. There's no separate
+  `print(s: str)`.
+- The same packs give `select(.{...})` its comptime tuple of cases
+  ([concurrency.md](concurrency.md#select-without-syntax)).
+
+## Interactions
+
+**Status:** Proposed
+
+### Parameter conventions and views
+
+- Conventions apply to `T` as to any type: `inout x: T`, `sink x: T`,
+  `set x: T`. Exclusivity is checked in the generic body as today.
+- Swapping or replacing a `T` in place without `Copy` needs moving out of
+  a place, which the language doesn't allow. `std/mem` provides `swap` and
+  `replace` (`unsafe` inside, safe outside).
+- `[]T` and `inout xs: []T` work for any `T`: reading `xs[i]` into a default
+  parameter or a method call doesn't copy. `let x = xs[i]` needs `T: Copy`.
+- A generic function returning a view borrows from its parameters, with the
+  same rule as any function ([memory.md](memory.md#views)).
+
+### Contexts and errors
+
+- `throws(E)` may name a type parameter or an associated type:
+  `fn read_all[R: Reader](inout r: R) throws(R.Error) -> ...`. `try` keeps
+  today's rule (same error type, no conversion). A function that calls two
+  generic operations with different error types has to convert by hand
+  until error-set unions exist ([errors.md](errors.md#error-sets)); the
+  concurrency doc's `copy[R: Reader, W: Writer]` waits for those.
+- An impl's method may throw nothing where the trait's throws, never a
+  different type.
+- `uses alloc` is part of a trait method's signature. An impl may use fewer
+  contexts than the trait declares, never more. A generic function that
+  calls a trait method with `uses alloc` must declare it too. The rule is
+  the same for `uses task` later.
+
+### Sequencing with the allocator
+
+Heap containers (`List[T]`, `Map[K, V]`, `Box[T]`) need generics *and* the
+allocator context. **Recommendation:** M7 doesn't wait for allocation. It
+ships generics with fixed-capacity types (`StackBuf[N]`, `ArrayVec[T, N]`)
+and generic functions over slices. The allocator context comes in its own
+milestone right after, and its containers are the first big user of M7.
+`StackBuf[N]` is also option 3 for
+[uninitialized buffers](memory.md#uninitialized-buffers).
+
+### Strings
+
+`str` stays built in during M7. Moving to `Str[E]` with an `Encoding` trait
+needs associated types and constants (M7c), plus literals re-encoded at
+compile time; it's a separate step after M7, with `str` remaining the name
+of `Str[utf8]` ([strings.md](strings.md)).
+
+## Implementation plan
+
+**Status:** Proposed
+
+Five steps, each shippable on its own with tests, std changes and docs, as
+the earlier milestones were. Sizes are rough estimates of compiler code
+(the compiler is about 14,000 lines today).
+
+### M7a: generic functions over the built-in traits
+
+- Parser: `[...]` after a function name (today an error), generic arguments
+  in types and after expressions (the `[T]` rule above), `+` in bounds.
+- Checker: type parameters as a new `Ty::Param`, the built-in traits
+  `Eq`, `Ordered`, `Integer`, `Unsigned`, `Signed`, `Copy` with their
+  compiler impls, bounds at call sites, inference from arguments and the
+  expected type, the move-only rule for `T`.
+- Facts: hull and intersection ranges for numeric bounds, the relation
+  rule for "fits in `T`", literal checks.
+- `src/mono.rs`: instantiation from `main` (replacing the walk in
+  `reach.rs`), substitution, symbols with arguments. Lowering sees
+  concrete types only.
+- About 1,500 to 2,000 lines.
+- **std gains:** `math.min`, `max`, `clamp`, `abs` for any integer;
+  `sort[T: Ordered](inout xs: []T)`; `io.print_int[T: Integer]` replacing
+  `print_u64` and `print_i64` (until M7e removes it too).
+
+### M7b: generic structs and enums, value parameters, generic methods
+
+- Instantiated types in the interner (a declaration plus arguments),
+  inference for literals, implied bounds, methods with added bounds,
+  `[N: usize]` as a term.
+- About 1,000 to 1,500 lines.
+- **std gains:** `StackBuf[N]` (and with it the end of `[0; 21]` in
+  `std/io`), `ArrayVec[T, N]`, `Pair` if wanted.
+
+### M7c: user traits
+
+- `trait` declarations: methods, associated functions, types and constants,
+  default methods, supertraits. `impl` blocks, conditional impls, the
+  coherence check, derived `Eq` for generic types, dot calls on trait
+  methods.
+- About 1,500 to 2,000 lines.
+- **std gains:** `Ordered` for user types, `io.Writer` implemented by
+  `io.File`, the `Encoding` trait and `utf8` (as a library, beside the
+  built-in `str`).
+
+### M7d: compile-time evaluation and target selection
+
+- The evaluator with budgets, constants of any storable type computed by
+  calls, `if comptime` in bodies and at package scope, `target`,
+  `compile_error`, on-demand checking of functions, `lode check
+  --targets=...`.
+- About 1,500 to 2,500 lines, most of it the evaluator.
+- **std gains:** `std/os` split by `target.os` and `target.arch` (one real
+  target until LatticeFoundry's others are wired, but the structure for
+  them), tables built at compile time.
+
+M7d depends only on M7a and could go before M7b or M7c if multi-target work
+becomes urgent.
+
+### M7e: format strings
+
+- `comptime` parameters, packs, `comptime for`, `match comptime`, the
+  "discharged by running it" rule, `Format` with impls for integers, `bool`
+  and `str`.
+- About 1,000 to 1,500 lines, plus `fmt_parse` and `BufWriter` in std.
+- **std gains:** `io.print("x = {}\n", x)` and `io.eprint`; `print_u64`,
+  `print_i64` and `print_int` go away. Hello world stays 2 syscalls, and
+  its size is checked in CI.
+
+### After M7
+
+`dyn Trait`; the allocator context and heap containers; `Send`/`Sync` with
+the concurrency work; `Str[E]`; error-set unions with generic errors; code
+sharing for small targets; reflection.
+
+## Questions for the user
+
+Each has a recommended answer; the reasoning is in the section linked.
+
+1. **How are traits implemented?** Recommended: `impl Trait for T { ... }`
+   blocks holding the methods, callable as `p.cmp(q)`
+   ([Implementations](#implementations)). Alternative: a one-line `impl`
+   plus ordinary `fn Point.cmp` methods.
+2. **Is `T` copyable by default?** Recommended: no; copying needs
+   `T: Copy`, and `max` takes `sink` parameters
+   ([`Copy` and moves](#copy-and-moves-in-generic-code)).
+3. **Does `<` work on `T: Ordered`?** Recommended: no; only sealed numeric
+   bounds get operators, `Ordered` gives `a.lt(b)`
+   ([Operators in generic code](#operators-in-generic-code)).
+4. **Equality: derived only?** Recommended: yes; `Eq` is never written by
+   hand, stays automatic as today, and floats (so structs with float
+   fields) aren't `Eq`. This also closes types.md's "opt-in or automatic"
+   question as automatic.
+5. **Coherence:** recommended: impls in the trait's or the type's package,
+   one per trait and type, no blanket impls ([Coherence](#coherence)).
+6. **Per-target code:** recommended: package-scope `if comptime` instead of
+   file-name suffixes ([What M7 needs](#what-m7-needs)).
+7. **Code that only runs at compile time is checked by running it**
+   instead of by the prover ([Proof obligations in compile-time
+   code](#proof-obligations-in-compile-time-code)). Recommended: yes.
+8. **One `print`:** recommended: `io.print` becomes the formatted print
+   with a compile-time format, and `print(s)` of a runtime string becomes
+   `print("{}", s)` ([Format strings](#format-strings)).
+9. **`dyn Trait` and allocation stay out of M7.** Recommended: yes; M7 ships
+   with fixed-capacity containers, and `dyn` and the allocator context come
+   right after ([`dyn Trait`](#dyn-trait),
+   [Sequencing](#sequencing-with-the-allocator)).

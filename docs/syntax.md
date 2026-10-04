@@ -430,7 +430,8 @@ fn main() -> u32 {
   Leaning toward requiring `return` in functions and allowing the last
   expression in `match` arms and blocks used as expressions.
 - Generic brackets: `[T]` (Go) avoids the `<>` parsing ambiguity. Leaning `[T]`,
-  with indexing told apart by context.
+  with indexing told apart by context
+  ([generics.md](generics.md#t-and-indexing)).
 - The `&` that marks an `inout` or `set` argument: `&x` is familiar from C
   and Rust, but there it takes an address, which Lode code never does. A
   keyword (`f(inout x)`, as in C#'s `ref x`) would read better and say which

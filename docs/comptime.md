@@ -13,6 +13,7 @@ lead, with restrictions for predictability.
 - `const` declarations are always evaluated at compile time.
 - `comptime` parameters are known at compile time. Generic `[T]` parameters are
   comptime type parameters constrained by traits ([types.md](types.md#generics-and-traits)).
+  What M7 needs of comptime is in [generics.md](generics.md#comptime).
 
 ```
 const CRC_TABLE: [256]u32 = make_crc_table()   // computed while compiling

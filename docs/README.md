@@ -26,6 +26,7 @@ The examples show semantics. They are not a grammar.
 | [memory.md](memory.md) | Memory model: value semantics, parameter conventions, allocation |
 | [errors.md](errors.md) | Error handling: `throws`, `try`, `catch`, cleanup |
 | [comptime.md](comptime.md) | Compile-time evaluation, conditional compilation, target queries |
+| [generics.md](generics.md) | Proposal for M7: generic functions and types, traits, dispatch, the `comptime` they need |
 | [strings.md](strings.md) | Strings, encodings, runes |
 | [packages.md](packages.md) | Packages, imports, versions, FFI, build metadata |
 | [concurrency.md](concurrency.md) | Threads, data-race freedom, structured concurrency |

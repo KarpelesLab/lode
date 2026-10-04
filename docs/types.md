@@ -409,7 +409,8 @@ high, the only exception we'd consider is a numeric trait with algebraic laws
 
 ## Generics and traits
 
-**Status:** Proposed
+**Status:** Proposed. The detailed proposal for M7 is in
+[generics.md](generics.md).
 
 Generics are compile-time parameters (see [comptime.md](comptime.md)).
 **Traits** constrain them so that a generic function is type-checked once, at
