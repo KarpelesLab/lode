@@ -97,8 +97,11 @@ Go's vocabulary, which is proven:
     to standard output, with a `-` if it's negative, and `eprint_int` to
     standard error: `io.print_int(x)`, or `io.print_int[u64](5)` for a
     literal, which doesn't tell the type. Each call makes one `write` system
-    call, of digits built in a `buf.StackBuf[21]`. They're a stopgap until
-    `print("{}", n)` ([generics.md](generics.md#format-strings)).
+    call, of digits built in a plain `[21]u8`: a `buf.StackBuf[21]` made
+    each program printing integers 640 bytes larger at `-O2`, since
+    `push_front` isn't inlined, its error result goes through memory, and
+    the written part is checked again before the write. They're a stopgap
+    until `print("{}", n)` ([generics.md](generics.md#format-strings)).
   - `print` and the others but the `File` methods ignore output errors:
     they're for output that isn't worth failing over.
 - `std/math`, generic:

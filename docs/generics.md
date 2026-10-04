@@ -905,7 +905,8 @@ proposal left room:
   `std/vec.ArrayVec[T: Copy, N]`, a vector of at most `N` elements; and
   `io.File.write_buf`, which writes a `StackBuf`'s bytes
   ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
-  `io.print_int` builds its digits in a `StackBuf[21]`. Every access in
+  (`io.print_int` built its digits in a `StackBuf[21]` at first, and went
+  back to a plain array: 640 bytes less at `-O2`.) Every access in
   them is proven. Without refinements, each method checks the invariant it
   needs (`end <= N`), and without private fields, `StackBuf` still fills
   its storage when it's made ([memory.md](memory.md#uninitialized-buffers)).

@@ -103,7 +103,7 @@ fn main() {
 	}
 	io.print("\n")
 
-	// `io.print_int` uses a `StackBuf` for its digits.
+	// `io.print_int` of a narrow and a wide type, and of 0.
 	print_sp(i8(-42))
 	print_sp(u64(18446744073709551615))
 	io.print_int(u8(0))
