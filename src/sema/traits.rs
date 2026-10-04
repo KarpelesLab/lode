@@ -801,7 +801,7 @@ impl<'a> Checker<'a> {
                 .or_default()
                 .push((Trait::Ordered, *id));
         }
-        if !table.contains_key("cmp") {
+        if !methods.iter().any(|(n, _)| n == "cmp") {
             let head = self.impls[k].decl.span_head();
             self.diags.push(
                 Diagnostic::error(
@@ -865,7 +865,7 @@ impl<'a> Checker<'a> {
         }
         let mut missing = Vec::new();
         for (name, tid, default) in &trait_methods {
-            if table.contains_key(name) {
+            if methods.iter().any(|(n, _)| n == name) {
                 continue;
             }
             if *default {

@@ -2307,11 +2307,9 @@ impl<'a> Checker<'a> {
                 .with_help("make it a generic function that takes the value: `fn f[T: Trait, U](x: T, ...)`"),
             );
         }
-        let (own, own_bounds) = if is_member {
-            (Vec::new(), Vec::new())
-        } else {
-            self.declare_generics(cx, &f.generics)
-        };
+        // (A member's own parameters are reported above, and declared so its
+        // body is checked without more errors.)
+        let (own, own_bounds) = self.declare_generics(cx, &f.generics);
         for p in &own {
             if type_params.iter().any(|q| q.to_string() == p.to_string()) {
                 self.error(
