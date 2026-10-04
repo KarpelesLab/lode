@@ -1,0 +1,130 @@
+// error: `Loop` can't be its own supertrait
+// error: `Square` already implements `Labeled`
+// error: `Eq` is derived, never implemented
+// error: `Integer` is sealed
+// error: an `impl` is for a named type, not for a type parameter
+// error: the `impl` of `Shape` for `Square` is missing `scale`
+// error: `Circle.area` doesn't match `Shape.area`: it returns `u16`, the trait's `u32`
+// error: `Circle.scale` doesn't match `Shape.scale`: `self` is passed differently
+// error: `perimeter` is not a method of `Shape`
+// error: the `impl` of `Ordered` for `Plain` has no `cmp`
+// error: `Plain` doesn't implement `Shape`, which `area_of` requires of `T`
+// error: `name` of `Square` is ambiguous: `Shape` and `Labeled` each have one
+// error: `<` can't compare values of type `T`
+// error: `T` has no method `volume`
+// help: add `fn scale(inout self, k: u32)`
+// help: declare it `fn area(self) -> u32`
+// help: add `impl Shape for Plain`
+// help: call it through its trait: `Shape.name(x, ...)`
+// help: blanket implementations are not supported
+package main
+
+trait Shape {
+	fn area(self) -> u32
+	fn scale(inout self, k: u32)
+
+	fn name(self) -> str {
+		return "shape"
+	}
+}
+
+trait Labeled {
+	fn name(self) -> str
+}
+
+struct Square {
+	side: u32
+}
+
+// Missing `scale`.
+impl Shape for Square {
+	fn area(self) -> u32 {
+		return self.side *| self.side
+	}
+}
+
+impl Labeled for Square {
+	fn name(self) -> str {
+		return "square"
+	}
+}
+
+struct Circle {
+	r: u32
+}
+
+impl Shape for Circle {
+	// The wrong return type.
+	fn area(self) -> u16 {
+		return 3
+	}
+
+	// The wrong convention.
+	fn scale(self, k: u32) {
+	}
+
+	// Not in the trait.
+	fn perimeter(self) -> u32 {
+		return 6
+	}
+}
+
+// A second impl of the same trait for the same type.
+impl Labeled for Square {
+	fn name(self) -> str {
+		return "again"
+	}
+}
+
+struct Plain {
+	x: u8
+}
+
+fn area_of[T: Shape](x: T) -> u32 {
+	return x.area()
+}
+
+fn use_them() {
+	// `Plain` doesn't implement `Shape`.
+	let a = area_of(Plain{x: 1})
+	// Two traits give `name`.
+	let s = Square{side: 2}
+	let n = s.name()
+}
+
+fn bigger[T: Shape](a: T, b: T) -> bool {
+	// A user trait gives no operators.
+	return a < b
+}
+
+fn missing[T: Shape](x: T) -> u32 {
+	return x.volume()
+}
+
+// Built-in traits that aren't implemented by hand.
+impl Eq for Plain {
+}
+
+impl Integer for Plain {
+}
+
+// A blanket impl.
+impl[T] Labeled for T {
+	fn name(self) -> str {
+		return "any"
+	}
+}
+
+trait Loop: Loop {
+	fn f(self)
+}
+
+// `Ordered` needs `cmp`.
+impl Ordered for Plain {
+	fn lt(self, other: Self) -> bool {
+		return self.x < other.x
+	}
+}
+
+fn main() {
+}

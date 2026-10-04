@@ -1,0 +1,128 @@
+// stdout: 3 104 2 1\n
+// stdout: 4 2 1\n
+// stdout: 7 9 2\n
+package main
+
+import "std/io"
+
+/// A tiny encoding: an associated type, an associated constant, and
+/// associated functions.
+trait Code {
+	type Unit: Copy + Eq
+	const WIDTH: usize
+
+	fn first(bytes: []u8) -> ?Self.Unit
+	fn put(u: Unit, set out: [WIDTH]u8) -> usize
+
+	/// A default associated function, using the others.
+	fn count(bytes: []u8) -> usize {
+		var n: usize = 0
+		for i in 0..bytes.len {
+			if bytes[i] < 128 {
+				n = n + 1
+			}
+		}
+		return n
+	}
+}
+
+struct Ascii {
+	unused: u8
+}
+
+impl Code for Ascii {
+	type Unit = u8
+	const WIDTH: usize = 1
+
+	fn first(bytes: []u8) -> ?u8 {
+		if bytes.len == 0 {
+			return none
+		}
+		return bytes[0]
+	}
+
+	fn put(u: u8, set out: [1]u8) -> usize {
+		out = [u]
+		return 1
+	}
+}
+
+struct Wide {
+	unused: u8
+}
+
+impl Code for Wide {
+	type Unit = u16
+	const WIDTH: usize = 2
+
+	fn first(bytes: []u8) -> ?u16 {
+		if bytes.len < 2 {
+			return none
+		}
+		return u16(bytes[0]) << 8 | u16(bytes[1])
+	}
+
+	fn put(u: u16, set out: [2]u8) -> usize {
+		out = [u8(u >> 8), u8(u & 255)]
+		return 2
+	}
+
+	fn count(bytes: []u8) -> usize {
+		return bytes.len / 2
+	}
+}
+
+/// Generic code over the trait: `C.Unit`, `C.WIDTH`, and `C.first`.
+fn round_trip[C: Code](bytes: []u8) -> usize {
+	let u = C.first(bytes) else {
+		return 0
+	}
+	var out: [C.WIDTH]u8
+	let n = C.put(u, &out)
+	if n != C.WIDTH {
+		return 0
+	}
+	return n +| C.count(bytes)
+}
+
+fn width[C: Code]() -> usize {
+	return C.WIDTH
+}
+
+/// An associated type in a signature.
+fn same[C: Code](a: C.Unit, b: C.Unit) -> bool {
+	return a == b
+}
+
+fn main() {
+	let text = "hi!".bytes()
+	io.print_int(round_trip[Ascii](text) -| 1)
+	io.print(" ")
+	io.print_int(Ascii.first(text) ?? 0)
+	io.print(" ")
+	io.print_int(round_trip[Wide](text) -| 1)
+	io.print(" ")
+	io.print_int(width[Ascii]())
+	io.print("\n")
+
+	io.print_int(round_trip[Ascii](text) + 0)
+	io.print(" ")
+	io.print_int(Wide.WIDTH)
+	io.print(" ")
+	var n: u8 = 0
+	if same[Wide](3, 3) && !same[Ascii](1, 2) {
+		n = 1
+	}
+	io.print_int(n)
+	io.print("\n")
+
+	var out: [Ascii.WIDTH]u8
+	let k = Ascii.put(7, &out)
+	io.print_int(out[0])
+	io.print(" ")
+	let w: Wide.Unit = 9
+	io.print_int(w)
+	io.print(" ")
+	io.print_int(k +| Ascii.WIDTH)
+	io.print("\n")
+}

@@ -1,0 +1,98 @@
+// error: `Code` has no associated type `Other`
+// error: the `impl` of `Code` for `A` doesn't give `WIDTH`
+// error: an `impl` for the generic type `Pair` declares a parameter for each of its parameters and names them, in order
+// error: unknown trait `Unknown`
+// error: a method of a trait or an `impl` with generic parameters of its own is not supported by the compiler yet
+// error: `Self` is only used in a trait or an `impl`
+// error: `Code` is a trait, not a type
+// error: `Sized` requires `Code`, which `Plain` doesn't implement
+// error: `A.cmp` doesn't match `Ordered.cmp`
+// error: `Pair[Plain]` doesn't implement `Ordered`, which `math.max` requires of `T`
+// help: write `impl[T] Code for Pair[T]`
+// help: add `impl Code for Plain`
+// help: declare it `fn cmp(self, other: Self) -> Ordering`
+// help: `impl Ordered for Pair` requires bounds of `Pair[Plain]`'s arguments that they don't satisfy
+package main
+
+import "std/math"
+
+trait Code {
+	type Unit: Copy
+	const WIDTH: usize
+
+	fn first(bytes: []u8) -> ?Unit
+
+	fn convert[U](self, sink u: U) -> U {
+		return u
+	}
+}
+
+trait Sized: Code {
+	fn size(self) -> usize
+}
+
+struct A {
+	x: u8
+}
+
+impl Code for A {
+	type Unit = u8
+	type Other = u8
+
+	fn first(bytes: []u8) -> ?u8 {
+		return none
+	}
+}
+
+impl Sized for Plain {
+	fn size(self) -> usize {
+		return 1
+	}
+}
+
+struct Plain {
+	x: u8
+}
+
+struct Pair[T] {
+	a: T
+	b: T
+}
+
+impl[A: Ordered] Ordered for Pair[A] {
+	fn cmp(self, other: Self) -> Ordering {
+		return self.a.cmp(other.a)
+	}
+}
+
+impl[X, Y] Code for Pair[Y] {
+	type Unit = u8
+	const WIDTH: usize = 1
+
+	fn first(bytes: []u8) -> ?u8 {
+		return none
+	}
+}
+
+impl Unknown for Plain {
+}
+
+impl Ordered for A {
+	fn cmp(self, other: A) -> bool {
+		return true
+	}
+}
+
+fn self_outside(x: Self) {
+}
+
+fn trait_as_type(c: Code) {
+}
+
+fn bounds() {
+	let p = Pair{a: Plain{x: 1}, b: Plain{x: 2}}
+	let q = math.max(p, p)
+}
+
+fn main() {
+}

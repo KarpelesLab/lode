@@ -1,0 +1,96 @@
+// stdout: 5 7 233 2\n
+// stdout: 2 195 169\n
+// stdout: 128512 4 240 159 152 128\n
+// stdout: true false false true\n
+// stdout: 3 4 1\n
+package main
+
+import "std/encoding"
+import "std/io"
+
+/// Encode a rune and decode it back, in any encoding.
+fn round_trip[E: encoding.Encoding](r: E.Rune) -> bool {
+	var out: [E.MAX_LEN]u8
+	let n = E.encode(r, &out)
+	if n > out.len {
+		return false
+	}
+	let d = E.decode(out[..n]) else {
+		return false
+	}
+	return d.rune == r && d.len == n
+}
+
+fn main() {
+	// "héllo" is 5 runes in 6 bytes; "été" too has an `é` (U+00E9).
+	let s = "héllo".bytes()
+	let n = encoding.count[encoding.Utf8](s) ?? 0
+	io.print_int(n)
+	io.print(" ")
+	io.print_int(encoding.count[encoding.Utf8]("naïveté".bytes()) ?? 0)
+	io.print(" ")
+	let d = encoding.Utf8.decode(s[1..]) ?? encoding.Decoded{rune: 0, len: 0}
+	io.print_int(d.rune)
+	io.print(" ")
+	io.print_int(d.len)
+	io.print("\n")
+
+	var out: [encoding.Utf8.MAX_LEN]u8
+	let k = encoding.Utf8.encode(0xe9, &out)
+	io.print_int(k)
+	io.print(" ")
+	io.print_int(out[0])
+	io.print(" ")
+	io.print_int(out[1])
+	io.print("\n")
+
+	let smile = "😀".bytes()
+	let e = encoding.Utf8.decode(smile) ?? encoding.Decoded{rune: 0, len: 0}
+	io.print_int(e.rune)
+	io.print(" ")
+	io.print_int(e.len)
+	for b in smile {
+		io.print(" ")
+		io.print_int(b)
+	}
+	io.print("\n")
+
+	// Valid, a lone continuation byte, an overlong `/`, and ASCII.
+	let bad: [1]u8 = [0x80]
+	let overlong: [2]u8 = [0xc0, 0xaf]
+	let checks = [
+		encoding.Utf8.validate(s),
+		encoding.Utf8.validate(bad),
+		encoding.Utf8.validate(overlong),
+		encoding.Ascii.validate("plain".bytes()),
+	]
+	for i in 0..checks.len {
+		if i > 0 {
+			io.print(" ")
+		}
+		if checks[i] {
+			io.print("true")
+		} else {
+			io.print("false")
+		}
+	}
+	io.print("\n")
+
+	var good: u8 = 0
+	if round_trip[encoding.Utf8](0x41) {
+		good = good + 1
+	}
+	if round_trip[encoding.Utf8](0x20ac) {
+		good = good + 1
+	}
+	if round_trip[encoding.Utf8](0x1f600) {
+		good = good + 1
+	}
+	io.print_int(good)
+	io.print(" ")
+	io.print_int(encoding.Utf8.MAX_LEN)
+	io.print(" ")
+	if round_trip[encoding.Ascii](65) {
+		io.print("1\n")
+	}
+}

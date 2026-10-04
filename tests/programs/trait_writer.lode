@@ -1,0 +1,72 @@
+// stdout: hello, file\n
+// stdout: own write\n
+// stdout: hello, buffer\n
+// stdout: full after 4\n
+// stdout: my writer: 3 writes, 10 bytes\n
+package main
+
+import "std/buf"
+import "std/io"
+import "std/os"
+
+/// Generic over any writer of `std/io`.
+fn greet[W: io.Writer](inout w: W, who: str) throws(os.Error) {
+	try w.write("hello, ")
+	try w.write(who)
+	try w.write_bytes("\n".bytes())
+}
+
+/// A writer of this package: it counts.
+struct Counting {
+	writes: u32
+	bytes: usize
+}
+
+impl io.Writer for Counting {
+	fn write_bytes(inout self, b: []u8) throws(os.Error) {
+		self.writes = self.writes +| 1
+		self.bytes = self.bytes +| b.len
+	}
+}
+
+fn main() -> u8 {
+	var f = io.stdout()
+	greet(&f, "file") catch _ {
+		return 1
+	}
+	// The file's own `write` (by value), and the trait's (through `&`).
+	f.write("own ") catch _ {
+		return 1
+	}
+	io.Writer.write(&f, "write\n") catch _ {
+		return 1
+	}
+
+	var b = buf.StackBuf[16].new()
+	greet(&b, "buffer") catch _ {
+		return 1
+	}
+	io.stdout().write_buf(b) catch _ {
+		return 1
+	}
+
+	var small = buf.StackBuf[4].new()
+	small.write("12345") catch e {
+		if e == .no_space {
+			io.print("full after ")
+			io.print_int(small.len())
+			io.print("\n")
+		}
+	}
+
+	var c = Counting{writes: 0, bytes: 0}
+	greet(&c, "me") catch _ {
+		return 1
+	}
+	io.print("my writer: ")
+	io.print_int(c.writes)
+	io.print(" writes, ")
+	io.print_int(c.bytes)
+	io.print(" bytes\n")
+	return 0
+}

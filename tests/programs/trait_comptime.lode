@@ -1,0 +1,80 @@
+// stdout: 14 5 1 2 3\n
+// stdout: 2 4\n
+package main
+
+import "std/io"
+import "std/math"
+import "std/slices"
+
+trait Shape {
+	fn area(self) -> u32
+
+	fn twice(self) -> u32 {
+		return self.area() *| 2
+	}
+}
+
+struct Rect {
+	w: u32
+	h: u32
+}
+
+impl Shape for Rect {
+	fn area(self) -> u32 {
+		return self.w *| self.h
+	}
+}
+
+struct Point {
+	x: u8
+	y: u8
+}
+
+impl Ordered for Point {
+	fn cmp(self, other: Point) -> Ordering {
+		let c = self.x.cmp(other.x)
+		if c != .equal {
+			return c
+		}
+		return self.y.cmp(other.y)
+	}
+}
+
+fn total[T: Shape](xs: []T) -> u32 {
+	var sum: u32 = 0
+	for i in 0..xs.len {
+		sum = sum +| xs[i].twice()
+	}
+	return sum
+}
+
+fn sorted(xs: [3]Point) -> [3]Point {
+	var a = xs
+	slices.sort(&a)
+	return a
+}
+
+// Computed when compiling: trait methods and `impl Ordered` run there too.
+const AREA: u32 = total[Rect]([Rect{w: 2, h: 3}, Rect{w: 1, h: 1}])
+const SMALL: Point = math.min(Point{x: 5, y: 0}, Point{x: 5, y: 1})
+const SORTED: [3]Point = sorted([Point{x: 3, y: 0}, Point{x: 1, y: 0}, Point{x: 2, y: 0}])
+const LESS: bool = Point{x: 1, y: 2}.lt(Point{x: 1, y: 3})
+
+fn main() {
+	io.print_int(AREA)
+	io.print(" ")
+	io.print_int(SMALL.x +| SMALL.y)
+	for p in SORTED {
+		io.print(" ")
+		io.print_int(p.x)
+	}
+	io.print("\n")
+	var n: u8 = 1
+	if LESS {
+		n = n +| 1
+	}
+	io.print_int(n)
+	io.print(" ")
+	io.print_int(Shape.twice(Rect{w: 2, h: 1}))
+	io.print("\n")
+}
