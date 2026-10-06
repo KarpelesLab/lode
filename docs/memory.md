@@ -131,7 +131,9 @@ and `set` parameters are variables whose facts start from their type.
 
 ### Owning pointers are values
 
-**Status:** Proposed
+**Status:** Implemented (M8b): `alloc.Box[T]`, with the iterative
+destruction of chains
+([allocation.md](allocation.md#m8b-in-the-compiler))
 
 The rule is **no *non-owning* references in structs**. A pointer that *owns*
 what it points to is just a value stored on the heap. It has exactly one owner,
@@ -503,9 +505,9 @@ fits the model well.
 
 ## Allocation
 
-**Status:** Proposed. The M8 proposal works it out, with the lowering of the
-context and the safety of arenas:
-[allocation.md](allocation.md#2-the-allocator-context).
+**Status:** Implemented (M8b), but the `oom` policy and arenas (M8d). The
+M8 proposal works it out, with the lowering of the context and the safety
+of arenas: [allocation.md](allocation.md#2-the-allocator-context).
 
 - There is no global `malloc` that code can call behind the user's back.
   Anything that allocates takes an allocator.
@@ -527,6 +529,33 @@ with alloc = arena {
 - A function without `uses alloc` provably doesn't allocate. That is useful in
   interrupt handlers and real-time code.
 
+### In the compiler today
+
+**Status:** Implemented (M8b)
+
+- `fn f() uses alloc throws(AllocError) -> T` declares that `f`
+  allocates; a function without `uses alloc` can't call it, nor allocate
+  through a handle (`h.alloc(...)`), so it allocates through no call.
+  Destroying a value that owns memory needs no context: it frees through
+  the allocator it remembers.
+- `with alloc = h { ... }`, in a `uses alloc` function, runs the block
+  with the allocator of the handle `h` (`alloc.Handle`) in context:
+  `alloc.root()`, or `alloc.handle(a)` of any allocator `a` (`unsafe`: `a`
+  must outlive what it allocates, as a `static` does).
+- `main` declares `uses alloc` to get the root allocator, `alloc.ROOT`,
+  a general allocator written in Lode (`alloc.Heap`: size classes, free
+  lists, 64 KiB chunks and large blocks mapped with `mmap`).
+- `alloc.Box[T]` owns one value on the heap: `b.value` is the value, as a
+  place ([Owning pointers are values](#owning-pointers-are-values)).
+- When the program has no allocator but the root, the context costs
+  nothing: no hidden parameter, a zero-sized handle in each box, and
+  direct calls of the root allocator. Otherwise a `uses alloc` function
+  takes the handle in context as a hidden parameter, and a call through a
+  handle tests which allocator it names
+  ([allocation.md](allocation.md#m8b-in-the-compiler)).
+- Allocating throws `AllocError` (`out_of_memory`), built in like
+  `Ordering`. The `oom` policy below isn't there yet (M8d).
+
 ### Out of memory
 
 Allocation returns `AllocError`. Because that is noisy for applications, a
@@ -545,7 +574,8 @@ needs only explicit unions (`throws(A | B)`), not inference.
 
 ## Globals
 
-**Status:** Decided (details Proposed)
+**Status:** Decided (details Proposed); `static` in `unsafe` code
+implemented (M8b)
 
 Package-level state comes in three kinds:
 
@@ -558,7 +588,11 @@ static config: Mutex[Config] = Mutex.new(Config.default())   // or Mutex only
 
 - **Mutable globals must be `Atomic[T]` or `Mutex[T]`** (or `RwLock[T]`). A
   plain mutable global is only allowed in `unsafe` code, for kernels and
-  drivers that manage their own synchronization.
+  drivers that manage their own synchronization. That much is implemented
+  (M8b): `static NAME: T = value`, of a `Copy` type a constant can have,
+  initialized when compiling, and used (read, assigned, passed `&`) only
+  in `unsafe` code. The root allocator is one. `Atomic` and `Mutex` come
+  with threads.
 - **Every global is initialized at compile time.** There are no `init()`
   functions and no static constructors, so nothing runs before `main`
   ([pay only for what you use](concept.md#pay-only-for-what-you-use)), and

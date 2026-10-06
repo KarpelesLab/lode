@@ -14,6 +14,8 @@ end, in [Decisions](#7-decisions).
 Everything here is **Proposed** unless a section says otherwise. M8a is
 implemented (2026-10-06): resource types, destruction and moves, with
 what the compiler does in [M8a in the compiler](#m8a-in-the-compiler).
+M8b is implemented (2026-10-06): the allocator context, the root
+allocator and `Box`, in [M8b in the compiler](#m8b-in-the-compiler).
 
 ## Starting point
 
@@ -66,7 +68,7 @@ what the compiler does in [M8a in the compiler](#m8a-in-the-compiler).
 
 ### Which types own resources
 
-**Status:** Implemented (M8a); raw pointer fields come with M8b
+**Status:** Implemented (M8a); raw pointer fields in M8b
 
 A type **needs destruction** when it declares a `deinit`, or has a field or
 payload that needs destruction (an array or optional of one too). Such a
@@ -193,8 +195,8 @@ costs a byte and a test.
 
 ### Explicit copies
 
-**Status:** Implemented (M8a), without `uses alloc throws(AllocError)`,
-which come with M8b; `clone()` kept as the name (question 9)
+**Status:** Implemented (M8a), with `uses alloc throws(AllocError)` in
+M8b; `clone()` kept as the name (question 9)
 
 memory.md: "Copying them is explicit: `x.copy()`, which can allocate and
 therefore can throw." That needs a trait:
@@ -309,7 +311,7 @@ with transactions or channels' senders.
 
 ### Destroying recursive structures
 
-**Status:** Proposed
+**Status:** Implemented (M8b) for chains through a struct's field
 
 memory.md requires the generated destruction of a self-recursive owning
 type to be iterative, for [stack bounds](safety.md#stack-bounds).
@@ -335,7 +337,7 @@ like a `defer` body: nothing to forget.
 
 ### `uses alloc`
 
-**Status:** Proposed (memory.md); details proposed here
+**Status:** Implemented (M8b)
 
 ```
 fn read_lines(f: File) uses alloc throws(LineError | AllocError) -> List[String] { ... }
@@ -362,7 +364,8 @@ fn read_lines(f: File) uses alloc throws(LineError | AllocError) -> List[String]
 
 ### `with alloc = x`
 
-**Status:** Proposed
+**Status:** Implemented (M8b); handles of the root, of a `static`
+allocator, or (`unsafe`) of any allocator until counted ones (M8d)
 
 ```
 fn summarize(path: str) uses alloc throws(Error | AllocError) -> Summary {
@@ -385,7 +388,8 @@ fn summarize(path: str) uses alloc throws(Error | AllocError) -> Summary {
 
 ### The `Allocator` trait
 
-**Status:** Proposed
+**Status:** Implemented (M8b), with `resize` and `free` `unsafe`, and
+`AllocError` built in
 
 ```
 pub unsafe trait Allocator {
@@ -414,7 +418,8 @@ pub enum AllocError {
 
 ### Who frees: containers remember their allocator
 
-**Status:** Proposed
+**Status:** Recommended answer kept (question 4); implemented (M8b,
+`Box`)
 
 A value allocated in one `with` block can be destroyed, or grown, under
 another context. Options:
@@ -437,7 +442,7 @@ and the stored allocator is zero-sized ([Lowering](#lowering-the-context)).
 
 ### Allocators that end: arenas and fixed buffers
 
-**Status:** Open; recommendation below
+**Status:** Decided (question 5): counted allocators, in M8d
 
 Option 1 above stores a pointer to the allocator in every container. If
 the allocator is destroyed first (an arena local whose function returns, a
@@ -491,7 +496,7 @@ allocation of its parent. Then:
 
 ### The root allocator
 
-**Status:** Proposed
+**Status:** Implemented (M8b), but `@root_allocator`
 
 - `std/os` gains `mmap`, `munmap` and `mremap` (`unsafe`, like `read` and
   `write`), and `os.PageAllocator`: each allocation is its own mapping,
@@ -513,7 +518,8 @@ allocation of its parent. Then:
 
 ### Lowering the context
 
-**Status:** Proposed
+**Status:** Recommended answer kept (question 6); implemented (M8b),
+with the choices of [M8b in the compiler](#m8b-in-the-compiler)
 
 Options:
 
@@ -593,7 +599,7 @@ changes what compiles (question 6).
 
 ### The unsafe toolkit
 
-**Status:** Proposed
+**Status:** Implemented (M8b), but `mem.view` (M8c, with returned views)
 
 Heap types are written in Lode, in std, with `unsafe` inside and a safe API
 outside, as memory.md decides for shared structures. They need:
@@ -616,7 +622,7 @@ outside, as memory.md decides for shared structures. They need:
 
 ### `Box[T]`
 
-**Status:** Proposed
+**Status:** Implemented (M8b), as `alloc.Box` until the prelude
 
 An owning pointer: one `T` on the heap (memory.md,
 [Owning pointers are values](memory.md#owning-pointers-are-values)).
@@ -989,12 +995,15 @@ What M8a does, and the choices made where the proposal left room:
   leaves `none`, as `mem.take(&opt)` does. **`needs_deinit[T]()`** is a
   `bool` known in each instance: whether destroying a `T` does anything.
 - **Not done in M8a.** `match &x` (bindings that are `inout`
-  projections), raw pointer fields (M8b). A value built into a literal or into a call's arguments before a
-  `try` in the same expression fails leaks, as does a `set` parameter the
-  callee assigned before it throws: their `deinit` doesn't run, which is
-  safe.
+  projections), raw pointer fields (M8b). A value built into a literal or
+  into a call's arguments before a `try` in the same expression fails
+  leaked, as did a `set` parameter the callee assigned before it threw:
+  their `deinit` didn't run, which is safe. M8b destroys both, once.
 
 ### M8b: the allocator context, the root allocator and `Box`
+
+**Status:** Implemented (2026-10-06): see
+[M8b in the compiler](#m8b-in-the-compiler)
 
 - Parser and checker: `uses alloc` on functions and trait methods, the
   check at calls, `with alloc = h { }` (only in `uses alloc` functions).
@@ -1012,6 +1021,136 @@ What M8a does, and the choices made where the proposal left room:
   and destroyed with a constant stack, `--stack-usage` bounded, hello world
   size and syscalls unchanged, a function without `uses alloc` calling one
   with it rejected.
+
+### M8b in the compiler
+
+**Status:** Implemented (2026-10-06)
+
+What M8b does, and the choices made where the proposal left room:
+
+- **`uses alloc`** comes after the parameters, before `throws`: `fn
+  read(f: File) uses alloc throws(AllocError) -> T`. A call of a function
+  that declares it, in one that doesn't, is an error with the fix ("`f`
+  allocates (`uses alloc`), so it's only called by a function that
+  declares `uses alloc`"). A trait's method declares it too, and an
+  impl's may leave it out, not add it. A `deinit` can't declare it, and a
+  constant's value can't call such a function. `uses` takes only `alloc`.
+- **`with alloc = h { ... }`** is only allowed in a function that declares
+  `uses alloc`, with `h` an `alloc.Handle`. It's an ordinary block:
+  `defer`, destruction and every exit work as in any block, and the
+  context is the outer one again after it.
+- **Handles** (`std/alloc`). `alloc.current()` (`uses alloc`) is the
+  context's; `alloc.root()` the root allocator's; and `unsafe
+  alloc.handle(a)` one of the allocator `a`, a struct or an enum: its
+  caller promises that `a` outlives what it allocates and doesn't move,
+  which a `static` does. Counted allocators, which make handles safe to
+  keep, are M8d. `h.alloc(size, align)` and `h.resize(...)` declare `uses
+  alloc` too, so a function without it allocates through no handle
+  either; `h.free(...)` doesn't, as destruction needs no context.
+- **`Allocator`** is an `unsafe trait` (`unsafe impl` implements one, and
+  only one): `alloc(self, size, align) throws(AllocError) -> *u8`, and
+  `resize` and `free`, which are `unsafe fn`: their caller promises the
+  block is one the allocator gave. `AllocError` (`out_of_memory`) is built
+  in, like `Ordering`: usable without an import.
+- **Lowering.** The program's allocator types are the root's and each
+  type an `alloc.handle(a)` in the instances `main` reaches makes a handle
+  of. With the root's only, `alloc.Handle` has no fields (a box is one
+  pointer), a `uses alloc` function takes no hidden parameter, and a call
+  through a handle calls the root's method (`alloc.root().alloc(...)`
+  directly). Otherwise a handle is two words, its type's number among the
+  allocator types and its address; a `uses alloc` function takes the
+  address of the handle in context as a last hidden parameter, which
+  `main` makes the root's and `with` replaces; and a call through a handle
+  calls a function `mono` makes (`std/alloc.Handle.$alloc`) that tests the
+  number and calls the type's method directly. This is a little finer
+  than "no `with` reachable" (`with alloc = alloc.root()` adds no type),
+  and the handle isn't the proposal's one pointer to a control block
+  whose first word is the type: control blocks come with counted
+  allocators (M8d).
+- **The root allocator** is `alloc.ROOT`, a `static` of type `alloc.Heap`,
+  all zeros, in `.bss`: nothing runs before `main`, and its first
+  allocation maps its first chunk. A block of at most 2048 bytes is of
+  the smallest size class that holds it (16 to 2048 bytes, powers of
+  two), aligned to its size, from the class's list of freed blocks (last
+  in, first out) or else carved from the current 64 KiB chunk; a larger
+  one is a mapping of its own (`os.PageAllocator`), unmapped when it's
+  freed. `resize` keeps a block in its class, or remaps a large one in
+  place. Chunks are never unmapped. There's one heap: its methods change
+  `ROOT` in place, and an allocator built on it calls them directly
+  (`alloc.ROOT.alloc(size, align)`, in `unsafe` code). `@root_allocator`
+  isn't there yet: the root is always the heap.
+- **std/os** gains `mmap`, `munmap` and `mremap` (`unsafe`, with the
+  system call numbers of x86-64 and AArch64), `PAGE_SIZE`, and
+  `PageAllocator` (`map`, `unmap`, `remap`). Its `Allocator`
+  implementation is in `std/alloc`, the trait's package: `std/alloc`
+  imports `std/os`, which can't import it back.
+- **Raw pointers** point to any type but a view: `*T` can be a struct
+  field, a payload field, an element or an optional's value. Holding,
+  copying and comparing one, and `p.addr()`, are safe; `p.read()` (moves
+  the value out), `p.write(v)` (moves `v` in, destroying nothing),
+  `p.destroy()`, `p.cast[U]()`, `p + n` (`n` elements) and
+  `mem.from_addr[T](a)` are `unsafe`. A struct or an enum holding a raw
+  pointer (or an array or an optional of one) isn't `Copy`, `Eq` or
+  derived `Clone`: its author writes what it needs. `s.ptr` works for
+  arrays and slices of any type. `size_of[T]()` and `align_of[T]()` are
+  `usize`s LatticeFoundry's layout gives each instance, not known when
+  compiling. `mem.view` comes with M8c, which returns views.
+- **`static NAME: T = value`**, `pub` or not: a global, initialized when
+  compiling like a constant, of a `Copy` type a constant can have. Every
+  use is `unsafe` (memory.md: a plain mutable global is only for `unsafe`
+  code): read, assigned (in its package), passed with `&`, or a method's
+  receiver. It's in `.bss` when its value is all zeros, otherwise in
+  `.data`; a constant can't read one.
+- **`Box[T]`** is `alloc.Box`, a struct of `ptr: *T` and `alloc: Handle`:
+  `alloc.Box.new(v) uses alloc throws(AllocError)` (`v` is destroyed if
+  it fails), `b.into_inner()` (the value, the box freed), and a `deinit`
+  that destroys the value and frees it through the box's handle.
+  `b.value` is the boxed value as a place, which the box's variable makes
+  changeable or not (`var b`): `b.value.x = 1`, `bump(&b.value)`. Moving
+  out of it is an error (`into_inner`, or `mem.replace(&b.value, v)`),
+  and `b.x` and `b.f()` are errors whose help is `b.value.x`. It's
+  `Clone` when `T` is (`impl[T: Clone] Clone for Box[T]`), and never
+  `Eq` yet.
+- **Chains.** A struct without a `deinit` with exactly one field of type
+  `?Box[Self]` is destroyed by a loop: it destroys the other fields, takes
+  the link, reads the node out of its box, frees the box through its
+  handle, and goes on with the node's link. No function on the way
+  destroys a box of the struct, so the call graph has no cycle and the
+  program has a stack bound, at `-O0` too. A million nodes are destroyed
+  with the same stack as one. Other recursive types (two links, an enum)
+  still recurse.
+- **`Clone`** declares `uses alloc throws(AllocError)`: `x.clone()` of a
+  type parameter needs both (`try x.clone()` in a `uses alloc` function).
+  A type with an `impl Clone` has its impl's signature, which may leave
+  both out; a derived clone allocates and throws when a part's does.
+  Where generic code expects a result and the instance's clone can't
+  fail, `mono` makes it give `ok` (a copy, or the impl's `clone` made to
+  throw).
+- **M8a's destruction gaps are closed.** (1) While an array literal, a
+  struct literal, a variant or a call's `sink` arguments are built, the
+  parts already built that need destruction are registered like a
+  `defer`, until the value is complete: an early exit in a later part (a
+  failed `try`, a `throw` after `??`, a `catch` block that leaves)
+  destroys them once. A literal returned in memory is built aside first
+  when one of its parts may leave, so the exit doesn't destroy what the
+  error was written over. (2) In a function that throws, a `set`
+  parameter of a type that isn't `Copy` is destroyed when the function
+  leaves with an error, if it was assigned (its drop flag says): the
+  caller's variable isn't assigned then.
+- **Sizes.** Hello world is still 577 bytes and two system calls at
+  `-O2`. Of the 94 programs that ran before M8b, 93 are byte for byte the
+  same at `-O0` and `-O2`; `clone_mem`, whose generic clone now throws,
+  changed its source (8,978 bytes at `-O2`, from 7,282). Importing
+  `std/alloc` and declaring `uses alloc` in a program that doesn't
+  allocate changes nothing. A program that boxes a `u32` is 3,048 bytes at
+  `-O2`, with two system calls (`mmap` of one chunk, `exit`) and a stack
+  bound of 432 bytes; `alloc_chain.lode` (a million boxes) is 6,664
+  bytes, `box.lode` 15,617 and `alloc_with.lode` 12,024.
+- **Not done in M8b.** `mem.view` (M8c); `@root_allocator`; the prelude
+  (question 11): `Box` is `alloc.Box`, as loading `std/alloc` into every
+  program would load `std/os`, which compiles only for Linux; counted
+  allocators, so `alloc.handle` is `unsafe` (M8d); the iterative
+  destruction of chains through an enum.
 
 ### M8c: views from functions, `List` and `String`
 
@@ -1050,7 +1189,9 @@ compile time (an evaluator heap whose values can't be a constant's value).
 
 **Status:** Decided 2026-10-06 by the user for 3 (with `pub let`), 5, 8 and
 11; the others keep the recommended answer unless the user changes them.
-M8a implements 1, 2, 3, 9 and 10 as written.
+M8a implements 1, 2, 3, 9 and 10 as written. M8b implements 4, and the
+context's part of 6 with a handle of two words until counted allocators
+(M8d); of 11, only `AllocError` is built in so far.
 
 1. **Destruction is a method, `fn T.deinit(sink self)`**, not a `Drop`
    trait; it can't throw or allocate
@@ -1065,7 +1206,8 @@ M8a implements 1, 2, 3, 9 and 10 as written.
 4. **Containers store their allocator**, a word that's zero-sized when the
    program never uses `with`
    ([Who frees](#who-frees-containers-remember-their-allocator)).
-   *Recommended.*
+   *Recommended; implemented (M8b): zero-sized when the program has no
+   allocator type but the root's.*
 5. **Allocators that can end are counted** (option C): an arena's memory
    lives until its last allocation is freed; stack-backed buffers aren't
    `with` allocators in safe code
@@ -1075,7 +1217,8 @@ M8a implements 1, 2, 3, 9 and 10 as written.
    omitted when no `with` is reachable, and dispatched over the program's
    allocator types otherwise ([Lowering](#lowering-the-context)); **the
    `oom` policy is `@oom(abort)` in the main package**, default `error`
-   ([Out of memory](#out-of-memory)). *Recommended.*
+   ([Out of memory](#out-of-memory)). *Recommended; the context is
+   implemented (M8b), the policy is M8d.*
 7. **Error-set unions `throws(A | B)` come in M8**, explicit, without
    inference ([Out of memory](#out-of-memory)). *Recommended.*
 8. **`xs[i]` works on `List`** through a sealed, std-only projection to a
@@ -1088,4 +1231,6 @@ M8a implements 1, 2, 3, 9 and 10 as written.
     *Recommended; M8a has none.*
 11. **A small prelude**: `Box`, `List`, `String`, `AllocError` and the
     built-in traits usable without an import, from `std/core`, rather than
-    `list.List[u32]` everywhere. *Decided.*
+    `list.List[u32]` everywhere. *Decided; `AllocError` is built in (M8b),
+    `Box` is `alloc.Box` until the prelude is loaded only by programs that
+    use it.*

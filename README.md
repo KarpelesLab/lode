@@ -73,6 +73,15 @@ What works:
   explicitly (the `Clone` trait), and `std/mem` swaps, replaces and takes
   parts out of places ([docs/memory.md](docs/memory.md#destruction),
   [docs/allocation.md](docs/allocation.md#m8a-in-the-compiler))
+- allocation: `fn f() uses alloc throws(AllocError)` declares that `f`
+  allocates, and a function without `uses alloc` can't call it;
+  `alloc.Box.new(v)` boxes a value on the heap, `b.value` is the boxed
+  value (a place), and destroying the box frees it, through the allocator
+  it came from; `with alloc = h { ... }` installs another allocator for a
+  block. The root allocator, `std/alloc`'s `Heap` (size classes, `mmap`),
+  is written in Lode. A program that doesn't allocate pays nothing, and one
+  with only the root allocator passes no context and keeps no handle in
+  its boxes ([docs/allocation.md](docs/allocation.md#m8b-in-the-compiler))
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
   `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and
@@ -125,12 +134,16 @@ What works:
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
   (bytes, whose storage isn't filled when it's made) and
   `std/vec.ArrayVec[T, N]` (of any type, resources too); `std/mem`
-  (`swap`, `replace`, `take`, `destroy`, `forget`); `io.Writer`,
+  (`swap`, `replace`, `take`, `destroy`, `forget`); `std/alloc`
+  (`Allocator`, `Handle`, `Heap`, `Box`); `io.Writer`,
   implemented by files and buffers; `std/encoding` (UTF-8 and ASCII over
   bytes)
-- `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
-  array or slice), the `syscall` intrinsic, and `@uninit` fields, private
-  arrays that `unsafe` code may leave unwritten in a literal
+- `unsafe` blocks and functions, raw pointers to any type (`*T`, `s.ptr`
+  of a string, array or slice, struct fields), used with `p.read()`,
+  `p.write(v)`, `p.destroy()`, `p.cast[U]()` and `p + n`; `size_of[T]()`
+  and `align_of[T]()`; `unsafe trait` and `unsafe impl`; `static` globals,
+  used in `unsafe` code; the `syscall` intrinsic, and `@uninit` fields,
+  private arrays that `unsafe` code may leave unwritten in a literal
   ([docs/memory.md](docs/memory.md#uninitialized-buffers))
 - output: `io.print("x = {}\n", x)` with a format string checked when
   compiling, for integers, `bool`, `str` and types with an `impl

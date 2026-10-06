@@ -48,9 +48,12 @@ Go's vocabulary, which is proven:
   has the trait's name and the type:
   `std/io.Writer[std/buf.StackBuf[16]].write`. An expansion of a function
   with `comptime` parameters or a pack is numbered:
-  `std/io.print$3[u32, str]`.
-- So far there are eight packages: `std/os`, `std/io`, `std/mem`,
-  `std/math`, `std/slices`, `std/buf`, `std/vec` and `std/encoding`.
+  `std/io.print$3[u32, str]`. A `static` is `<import path>.<name>`
+  (`std/alloc.ROOT`), and a function the compiler makes has a `$` in its
+  name (`main.Pair[main.Fd, u8].$destroy`, `std/alloc.Handle.$alloc`).
+- So far there are nine packages: `std/os`, `std/io`, `std/mem`,
+  `std/alloc`, `std/math`, `std/slices`, `std/buf`, `std/vec` and
+  `std/encoding`.
 - `std/os` is the Linux system calls, for x86-64 and AArch64 (see
   [Per-target code](#per-target-code)):
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
@@ -95,6 +98,17 @@ Go's vocabulary, which is proven:
     error (`EIO` from a write that failed late, on some file systems). The
     descriptor is closed either way. Destroying an `Fd` closes it too, and
     ignores the error.
+  - `mmap(len: usize) -> isize`, `munmap(addr: *u8, len: usize) -> isize`
+    and `mremap(addr: *u8, old: usize, new: usize) -> isize` (M8b,
+    `unsafe`): memory of the process only, readable and writable and zero
+    at first, mapped, unmapped, and grown or shrunk in place (never moved).
+    Each returns an address or 0, or a negative error number.
+  - `PageAllocator`, an allocator of whole pages (`PAGE_SIZE`, 4 KiB):
+    `PageAllocator.new()`, `map(self, size: usize) throws(AllocError) ->
+    *u8` (a mapping of its own, aligned to a page; `out_of_memory` past
+    `MAP_MAX`, 2^46 bytes, or when the kernel has none), and the `unsafe`
+    `unmap(self, p: *u8, size: usize)` and `remap(self, p: *u8, old:
+    usize, new: usize) -> bool`. `std/alloc` makes it an `Allocator`.
 - `std/io`:
   - `File`, an open file: a struct holding its file descriptor in a
     private field. It doesn't own the descriptor, and doesn't close it: it's
@@ -178,9 +192,38 @@ Go's vocabulary, which is proven:
   - `destroy[T](sink x: T)` destroys `x` now, and `forget[T](sink x: T)`
     ends it without destroying it (its `deinit` never runs: a leak, which
     is safe).
-  - `swap`, `take` and `forget` are implemented by the compiler: they're
-    declared `@intrinsic`, which only the standard library can do, and
-    their empty bodies aren't used.
+  - `from_addr[T](addr: usize) -> *T` (`unsafe`, M8b): an address as a
+    pointer, the reverse of `p.addr()`.
+  - `swap`, `take`, `forget` and `from_addr` are implemented by the
+    compiler: they're declared `@intrinsic`, which only the standard
+    library can do, and their empty bodies aren't used.
+- `std/alloc`, allocation (M8b,
+  [allocation.md](allocation.md#m8b-in-the-compiler)):
+  - `Allocator`, an `unsafe trait`: `alloc(self, size: usize, align: usize)
+    throws(AllocError) -> *u8`, and the `unsafe` `resize(self, p, old, new,
+    align) -> bool` (in place) and `free(self, p, size, align)`. Its
+    methods take `self` read-only: an allocator changes its state in
+    `unsafe` code. `os.PageAllocator` and `Heap` implement it.
+  - `Handle`, which allocator, and where: what `with alloc = h` takes and
+    what a value that owns memory keeps. `current()` (`uses alloc`) is the
+    context's, `root()` the root allocator's, and `unsafe handle(a)` one of
+    the allocator `a`, which must outlive what it allocates (a `static`).
+    `h.alloc(size, align)` and `h.resize(...)` (`uses alloc`) and
+    `h.free(...)` call the handle's allocator. With no allocator but the
+    root in the program, a handle is zero-sized.
+  - `Heap`, the general allocator, and `ROOT`, the one heap and the root
+    allocator (a `pub static`, used in `unsafe` code): blocks of 16 to 2048
+    bytes in size classes (powers of two), each class with a list of freed
+    blocks used again first, carved from 64 KiB chunks of pages; larger
+    blocks mapped one by one, and unmapped when freed. Not thread-safe:
+    there are no threads yet.
+  - `Box[T]`, one `T` on the heap: `Box.new(sink v: T) uses alloc
+    throws(AllocError) -> Box[T]`, `b.value` (the boxed value, a place),
+    `into_inner(sink self) -> T`, and a `deinit` that destroys the value
+    and frees it through the box's handle. `Clone` when `T` is. A chain of
+    boxes (`next: ?Box[Self]`) is destroyed by a loop.
+  - `AllocError` itself is built into the compiler, like `Ordering`:
+    `throws(AllocError)` needs no import.
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
     (the integers, `bool`, and the structs and enums with an

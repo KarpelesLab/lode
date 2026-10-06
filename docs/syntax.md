@@ -117,16 +117,17 @@ fn main() {
 | Compound assignment | `x += 1`, `x +%= 1`, `flags \|= bit`: every binary operator `op` has `x op= v` |
 | Function | `fn name(a: T, b: U) -> R { ... }` |
 | Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
+| Allocation | `fn name(a: T) uses alloc throws(AllocError) -> R` (`uses` after the parameters, before `throws`), `with alloc = h { ... }`, `alloc.Box.new(v)`, `b.value` ([allocation.md](allocation.md#m8b-in-the-compiler)) |
 | Generic parameters | `fn max[T: Ordered](sink a: T, sink b: T) -> T` |
 | Parameter conventions | `inout x: T`, `sink x: T`, `set x: T`, passed `f(&x)` (see below) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
 | Visibility | `pub` (default is package-private), on declarations and struct fields |
 | Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
 | Refinement | `i: usize where i < buf.len`, `-> u8 where result <= 9`, `type Digit = u8 where self <= 9` (see below) |
-| Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
+| Mutable global | `static n: Atomic[u64] = Atomic.new(0)`; implemented: `static n: u64 = 0`, used in `unsafe` code ([memory.md](memory.md#globals)) |
 | Compile-time | `comptime fmt: str`, `comptime let`, `comptime for`, `match comptime`, `if comptime cond { ... }`, `compile_error("...")`, `target.os` (see below) |
 | Pack | `fn print[..A: Format](comptime fmt: str, args: ..A)`, `args[i]`, `args.len`, `..args` (see below) |
-| Unsafe | `unsafe fn`, `unsafe { ... }` |
+| Unsafe | `unsafe fn`, `unsafe { ... }`, `unsafe trait`, `unsafe impl`; raw pointers `*T`, `p.read()`, `p.write(v)`, `p.destroy()`, `p.cast[U]()`, `p.addr()`, `p + n`, `size_of[T]()` |
 | Cleanup | `defer`, `errdefer` |
 | Array, slice | `[4]u8`, `[]u8`, `[1, 2, 3]`, `[0; 16]`, `a[i]`, `a[i..j]`, `a.len` (see below) |
 | Struct | `struct Point { x: u32 ... }`, `Point{x: 1, y: 2}`, `p.x` (see below) |

@@ -2,6 +2,7 @@
 // stdout: nested: 5 6 7 ~7 ~6 ~5 | allocs 1 frees 1, other 1 1\n
 // stdout: kept: 8 ~8 | allocs 1 frees 1\n
 // stdout: clone: 9 9 ~9 ~9 | allocs 2 frees 2\n
+// stdout: a box is 24 bytes, a handle 16\n
 // stdout:  ~0
 package main
 
@@ -187,6 +188,9 @@ fn main() uses alloc -> u8 {
 	}
 	show()
 	io.print("\n")
+	// With allocators besides the root, a box keeps its allocator's
+	// handle: its type's number and its address.
+	io.print("a box is {} bytes, a handle {}\n", size_of[alloc.Box[u64]](), size_of[alloc.Handle]())
 	return 0
 }
 

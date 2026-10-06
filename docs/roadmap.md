@@ -136,15 +136,35 @@ and in std: `std/mem`, `os.Fd` (closed by its `deinit`), `os.open`,
 `os.close`, and `ArrayVec` of any type. Code without resource types is
 unchanged: hello world is still 577 bytes and two system calls.
 
+**M8b: The allocator context, the root allocator and `Box`** (2026-10-06,
+[allocation.md](allocation.md#m8b-in-the-compiler)). `uses alloc` on
+functions and trait methods, checked at every call; `with alloc = h { }`
+in them; handles of the root and of any allocator. With no allocator but
+the root, the context costs nothing (no hidden parameter, zero-sized
+handles); otherwise `uses alloc` functions take the handle in context, and
+calls through a handle are dispatched over the program's allocator types.
+Raw pointers to any type, as fields, with `read`, `write`, `destroy`,
+`cast` and `addr`; `size_of` and `align_of`; `unsafe trait` and `unsafe
+impl`; `static` globals in `unsafe` code; `AllocError` built in, and
+`Clone` that may allocate. std gains `os.mmap`, `munmap`, `mremap` and
+`os.PageAllocator`, and `std/alloc`: `Allocator`, `Handle`, `Heap` (size
+classes, the root) and `Box[T]`, with `b.value` as a place and chains
+destroyed by a loop. M8a's two leaks are gone: a value built into an
+aggregate before a failed `try`, and a `set` parameter assigned before a
+`throw`, are destroyed once. Programs that don't allocate are unchanged:
+hello world is still 577 bytes and two system calls.
+
 ## Next
 
 - **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
   after refinements). The proposal is [allocation.md](allocation.md), in
   four steps: M8a, resource types, `deinit` and moves for every type, and
   field visibility (done); M8b, `uses alloc`, `with`, the root allocator
-  and `Box[T]`; M8c, views returned from functions (rule 2 of
-  [memory.md](memory.md#views)), `List[T]` and `String`; M8d, error-set
-  unions, the `oom` policy and arenas. Its open questions are in
+  and `Box[T]` (done); M8c, views returned from functions (rule 2 of
+  [memory.md](memory.md#views)), `List[T]`, `String` and `mem.view`; M8d,
+  error-set unions, the `oom` policy, arenas and counted allocators (which
+  make `alloc.handle` safe). The prelude (`Box` without an import) is
+  decided, not placed yet. Its open questions are in
   [allocation.md](allocation.md#7-decisions).
 - **Checker: filling buffers.** A plain array must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read.

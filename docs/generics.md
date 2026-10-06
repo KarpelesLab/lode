@@ -371,7 +371,7 @@ them in Lode, and nothing needs that yet.
 | `Integer: Ordered + Copy` | The integer operators | Sealed: only the integer primitives |
 | `Unsigned`, `Signed` | `Integer` and the sign | Sealed |
 | `Copy: Clone` | A value can be copied implicitly | Automatic, see below |
-| `Clone` | An explicit copy, `x.clone()` ([allocation.md](allocation.md#explicit-copies)) | Automatic for `Copy` types, and for a type without a `deinit` whose parts are `Clone`; other types write an impl (M8a) |
+| `Clone` | An explicit copy, `x.clone()`, which may allocate and throw `AllocError` ([allocation.md](allocation.md#explicit-copies)) | Automatic for `Copy` types, and for a type without a `deinit` or a raw pointer field whose parts are `Clone`; other types write an impl (M8a; `uses alloc throws(AllocError)` in M8b) |
 | `Format` | Writable by `print("{}")` ([Format strings](#format-strings)) | `std/io` implements it for integers, `bool`, `str`; user types write an impl |
 | `Send`, `Sync` | May cross / be shared across threads ([concurrency.md](concurrency.md#data-race-freedom)) | Automatic; opt-out and `unsafe impl`. Deferred to the concurrency milestone. |
 
@@ -738,7 +738,8 @@ pub fn print[..A: Format](comptime fmt: str, args: ..A) {
 - `uses alloc` is part of a trait method's signature. An impl may use fewer
   contexts than the trait declares, never more. A generic function that
   calls a trait method with `uses alloc` must declare it too. The rule is
-  the same for `uses task` later.
+  the same for `uses task` later. (Implemented in M8b:
+  [allocation.md](allocation.md#m8b-in-the-compiler).)
 
 ### Sequencing with the allocator
 

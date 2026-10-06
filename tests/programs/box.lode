@@ -1,6 +1,6 @@
 // stdout: ints: 1 42 43 | structs: 3 4 7 moved 5 ~5 | nested 6 66 ~6\n
 // stdout: inner: 8 ~8 | clone: clone9 9 109 ~109 ~9 | resources: 10 ~10 | list: 3 2 ~3 ~2 ~1\n
-// stdout: fd: closed\n
+// stdout: fd: closed, a box is 8 bytes\n
 package main
 
 import "std/alloc"
@@ -155,8 +155,10 @@ fn main() uses alloc -> u8 {
 	let ok = fds() catch _ {
 		return 8
 	}
+	// With only the root allocator, a box is one pointer: its handle is
+	// zero-sized.
 	if ok {
-		io.print("fd: closed\n")
+		io.print("fd: closed, a box is {} bytes\n", size_of[alloc.Box[u64]]())
 	}
 	return 0
 }

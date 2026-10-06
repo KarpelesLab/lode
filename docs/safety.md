@@ -685,6 +685,12 @@ the bound in the binary's metadata, and a profile that requires a bound.
 Today there is only `main`, and Lode has no indirect calls or runtime-sized
 allocations yet, so recursion is the only cause of a missing bound. Overflow
 already hits a guard page: LatticeFoundry's stack probes are on.
+Allocation keeps the bound (M8b): a call through an allocator's handle is a
+direct call of each allocator type's method, the root allocator doesn't
+recurse, and the destruction of a chain of boxes is a loop
+([allocation.md](allocation.md#m8b-in-the-compiler)). An allocator that
+allocates through a handle it keeps makes a cycle, as does the destruction
+of a tree.
 
 ## The trusted boundary
 
@@ -712,9 +718,15 @@ Rules:
 
 What's unsafe so far (implemented): calling `syscall` or an `unsafe fn`,
 reading the raw pointer of a `str`, an array or a slice (`s.ptr`),
-pointer arithmetic (`p + n`), and leaving an `@uninit` field out of a
-struct literal.
-Holding or comparing a pointer is safe; only using it isn't.
+pointer arithmetic (`p + n`), using what a pointer points to (`p.read()`,
+`p.write(v)`, `p.destroy()`) or casting it (`p.cast[U]()`,
+`mem.from_addr[T](a)`), using a `static`, implementing an `unsafe trait`
+(`unsafe impl`, as for `alloc.Allocator`), and leaving an `@uninit` field
+out of a struct literal.
+Holding, comparing or taking the address of a pointer (`p.addr()`) is
+safe; only using it isn't. A struct that holds a raw pointer isn't
+`Copy`: copying it would share what it points to
+([allocation.md](allocation.md#m8b-in-the-compiler)).
 
 Leaving an `@uninit` field unwritten
 ([memory.md](memory.md#uninitialized-buffers)) promises this: **the
