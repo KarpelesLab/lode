@@ -62,9 +62,17 @@ What works:
 - structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
   with value semantics: `let q = p` copies, and structs and arrays are passed
   and returned by value; `==` compares structs and arrays field by field;
-  fields are private to their package unless marked `pub` (`pub x: i32`),
-  so a type with private fields is made and changed only by its package's
-  functions ([docs/types.md](docs/types.md#structs))
+  fields are private to their package unless marked `pub` (`pub x: i32`)
+  or `pub let` (read-only outside it), so a type with private fields is
+  made and changed only by its package's functions
+  ([docs/types.md](docs/types.md#structs))
+- resource types: `fn Fd.deinit(sink self)` runs when a value is
+  destroyed, at every exit of its variable's scope, in reverse order and
+  interleaved with `defer`; such a value isn't `Copy`, so it moves, and
+  using it after a move is an error on every path; `x.clone()` copies
+  explicitly (the `Clone` trait), and `std/mem` swaps, replaces and takes
+  parts out of places ([docs/memory.md](docs/memory.md#destruction),
+  [docs/allocation.md](docs/allocation.md#m8a-in-the-compiler))
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
   `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and
@@ -80,7 +88,7 @@ What works:
   `p.scale(2)`, and associated functions like `Point.origin()`, on structs
   and enums ([docs/types.md](docs/types.md#methods))
 - generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, over
-  the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
+  the built-in traits `Eq`, `Ordered`, `Copy`, `Clone`, `Integer`, `Unsigned` and
   `Signed`, each body checked once against its bounds; `max(a, b)` infers
   `T`, `max[u32](a, b)` writes it ([docs/generics.md](docs/generics.md#m7a-in-the-compiler))
 - generic structs and enums: `struct Pair[A, B]`, `enum Either[L, R]`,
@@ -116,8 +124,10 @@ What works:
   `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
   (bytes, whose storage isn't filled when it's made) and
-  `std/vec.ArrayVec[T, N]`; `io.Writer`, implemented by files
-  and buffers; `std/encoding` (UTF-8 and ASCII over bytes)
+  `std/vec.ArrayVec[T, N]` (of any type, resources too); `std/mem`
+  (`swap`, `replace`, `take`, `destroy`, `forget`); `io.Writer`,
+  implemented by files and buffers; `std/encoding` (UTF-8 and ASCII over
+  bytes)
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
   array or slice), the `syscall` intrinsic, and `@uninit` fields, private
   arrays that `unsafe` code may leave unwritten in a literal
@@ -134,6 +144,9 @@ What works:
   `io.stdin().read_full(&buf)` (until `buf` is full or the input ends),
   which throw an `os.Error`; `os.exit(code)` and `os.abort()` end the
   process at once
+- files: `os.open(path, os.O_RDONLY, 0)` gives an `os.Fd`, which owns the
+  descriptor and closes it when it's destroyed (or `os.close(f)`, which
+  reports the error); `io.File.from_fd(f.fd)` reads and writes it
 - `s.bytes()`, the bytes of a `str` as a read-only `[]u8` (sliced with
   `s.bytes()[i..j]`; a `str` itself can't be sliced yet), and returning a
   `str` literal from a function (`fn Day.name(self) -> str`)

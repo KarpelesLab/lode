@@ -11,12 +11,13 @@ generics.md; [error sets](errors.md#error-sets); and the proof checker of
 recommendation. The decisions only the user can make are collected at the
 end, in [Decisions](#7-decisions).
 
-Everything here is **Proposed** unless a section says otherwise. Nothing is
-implemented yet.
+Everything here is **Proposed** unless a section says otherwise. M8a is
+implemented (2026-10-06): resource types, destruction and moves, with
+what the compiler does in [M8a in the compiler](#m8a-in-the-compiler).
 
 ## Starting point
 
-**Status:** Implemented (what the compiler does today)
+**Status:** What the compiler did before M8a
 
 - Every concrete type is plain data and `Copy`: integers, `bool`, views,
   arrays, structs, enums, optionals. Nothing owns a resource, nothing is
@@ -65,7 +66,7 @@ implemented yet.
 
 ### Which types own resources
 
-**Status:** Proposed
+**Status:** Implemented (M8a); raw pointer fields come with M8b
 
 A type **needs destruction** when it declares a `deinit`, or has a field or
 payload that needs destruction (an array or optional of one too). Such a
@@ -79,11 +80,11 @@ share what it points to. Its author writes the `deinit` or a `Clone` impl,
 or neither (a type that is moved and never destroyed, which is safe, only
 leaky).
 
-Existing code is unaffected: no type needs destruction today.
+Existing code is unaffected: before M8a, no type needed destruction.
 
 ### Declaring destruction
 
-**Status:** Proposed
+**Status:** Recommended answer kept (question 1); implemented (M8a)
 
 Options:
 
@@ -115,7 +116,8 @@ and coherence already allows one method of a name per type.
 
 ### When destruction runs
 
-**Status:** Proposed
+**Status:** Implemented (M8a), with the choices of
+[M8a in the compiler](#m8a-in-the-compiler)
 
 - At the end of the scope that owns the value, in reverse order of
   declaration, **interleaved with `defer`**: one stack per block. A `defer`
@@ -141,7 +143,7 @@ and coherence already allows one method of a name per type.
 
 ### Moves
 
-**Status:** Proposed
+**Status:** Implemented (M8a), with drop flags (question 2)
 
 The M7a rule extends from type parameters to every type that isn't `Copy`,
 unchanged: keeping a value (storing it, returning it, passing it `sink`,
@@ -171,7 +173,8 @@ costs a byte and a test.
 
 ### Partial moves and patterns
 
-**Status:** Proposed
+**Status:** Implemented (M8a), but `opt.take()` (`mem.take(&opt)` does it)
+and `match &x`
 
 - **No partial moves out of a struct local** (`let n = p.name` where `name`
   needs destruction is an error). `mem.replace(&p.name, v)` and
@@ -191,7 +194,8 @@ costs a byte and a test.
 
 ### Explicit copies
 
-**Status:** Proposed
+**Status:** Implemented (M8a), without `uses alloc throws(AllocError)`,
+which come with M8b; `clone()` kept as the name (question 9)
 
 memory.md: "Copying them is explicit: `x.copy()`, which can allocate and
 therefore can throw." That needs a trait:
@@ -212,7 +216,7 @@ trait Clone {
 
 ### `defer` and `errdefer`
 
-**Status:** Proposed
+**Status:** Implemented (M8a)
 
 Today a `defer` body can't move a variable declared outside it. Cleanup
 of a resource type needs exactly that: `errdefer os.close(fd) catch _ {}`,
@@ -234,7 +238,7 @@ error: on that `try`'s error exit, `fa` is already gone.
 
 ### Parameter conventions
 
-**Status:** Proposed; unchanged where not said
+**Status:** Implemented (M8a); unchanged where not said
 
 - Default: read-only, passed by address, no copy (already).
 - `inout`: the callee may replace the value; `x = v` in the callee
@@ -248,7 +252,7 @@ error: on that `try`'s error exit, `fa` is already gone.
 
 ### Generics
 
-**Status:** Proposed
+**Status:** Implemented (M8a), but `needs_deinit[T]()`
 
 - Generic code destroys `T` values at scope ends like any other values,
   with no bound needed. `mono` instantiates the destruction for each
@@ -257,15 +261,15 @@ error: on that `try`'s error exit, `fa` is already gone.
 - `needs_deinit[T]()` (compile-time `bool`) lets containers skip the loop
   over elements, though the optimizer removes an empty loop anyway.
 - `ArrayVec[T: Copy, N]` can drop its `Copy` bound once optionals of
-  non-`Copy` values are destroyed.
+  non-`Copy` values are destroyed (done in M8a).
 - A type argument still can't be a view, so `List[str]` is not a type:
   `List[String]`, or a list of indices into a buffer. memory.md's example
   `-> List[str]` changes accordingly.
 
 ### Field visibility
 
-**Status:** Decided (2026-10-06): option 1, implemented
-([types.md](types.md#structs)); `pub let` is still proposed
+**Status:** Decided (2026-10-06): option 1 with `pub let`, implemented
+([types.md](types.md#structs); `pub let` in M8a)
 
 A type that keeps an invariant (a `List`'s pointer, length and capacity, an
 owned file descriptor) needs fields that code outside the package can't
@@ -322,7 +326,7 @@ type to be iterative, for [stack bounds](safety.md#stack-bounds).
 
 ### In the proof checker
 
-**Status:** Proposed
+**Status:** Implemented (M8a)
 
 A `deinit` sees only `self` and globals, so the destruction at a scope's
 end changes no facts about the locals still alive. The checker treats it
@@ -845,6 +849,9 @@ step's tests run under `cargo test`; the ones about system calls use
 
 ### M8a: resource types, destruction and moves
 
+**Status:** Implemented (2026-10-06): see
+[M8a in the compiler](#m8a-in-the-compiler)
+
 - Field visibility: `pub let`. (Private by default, `pub`, and literals
   of structs with private fields only in their package are done: std and
   tests have `pub` where fields are used across packages.)
@@ -864,6 +871,128 @@ step's tests run under `cargo test`; the ones about system calls use
   `T: Copy`. **Tests:** destruction order (a type whose `deinit` prints),
   every exit kind, conditional moves, use after move, `close` counted in
   system calls, `errdefer` consuming.
+
+### M8a in the compiler
+
+**Status:** Implemented (2026-10-06)
+
+What M8a does, and the choices made where the proposal left room:
+
+- **`pub let` fields** are read everywhere (with their refinements as
+  facts) and assigned, passed with `&` or changed by an `inout self`
+  method only in their package; a struct with one is built by a literal
+  only there ([types.md](types.md#structs)). `os.Fd` has `pub let fd`.
+- **`deinit`.** `fn T.deinit(sink self)` on a struct or an enum: `sink
+  self` and nothing else, no result, no `throws`, not `unsafe`, no
+  generic parameters or bounds of its own (every instance is destroyed).
+  Each is an error otherwise. Calling it directly is an error too. In its
+  body, `self` can't be moved; when the body ends, the fields that aren't
+  `Copy` are destroyed, last first (for an enum, the variant's payload),
+  as a `defer` registered first. A type with a `deinit` isn't `Copy`, nor
+  is what holds one (a field, a payload, an element, an optional).
+- **What can't hold a resource.** A constant's type must be `Copy` (a
+  constant is copied where it's used), and so must an error type (`catch
+  v` and `catch _` drop the error). A `catch` statement whose call
+  returns a value that isn't `Copy` is an error: on success, the value
+  would be lost.
+- **Moves** extend M7a's to every type that isn't `Copy`: keeping a value
+  read from a `let`, a `var` or a `sink` parameter moves it, and the
+  variable is unassigned until assigned again, on every path, loops
+  included ("`f` is used after it was moved (on some path to here)").
+  Keeping a read-only, `inout` or `set` parameter, or an element, is an
+  error that says which type isn't `Copy` and why ("`Fd` has a `deinit`:
+  its values are moved, never copied"). In the typed tree, the kept value
+  is a `Move` of the variable, which clears its drop flag.
+- **No partial moves.** Keeping a field moves the whole variable, which
+  is allowed only when the rest of it is `Copy` and no `deinit` holds it:
+  `return t.n` from a `Tagged{n: Fd, tag: u32}` is fine, from a `Two{a:
+  Fd, b: Fd}` it's an error with the fix (`mem.replace(&t.a, v)`). So
+  M7b's `fn Pair[A, B].into_first(sink self)` needs `B: Copy` now. A part
+  of a temporary moves the temporary the same way (`f().n`).
+- **Pattern bindings read in place.** A binding of `match` or `if let`
+  whose type isn't `Copy`, and the variable of `for x in xs`, are
+  projections: reading them needs nothing, and keeping one moves what it
+  reads, which must be a value the code may consume (a `let`, `var` or
+  `sink` variable, or a temporary scrutinee). Moving or changing that
+  value makes the bindings unusable after. A `for` element can't be kept
+  (it's an element). `let ... else` moves the optional's value into its
+  new variable, which owns it. A `match` on another place that isn't
+  `Copy` (`match p.opt`) reads it in place too.
+- **Destruction** runs at every exit of a block, where `defer` bodies run,
+  interleaved with them in reverse order: lowering's stack of `defer`s
+  holds the variables that own a value (`TStmt::Drop`). A `return`
+  computes its value first. A call of a `never` function destroys
+  nothing. An assignment computes the new value, then destroys the old
+  one (a local, a field, an element, an `inout` parameter's value). The
+  elements of an array are destroyed first to last, the fields of a
+  struct last to first.
+- **Drop flags.** A variable gets one when it may be unassigned where it's
+  destroyed or assigned: moved anywhere, declared without a value, a `set`
+  parameter, or a temporary. That's a little more than "moved on some
+  paths": a variable always moved has one too, and the optimizer folds it
+  (at `-O2`, nothing of it is left). At `-O0` it's a byte and a test.
+- **Temporaries.** A value that isn't kept (a call's result passed to a
+  read-only parameter, a field read from it, a method called on it, a
+  statement's value, a side of `==`) is stored in a hidden local and
+  destroyed when its statement ends, or at an exit before. The ones made
+  in a `while` condition are destroyed when the next one is made, and the
+  last after the loop. A `match` or `if let` on a value that isn't a
+  variable owns it until the statement ends.
+- **`set` arguments** that aren't `Copy` must not hold a value: a variable
+  that does on every path is an error. One that holds a value on some
+  paths only keeps the old value, which leaks.
+- **`defer` that moves.** A `defer` or `errdefer` body may move a variable
+  declared outside it; at each exit it runs at (the block's end, `break`,
+  `continue`, `return`, and for `errdefer` only `throw` and a failed
+  `try`), the variable must be assigned, or it's an error at that exit.
+  After the exit, it's unassigned.
+- **Instances.** `mono` makes the destruction of each concrete type that's
+  destroyed: its `deinit`'s instance, or a function made for it
+  (`main.Pair[main.Fd, u8].$destroy`) that destroys its parts. For an
+  instance whose type needs no destruction, the checker's moves,
+  temporaries and destructions are removed: code without resource types
+  is unchanged (each program of tests/programs is byte for byte the same,
+  or smaller, below).
+- **A `sink` parameter in memory** that the callee never changes (no
+  assignment, no `&`, no `inout self` call on it) is read in place, like a
+  read-only one, without the copy on entry: the caller's value moves in,
+  or can't change during the call (exclusivity). Several programs are
+  smaller for it.
+- **`Clone`** is a built-in trait, beside `Eq` and `Copy`: a `Copy` type's
+  clone is the copy (`T: Copy` implies `T: Clone`); a struct, an enum, an
+  optional or an array without a `deinit` whose parts are `Clone` gets one
+  that `mono` makes (`$clone`), cloning each part; any other type writes
+  `impl Clone for T { fn clone(self) -> T }` (an impl for a `Copy` type is
+  an error). `x.clone()` reads `x` in place. Generic code bounds `T:
+  Clone`.
+- **The compile-time evaluator** runs moves, `mem` and `clone()` as they
+  run in a program, but destroys nothing: a value made while compiling
+  holds no resource, and the only effects a `deinit` could have there are
+  its failures.
+- **The proof checker** forgets what it knew of a variable that's moved
+  (it's unassigned), as it does for any assignment. Destruction changes
+  no facts about the variables still alive: a `deinit` sees only `self`.
+  A `deinit`'s body is checked like any method's.
+- **std.** `std/mem` (`swap`, `replace`, `take`, `destroy`, `forget`;
+  `swap`, `take` and `forget` are `@intrinsic`, implemented by the
+  compiler, which only the standard library can declare); `os.Fd`,
+  `os.open`, `os.close(sink f) throws(os.Error)` and the `O_*` flags;
+  `vec.ArrayVec[T, N]` of any `T`
+  ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
+  `io.File` stays a non-owning handle: `io.stdout()` is one, and
+  `io.File.from_fd(f.fd)` reads and writes an `os.Fd`.
+- **Sizes.** Hello world is still 577 bytes and two system calls at
+  `-O2`. Of the 89 runnable programs, 85 are byte for byte the same at
+  `-O0` and `-O2`, and 4 are smaller (`generic_methods`,
+  `generic_optionals`, `std_containers`, `trait_ordered`: 96 to 450
+  bytes less), from the `sink` parameters read in place.
+- **Not done in M8a.** `needs_deinit[T]()` (no container loops over its
+  elements yet), the built-in `opt.take()` (`mem.take(&opt)` does it),
+  `match &x` (bindings that are `inout` projections), raw pointer fields
+  (M8b). A value built into a literal or into a call's arguments before a
+  `try` in the same expression fails leaks, as does a `set` parameter the
+  callee assigned before it throws: their `deinit` doesn't run, which is
+  safe.
 
 ### M8b: the allocator context, the root allocator and `Box`
 
@@ -921,17 +1050,18 @@ compile time (an evaluator heap whose values can't be a constant's value).
 
 **Status:** Decided 2026-10-06 by the user for 3 (with `pub let`), 5, 8 and
 11; the others keep the recommended answer unless the user changes them.
+M8a implements 1, 2, 3, 9 and 10 as written.
 
 1. **Destruction is a method, `fn T.deinit(sink self)`**, not a `Drop`
    trait; it can't throw or allocate
-   ([Declaring destruction](#declaring-destruction)). *Recommended.*
+   ([Declaring destruction](#declaring-destruction)). *Recommended;
+   implemented (M8a).*
 2. **Conditional moves use drop flags**, so destruction is always at the
-   scope's end ([Moves](#moves)). *Recommended.*
+   scope's end ([Moves](#moves)). *Recommended; implemented (M8a).*
 3. **Fields are private to their package by default**, with `pub` and
    `pub let` (read-only outside), and literals of structs with private
    fields only in their package ([Field visibility](#field-visibility)).
-   *Decided:* private fields and `pub` are implemented; `pub let` is
-   decided, to implement in M8a.
+   *Decided; implemented* (`pub let` in M8a).
 4. **Containers store their allocator**, a word that's zero-sized when the
    program never uses `with`
    ([Who frees](#who-frees-containers-remember-their-allocator)).
@@ -953,9 +1083,9 @@ compile time (an evaluator heap whose values can't be a constant's value).
    exactly slice indexing ([`List[T]`](#listt)). *Decided.*
 9. **The explicit copy is `x.clone()`** from a `Clone` trait, rather than
    memory.md's `x.copy()` ([Explicit copies](#explicit-copies)).
-   *Recommended, weakly: a naming choice.*
+   *Recommended, weakly: a naming choice; implemented (M8a).*
 10. **No linear types in M8** ([Linear types](#linear-types)).
-    *Recommended.*
+    *Recommended; M8a has none.*
 11. **A small prelude**: `Box`, `List`, `String`, `AllocError` and the
     built-in traits usable without an import, from `std/core`, rather than
     `list.List[u32]` everywhere. *Decided.*

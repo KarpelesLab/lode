@@ -124,13 +124,25 @@ returns `n where result <= buf.len`, and `StackBuf`, `ArrayVec` and
 `print`'s buffer keep their bounds without checking them again (64 bytes
 less in every program that prints).
 
+**M8a: Resource types, destruction and moves** (2026-10-06,
+[allocation.md](allocation.md#m8a-in-the-compiler)). `fn T.deinit(sink
+self)` runs at every exit of a value's scope, in reverse order and
+interleaved with `defer`; a type with one isn't `Copy`, and every value
+that isn't `Copy` moves, with use-after-move errors on every path and drop
+flags for the variables moved on some paths. Pattern bindings read in
+place, temporaries are destroyed at the end of their statement, and a
+`defer` may move a variable. `Clone` and `x.clone()`, `pub let` fields,
+and in std: `std/mem`, `os.Fd` (closed by its `deinit`), `os.open`,
+`os.close`, and `ArrayVec` of any type. Code without resource types is
+unchanged: hello world is still 577 bytes and two system calls.
+
 ## Next
 
 - **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
   after refinements). The proposal is [allocation.md](allocation.md), in
   four steps: M8a, resource types, `deinit` and moves for every type, and
-  field visibility; M8b, `uses alloc`, `with`, the root allocator and
-  `Box[T]`; M8c, views returned from functions (rule 2 of
+  field visibility (done); M8b, `uses alloc`, `with`, the root allocator
+  and `Box[T]`; M8c, views returned from functions (rule 2 of
   [memory.md](memory.md#views)), `List[T]` and `String`; M8d, error-set
   unions, the `oom` policy and arenas. Its open questions are in
   [allocation.md](allocation.md#7-decisions).

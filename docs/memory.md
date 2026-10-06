@@ -275,29 +275,38 @@ yet (its result would hold a view in memory).
 
 ## Copies
 
-**Status:** Proposed (M8: [allocation.md](allocation.md#moves))
+**Status:** Implemented (M8a: [allocation.md](allocation.md#moves))
 
 - Small plain types (integers, fixed arrays of them, structs of them) are
   implicitly copied.
 - Types that own resources (heap memory, file handles) are **moved** by
-  default. Copying them is explicit: `x.copy()`, which can allocate and
-  therefore can throw.
+  default. Copying them is explicit: `x.clone()`, from the trait `Clone`
+  (decided as `clone`, not `copy`, in
+  [allocation.md](allocation.md#explicit-copies)); with allocation (M8b)
+  it can allocate and therefore throw.
 - The last use of a variable moves instead of copying (the compiler knows).
 
 ### In the compiler today
 
-**Status:** Implemented for arrays, structs, enums and optionals
+**Status:** Implemented (M8a)
 
-- Every array, struct, enum and optional is a plain value, copied by `let`,
-  by assignment and into array elements and fields. A `match` binds copies
-  of the payload fields. Nothing owns resources yet, so a concrete type
-  never moves.
-- In a generic function, a type parameter without the bound `Copy` (and an
-  optional or an array of one) is moved, never copied: keeping the value
-  of a `let`, a `var` or a `sink` parameter moves it out, and the variable
-  can't be used until it's assigned again; keeping an element or another
-  parameter is an error ([generics.md](generics.md#copy-and-moves-in-generic-code)).
-  So generic code already follows the rule move-only types will need.
+- An array, struct, enum or optional of plain data is a plain value,
+  copied by `let`, by assignment and into array elements and fields.
+- A type with a `deinit` ([Destruction](#destruction)) isn't `Copy`, nor
+  is what holds one, nor a type parameter without the bound `Copy`. Such
+  a value moves: keeping the value of a `let`, a `var` or a `sink`
+  parameter (storing it, returning it, passing it `sink`) moves it out,
+  and the variable can't be used until it's assigned again, on any path.
+  Keeping an element or another parameter is an error, and so is moving a
+  field out when the rest of the variable isn't `Copy`: `std/mem`'s
+  `replace`, `take` and `swap` take a part out by putting another value
+  in its place ([allocation.md](allocation.md#m8a-in-the-compiler)).
+- A `match`, an `if let` or a `for` reads what it binds in place: a
+  binding that isn't `Copy` can be read freely, and keeping it moves the
+  matched variable.
+- `x.clone()` copies explicitly: a `Copy` type's clone is the copy, a
+  type without a `deinit` whose parts are `Clone` clones each part, and
+  any other type writes `impl Clone for T`.
 - A default parameter is read-only for the duration of the call. Nothing can
   change the argument during the call, so an array or a struct is passed as
   the address of the caller's value, without a copy. An `inout` or `set`
@@ -460,13 +469,33 @@ invariants between a field and an array's contents (an empty slot means
 
 ## Destruction
 
-**Status:** Proposed. The M8 proposal works it out:
+**Status:** Implemented (M8a). The M8 proposal works it out:
 [allocation.md](allocation.md#1-resource-types-and-destruction).
 
 Values are destroyed at the end of their scope in reverse order. A type can
 define `fn deinit(sink self)`. Destruction is deterministic and visible in the
 scope structure. Only `defer` and scope end run cleanup, so there is no hidden
 control flow.
+
+### In the compiler today
+
+**Status:** Implemented (M8a)
+
+- `fn T.deinit(sink self)` on a struct or an enum: it can't throw, take
+  anything but `self`, or return a value, and it can't be called directly
+  (`mem.destroy(x)` destroys a value early). When its body ends, the
+  fields of `self` are destroyed, last first. A type without a `deinit`
+  whose parts need destruction destroys them, the same way.
+- What a variable owns is destroyed at every exit of its block (its end,
+  `return`, `throw`, a failed `try`, `break`, `continue`), in reverse
+  order of declaration, interleaved with `defer` bodies. A value moved
+  out isn't destroyed; a variable moved on some paths only has a hidden
+  flag, which the optimizer folds when the paths are known. A call to a
+  `never` function (`os.exit`) destroys nothing: leaking is safe.
+- A temporary is destroyed at the end of its statement. An assignment
+  destroys the old value after computing the new one.
+- `os.Fd` owns a file descriptor and closes it in its `deinit`
+  ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
 
 **Open:** "linear" types that *must* be consumed explicitly (for example a
 transaction that must be committed or rolled back). This would be valuable, and

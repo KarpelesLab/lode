@@ -49,8 +49,8 @@ Go's vocabulary, which is proven:
   `std/io.Writer[std/buf.StackBuf[16]].write`. An expansion of a function
   with `comptime` parameters or a pack is numbered:
   `std/io.print$3[u32, str]`.
-- So far there are seven packages: `std/os`, `std/io`, `std/math`,
-  `std/slices`, `std/buf`, `std/vec` and `std/encoding`.
+- So far there are eight packages: `std/os`, `std/io`, `std/mem`,
+  `std/math`, `std/slices`, `std/buf`, `std/vec` and `std/encoding`.
 - `std/os` is the Linux system calls, for x86-64 and AArch64 (see
   [Per-target code](#per-target-code)):
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
@@ -74,13 +74,33 @@ Go's vocabulary, which is proven:
   - `Error`, the errors std reports, from the error numbers `write` and
     `read` can give: `bad_fd` (`EBADF`), `broken_pipe` (`EPIPE`), `no_space`
     (`ENOSPC`, `EDQUOT`), `io` (`EIO`, or a result the kernel never gives),
-    and `other(errno)` for any other number. `error(n)` converts a failed
-    call's result to an `Error`.
+    and `other(errno)` for any other number (`other(2)` is `ENOENT`).
+    `error(n)` converts a failed call's result to an `Error`.
+  - `Fd`, a file descriptor the value owns (M8a,
+    [allocation.md](allocation.md#m8a-in-the-compiler)): its `deinit`
+    closes it, so it's closed once, when the `Fd` is destroyed. It isn't
+    `Copy`: it moves. Its number is `pub let fd: i32`, read everywhere,
+    set only in `std/os`; `io.File.from_fd(f.fd)` reads and writes it,
+    and that `File` is valid only while `f` is. `unsafe fn Fd.own(fd: i32)`
+    takes a descriptor over.
+  - `open(path: str, flags: u32, mode: u32) throws(Error) -> Fd` opens a
+    file (`openat` from the working directory, with `O_CLOEXEC` added).
+    `flags` joins `O_RDONLY`, `O_WRONLY` or `O_RDWR` with `O_CREAT`,
+    `O_EXCL`, `O_TRUNC`, `O_APPEND` and `O_CLOEXEC`; `mode` gives a new
+    file's permissions (`0o644`). The path is copied to a stack buffer of
+    `PATH_MAX` (4096) bytes for its trailing 0 (`@uninit`, so not filled
+    first): a longer path throws `other(36)` (`ENAMETOOLONG`), and one
+    with a 0 byte `other(22)` (`EINVAL`).
+  - `close(sink f: Fd) throws(Error)` closes `f` and reports the kernel's
+    error (`EIO` from a write that failed late, on some file systems). The
+    descriptor is closed either way. Destroying an `Fd` closes it too, and
+    ignores the error.
 - `std/io`:
   - `File`, an open file: a struct holding its file descriptor in a
-    private field. It doesn't close the file (there's no way to open one
-    yet). `stdin()`, `stdout()` and `stderr()` return the standard ones,
-    and `File.from_fd(fd: i32)` any other.
+    private field. It doesn't own the descriptor, and doesn't close it: it's
+    plain data, `Copy`. `stdin()`, `stdout()` and `stderr()` return the
+    standard ones, and `File.from_fd(fd: i32)` any other, such as the
+    descriptor of an `os.Fd` that owns it (`io.File.from_fd(f.fd)`).
   - `File.read(self, inout buf: []u8) throws(os.Error) -> usize where
     result <= buf.len` reads into
     `buf` once and returns the number of bytes read: 0 only at the end of
@@ -145,6 +165,22 @@ Go's vocabulary, which is proven:
   - `print` and `eprint` ignore output errors: they're for output that
     isn't worth failing over. `write_fmt` and the `File` methods report
     them.
+- `std/mem`, for values that own resources (M8a,
+  [allocation.md](allocation.md#partial-moves-and-patterns)): a value that
+  isn't `Copy` moves, and nothing is moved out of an element, a part of a
+  variable, or a place passed `inout`. These take a part out by putting
+  another value in its place:
+  - `swap[T](inout a: T, inout b: T)` exchanges two values.
+  - `replace[T](inout place: T, sink v: T) -> T` puts `v` in `place` and
+    returns the old value: `mem.replace(&p.name, v)`.
+  - `take[T](inout place: ?T) -> ?T` takes an optional's value and leaves
+    `none`: `mem.take(&slots[i])`.
+  - `destroy[T](sink x: T)` destroys `x` now, and `forget[T](sink x: T)`
+    ends it without destroying it (its `deinit` never runs: a leak, which
+    is safe).
+  - `swap`, `take` and `forget` are implemented by the compiler: they're
+    declared `@intrinsic`, which only the standard library can do, and
+    their empty bodies aren't used.
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
     (the integers, `bool`, and the structs and enums with an
@@ -175,14 +211,18 @@ Go's vocabulary, which is proven:
     isize` writes it to a file descriptor as `os.write_all` does (0 or a
     negative error number), and `io.File.write_buf` calls it.
 - `std/vec`, fixed-capacity vectors:
-  - `ArrayVec[T: Copy, N: usize]`, a list of at most `N` elements of type
-    `T`, stored in place: no allocation. Its slots are `[N]?T`, so it needs
-    no value to fill the empty ones with; `T` must be `Copy` to make them
-    `none`.
+  - `ArrayVec[T, N: usize]`, a list of at most `N` elements of type `T`,
+    stored in place: no allocation. Its slots are `[N]?T`, so it needs no
+    value to fill the empty ones with (`[none; N]` works for an optional
+    of any type). `T` can be any type since M8a: an element that isn't
+    `Copy` is moved in and out, and the elements left are destroyed with
+    the vector.
   - `ArrayVec[T, N].new()`, `len(self) -> usize`,
-    `push(inout self, v: T) throws(Error)` (`vec.Error.full` when it holds
-    `N` elements), `pop(inout self) -> ?T`, `get(self, i: usize) -> ?T`, and
-    `put(inout self, i: usize, v: T) -> bool`, which replaces element `i`.
+    `push(inout self, sink v: T) throws(Error)` (`vec.Error.full` when it
+    holds `N` elements), `pop(inout self) -> ?T` (with `mem.take`),
+    `get(self, i: usize) -> ?T`, which copies and so needs `T: Copy`, and
+    `put(inout self, i: usize, sink v: T) -> bool`, which replaces element
+    `i` and destroys the old one.
   - `var v = vec.ArrayVec[u16, 8].new()`, or `var v: vec.ArrayVec[u16, 8] =
     vec.ArrayVec.new()`.
 - Every access in `std/buf` and `std/vec` is proven. Their fields are

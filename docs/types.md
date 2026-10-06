@@ -238,6 +238,12 @@ let p = Point{x: 1, y: 2}
 - A struct is a value, like an array. `let q = p` and `q = p` copy it, and
   changing `p` afterwards doesn't change `q`. Fields of a `var` struct can be
   assigned, also nested and with `op=`: `r.min.x = 1`, `ps[i].y += 2`.
+- A struct or an enum can declare `fn T.deinit(sink self)`, which runs
+  when a value is destroyed, at the end of its variable's scope. Such a
+  type, and any that holds one, isn't `Copy`: `let q = p` moves `p`, and
+  `p.clone()` copies it explicitly if the type is `Clone`
+  ([memory.md](memory.md#destruction),
+  [allocation.md](allocation.md#m8a-in-the-compiler)).
 - Structs and arrays are passed and returned by value. A default parameter
   is read-only, so the callee reads the caller's value in place, without a
   copy ([memory.md](memory.md#in-the-compiler-today)). An `inout` one
@@ -595,8 +601,9 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
 [syntax.md](syntax.md#traits-and-impls))
 
 - Generic functions: `fn max[T: Ordered](sink a: T, sink b: T) -> T`, with
-  bounds from the built-in traits `Eq`, `Ordered`, `Copy`, `Integer`,
-  `Unsigned` and `Signed` and from traits declared in Lode, joined with
+  bounds from the built-in traits `Eq`, `Ordered`, `Copy`, `Clone`,
+  `Integer`, `Unsigned` and `Signed` and from traits declared in Lode,
+  joined with
   `+`. A generic body is checked once,
   against its bounds; the errors at a call are about its arguments.
 - `Eq` gives `==` and `!=`. `Ordered` gives the methods `a.cmp(b)` (an

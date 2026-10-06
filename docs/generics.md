@@ -354,13 +354,13 @@ them.
 
 **Status:** Proposed; `Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned` and
 `Signed` implemented (M7a, built into the compiler), `impl Ordered`
-for structs and enums (M7c), and `Format`, declared in Lode in `std/io`
-(M7e)
+for structs and enums (M7c), `Format`, declared in Lode in `std/io`
+(M7e), and `Clone`, built into the compiler (M8a)
 
 Some traits are known to the compiler. They are declared in the standard
 library (`std/core`, name Open) so they have documentation and a place in
 the package graph, but some of their impls come from the compiler. The
-compiler still knows the six of M7a by name, and `Ordering` is a built-in
+compiler still knows the seven of M7a and M8a by name, and `Ordering` is a built-in
 enum: `std/core` and an implicit import of it would be needed to declare
 them in Lode, and nothing needs that yet.
 
@@ -370,7 +370,8 @@ them in Lode, and nothing needs that yet.
 | `Ordered: Eq` | A total order, `cmp` and the defaults `lt`, `le`, `gt`, `ge`, `min`, `max` | Built in for integers and `bool`; user types write an impl |
 | `Integer: Ordered + Copy` | The integer operators | Sealed: only the integer primitives |
 | `Unsigned`, `Signed` | `Integer` and the sign | Sealed |
-| `Copy` | A value can be copied implicitly | Automatic, see below |
+| `Copy: Clone` | A value can be copied implicitly | Automatic, see below |
+| `Clone` | An explicit copy, `x.clone()` ([allocation.md](allocation.md#explicit-copies)) | Automatic for `Copy` types, and for a type without a `deinit` whose parts are `Clone`; other types write an impl (M8a) |
 | `Format` | Writable by `print("{}")` ([Format strings](#format-strings)) | `std/io` implements it for integers, `bool`, `str`; user types write an impl |
 | `Send`, `Sync` | May cross / be shared across threads ([concurrency.md](concurrency.md#data-race-freedom)) | Automatic; opt-out and `unsafe impl`. Deferred to the concurrency milestone. |
 
@@ -832,7 +833,11 @@ proposal left room:
   assigned is an error, on any path, loops included. Keeping an element, a
   read-only parameter or an `inout` one is a copy, an error without `Copy`,
   as is `[v; n]`. Reading in place (comparing, calling a method, passing to
-  a parameter that isn't `sink`) needs nothing.
+  a parameter that isn't `sink`) needs nothing. M8a extends this to every
+  type that isn't `Copy`, and changes two things: a pattern binding and a
+  `for` element read in place (keeping one moves the matched variable),
+  and a `defer` body may move a variable declared outside it
+  ([allocation.md](allocation.md#m8a-in-the-compiler)).
 - **Facts** about integer type parameters follow
   [Facts about `T` values](#facts-about-t-values), over the integer types
   the compiler has (up to 64 bits): the exact rule is in
@@ -917,9 +922,12 @@ proposal left room:
 - **Copy and moves.** A struct or an enum is `Copy` when every field of
   the instance is: `Pair[T, U]` is `Copy` only if `T` and `U` are. Keeping
   a field of a value that isn't `Copy` moves the whole variable out (there
-  are no partial moves yet). So `swap` with a read-only `self` needs
-  `A: Copy, B: Copy`, and `fn Pair[A, B].into_first(sink self)` needs
-  nothing.
+  are no partial moves). So `swap` with a read-only `self` needs
+  `A: Copy, B: Copy`. `fn Pair[A, B].into_first(sink self)` needed
+  nothing at first; since M8a, where what isn't `Copy` may need
+  destruction, moving `first` out must leave a `Copy` rest, so it's
+  `fn Pair[A, B: Copy].into_first`
+  ([allocation.md](allocation.md#m8a-in-the-compiler)).
 - **Recursive types.** A struct or an enum that holds any instance of
   itself by value is an error, "the struct `Holder` contains itself", also
   through another generic type's parameter (`p: Pair[u8, Holder]`), and
@@ -934,7 +942,8 @@ proposal left room:
   `Grow[Pair[T, T]].deeper`, which calls back here".
 - **`?T` stays built in**, as decided above.
 - **std.** `std/buf.StackBuf[N]`, a byte buffer written at either end;
-  `std/vec.ArrayVec[T: Copy, N]`, a vector of at most `N` elements; and
+  `std/vec.ArrayVec[T: Copy, N]`, a vector of at most `N` elements (of
+  any `T` since M8a); and
   `io.File.write_buf`, which writes a `StackBuf`'s bytes
   ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
   (`io.print_int` built its digits in a `StackBuf[21]` at first, and went
@@ -946,7 +955,8 @@ proposal left room:
   it's made
   ([memory.md](memory.md#uninitialized-buffers)).
   `ArrayVec` keeps its elements as `[N]?T`, so it needs no value to fill
-  empty slots with, and `T: Copy` to make them `none`.
+  empty slots with. It needed `T: Copy` to make them `none` until M8a,
+  where `[none; N]` works for an optional of any type.
 
 ### M7c: user traits
 

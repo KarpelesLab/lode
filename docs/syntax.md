@@ -221,14 +221,18 @@ fn main() -> i32 {
 - A declaration lists one field per line, `name: Type`. `pub struct` makes
   the struct usable from other packages. A field is private to the
   package unless it's marked `pub`: `pub min: Point`
-  ([types.md](types.md#structs)).
+  ([types.md](types.md#structs)). `pub let len: usize` is read-only
+  outside the package.
 - `@uninit name: [N]T` marks a private array that `unsafe` code may leave
   out of a literal ([memory.md](memory.md#uninitialized-buffers)). It
   can't be `pub`.
 - A field's refinement follows its type: `pub head: usize where head <
   CAP` ([Refinements](#refinements)). So a field line is `@uninit` or
-  `pub` (either first, but not both), the name, `:`, the type, then
-  `where cond`; an `@uninit` field, an array, has no refinement.
+  `pub` or `pub let` (either first, but not both), the name, `:`, the
+  type, then `where cond`; an `@uninit` field, an array, has no
+  refinement.
+- `fn T.deinit(sink self) { ... }` is the method that destroys a value
+  ([memory.md](memory.md#destruction)); it's declared like any method.
 - `Name{field: value, ...}` is a literal. Every field is given exactly once,
   in any order. The values are evaluated in the order they're written. A
   literal can span lines, with a comma after each field, the last one too.
@@ -742,6 +746,10 @@ fn word() -> str {
 - A typed `const` takes any expression of its type, calls included.
 - `@comptime_budget(n)` on its own line before a `const` sets how many
   steps computing it may take.
+- `@intrinsic` on its own line before a function of the standard library
+  marks one the compiler implements (`mem.swap`, `mem.take`,
+  `mem.forget`): its body is empty and not used. Elsewhere it's an
+  error.
 - `if comptime cond { ... } else ...` in a body or among declarations.
   `else if comptime` continues the chain. The branches not taken must
   parse, nothing more. `if comptime let` doesn't exist.

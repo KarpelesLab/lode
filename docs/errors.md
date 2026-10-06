@@ -140,12 +140,22 @@ and `errdefer` cover the rest.
   reverse order. `errdefer` runs only when the function leaves with an
   error, and only in a function that throws. A `return` runs them after
   computing its value. `os.exit` ends the process without running any.
+- Destruction runs at the same exits, in the same order: a variable that
+  owns a value with a `deinit` is destroyed where a `defer` written at its
+  declaration would run ([memory.md](memory.md#destruction)). So a `defer`
+  written after `let f = os.open(...)` runs before `f` is closed.
 - A `defer` body can't leave itself (`return`, `throw`, `try`, or a
   `break` or `continue` out of it), and can't assign variables declared
   outside it, or pass them `inout` or `set`. So running it changes no
   facts. It's checked where it's
   written, with the facts there about the variables nothing after it
   assigns ([safety.md](safety.md#the-fact-language)).
+- It can move a variable declared outside it (pass it `sink`, as in
+  `errdefer os.close(f) catch _ {}`), when the variable is assigned at
+  every exit the body runs at; moving it after the `defer` is an error at
+  those exits ([allocation.md](allocation.md#defer-and-errdefer)).
+- An error type is an enum that's `Copy`: `catch v` and `catch _` drop the
+  error, so it can't hold a value that needs destruction.
 - `main` can't throw: it handles its errors and returns an exit status.
 - Under the hood, a function that throws returns a result, an enum
   `{ ok(T), err(E) }` laid out like any enum
