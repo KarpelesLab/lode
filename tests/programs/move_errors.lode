@@ -7,7 +7,7 @@
 // error: this copies `xs[0]`, a `Fd`, but `Fd` isn't `Copy`
 // error: `w.f` can't be moved out of `w`, a `Wrapped`, which has a `deinit`
 // error: this copies `f`, part of `o`, a read-only parameter, but `Fd` isn't `Copy`
-// error: `v` is used after it was moved (on some path to here)
+// error: `v` is used after `o`, which it reads in place, changed or was moved (on some path to here)
 // error: `self` can't be moved out of `deinit`
 // error: `f` holds a value, which `fill` would replace without destroying it: a `set` argument of a type that isn't `Copy` must be unassigned
 // error: `f` may be moved already at this exit, where an `errdefer` that moves it runs

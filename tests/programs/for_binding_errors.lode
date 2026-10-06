@@ -1,0 +1,240 @@
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `s`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `rows`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `p`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `s`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `s`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: `x` is used after `xs`, which it reads in place, changed or was moved (on some path to here)
+// error: this loop goes over a view of `xs`, which the loop's body changes
+// help: `x` reads part of a variable in place, which was moved or changed since
+package main
+
+import "std/mem"
+
+fn new_box(v: u32) uses alloc -> ?Box[[4]u32] {
+	return Box[[4]u32].new([v; 4]) catch _ {
+		return none
+	}
+}
+
+fn read(b: Box[[4]u32]) -> u32 {
+	return b.value[0]
+}
+
+fn consume(sink xs: List[Box[[4]u32]]) {
+}
+
+fn replace_first(inout s: []Box[[4]u32]) uses alloc {
+	if s.len > 0 {
+		if let nb = new_box(7) {
+			s[0] = nb
+		}
+	}
+}
+
+struct Holder {
+	l: List[Box[[4]u32]]
+	n: u32
+}
+
+// The list's elements are destroyed, then `x` is read: `break` leaves the
+// loop before its next iteration.
+fn cleared(inout xs: List[Box[[4]u32]]) {
+	for x in xs {
+		xs.clear()
+		let k = read(x)
+		break
+	}
+}
+
+// A slice of the list.
+fn sliced(inout xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs[..] {
+		xs.clear()
+		return read(x)
+	}
+	return 0
+}
+
+// An `inout` slice whose element is replaced.
+fn replaced(inout s: []Box[[4]u32]) uses alloc -> u32 {
+	for x in s {
+		if s.len > 0 {
+			if let nb = new_box(7) {
+				s[0] = nb
+			}
+		}
+		return read(x)
+	}
+	return 0
+}
+
+// The list grows: its elements move.
+fn pushed(inout xs: List[Box[[4]u32]]) uses alloc -> u32 {
+	for x in xs {
+		if let nb = new_box(1) {
+			xs.push(nb) catch _ {}
+		}
+		return read(x)
+	}
+	return 0
+}
+
+fn swapped(inout xs: List[Box[[4]u32]], inout ys: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		mem.swap(&xs, &ys)
+		return read(x)
+	}
+	return 0
+}
+
+fn replaced_list(inout xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		let old = mem.replace(&xs, List[Box[[4]u32]].new())
+		return read(x)
+	}
+	return 0
+}
+
+fn moved(sink xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		consume(xs)
+		return read(x)
+	}
+	return 0
+}
+
+// Nested loops: the inner element reads the outer list in place.
+fn nested(inout rows: List[List[Box[[4]u32]]]) -> u32 {
+	for row in rows {
+		for x in row {
+			rows.clear()
+			return read(x)
+		}
+	}
+	return 0
+}
+
+// A view of the list, kept in a variable.
+fn viewed(inout xs: List[Box[[4]u32]]) -> u32 {
+	let v = xs.as_slice()
+	for x in v {
+		xs.clear()
+		return read(x)
+	}
+	return 0
+}
+
+// A list in a field.
+fn field(inout p: Holder) -> u32 {
+	for x in p.l {
+		p.l.clear()
+		return read(x)
+	}
+	return 0
+}
+
+// An element replaced by assignment.
+fn assigned(inout xs: List[Box[[4]u32]]) uses alloc -> u32 {
+	for x in xs {
+		if xs.len > 0 {
+			if let nb = new_box(2) {
+				xs[0] = nb
+			}
+		}
+		return read(x)
+	}
+	return 0
+}
+
+// An `inout` slice passed `&` to a function that replaces an element.
+fn passed(inout s: []Box[[4]u32]) uses alloc -> u32 {
+	for x in s {
+		replace_first(&s)
+		return read(x)
+	}
+	return 0
+}
+
+// An element of the `inout` slice swapped out.
+fn swapped_element(inout s: []Box[[4]u32], inout other: Box[[4]u32]) -> u32 {
+	for x in s {
+		if s.len > 0 {
+			mem.swap(&s[0], &other)
+		}
+		return read(x)
+	}
+	return 0
+}
+
+// Without `break`, the loop's next iteration is reported too.
+fn looped(inout xs: List[Box[[4]u32]]) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		xs.clear()
+		total = total +% read(x)
+	}
+	return total
+}
+
+fn shrink(inout xs: List[Box[[4]u32]]) -> bool {
+	xs.clear()
+	return false
+}
+
+enum Fail {
+	bad
+}
+
+fn may() throws(Fail) -> bool {
+	throw .bad
+}
+
+// A `while` condition that changes the list.
+fn cond_change(inout xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		while shrink(&xs) {
+		}
+		return read(x)
+	}
+	return 0
+}
+
+// A `while` condition's `catch` block that changes the list.
+fn cond_catch(inout xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		while may() catch _ {
+			xs.clear()
+			break
+		} {
+		}
+		return read(x)
+	}
+	return 0
+}
+
+// A `while` condition that uses the element after the body changed the
+// list.
+fn cond_use(inout xs: List[Box[[4]u32]]) -> u32 {
+	for x in xs {
+		var n: u32 = 0
+		while read(x) > n {
+			xs.clear()
+			n = n +% 1
+		}
+		return n
+	}
+	return 0
+}
+
+fn main() {
+}

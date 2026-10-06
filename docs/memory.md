@@ -323,6 +323,17 @@ Roots are whole variables: changing `p.tag` stops a view of `p.rows` too.
   the body is an error at the next iteration ("this loop goes over a view
   of `xs`, which the loop's body changes"). `for x in a[i..j]` whose body
   assigns `a` is reported at the loop, as before.
+- A binding read in place (of a `match`, an `if let` or a `for`, whose
+  type isn't `Copy`) can't be used after a change of the variable it
+  reads, or of a variable that the view it reads an element of borrows
+  from, on some path, from the change on: the change may have destroyed
+  or moved the element. So `for x in xs { xs.clear(); use(x); break }`
+  is an error at `use(x)`, as is the same with `xs.push(v)`,
+  `mem.swap(&xs, &ys)`, `xs[0] = v`, a move of `xs`, a change of an
+  `inout` slice `s` it goes over (`s[0] = v`, `f(&s)`, `mem.swap(&s[0], &v)`),
+  or of the list of an outer loop's element. A change of a `Copy` part
+  (`p.n = 1` in `for x in p.l`) destroys nothing and doesn't count; a
+  `Copy` element is copied out, so it can be used after.
 - A `catch` block after a call that changes a root sees the change: the
   call may have changed it before it failed.
 - A `defer` body can use a view declared outside it only if the view

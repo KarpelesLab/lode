@@ -1156,14 +1156,23 @@ impl Checker<'_> {
     }
 
     /// `local` was moved or changed: the pattern bindings that read part of
-    /// it in place, and aren't `Copy`, can't be used any more.
+    /// it in place, and aren't `Copy`, can't be used any more. That's also
+    /// a binding that reads an element of a view of it in place, as the
+    /// element of `for x in xs` does (the loop goes over a hidden view of
+    /// `xs` when the body changes `xs`): the element may be gone right
+    /// after the change, not only at the next iteration.
     pub(super) fn invalidate_projections(cx: &mut FnCx, local: LocalId) {
+        let reads = |place: &TExpr| match place_local(cx, place) {
+            Some(l) if l == local => true,
+            Some(l) => {
+                cx.locals[l].ty.is_view() && cx.borrows.get(&l).is_some_and(|r| r.contains(&local))
+            }
+            None => false,
+        };
         let stale: Vec<LocalId> = cx
             .projections
             .iter()
-            .filter(|&(&b, place)| {
-                !cx.locals[b].ty.is_copy() && place_local(cx, place) == Some(local)
-            })
+            .filter(|&(&b, place)| !cx.locals[b].ty.is_copy() && reads(place))
             .map(|(&b, _)| b)
             .collect();
         for b in stale {
@@ -1181,10 +1190,27 @@ impl Checker<'_> {
         let name = &cx.locals[local].name;
         let ty = cx.locals[local].ty;
         let (param, _) = not_copy(ty);
-        let mut d = Diagnostic::error(
-            span,
-            format!("`{name}` is used after it was moved (on some path to here)"),
-        );
+        // A binding that reads (a view of) a variable in place: the
+        // variable, named.
+        let read = cx.projections.get(&local).and_then(|place| {
+            let l = place_local(cx, place)?;
+            // A view of one variable (the hidden one of a `for` loop, say):
+            // that variable.
+            let l = match cx.borrows.get(&l) {
+                Some(roots) if cx.locals[l].ty.is_view() && roots.len() == 1 => {
+                    *roots.iter().next()?
+                }
+                _ => l,
+            };
+            Some(cx.locals[l].name.clone()).filter(|n| !n.starts_with('$'))
+        });
+        let msg = match &read {
+            Some(var) => format!(
+                "`{name}` is used after `{var}`, which it reads in place, changed or was moved (on some path to here)"
+            ),
+            None => format!("`{name}` is used after it was moved (on some path to here)"),
+        };
+        let mut d = Diagnostic::error(span, msg);
         if cx.projections.contains_key(&local) {
             d = d.with_help(format!(
                 "`{name}` reads part of a variable in place, which was moved or changed since"

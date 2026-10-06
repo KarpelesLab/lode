@@ -940,7 +940,10 @@ What M8a does, and the choices made where the proposal left room:
   projections: reading them needs nothing, and keeping one moves what it
   reads, which must be a value the code may consume (a `let`, `var` or
   `sink` variable, or a temporary scrutinee). Moving or changing that
-  value makes the bindings unusable after. A `for` element can't be kept
+  value makes the bindings unusable after, right from the change: for a
+  `for` element, a change of the list or the slice it goes over, or of
+  what that slice views ([memory.md](memory.md#views-in-the-compiler-today)).
+  A `for` element can't be kept
   (it's an element). `let ... else` moves the optional's value into its
   new variable, which owns it. A `match` on another place that isn't
   `Copy` (`match p.opt`) reads it in place too.

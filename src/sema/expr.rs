@@ -4300,23 +4300,27 @@ impl Checker<'_> {
         // a variable passed `set` is assigned (if the call succeeds).
         let mut sets = Vec::new();
         for (place, conv) in &changed {
-            if !place.ty.is_copy() {
-                if *conv == Convention::Set
-                    && !matches!(place.kind, TExprKind::Local(l) if cx.env.is_uninit(l))
-                {
-                    let text = place_text(cx, place).unwrap_or_else(|| "it".to_owned());
-                    self.diags.push(
-                        Diagnostic::error(
-                            span,
-                            format!("`{text}` holds a value, which `{name}` would replace without destroying it: a `set` argument of a type that isn't `Copy` must be unassigned"),
-                        )
-                        .with_help("pass a variable declared without a value, or moved out of; or pass it `inout`"),
-                    );
-                    ok = false;
-                }
-                if let Some(l) = super::generic::place_local(cx, place) {
-                    Self::invalidate_projections(cx, l);
-                }
+            if !place.ty.is_copy()
+                && *conv == Convention::Set
+                && !matches!(place.kind, TExprKind::Local(l) if cx.env.is_uninit(l))
+            {
+                let text = place_text(cx, place).unwrap_or_else(|| "it".to_owned());
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{text}` holds a value, which `{name}` would replace without destroying it: a `set` argument of a type that isn't `Copy` must be unassigned"),
+                    )
+                    .with_help("pass a variable declared without a value, or moved out of; or pass it `inout`"),
+                );
+                ok = false;
+            }
+            // The pattern bindings that read part of it in place go stale;
+            // a slice is `Copy`, but its elements may not be.
+            if (!place.ty.is_copy() || place.ty.is_view())
+                && let Some(l) = super::generic::place_local(cx, place)
+                    .or_else(|| super::views::changed_root(cx, place))
+            {
+                Self::invalidate_projections(cx, l);
             }
             if let Some(l) = super::views::changed_root(cx, place) {
                 super::views::source_changed(cx, l, super::views::Change::Changed, span);

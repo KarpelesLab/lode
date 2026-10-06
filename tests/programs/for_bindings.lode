@@ -1,0 +1,78 @@
+// stdout: 6 | 3 2 | 1 0 | 7 | 4\n
+package main
+
+import "std/io"
+
+fn new_box(v: u32) uses alloc -> ?Box[[4]u32] {
+	return Box[[4]u32].new([v; 4]) catch _ {
+		return none
+	}
+}
+
+struct Holder {
+	l: List[Box[[4]u32]]
+	n: u32
+}
+
+fn main() uses alloc {
+	var xs = List[Box[[4]u32]].new()
+	for v in 1..4 {
+		if let b = new_box(u32(v)) {
+			xs.push(b) catch _ {}
+		}
+	}
+	// The body changes other variables than the list.
+	var total: u32 = 0
+	var ys = List[u32].new()
+	for x in xs {
+		total = total +% x.value[0]
+		ys.push(x.value[3]) catch _ {}
+	}
+	io.print("{} | ", total)
+
+	// The element is used before the list changes, then the loop is left.
+	var last: u32 = 0
+	for x in xs {
+		last = x.value[0] +% 2
+		xs.clear()
+		break
+	}
+	io.print("{} {} | ", last, ys.get(1) ?? 0)
+
+	// `Copy` elements are copied out: the list can change after.
+	var first: u32 = 0
+	for y in ys {
+		ys.clear()
+		first = y
+		break
+	}
+	io.print("{} {} | ", first, ys.len)
+
+	// A change to a `Copy` field of the holder doesn't destroy an element.
+	var p = Holder{l: List[Box[[4]u32]].new(), n: 0}
+	if let b = new_box(7) {
+		p.l.push(b) catch _ {}
+	}
+	for x in p.l {
+		p.n = 1
+		p.n = x.value[0]
+		break
+	}
+	io.print("{} | ", p.n)
+
+	// A new element bound after the change.
+	var zs = List[Box[[4]u32]].new()
+	if let b = new_box(4) {
+		zs.push(b) catch _ {}
+	}
+	for i in 0..zs.len {
+		if let b = new_box(5) {
+			zs.push(b) catch _ {}
+		}
+		for z in zs {
+			io.print("{}\n", z.value[0])
+			break
+		}
+		break
+	}
+}
