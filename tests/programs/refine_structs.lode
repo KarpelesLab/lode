@@ -1,0 +1,142 @@
+// stdout: 3 5 5\n
+// stdout: 0 6\n
+// stdout: 9 1\n
+// stdout: 6 8\n
+// stdout: 4 2\n
+// stdout: 3\n
+package main
+
+import "std/io"
+
+const SIZE = 8
+
+type Index = usize where self < SIZE
+
+// A window into an array of `SIZE`: every value of `Window` keeps
+// `start <= end <= SIZE`, checked at each literal and field assignment
+// and known wherever a field is read.
+struct Window {
+	start: usize where start <= end
+	end: usize where end <= SIZE
+}
+
+// A field of a named refinement keeps its range too.
+struct Cursor {
+	at: Index
+	moves: u32
+}
+
+// A generic struct: the refinement names its value parameter.
+struct Stack[N: usize] {
+	items: [N]u8
+	count: usize where count <= N
+}
+
+fn Stack[N].push(inout self, v: u8) -> bool {
+	if self.count >= N {
+		return false
+	}
+	self.items[self.count] = v
+	self.count += 1
+	return true
+}
+
+fn Stack[N].top(self) -> ?u8 {
+	if self.count == 0 {
+		return none
+	}
+	return self.items[self.count - 1] // count - 1 < count <= N
+}
+
+// `pub`, `@uninit` and a refinement together: the storage has none, the
+// length keeps its bound.
+struct Bytes {
+	@uninit data: [SIZE]u8
+	pub len: usize where len <= SIZE
+}
+
+fn Bytes.new() -> Bytes {
+	// Sound: `data` is read only below `len`, which `push` writes first.
+	unsafe {
+		return Bytes{len: 0}
+	}
+}
+
+fn Bytes.push(inout self, b: u8) {
+	if self.len < SIZE {
+		self.data[self.len] = b
+		self.len += 1
+	}
+}
+
+fn Bytes.last(self) -> u8 {
+	if self.len == 0 {
+		return 0
+	}
+	return self.data[self.len - 1] // len - 1 < len <= SIZE
+}
+
+fn sum(data: [SIZE]u8, w: Window) -> u32 {
+	var total: u32 = 0
+	for i in w.start..w.end {
+		total +%= u32(data[i]) // proven: w.end <= SIZE
+	}
+	return total
+}
+
+fn shrink(inout w: Window) {
+	if w.end > w.start {
+		w.end -= 1 // still at least `start`
+	}
+}
+
+fn advance(c: Cursor) -> Cursor {
+	var next = c
+	next.at = (c.at + 1) % SIZE
+	next.moves = c.moves +| 1
+	return next
+}
+
+fn set_end(inout end: usize where end <= SIZE) {
+	end = SIZE
+}
+
+fn main() {
+	let data: [SIZE]u8 = [1, 1, 1, 1, 2, 2, 2, 2]
+	var w = Window{start: 1, end: 4}
+	io.print("{} ", sum(data, w))
+	w.end = 5
+	io.print("{} ", sum(data, w))
+	w.start = 0
+	w.end = 4
+	shrink(&w)
+	io.print("{}\n", sum(data, w) +% 2)
+	var c = Cursor{at: 6, moves: 0}
+	c = advance(c)
+	c = advance(c)
+	io.print("{} {}\n", c.at, data[c.at] +% 5)
+	var s: Stack[4] = Stack{items: [0; 4], count: 0}
+	if !s.push(9) {
+		return
+	}
+	if !s.push(1) {
+		return
+	}
+	io.print("{} {}\n", s.items[0], s.top() ?? 0)
+	var e = w.end
+	set_end(&e)
+	var v = Window{start: 0, end: 0}
+	set_end(&v.end)
+	io.print("{} {}\n", sum(data, v) -% 6, e)
+	// Elements have no facts, but a field read from one keeps its
+	// refinement's range: `ws[0].end <= SIZE`.
+	let ws = [Window{start: 2, end: 6}, v]
+	let last = ws[0].end
+	if last >= 1 {
+		io.print("{} {}\n", data[last - 1] +% 2, ws[1].end -| last)
+	}
+	var bs = Bytes.new()
+	bs.push(1)
+	bs.push(3)
+	io.print("{}\n", bs.last())
+}

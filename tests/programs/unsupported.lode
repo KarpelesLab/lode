@@ -1,8 +1,8 @@
-// error: `type` declarations are not supported by the compiler yet
+// error: `alias` declarations are not supported by the compiler yet
 // error: `uses` clauses are not supported by the compiler yet
 package main
 
-type Meters = u32
+alias Meters = u32
 
 fn parse() uses alloc -> u32 {
 	return 0

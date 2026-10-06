@@ -1,0 +1,35 @@
+// stdout: 3 6 40 4\n
+package main
+
+import "std/io"
+
+type Small = u8 where self < 100
+
+struct Slot {
+	at: u8 where at < 10
+}
+
+const TABLE: [4]u8 = [1, 2, 3, 4]
+
+fn at(xs: []u8, i: usize where i < xs.len) -> u8 {
+	return xs[i]
+}
+
+fn last[N: usize where N > 0](xs: [N]u8) -> u8 {
+	return xs[N - 1]
+}
+
+fn twice(n: usize) -> usize {
+	return n *| 2
+}
+
+// In a constant's value, what the checker can't prove is checked as it
+// runs: `twice(1)` is 2, which is less than `TABLE.len`.
+const A: u8 = at(TABLE, twice(1))
+const B: Slot = Slot{at: u8(twice(3))}
+const C: u8 = Small(u8(twice(20)))
+const D: u8 = last(TABLE)
+
+fn main() {
+	io.print("{} {} {} {}\n", A, B.at, C, D)
+}

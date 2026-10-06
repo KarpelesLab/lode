@@ -1,0 +1,36 @@
+// error: `i` of `at` doesn't meet its refinement `i < xs.len`
+// error: the field `at` of `Slot` doesn't meet its refinement `at < 10`
+// error: 100 isn't a `Small`: it doesn't meet `self < 100`
+// error: the generic arguments of `first` don't meet its refinement `N > 0`
+package main
+
+type Small = u8 where self < 100
+
+struct Slot {
+	at: u8 where at < 10
+}
+
+const TABLE: [4]u8 = [1, 2, 3, 4]
+
+fn at(xs: []u8, i: usize where i < xs.len) -> u8 {
+	return xs[i]
+}
+
+fn first[N: usize where N > 0](xs: [N]u8) -> u8 {
+	return xs[0]
+}
+
+fn twice(n: usize) -> usize {
+	return n *| 2
+}
+
+const EMPTY: [0]u8 = []
+
+// Each is checked as it runs, and fails.
+const A: u8 = at(TABLE, twice(2))
+const B: Slot = Slot{at: u8(twice(5))}
+const C: u8 = Small(u8(twice(50)))
+const D: u8 = first(EMPTY)
+
+fn main() {
+}

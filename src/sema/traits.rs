@@ -536,6 +536,7 @@ impl<'a> Checker<'a> {
         }
         let (params, bounds) =
             self.declare_owner_generics(&cx, base_ty, &decl.generics, decl.ty.span())?;
+        self.no_generic_refine(&decl.generics);
         Some((base_ty.instantiate(&params), params, bounds))
     }
 

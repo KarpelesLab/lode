@@ -1,0 +1,70 @@
+// stdout: 3 7 9\n
+// stdout: 5\n
+// stdout: 12 2\n
+// stdout: 4\n
+// stdout: 5 9\n
+package main
+
+import "std/io"
+
+const CAP = 16
+
+type Digit = u8 where self <= 9
+
+// The caller proves `i < buf.len`; the body assumes it.
+fn byte_at(buf: []u8, i: usize where i < buf.len) -> u8 {
+	return buf[i]
+}
+
+// A result refinement: the callee proves it at each `return`, and the
+// caller learns it.
+fn digit_value(c: u8 where c >= '0' && c <= '9') -> u8 where result <= 9 {
+	return c - '0'
+}
+
+fn clamp_index(i: usize) -> usize where result < CAP {
+	if i >= CAP {
+		return CAP - 1
+	}
+	return i
+}
+
+// Relative to an argument: `result <= n`.
+fn half(n: usize) -> usize where result <= n {
+	return n / 2
+}
+
+fn digit(c: u8) -> ?u8 where result <= 9 {
+	if c < '0' || c > '9' {
+		return none
+	}
+	return c - '0'
+}
+
+fn sum_digits(a: Digit, b: Digit) -> u8 where result <= 18 {
+	return a + b
+}
+
+fn main() {
+	let buf: [4]u8 = [1, 2, 3, 4]
+	let table: [CAP]u8 = [0; CAP]
+	let x = byte_at(buf, 2)
+	let d = digit_value('7')
+	let digits: [10]u8 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+	io.print("{} {} {}\n", x, digits[d], digits[digit_value('9')])
+	let k = clamp_index(100)
+	io.print("{}\n", table[k] +% 5)
+	let n = buf.len
+	let h = half(n - 1)
+	io.print("{} {}\n", byte_at(buf, h) +% 10, buf[h])
+	var total: u8 = 0
+	if let a = digit('3') {
+		if let b = digit('1') {
+			total = sum_digits(a, b)
+		}
+	}
+	let e: Digit = 4
+	io.print("{}\n", total + e - 4)
+	// `??` keeps the range: either the value in the optional, or 9.
+	io.print("{} {}\n", digits[digit('5') ?? 9], digits[digit('x') ?? 9])
+}

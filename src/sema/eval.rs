@@ -658,7 +658,15 @@ impl Eval<'_, '_> {
                         vs[k] = Value::Array(Rc::new(vec![Value::Int(0); n as usize]));
                     }
                 }
+                self.check_fields(frame.ty(e.ty), &vs)?;
                 Value::Struct(Rc::new(vs))
+            }
+            TExprKind::Refined(inner, k) => {
+                let v = self.expr(frame, inner)?;
+                if let Some(msg) = self.ck.refined_fails(*k, &v) {
+                    return fail(msg);
+                }
+                v
             }
             TExprKind::Field(base, k) => match self.expr(frame, base)? {
                 Value::Struct(fields) => fields[*k as usize].clone(),
@@ -948,6 +956,13 @@ impl Eval<'_, '_> {
             };
             callee.locals[p] = v;
         }
+        let failed = self.ck.vparams_fail(f, &|t| callee.ty(t)).or_else(|| {
+            self.ck
+                .params_fail(f, &func.params, &callee.locals, &|t| callee.ty(t))
+        });
+        if let Some(msg) = failed {
+            return fail(msg);
+        }
         self.depth += 1;
         let out = self.block(&mut callee, &func.body);
         self.depth -= 1;
@@ -987,6 +1002,14 @@ impl Eval<'_, '_> {
             (Some(_), Err(e)) => Value::variant_of(1, vec![e]),
             (None, Err(_)) => unreachable!("only a function that throws can throw"),
         })
+    }
+
+    /// A struct value `vs` of type `sty` must meet its fields' refinements.
+    fn check_fields(&self, sty: Ty, vs: &[Value]) -> R<()> {
+        match self.ck.fields_fail(sty, vs) {
+            Some(msg) => fail(msg),
+            None => Ok(()),
+        }
     }
 
     /// The place an expression names (a local, an element, a field, a

@@ -1,0 +1,138 @@
+// error: a product of two values can't be in a refinement
+// error: a call can't be in a refinement
+// error: this refinement relates more than two values
+// error: an element can't be in a refinement
+// error: `buf` comes after `i`: a refinement can only name the parameters before it
+// error: `Digit` is a named refinement, which can't be part of another type yet
+// error: this refinement of the result doesn't name `result`
+// error: `b` can change, so its refinement can't name `a`, which can change too
+// error: a `type` declaration needs a refinement: `type Digit = u8 where self <= 9`
+// error: cannot prove `i < buf.len` for `i` of `at`
+// error: cannot prove `result < CAP` for the result
+// error: cannot prove `hi <= CAP` for the field `hi` of `Range`
+// error: cannot prove `lo <= hi` for the field `hi` of `Range`
+// error: cannot prove `lo <= hi` for the field `lo` of `Range`
+// error: cannot prove `self <= 9` for the value of `d`
+// error: `count` may change this to a value outside its refinement
+// error: cannot prove `N > 0` for the generic arguments of `last`
+// error: refinements on the methods of traits and impls are not supported by the compiler yet
+// error: `count` is a private field of `vec.ArrayVec`, which a refinement here can't name
+package main
+
+import "std/vec"
+
+const CAP = 8
+
+type Digit = u8 where self <= 9
+
+struct Range {
+	lo: usize where lo <= hi
+	hi: usize where hi <= CAP
+}
+
+fn at(buf: []u8, i: usize where i < buf.len) -> u8 {
+	return buf[i]
+}
+
+// The caller doesn't know `i < buf.len`.
+fn unchecked(buf: []u8, i: usize) -> u8 {
+	return at(buf, i)
+}
+
+// A `return` that doesn't meet the result's refinement.
+fn too_big(n: usize) -> usize where result < CAP {
+	if n > CAP {
+		return 0
+	}
+	return n
+}
+
+// A field assignment that breaks the struct's refinement.
+fn widen(r: Range) -> Range {
+	var out = r
+	out.hi = r.hi + 1
+	return out
+}
+
+// Another field's refinement names the field assigned: `lo <= hi`.
+fn lower_hi(inout r: Range) {
+	r.hi = 0
+}
+
+// A literal that breaks it.
+fn backwards() -> Range {
+	return Range{lo: 5, hi: 2}
+}
+
+// A named refinement given a value it can't prove.
+fn to_digit(c: u8) -> u8 {
+	let d: Digit = c
+	return d
+}
+
+fn count(inout x: u8) {
+	x +%= 1
+}
+
+// A variable of a named refinement passed to a parameter without it.
+fn bump(d: Digit) -> u8 {
+	var e: Digit = d
+	count(&e)
+	return e
+}
+
+// Outside the fact language: a product of two values, a call, three
+// values, an element.
+fn product(a: usize, b: usize where a * b < 100) {
+}
+
+fn call(a: usize where a < at([1], 0)) {
+}
+
+fn three(a: usize, b: usize, c: usize where a + b < c) {
+}
+
+fn element(xs: []u8, i: usize where xs[0] < 3) {
+}
+
+// A refinement that names a later parameter.
+fn later(i: usize where i < buf.len, buf: []u8) {
+}
+
+// A named refinement inside another type.
+fn digits(ds: [4]Digit) {
+}
+
+// A `type` declaration without a refinement.
+type Meters = u32
+
+// A result's refinement that doesn't name `result`.
+fn no_result(n: usize) -> usize where n < 4 {
+	return 0
+}
+
+// A parameter the function can change, whose refinement names another one
+// it can change.
+fn both(inout a: u8, inout b: u8 where b < a) {
+}
+
+fn last[N: usize where N > 0](xs: [N]u8) -> u8 {
+	return xs[N - 1]
+}
+
+// A value parameter whose refinement isn't met.
+fn none_left() -> u8 {
+	let empty: [0]u8 = []
+	return last(empty)
+}
+
+trait Shape {
+	fn corner(self, i: usize where i < 4) -> u32
+}
+
+// Another package's private field.
+fn nth(v: vec.ArrayVec[u8, 4], i: usize where i < v.count) {
+}
+
+fn main() {
+}

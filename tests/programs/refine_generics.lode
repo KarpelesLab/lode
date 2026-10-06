@@ -1,0 +1,67 @@
+// stdout: 6 10\n
+// stdout: 4 5 2\n
+// stdout: 3 9 2\n
+// stdout: 7\n
+package main
+
+import "std/io"
+
+// A refinement naming a value parameter: proven once, for every `N`.
+fn take[N: usize](xs: [N]u8, n: usize where n <= N) -> u32 {
+	var s: u32 = 0
+	for i in 0..n {
+		s +%= u32(xs[i]) // i < n <= N
+	}
+	return s
+}
+
+// A value parameter's own refinement, proven where it's instantiated.
+fn last[N: usize where N > 0](xs: [N]u8) -> u8 {
+	return xs[N - 1]
+}
+
+// Refinements on values of a type parameter with a numeric bound.
+fn gap[T: Unsigned](lo: T, hi: T where lo <= hi) -> T where result <= hi {
+	return hi - lo // lo <= hi: no underflow; lo >= 0: at most hi
+}
+
+fn first_at_least[T: Unsigned](xs: []T, v: T) -> usize where result <= xs.len {
+	for i in 0..xs.len {
+		if !xs[i].lt(v) {
+			return i
+		}
+	}
+	return xs.len
+}
+
+// A method of a generic type whose refinement names a field of `self`.
+struct Buf[N: usize] {
+	data: [N]u8
+	len: usize where len <= N
+}
+
+fn Buf[N].at(self, i: usize where i < self.len) -> u8 {
+	return self.data[i] // i < self.len <= N
+}
+
+// A generic caller passes its own value parameter on: its refinement
+// proves the callee's.
+fn tail[M: usize where M >= 2](xs: [M]u8) -> u8 {
+	return last(xs) +% xs[M - 2]
+}
+
+fn main() {
+	let a: [4]u8 = [1, 2, 3, 4]
+	io.print("{} {}\n", take(a, 3), take(a, a.len))
+	let x: u32 = 7
+	let g = gap[u32](2, x)
+	let digits: [8]u8 = [0, 1, 2, 3, 4, 5, 6, 7]
+	io.print("{} {} {}\n", last(a), digits[g], gap[u8](3, 5))
+	let b = Buf[3]{data: [3, 2, 1], len: 2}
+	let xs: [3]u16 = [1, 5, 9]
+	let k = first_at_least[u16](xs, 6)
+	if k < xs.len {
+		io.print("{} {} {}\n", b.at(0), xs[k], k)
+	}
+	io.print("{}\n", tail(a))
+}

@@ -9,6 +9,7 @@ mod eval;
 mod expr;
 pub mod facts;
 mod generic;
+mod refine;
 mod traits;
 pub mod tree;
 
@@ -61,6 +62,8 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         expansion_counts: HashMap::new(),
         expanding: 0,
         view_params: HashSet::new(),
+        refined_types: Vec::new(),
+        field_refines: HashMap::new(),
         sources: packages
             .iter()
             .flat_map(|p| &p.files)
@@ -68,6 +71,10 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
             .collect(),
     };
     ck.collect(packages);
+    // Every named refinement, used or not, so its errors are reported.
+    for k in 0..ck.refined_types.len() {
+        ck.refined_type(k);
+    }
     ck.declaring = false;
     if ck.package_error {
         let program = Program {
@@ -160,6 +167,24 @@ enum Item {
     Type(Ty),
     /// A trait declared in Lode.
     Trait(Trait),
+    /// A named refinement (`type Digit = u8 where self <= 9`), by index
+    /// into [`Checker::refined_types`].
+    Refined(usize),
+}
+
+/// A named refinement's declaration, and its type and refinement once
+/// resolved.
+struct RefinedType<'a> {
+    decl: &'a ast::TypeDecl,
+    pkg: usize,
+    file: FileId,
+    state: RefinedState,
+}
+
+enum RefinedState {
+    Unresolved,
+    Resolving,
+    Done(Option<(Ty, Rc<refine::Refine>)>),
 }
 
 struct PkgInfo {
@@ -201,6 +226,13 @@ struct Sig {
     /// For a function with `comptime` parameters or a pack: the kind of
     /// each parameter. Its calls are calls of its expansions.
     template: Option<comptime::Template>,
+    /// The refinement of each parameter (docs/safety.md, Refinements in
+    /// types), and of the result.
+    refines: Vec<Option<Rc<refine::Refine>>>,
+    ret_refine: Option<Rc<refine::Refine>>,
+    /// The refinements of its own value parameters (`[N: usize where N >
+    /// 0]`), together.
+    vparam_refine: Option<Rc<refine::Refine>>,
 }
 
 /// The value of a checked constant.
@@ -308,6 +340,11 @@ struct Checker<'a> {
     view_params: HashSet<Ty>,
     /// The text of each file, for errors pointing into string literals.
     sources: HashMap<FileId, &'a str>,
+    /// The named refinements.
+    refined_types: Vec<RefinedType<'a>>,
+    /// The refinements of each struct's fields, by declaration, with the
+    /// field's index.
+    field_refines: HashMap<Ty, Vec<(usize, Rc<refine::Refine>)>>,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -390,6 +427,12 @@ struct FnCx {
     /// The type parameters a pack declared (one per argument in an
     /// expansion).
     pack_params: Vec<Ty>,
+    /// The locals with a refinement every value they're given must meet: a
+    /// `var` of a named refinement, and a parameter with a refinement that
+    /// the body can assign. With the leaf that's the local itself.
+    place_refines: HashMap<LocalId, (Rc<refine::Refine>, refine::Leaf)>,
+    /// The refinement of the function's result.
+    ret_refine: Option<Rc<refine::Refine>>,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -462,6 +505,8 @@ impl FnCx {
             ct_loop_floor: None,
             expanding: None,
             pack_params: Vec::new(),
+            place_refines: HashMap::new(),
+            ret_refine: None,
         }
     }
 
@@ -1326,6 +1371,7 @@ impl<'a> Checker<'a> {
                             let shown = Self::shown_name(packages, pkg, &s.name.name);
                             let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
                             self.no_pack(&s.generics, "a struct's");
+                            self.no_generic_refine(&s.generics);
                             let (params, _) = self.declare_generics(&mut gcx, &s.generics);
                             let ty = Ty::new_struct(shown, pkg, s.is_pub, params);
                             self.check_type_name(&s.name);
@@ -1336,11 +1382,22 @@ impl<'a> Checker<'a> {
                             let shown = Self::shown_name(packages, pkg, &e.name.name);
                             let mut gcx = FnCx::new(pkg, file.id, Ty::Unit, false);
                             self.no_pack(&e.generics, "an enum's");
+                            self.no_generic_refine(&e.generics);
                             let (params, _) = self.declare_generics(&mut gcx, &e.generics);
                             let ty = Ty::new_enum(shown, pkg, e.is_pub, params);
                             self.check_type_name(&e.name);
                             enums.push((e, pkg, file.id, ty));
                             (&e.name, Item::Type(ty))
+                        }
+                        ast::Item::Type(t) => {
+                            self.refined_types.push(RefinedType {
+                                decl: t,
+                                pkg,
+                                file: file.id,
+                                state: RefinedState::Unresolved,
+                            });
+                            self.check_type_name(&t.name);
+                            (&t.name, Item::Refined(self.refined_types.len() - 1))
                         }
                         ast::Item::If(_) | ast::Item::CompileError(_) => {
                             unreachable!("replaced by `active_items`")
@@ -1728,6 +1785,8 @@ impl<'a> Checker<'a> {
         let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
         cx.type_params = ty.decl_params();
         let mut fields: Vec<Field> = Vec::new();
+        // The named refinements of the fields' types, by field.
+        let mut named = Vec::new();
         if s.fields.is_empty() {
             self.error(
                 s.name.span,
@@ -1745,7 +1804,11 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
-            let ty = self.field_type(&mut cx, &f.ty, "struct");
+            let (ty, r) = match self.resolve_refined(&mut cx, &f.ty) {
+                Some((ty, r)) => (self.storable_field(ty, &f.ty, "struct"), r),
+                None => (Ty::Unit, None),
+            };
+            named.push((fields.len(), f, r));
             if let Some(at) = f.uninit {
                 self.check_uninit_field(f, at, ty);
             }
@@ -1755,6 +1818,39 @@ impl<'a> Checker<'a> {
                 is_pub: f.is_pub,
                 uninit: f.uninit.is_some(),
             });
+        }
+        // The refinements, which can name any field.
+        let mut refines = Vec::new();
+        for (j, f, r) in named {
+            let written = match &f.refine {
+                Some(e) => {
+                    let scope = refine::Scope {
+                        params: &[],
+                        visible: 0,
+                        own: None,
+                        result: None,
+                        fields: Some((&fields, j)),
+                        self_ty: None,
+                    };
+                    let w = self.refinement(&mut cx, e, &scope);
+                    if w.is_some() && type_range(fields[j].ty).is_none() {
+                        self.error(
+                            f.ty.span(),
+                            format!("a refined field is an integer, not a `{}`", fields[j].ty),
+                        );
+                        None
+                    } else {
+                        w
+                    }
+                }
+                None => None,
+            };
+            if let Some(r) = refine::Refine::and(r, written) {
+                refines.push((j, r));
+            }
+        }
+        if !refines.is_empty() {
+            self.field_refines.insert(ty, refines);
         }
         fields
     }
@@ -1799,6 +1895,12 @@ impl<'a> Checker<'a> {
         let Some(ty) = self.resolve_type(cx, t) else {
             return Ty::Unit;
         };
+        self.storable_field(ty, t, what)
+    }
+
+    /// `ty`, written `t`, if a field of a `what` can have it; `()` after
+    /// an error.
+    fn storable_field(&mut self, ty: Ty, t: &TypeExpr, what: &str) -> Ty {
         match storable(ty) {
             Ok(()) => ty,
             Err(Some(())) => {
@@ -2173,6 +2275,10 @@ impl<'a> Checker<'a> {
                 };
                 match self.package_item(cx, pkg, &name.name, name.span)? {
                     Item::Type(ty) => Some(ty),
+                    Item::Refined(_) => {
+                        self.refined_here(t.span(), &format!("{}.{}", pkg_name.name, name.name));
+                        None
+                    }
                     _ => {
                         self.error(
                             t.span(),
@@ -2227,6 +2333,10 @@ impl<'a> Checker<'a> {
                 }
                 None => match self.pkgs[cx.pkg].items.get(&id.name) {
                     Some(Item::Type(ty)) => Some(*ty),
+                    Some(Item::Refined(_)) => {
+                        self.refined_here(id.span, &id.name);
+                        None
+                    }
                     Some(Item::Trait(_)) => {
                         self.diags.push(
                             Diagnostic::error(
@@ -2268,6 +2378,15 @@ impl<'a> Checker<'a> {
                 },
             },
         }
+    }
+
+    /// Report a named refinement used inside another type, where it would
+    /// lose its refinement.
+    fn refined_here(&mut self, span: Span, name: &str) {
+        self.diags.push(
+            Diagnostic::error(span, format!("`{name}` is a named refinement, which can't be part of another type yet"))
+                .with_help("a named refinement is the whole type of a parameter, a result, a struct field or a `let` or `var`"),
+        );
     }
 
     /// Whether `elem` can be the element type of an array or slice (`what`).
@@ -2401,6 +2520,9 @@ impl<'a> Checker<'a> {
             && (!o.decl_params().is_empty() || !f.owner_generics.is_empty())
         {
             let span = f.owner.as_ref().map_or(f.name.span, TypeExpr::span);
+            if cx.expanding.is_none() {
+                self.no_generic_refine(&f.owner_generics);
+            }
             match self.declare_owner_generics(cx, o, &f.owner_generics, span) {
                 Some((ps, bs)) => {
                     owner = Some(o.instantiate(&ps));
@@ -2423,7 +2545,14 @@ impl<'a> Checker<'a> {
         type_params.extend(own);
         bounds.extend(own_bounds);
         cx.type_params = type_params.clone();
+        let vparam_refine = if cx.expanding.is_none() {
+            self.vparam_refine(cx, &f.generics)
+        } else {
+            None
+        };
         let mut params = Vec::new();
+        // The named refinements of the parameters' types.
+        let mut named = Vec::new();
         let has_self = f.params.first().is_some_and(ast::Param::is_self);
         // `comptime` parameters and a pack make a template
         // ([`comptime`]); its expansions have neither.
@@ -2496,9 +2625,12 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
+                named.push(None);
                 owner.unwrap_or(Ty::Unit)
             } else {
-                self.resolve_type(cx, &p.ty).unwrap_or(Ty::Unit)
+                let (ty, r) = self.resolve_refined(cx, &p.ty).unwrap_or((Ty::Unit, None));
+                named.push(r);
+                ty
             };
             self.check_convention(p, ty);
             // A `set self` is reported, and checked as `self`.
@@ -2508,6 +2640,7 @@ impl<'a> Checker<'a> {
             };
             params.push((ty, convention, p.name.name.clone()));
         }
+        let mut ret_named = None;
         let ret = match &f.ret {
             // `never` is only a return type (docs/types.md).
             Some(TypeExpr::Named(id)) if id.name == NEVER => {
@@ -2519,7 +2652,10 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Never
             }
-            Some(t) => match self.resolve_type(cx, t) {
+            Some(t) => match self.resolve_refined(cx, t).map(|(ty, r)| {
+                ret_named = r;
+                ty
+            }) {
                 // A `str` with static storage can be returned (see
                 // `check_str_returns`).
                 Some(Ty::Str) if f.throws.is_some() => {
@@ -2540,6 +2676,22 @@ impl<'a> Checker<'a> {
             None => Ty::Unit,
         };
         let throws = f.throws.as_ref().and_then(|t| self.error_type(cx, t));
+        let (refines, ret_refine) = if is_template || cx.expanding.is_some() {
+            let given = f
+                .params
+                .iter()
+                .find_map(|p| p.refine.as_ref())
+                .or(f.ret_refine.as_ref());
+            if let (Some(e), None) = (given, cx.expanding) {
+                self.error(
+                    e.span,
+                    "refinements on a function with `comptime` parameters or a pack are not supported by the compiler yet",
+                );
+            }
+            (vec![None; params.len()], None)
+        } else {
+            self.sig_refines(cx, f, &params, &named, ret, ret_named, is_member)
+        };
         let name = match &f.owner {
             Some(TypeExpr::Named(t)) => format!("{}.{}", t.name, f.name.name),
             Some(TypeExpr::Qualified(p, t)) => format!("{}.{}.{}", p.name, t.name, f.name.name),
@@ -2562,6 +2714,9 @@ impl<'a> Checker<'a> {
             owner_params,
             self_ty: cx.self_ty,
             symbol_name: None,
+            refines,
+            ret_refine,
+            vparam_refine,
         }
     }
 
@@ -2621,6 +2776,7 @@ impl<'a> Checker<'a> {
                 None => ty.as_enum().expect("a struct or an enum").is_pub,
             },
             Item::Trait(t) => self.traits[self.trait_index[&t]].decl.is_pub,
+            Item::Refined(k) => self.refined_types[k].decl.is_pub,
         };
         if pkg != cx.pkg && !is_pub {
             let path = self.pkgs[pkg].path.clone();
@@ -2900,6 +3056,8 @@ impl<'a> Checker<'a> {
             let local = Self::declare_local(&mut cx, &format!("${p}"), Ty::Int(it), false, None);
             cx.value_locals.push((p, local));
         }
+        self.assume_vparams(&mut cx, id);
+        self.assume_params(&mut cx, id);
         let body = self.block(&mut cx, &f.body.stmts);
         self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
@@ -3252,6 +3410,11 @@ impl<'a> Checker<'a> {
                 c: up.offset,
             }]);
         }
+        // Bounds a call's result refinement gives (`result <= buf.len`).
+        if !value.known.is_empty() {
+            let known = refine::known_facts(cx, local, &value.known);
+            cx.env.apply(&known);
+        }
         // A slice `v[i..j]` has the length `j - i`: its range, and how it
         // relates to `j` when that's a term (exactly, when `i` is a
         // constant).
@@ -3377,9 +3540,12 @@ impl<'a> Checker<'a> {
                 span,
                 ..
             } => {
-                let annotated = match ty {
-                    Some(t) => Some(self.resolve_type(cx, t)?),
-                    None => None,
+                let (annotated, named) = match ty {
+                    Some(t) => {
+                        let (ty, r) = self.resolve_refined(cx, t)?;
+                        (Some(ty), r)
+                    }
+                    None => (None, None),
                 };
                 let Some(init) = init else {
                     // `var x: T`: assigned later, before it's read.
@@ -3406,6 +3572,9 @@ impl<'a> Checker<'a> {
                     }
                     let local = self.declare(cx, &name.name, ty, true);
                     cx.env.declare_uninit(local);
+                    if let Some(r) = named {
+                        cx.place_refines.insert(local, (r, refine::Leaf::Value));
+                    }
                     return None;
                 };
                 if cx.scopes.last().expect("scope").contains_key(&name.name) {
@@ -3444,7 +3613,12 @@ impl<'a> Checker<'a> {
                 self.consume(cx, &value.expr, init.span)?;
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
                 self.check_kept_view(cx, &value, init.span)?;
+                if let Some(r) = named {
+                    cx.place_refines.insert(local, (r, refine::Leaf::Value));
+                    self.check_local_refine(cx, local, &value, init.span);
+                }
                 self.record_value(cx, local, &value);
+                self.assume_local_refine(cx, local);
                 Some(TStmt::Init(local, value.expr))
             }
             Stmt::Assign {
@@ -3515,7 +3689,9 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 self.check_kept_view(cx, &checked, value.span)?;
+                self.check_local_refine(cx, local, &checked, value.span);
                 self.record_value(cx, local, &checked);
+                self.assume_local_refine(cx, local);
                 Some(TStmt::Assign(local, checked.expr))
             }
             // Reached in code that's checked: an error. The program isn't
@@ -3588,6 +3764,7 @@ impl<'a> Checker<'a> {
                     }
                     (Some(v), ret) => self
                         .expr(cx, v, Some(ret))
+                        .inspect(|checked| self.check_return_refine(cx, checked, v.span))
                         .and_then(|checked| self.coerce(cx, checked, ret, v.span))
                         .filter(|c| self.consume(cx, &c.expr, v.span).is_some())
                         .map(|c| c.expr),
@@ -4206,6 +4383,8 @@ impl<'a> Checker<'a> {
         };
         let mut before = Vec::new();
         cx.scopes.push(HashMap::new());
+        // What a refined result says about the value in it.
+        let known = checked.as_ref().and_then(|c| c.payload.clone());
         let checked = checked.filter(|c| {
             matches!(c.expr.kind, TExprKind::Local(_))
                 || self.consume(cx, &c.expr, i.cond.span).is_some()
@@ -4219,7 +4398,11 @@ impl<'a> Checker<'a> {
         cx.scopes.push(HashMap::new());
         // The value's type, or `()` if it's in error (only to keep checking).
         let local = self.declare(cx, &name.name, inner.unwrap_or(Ty::Unit), false);
-        cx.env.assign(local, None);
+        cx.env.assign(local, known.as_ref().and_then(|k| k.0));
+        if let Some(k) = &known {
+            let facts = refine::known_facts(cx, local, &k.1);
+            cx.env.apply(&facts);
+        }
         let mut then = Vec::new();
         if let (Some(m), Some(t)) = (&matched, inner) {
             let value = payload(m, 1, 0, t);
@@ -4305,6 +4488,8 @@ impl<'a> Checker<'a> {
         if !matches!(checked.expr.kind, TExprKind::Local(_)) {
             self.consume(cx, &checked.expr, init.span)?;
         }
+        // What a refined result says about the value in it.
+        let known = checked.payload.clone();
         let matched = matched_local(cx, checked, &mut before);
         let entry = cx.env.clone();
         let else_body = self.block(cx, &otherwise.stmts);
@@ -4332,11 +4517,15 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let value = expr::Checked::new(
+        let mut value = expr::Checked::new(
             TExprKind::Payload(Box::new(matched.clone()), 1, 0),
             inner,
             None,
         );
+        if let Some(k) = known {
+            value.range = k.0;
+            value.known = k.1;
+        }
         self.consume(cx, &value.expr, name.span)?;
         let local = self.declare(cx, &name.name, inner, mutable);
         self.record_value(cx, local, &value);
@@ -4559,6 +4748,7 @@ impl<'a> Checker<'a> {
         cx.locals.truncate(mark.locals);
         cx.failed.retain(|&l| l < mark.locals);
         cx.ct_values.retain(|&l, _| l < mark.locals);
+        cx.place_refines.retain(|&l, _| l < mark.locals);
         cx.strs = mark.strs.clone();
         cx.moved = mark.moved.clone();
         self.generic_calls.truncate(mark.generic_calls);
@@ -5023,6 +5213,7 @@ impl<'a> Checker<'a> {
         };
         let checked = self.coerce(cx, checked, ty, value.span)?;
         self.consume(cx, &checked.expr, value.span)?;
+        self.check_field_assign(cx, &place.expr, &checked, value.span);
         // A field reached through fields only is a term, or a struct of them:
         // forget what was known about them, then learn their new values.
         // Anything under an index is in an array, which has no facts.

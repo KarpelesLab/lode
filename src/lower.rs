@@ -1888,7 +1888,7 @@ impl FnLower<'_> {
                 self.expr(call);
                 return self.no_value(e.ty);
             }
-            TExprKind::Unproven(..) | TExprKind::CompileError { .. } => {
+            TExprKind::Unproven(..) | TExprKind::Refined(..) | TExprKind::CompileError { .. } => {
                 unreachable!("only in code run at compile time")
             }
             TExprKind::EnumValue(inner) => self.tag_of(inner),

@@ -11,6 +11,7 @@ use super::facts::{self, CondFacts, Env, Form, Linear, Side, Term};
 use super::generic::{
     GenericEdge, Inference, ORDERED_METHODS, expr_type, num, param_help, show_range,
 };
+use super::refine::{self, ArgVal, Known};
 use super::tree::*;
 use super::{Checker, ConstVal, FnCx, Item, type_range};
 
@@ -36,6 +37,12 @@ pub(super) struct Checked {
     /// For integers, the value as `F / m` (rounded down) of a form `F` that
     /// can't be negative and a constant `m >= 1`, like `(MAX - d) / 10`.
     pub(super) quot: Option<(Form, i128)>,
+    /// For integers that aren't a form, bounds relative to terms: what a
+    /// call's result refinement says, in the caller's terms.
+    pub(super) known: Vec<Known>,
+    /// For an optional: what's known about the value in it, when there is
+    /// one (a call whose result `?T` is refined).
+    pub(super) payload: Option<Box<(Option<Range>, Vec<Known>)>>,
 }
 
 /// What the checker knows about the length of a slice `base[start..end]`,
@@ -62,6 +69,8 @@ impl Checked {
             len: None,
             form: None,
             quot: None,
+            known: Vec::new(),
+            payload: None,
         }
     }
 
@@ -85,6 +94,7 @@ impl Checked {
         out.upper = self.upper;
         out.form = self.form;
         out.quot = self.quot;
+        out.known = self.known;
         out
     }
 
@@ -1197,7 +1207,12 @@ impl Checker<'_> {
             }
             Some(_) => {}
         }
-        Some(Checked::new(TExprKind::Try(Box::new(c.expr)), value, None))
+        let known = c.payload.clone();
+        let mut out = Checked::new(TExprKind::Try(Box::new(c.expr)), value, None);
+        if let Some(k) = known {
+            attach_facts(&mut out, value, k.0, k.1);
+        }
+        Some(out)
     }
 
     /// `call catch e { ... }`, `call catch _ { ... }` or `call catch value`:
@@ -1216,6 +1231,9 @@ impl Checker<'_> {
     ) -> Option<Checked> {
         let c = self.throwing_call(cx, value, "catch", expected)?;
         let (ty, err) = c.ty().as_result().expect("a result");
+        // What a refined result says about the call's value: the value of
+        // the `catch` when its block leaves, joined with the fallback's.
+        let mut known = c.payload.clone();
         let entry = cx.env.clone();
         // When the call fails, the variables it was to assign (`set`) aren't.
         for l in std::mem::take(&mut cx.call_sets) {
@@ -1226,6 +1244,10 @@ impl Checker<'_> {
                 let d = self.expr(cx, v, Some(ty));
                 let d = self.coerce(cx, d?, ty, v.span)?;
                 self.consume(cx, &d.expr, v.span)?;
+                if let Some(k) = &mut known {
+                    let r = k.0.or(type_range(ty)).map(|r| r.hull(d.int_range()));
+                    **k = (r, Vec::new());
+                }
                 cx.env = Env::join(entry, std::mem::take(&mut cx.env));
                 (None, Handler::Value(Box::new(d.expr)))
             }
@@ -1258,10 +1280,13 @@ impl Checker<'_> {
                 }
                 let end = std::mem::take(&mut cx.env);
                 cx.env = Checker::join_branches(vec![(entry, false), (end, leaves)]);
+                if !leaves {
+                    known = None;
+                }
                 (local, Handler::Block(body))
             }
         };
-        Some(Checked::new(
+        let mut out = Checked::new(
             TExprKind::Catch {
                 call: Box::new(c.expr),
                 binding: local,
@@ -1269,7 +1294,11 @@ impl Checker<'_> {
             },
             ty,
             None,
-        ))
+        );
+        if let Some(k) = known {
+            attach_facts(&mut out, ty, k.0, k.1);
+        }
+        Some(out)
     }
 
     /// The error `value` of `throw value`, of the function's error type.
@@ -1373,6 +1402,8 @@ impl Checker<'_> {
         };
         let mut given = vec![false; def.fields.len()];
         let mut out = Vec::new();
+        // The integer fields' values, for the fields' refinements.
+        let mut vals = Vec::new();
         let mut ok = true;
         for (k, init) in inits.iter().enumerate() {
             let name = &init.name.name;
@@ -1398,7 +1429,12 @@ impl Checker<'_> {
                 .and_then(|c| self.coerce(cx, c, fty, init.value.span))
                 .filter(|c| self.consume(cx, &c.expr, init.value.span).is_some())
             {
-                Some(c) => out.push((i as u32, c.expr)),
+                Some(c) => {
+                    if type_range(fty).is_some() {
+                        vals.push((i, refine::Val::of(&c), init.value.span));
+                    }
+                    out.push((i as u32, c.expr));
+                }
                 None => ok = false,
             }
         }
@@ -1430,7 +1466,15 @@ impl Checker<'_> {
             );
             ok = false;
         }
-        ok.then(|| Checked::new(TExprKind::StructLit(out), sty, None))
+        if !ok {
+            return None;
+        }
+        let c = Checked::new(TExprKind::StructLit(out), sty, None);
+        Some(if self.check_struct_lit(cx, sty, &vals, span) {
+            c
+        } else {
+            c.unproven(span)
+        })
     }
 
     /// Report a literal of a struct with private fields outside its
@@ -2270,6 +2314,13 @@ impl Checker<'_> {
                 );
                 None
             }
+            Item::Refined(_) => {
+                self.error(
+                    span,
+                    format!("`{name}` is a type; convert a value to it with `{name}(x)`"),
+                );
+                None
+            }
             Item::Type(ty) => {
                 match ty.as_enum() {
                     Some(def) => self.error(
@@ -2387,6 +2438,8 @@ impl Checker<'_> {
                     Some(_) => field_term(&b.expr, i),
                     None => None,
                 };
+                let at = super::refine::struct_place(&b.expr);
+                let sty = b.ty();
                 // A field of a literal (a struct constant's value) is known.
                 let literal = match &b.expr.kind {
                     TExprKind::StructLit(fields) => fields.iter().find_map(|(k, v)| match v.kind {
@@ -2401,6 +2454,9 @@ impl Checker<'_> {
                     literal.or_else(|| term.and_then(|t| super::read_range(cx, t))),
                 );
                 c.term = term.map(Linear::of);
+                if literal.is_none() {
+                    self.field_read(cx, sty, at, i, &mut c);
+                }
                 Some(c)
             }
             (Ty::Str, "bytes") => {
@@ -2837,6 +2893,9 @@ impl Checker<'_> {
         // The right side runs only then: after it, what's known is what
         // holds whether it ran or not.
         let before = cx.env.clone();
+        // What a refined result says about the value in `opt`; with a
+        // fallback, the value is either.
+        let mut known = l.payload.clone();
         let r = match &rhs.kind {
             ExprKind::Throw(value) => TExpr {
                 kind: TExprKind::Throw(Box::new(self.throw(cx, value, rhs.span)?)),
@@ -2846,15 +2905,23 @@ impl Checker<'_> {
                 let r = self.expr(cx, rhs, Some(inner))?;
                 let r = self.coerce(cx, r, inner, rhs.span)?;
                 self.consume(cx, &r.expr, rhs.span)?;
+                if let Some(k) = &mut known {
+                    let range = k.0.or(type_range(inner)).map(|x| x.hull(r.int_range()));
+                    **k = (range, Vec::new());
+                }
                 r.expr
             }
         };
         cx.env = Env::join(before, std::mem::take(&mut cx.env));
-        Some(Checked::new(
+        let mut out = Checked::new(
             TExprKind::Coalesce(Box::new(l.expr), Box::new(r)),
             inner,
             None,
-        ))
+        );
+        if let Some(k) = known {
+            attach_facts(&mut out, inner, k.0, k.1);
+        }
+        Some(out)
     }
 
     /// `p + n` on a raw pointer: move it forward by `n` elements.
@@ -3410,6 +3477,8 @@ impl Checker<'_> {
                         format!("`{name}` is a struct; build one with `{name}{{...}}`"),
                     );
                     return None;
+                } else if let Some(&Item::Refined(k)) = self.pkgs[cx.pkg].items.get(name) {
+                    return self.refined_conversion(cx, k, name, callee.span, args, span);
                 } else if primitive(name, self.ptr_bits).is_some() {
                     return self.conversion(cx, name, callee.span, args, span);
                 } else if name == SYSCALL {
@@ -3436,6 +3505,10 @@ impl Checker<'_> {
                     }
                     Item::Type(ty) if ty.as_enum().is_some() => {
                         return self.enum_from(cx, ty, args, span);
+                    }
+                    Item::Refined(k) => {
+                        let shown = format!("{pkg_name}.{}", member.name);
+                        return self.refined_conversion(cx, k, &shown, callee.span, args, span);
                     }
                     Item::Const(_) | Item::Type(_) | Item::Trait(_) => {
                         self.error(
@@ -3606,19 +3679,30 @@ impl Checker<'_> {
             }
         }
         let mut targs = Vec::new();
-        // The places passed `inout` or `set`, which the call may change.
+        // The places passed `inout` or `set`, which the call may change,
+        // with the parameter each is passed to.
         let mut changed = Vec::new();
+        let mut changed_k = Vec::new();
+        // What each argument is known as, for the callee's refinements.
+        let mut arg_vals: Vec<ArgVal> = vec![ArgVal::default(); params.len()];
+        let mut recv_span = span;
         let mut ok = true;
         if let Some((recv, rspan)) = receiver {
+            recv_span = rspan;
             // The receiver gives the type's arguments: `p.swap()` on a
             // `Pair[u8, bool]`.
             inf.unify(params[0].0, recv.ty(), rspan);
+            if params[0].1 != Convention::Inout {
+                arg_vals[0] = self.arg_of_checked(cx, &recv);
+            }
             let e = match params[0].1 {
                 Convention::Inout => {
                     let place = self.mutable_place(cx, recv.expr, rspan, Changer::Receiver(&name));
                     match place {
                         Some(p) => {
+                            arg_vals[0] = self.arg_of_place(cx, &p);
                             changed.push((p.clone(), Convention::Inout));
+                            changed_k.push(0);
                             Some(TExpr {
                                 ty: p.ty,
                                 kind: TExprKind::Ref(Box::new(p)),
@@ -3641,6 +3725,7 @@ impl Checker<'_> {
         for (k, (arg, (pty, conv, pname))) in args.iter().zip(&params[skip..]).enumerate() {
             let (pty, conv) = (*pty, *conv);
             targs.push(None);
+            let before = changed.len();
             let e = if inf.known(pty) {
                 self.call_arg(cx, arg, inf.apply(pty), conv, pname, &name, &mut changed)
             } else if self.untyped_int(cx, arg).is_some()
@@ -3652,8 +3737,12 @@ impl Checker<'_> {
             } else {
                 self.infer_arg(cx, arg, pty, conv, pname, &name, &mut inf, &mut changed)
             };
+            changed_k.extend((before..changed.len()).map(|_| skip + k));
             match e {
-                Some(e) => targs[skip + k] = Some(e),
+                Some((e, av)) => {
+                    targs[skip + k] = Some(e);
+                    arg_vals[skip + k] = av;
+                }
                 None => ok = false,
             }
         }
@@ -3664,6 +3753,7 @@ impl Checker<'_> {
         }
         for k in deferred {
             let (pty, conv, pname) = &params[skip + k];
+            let before = changed.len();
             if !inf.known(*pty) {
                 // A literal of a generic type may fix the arguments itself.
                 if self.generic_literal(cx, &args[k]) {
@@ -3677,14 +3767,18 @@ impl Checker<'_> {
                         &mut inf,
                         &mut changed,
                     );
+                    changed_k.extend((before..changed.len()).map(|_| skip + k));
                     match e {
-                        Some(e) => targs[skip + k] = Some(e),
+                        Some((e, av)) => {
+                            targs[skip + k] = Some(e);
+                            arg_vals[skip + k] = av;
+                        }
                         None => ok = false,
                     }
                 }
                 continue;
             }
-            match self.call_arg(
+            let e = self.call_arg(
                 cx,
                 &args[k],
                 inf.apply(*pty),
@@ -3692,8 +3786,13 @@ impl Checker<'_> {
                 pname,
                 &name,
                 &mut changed,
-            ) {
-                Some(e) => targs[skip + k] = Some(e),
+            );
+            changed_k.extend((before..changed.len()).map(|_| skip + k));
+            match e {
+                Some((e, av)) => {
+                    targs[skip + k] = Some(e);
+                    arg_vals[skip + k] = av;
+                }
                 None => ok = false,
             }
         }
@@ -3735,6 +3834,77 @@ impl Checker<'_> {
         if generic && !self.check_bounds(id, &bound_name, &inf) {
             ok = false;
         }
+        // The parameters' refinements, proven here (docs/safety.md,
+        // Refinements in types). In code that only runs at compile time,
+        // the evaluator checks the ones that aren't.
+        let refines = self.sigs[id].refines.clone();
+        let ret_refine = self.sigs[id].ret_refine.clone();
+        let arg_span = |k: usize| {
+            if k < skip {
+                recv_span
+            } else {
+                args[k - skip].span
+            }
+        };
+        let mut unproven = None;
+        // The refinements of the fields of struct places passed, which the
+        // callee's refinements may name.
+        for a in &arg_vals {
+            if let (Some((l, b)), Some(t)) = (a.place, a.ty) {
+                self.assume_struct(cx, l, b, t);
+            }
+        }
+        if ok && let Some(r) = self.sigs[id].vparam_refine.clone() {
+            // The value arguments: known when compiling, or the caller's
+            // own value parameters.
+            let vparam = |p: Ty| inf.apply(p);
+            for atom in &r.atoms {
+                if refine::holds(cx, atom, &|l| {
+                    refine::call_leaf(cx, l, &arg_vals, &vparam, None)
+                }) {
+                    continue;
+                }
+                if cx.comptime {
+                    unproven = unproven.or(Some(span));
+                    continue;
+                }
+                self.refine_error(
+                    span,
+                    atom,
+                    &format!("for the generic arguments of `{name}`"),
+                    None,
+                );
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let vparam = |p: Ty| inf.apply(p);
+            'params: for (k, r) in refines.iter().enumerate() {
+                let Some(r) = r else {
+                    continue;
+                };
+                if params[k].1 == Convention::Set {
+                    continue;
+                }
+                for atom in &r.atoms {
+                    let proven = refine::holds(cx, atom, &|l| {
+                        refine::call_leaf(cx, l, &arg_vals, &vparam, None)
+                    });
+                    if proven {
+                        continue;
+                    }
+                    if cx.comptime {
+                        unproven = unproven.or(Some(arg_span(k)));
+                        continue;
+                    }
+                    let what = format!("for `{}` of `{name}`", params[k].2);
+                    self.refine_error(arg_span(k), atom, &what, arg_vals[k].value.as_ref());
+                    ok = false;
+                    break 'params;
+                }
+            }
+        }
         // What the call may have changed: facts about it are forgotten, and
         // a variable passed `set` is assigned (if the call succeeds).
         let mut sets = Vec::new();
@@ -3750,6 +3920,29 @@ impl Checker<'_> {
             }
         }
         cx.call_sets = sets;
+        // A changed place that isn't a term has no value known any more.
+        for &k in &changed_k {
+            if let Some(v) = &arg_vals[k].value
+                && v.form.is_none()
+                && let Some(t) = arg_vals[k].ty
+            {
+                arg_vals[k].value = type_range(t).map(refine::Val::opaque);
+            }
+        }
+        if ok {
+            let vparam = |p: Ty| inf.apply(p);
+            for ((place, _), &k) in changed.iter().zip(&changed_k) {
+                let callee = refines[k].clone();
+                if !self.ref_keeps_refine(cx, place, k, callee.as_deref(), &arg_vals, &vparam) {
+                    let at = arg_span(k);
+                    self.diags.push(
+                        Diagnostic::error(at, format!("`{name}` may change this to a value outside its refinement"))
+                            .with_help(format!("the parameter `{}` of `{name}` doesn't have a refinement that proves it: give it one", params[k].2)),
+                    );
+                    ok = false;
+                }
+            }
+        }
         // Nothing after a call to a `never` function runs: what follows it
         // can't be reached, as after a `return`.
         if sig_ret == Ty::Never {
@@ -3760,13 +3953,30 @@ impl Checker<'_> {
         }
         let targs: Vec<TExpr> = targs.into_iter().map(|a| a.expect("checked")).collect();
         let mut ret = inf.apply(sig_ret);
+        // What the result's refinement says about the value it returns.
+        let result_facts = ret_refine.map(|r| {
+            let vparam = |p: Ty| inf.apply(p);
+            refine::value_facts(cx, &r, &|l| {
+                refine::call_leaf(cx, l, &arg_vals, &vparam, None)
+            })
+        });
+        let value_ty = ret;
         if let Some(err) = throws
             && handled
         {
             ret = Ty::result(ret, err);
         }
+        let finish = |mut c: Checked| -> Checked {
+            if let Some((range, known)) = result_facts {
+                attach_facts(&mut c, value_ty, range, known);
+            }
+            match unproven {
+                Some(at) => c.unproven(at),
+                None => c,
+            }
+        };
         if !generic {
-            return Some(Checked::new(TExprKind::Call(id, targs), ret, None));
+            return Some(finish(Checked::new(TExprKind::Call(id, targs), ret, None)));
         }
         let types = inf.types();
         if let Some(caller) = cx.func
@@ -3779,11 +3989,11 @@ impl Checker<'_> {
                 span,
             });
         }
-        Some(Checked::new(
+        Some(finish(Checked::new(
             TExprKind::GenericCall(id, types, targs),
             ret,
             None,
-        ))
+        )))
     }
 
     /// The argument `arg` of a call of `name`, for its parameter `pname` of
@@ -3800,15 +4010,19 @@ impl Checker<'_> {
         pname: &str,
         name: &str,
         changed: &mut Vec<(TExpr, Convention)>,
-    ) -> Option<TExpr> {
+    ) -> Option<(TExpr, ArgVal)> {
         match (&arg.kind, conv) {
             (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
                 let place = self.ref_arg(cx, inner, pty, conv, arg.span)?;
+                let av = self.arg_of_place(cx, &place);
                 changed.push((place.clone(), conv));
-                Some(TExpr {
-                    kind: TExprKind::Ref(Box::new(place)),
-                    ty: pty,
-                })
+                Some((
+                    TExpr {
+                        kind: TExprKind::Ref(Box::new(place)),
+                        ty: pty,
+                    },
+                    av,
+                ))
             }
             (ExprKind::Ref(_), _) => {
                 let how = match conv {
@@ -3849,7 +4063,8 @@ impl Checker<'_> {
                 if conv == Convention::Sink {
                     self.consume(cx, &c.expr, arg.span)?;
                 }
-                Some(c.expr)
+                let av = self.arg_of_checked(cx, &c);
+                Some((c.expr, av))
             }
         }
     }
@@ -3868,7 +4083,7 @@ impl Checker<'_> {
         name: &str,
         inf: &mut Inference,
         changed: &mut Vec<(TExpr, Convention)>,
-    ) -> Option<TExpr> {
+    ) -> Option<(TExpr, ArgVal)> {
         match (&arg.kind, conv) {
             (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
                 let place = self.ref_place(cx, inner, None, conv)?;
@@ -3879,11 +4094,15 @@ impl Checker<'_> {
                 }
                 let pty = inf.apply(pty);
                 let place = self.ref_check(cx, place, pty, arg.span)?;
+                let av = self.arg_of_place(cx, &place);
                 changed.push((place.clone(), conv));
-                Some(TExpr {
-                    kind: TExprKind::Ref(Box::new(place)),
-                    ty: pty,
-                })
+                Some((
+                    TExpr {
+                        kind: TExprKind::Ref(Box::new(place)),
+                        ty: pty,
+                    },
+                    av,
+                ))
             }
             (ExprKind::Ref(_), _) | (_, Convention::Inout | Convention::Set) => {
                 self.call_arg(cx, arg, pty, conv, pname, name, changed)
@@ -3900,7 +4119,8 @@ impl Checker<'_> {
                 if conv == Convention::Sink {
                     self.consume(cx, &c.expr, arg.span)?;
                 }
-                Some(c.expr)
+                let av = self.arg_of_checked(cx, &c);
+                Some((c.expr, av))
             }
         }
     }
@@ -4156,7 +4376,7 @@ impl Checker<'_> {
     }
 
     /// `u8(x)` and similar: an integer conversion that must be proven lossless.
-    fn conversion(
+    pub(super) fn conversion(
         &mut self,
         cx: &mut FnCx,
         name: &str,
@@ -4212,4 +4432,26 @@ impl Checker<'_> {
         out.upper = None;
         Some(out)
     }
+}
+
+/// What a refinement says about a call's value, on its checked value `c`
+/// of type `ty` (inside an optional or a result, the payload's).
+pub(super) fn attach_facts(c: &mut Checked, ty: Ty, range: Option<Range>, known: Vec<Known>) {
+    let inner = ty.as_optional().unwrap_or(ty);
+    let range = match (range, type_range(inner)) {
+        (Some(r), Some(full)) => Some(r.intersect(full).unwrap_or(full)),
+        (r, _) => r,
+    };
+    if c.ty() != inner {
+        c.payload = Some(Box::new((range, known)));
+        return;
+    }
+    if let Some(r) = range {
+        let r0 = c.int_range();
+        c.range = Some(r0.intersect(r).unwrap_or(r0));
+    }
+    if c.upper.is_none() {
+        c.upper = refine::known_upper(&known);
+    }
+    c.known = known;
 }

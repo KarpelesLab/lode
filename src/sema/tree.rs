@@ -311,6 +311,11 @@ pub enum TExprKind {
     /// span (docs/generics.md, Proof obligations in compile-time code).
     /// Never lowered.
     Unproven(Span, Box<TExpr>),
+    /// `Digit(x)`, a conversion to a named refinement (by its number) that
+    /// wasn't proven, in code that only runs at compile time: the evaluator
+    /// checks the refinement as it runs. Always inside a
+    /// [`TExprKind::Unproven`]. Never lowered.
+    Refined(Box<TExpr>, usize),
     /// `compile_error(message, values...)` or `compile_error_at(place,
     /// message, values...)` in code that only runs at compile time: an
     /// error when it's reached, of type `never`. It's reported at `place`
@@ -445,6 +450,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
         | TExprKind::Never(inner)
+        | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],
@@ -550,6 +556,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
         | TExprKind::Never(inner)
+        | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
             Handler::Value(v) => vec![call, v],

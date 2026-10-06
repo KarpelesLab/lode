@@ -42,6 +42,8 @@ pub enum Item {
     CompileError(Expr),
     /// `trait Name: Super { ... }`
     Trait(TraitDecl),
+    /// `type Name = T where cond`: a named refinement of `T`.
+    Type(TypeDecl),
     /// `impl Trait for Type { ... }`
     Impl(ImplDecl),
 }
@@ -181,6 +183,22 @@ pub struct FieldDecl {
     pub uninit: Option<Span>,
     pub name: Ident,
     pub ty: TypeExpr,
+    /// `where cond` after the type: a refinement of the field, which every
+    /// value of the struct keeps (docs/safety.md, Refinements in types).
+    pub refine: Option<Expr>,
+}
+
+/// `type Name = T where cond` at package level: a named refinement of the
+/// type `T`, whose condition names the value `self`.
+#[derive(Debug)]
+pub struct TypeDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: TypeExpr,
+    /// The condition; `None` when the declaration has no `where`, which
+    /// the checker rejects.
+    pub refine: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug)]
@@ -205,6 +223,8 @@ pub struct FnDecl {
     /// `throws(E)`, or `throws` alone (an inferred error set).
     pub throws: Option<Throws>,
     pub ret: Option<TypeExpr>,
+    /// `-> T where cond`: a refinement of the result, named `result`.
+    pub ret_refine: Option<Expr>,
     pub body: Block,
     pub span: Span,
 }
@@ -219,6 +239,8 @@ pub struct GenericParam {
     /// `..A: Format`: a pack, any number of type parameters, each with the
     /// bounds (docs/generics.md, Format strings).
     pub pack: bool,
+    /// `N: usize where N > 0`: a refinement of a value parameter.
+    pub refine: Option<Expr>,
 }
 
 /// The `throws` clause of a function: `throws(E)` names the error type,
@@ -261,6 +283,9 @@ pub struct Param {
     pub convention: Convention,
     pub name: Ident,
     pub ty: TypeExpr,
+    /// `i: usize where i < buf.len`: a refinement, which callers prove and
+    /// the body assumes.
+    pub refine: Option<Expr>,
 }
 
 impl Param {

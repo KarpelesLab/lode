@@ -290,7 +290,8 @@ impl Parser {
                 "an `impl` is not marked `pub`: it's visible wherever its trait and type are",
             ),
             Tok::Kw(Kw::Impl) => self.impl_decl(start).map(Item::Impl),
-            Tok::Kw(kw @ (Kw::Type | Kw::Alias | Kw::Static | Kw::Unsafe)) => self.error(
+            Tok::Kw(Kw::Type) => self.type_decl(is_pub, start).map(Item::Type),
+            Tok::Kw(kw @ (Kw::Alias | Kw::Static | Kw::Unsafe)) => self.error(
                 self.span(),
                 format!(
                     "`{}` declarations are not supported by the compiler yet",
@@ -401,6 +402,26 @@ impl Parser {
         })
     }
 
+    /// `type Name = T where cond`: a named refinement.
+    fn type_decl(&mut self, is_pub: bool, start: Span) -> PResult<TypeDecl> {
+        self.bump(); // type
+        let name = self.ident("a type name")?;
+        self.expect_p(P::Eq)?;
+        let ty = self.type_expr()?;
+        let refine = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(TypeDecl {
+            is_pub,
+            name,
+            ty,
+            refine,
+            span: start.to(self.prev_span()),
+        })
+    }
+
     fn struct_decl(&mut self, is_pub: bool, start: Span) -> PResult<StructDecl> {
         self.bump(); // struct
         let name = self.ident("a struct name")?;
@@ -435,11 +456,17 @@ impl Parser {
             let field = self.ident("a field name or `}`")?;
             self.expect_p(P::Colon)?;
             let ty = self.type_expr()?;
+            let refine = if self.eat_kw(Kw::Where) {
+                Some(self.header_expr()?)
+            } else {
+                None
+            };
             fields.push(FieldDecl {
                 is_pub,
                 uninit,
                 name: field,
                 ty,
+                refine,
             });
             if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
                 return self.expected("a new line after the field");
@@ -497,6 +524,7 @@ impl Parser {
                         uninit: None,
                         name: field,
                         ty,
+                        refine: None,
                     });
                     self.skip_newlines();
                     if !self.eat_p(P::Comma) {
@@ -635,22 +663,29 @@ impl Parser {
         } else {
             None
         };
+        // `-> T where cond`: a `{` after it starts the body.
+        let ret_refine = if ret.is_some() && self.eat_kw(Kw::Where) {
+            Some(self.header_expr()?)
+        } else {
+            None
+        };
         if self.at_kw(Kw::Throws) {
             return self.error(
                 self.span(),
                 "`throws` comes before the return type: `fn f() throws(E) -> T`",
             );
         }
-        for kw in [Kw::Uses, Kw::Where] {
-            if self.at_kw(kw) {
-                return self.error(
-                    self.span(),
-                    format!(
-                        "`{}` clauses are not supported by the compiler yet",
-                        kw.as_str()
-                    ),
-                );
-            }
+        if self.at_kw(Kw::Uses) {
+            return self.error(
+                self.span(),
+                "`uses` clauses are not supported by the compiler yet",
+            );
+        }
+        if self.at_kw(Kw::Where) {
+            return self.error(
+                self.span(),
+                "a refinement follows a type: `fn f(i: usize where i < 10) -> u8 where result <= 9`",
+            );
         }
         // A trait's required method has no body.
         let has_body = member != Member::Trait || self.at_p(P::LBrace);
@@ -676,6 +711,7 @@ impl Parser {
                 params,
                 throws,
                 ret,
+                ret_refine,
                 span: start.to(body.span),
                 body,
             },
@@ -895,7 +931,17 @@ impl Parser {
             } else {
                 Vec::new()
             };
-            params.push(GenericParam { name, bounds, pack });
+            let refine = if self.eat_kw(Kw::Where) {
+                Some(self.nested_expr()?)
+            } else {
+                None
+            };
+            params.push(GenericParam {
+                name,
+                bounds,
+                pack,
+                refine,
+            });
             self.skip_newlines();
             if !self.eat_p(P::Comma) {
                 break;
@@ -1012,6 +1058,7 @@ impl Parser {
                 convention,
                 name,
                 ty,
+                refine: None,
             });
         }
         self.expect_p(P::Colon)?;
@@ -1023,11 +1070,17 @@ impl Parser {
         } else {
             self.type_expr()?
         };
+        let refine = if self.eat_kw(Kw::Where) {
+            Some(self.header_expr()?)
+        } else {
+            None
+        };
         Ok(Param {
             comptime,
             convention,
             name,
             ty,
+            refine,
         })
     }
 
@@ -2555,7 +2608,7 @@ mod tests {
 
     #[test]
     fn reports_and_recovers() {
-        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\ntype S = u8\n");
+        let errs = parse_errors("fn f() {\n\tlet = 1\n\treturn 1 < 2 < 3\n}\nalias S = u8\n");
         assert_eq!(errs.len(), 3, "{errs:?}");
         assert!(errs[1].contains("chained"));
         assert!(errs[2].contains("not supported"));
