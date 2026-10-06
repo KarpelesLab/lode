@@ -214,9 +214,11 @@ let p = Point{x: 1, y: 2}
   literal: its package's functions make it (`buf.StackBuf[64].new()`).
   Inside the package, every field is visible, to methods and to any other
   function. So a type keeps its invariants with private fields and
-  methods, and the checker doesn't need to know them. M8 proposes
-  `pub let` too, read-only outside the package
-  ([allocation.md](allocation.md#field-visibility)).
+  methods, and the checker doesn't need to know them. A field marked
+  `pub let` can be read everywhere but assigned only in its package
+  (decided with M8, [allocation.md](allocation.md#field-visibility)):
+  `pub let len: usize` lets users read a length that only the type's
+  methods change.
 - `==` (derived `Eq`) compares private fields too, from any package: it
   says whether two values are equal, not what they hold. A struct with an
   `@uninit` field isn't `Eq` at all ([memory.md](memory.md#uninitialized-buffers)).
@@ -258,6 +260,14 @@ let p = Point{x: 1, y: 2}
   implemented in that package, sees only the `pub` fields. Generic code
   can't reach fields through a type parameter, so visibility is checked
   where the struct is named.
+- `pub let name: T` is read-only outside the package: reading it works
+  as for a `pub` field (its refinement is a fact there too), but
+  assigning it, passing it with `&` or calling an `inout self` method on
+  it is an error ("`lo` of `geo.Span` is read-only outside package
+  `std/geo`"), and so is a literal of the struct ("`geo.Span` has
+  read-only (`pub let`) fields, so it can only be built in package
+  `std/geo`"). `let` without `pub` is a syntax error: a private field is
+  already invisible outside.
 - `@uninit name: [N]T`, with `T` an integer type, marks a private array
   that `unsafe` code may leave out of a literal
   ([memory.md](memory.md#uninitialized-buffers)).

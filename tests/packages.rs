@@ -85,6 +85,23 @@ fn Point.hidden() -> Point {
 	return origin()
 }
 
+/// Read-only fields: `lo <= hi` holds for every value, since only this
+/// package assigns them.
+pub struct Span {
+	pub let lo: u32
+	pub let hi: u32 where lo <= hi
+}
+
+pub fn Span.new(lo: u32) -> Span {
+	return Span{lo: lo, hi: lo}
+}
+
+pub fn Span.grow(inout self) {
+	if self.hi < 0xffffffff {
+		self.hi += 1
+	}
+}
+
 pub fn Shape.radius(self) -> u8 {
 	match self {
 		circle(_, r) => return r
@@ -268,6 +285,55 @@ fn main() {
         "expected `Point`, found `geo.Point`",
         "package `std/geo` has no `Nope`",
         "`geo.origin` is not a type",
+    ];
+    assert_eq!(errors, expected);
+}
+
+#[test]
+fn read_only_fields() {
+    let main = "\
+package main
+
+import \"std/geo\"
+
+fn width(s: geo.Span) -> u32 {
+	return s.hi - s.lo
+}
+
+fn main() -> u32 {
+	var s = geo.Span.new(3)
+	s.grow()
+	s.grow()
+	return width(s) +% s.lo
+}
+";
+    let program = check("read-only", main).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "read-only"), 5);
+    }
+    let main = "\
+package main
+
+import \"std/geo\"
+
+fn bump(inout x: u32) {
+	x +%= 1
+}
+
+fn main() {
+	var s = geo.Span.new(3)
+	s.lo = 1
+	s.hi += 1
+	bump(&s.hi)
+	let t = geo.Span{lo: 1, hi: 2}
+}
+";
+    let errors = check("read-only-errors", main).expect_err("fails to check");
+    let expected = [
+        "`lo` of `geo.Span` is read-only outside package `std/geo`",
+        "`hi` of `geo.Span` is read-only outside package `std/geo`",
+        "`hi` of `geo.Span` is read-only outside package `std/geo`",
+        "`geo.Span` has read-only (`pub let`) fields, so it can only be built in package `std/geo`",
     ];
     assert_eq!(errors, expected);
 }

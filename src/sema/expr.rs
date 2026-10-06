@@ -1372,7 +1372,7 @@ impl Checker<'_> {
             self.error(ty.span(), format!("`{sty}` is not a struct"));
             return None;
         };
-        if def.pkg != cx.pkg && def.fields.iter().any(|f| !f.is_pub) {
+        if def.pkg != cx.pkg && def.fields.iter().any(|f| !f.is_pub || f.read_only) {
             self.private_literal(&def, sty, span);
             return None;
         }
@@ -1494,10 +1494,15 @@ impl Checker<'_> {
             })
             .collect();
         makers.sort();
+        let what = if def.fields.iter().any(|f| !f.is_pub) {
+            "private"
+        } else {
+            "read-only (`pub let`)"
+        };
         let mut d = Diagnostic::error(
             span,
             format!(
-                "`{}` has private fields, so it can only be built in package `{}`",
+                "`{}` has {what} fields, so it can only be built in package `{}`",
                 def.name, self.pkgs[def.pkg].path
             ),
         );
@@ -4241,6 +4246,44 @@ impl Checker<'_> {
         None
     }
 
+    /// Report a change of `place` (an assignment, `&`, an `inout self`
+    /// receiver) through a `pub let` field of a struct of another package:
+    /// such a field is read-only outside its package.
+    pub(super) fn check_read_only(&mut self, cx: &FnCx, place: &TExpr, span: Span) -> Option<()> {
+        let mut e = place;
+        loop {
+            match &e.kind {
+                TExprKind::Field(base, i) => {
+                    if let Some(def) = base.ty.as_struct()
+                        && def.pkg != cx.pkg
+                        && def.fields[*i as usize].read_only
+                    {
+                        let name = &def.fields[*i as usize].name;
+                        self.diags.push(
+                            Diagnostic::error(
+                                span,
+                                format!(
+                                    "`{name}` of `{}` is read-only outside package `{}`",
+                                    def.name, self.pkgs[def.pkg].path
+                                ),
+                            )
+                            .with_help(format!(
+                                "it's declared `pub let {name}`: only code in its package can change it"
+                            )),
+                        );
+                        return None;
+                    }
+                    e = base;
+                }
+                TExprKind::Index(base, _)
+                | TExprKind::Slice(base, ..)
+                | TExprKind::ToSlice(base)
+                | TExprKind::Payload(base, ..) => e = base,
+                _ => return Some(()),
+            }
+        }
+    }
+
     /// Check that `place` can be changed by `changer`: a `var` (or a
     /// parameter the function may change), or a field or an element of one,
     /// or an element of an `inout` slice. Returns it.
@@ -4334,6 +4377,7 @@ impl Checker<'_> {
             return None;
         }
         self.check_defer_assign(cx, local, &name, span)?;
+        self.check_read_only(cx, &place, span)?;
         Some(place)
     }
 

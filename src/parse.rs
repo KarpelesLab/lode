@@ -453,6 +453,19 @@ impl Parser {
                 None
             };
             let is_pub = pub_first || self.eat_kw(Kw::Pub);
+            // `pub let`: read-only outside the package.
+            let read_only = if self.at_kw(Kw::Let) {
+                let at = self.bump().span;
+                if !is_pub {
+                    return self.error(
+                        at,
+                        "`let` on a field makes it read-only outside its package: write `pub let`",
+                    );
+                }
+                true
+            } else {
+                false
+            };
             let field = self.ident("a field name or `}`")?;
             self.expect_p(P::Colon)?;
             let ty = self.type_expr()?;
@@ -463,6 +476,7 @@ impl Parser {
             };
             fields.push(FieldDecl {
                 is_pub,
+                read_only,
                 uninit,
                 name: field,
                 ty,
@@ -521,6 +535,7 @@ impl Parser {
                     let ty = self.type_expr()?;
                     fields.push(FieldDecl {
                         is_pub: true,
+                        read_only: false,
                         uninit: None,
                         name: field,
                         ty,

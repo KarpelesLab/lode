@@ -940,6 +940,8 @@ pub struct Field {
     /// Visible outside the declaring package: a struct's `pub` field, and
     /// every payload field.
     pub is_pub: bool,
+    /// Declared `pub let`: assigned only in the declaring package.
+    pub read_only: bool,
     /// Declared `@uninit`: `unsafe` code may leave it unwritten in a
     /// literal, so the struct isn't `Eq` (docs/memory.md, "Uninitialized
     /// buffers").
@@ -954,6 +956,7 @@ impl Field {
             name: name.into(),
             ty,
             is_pub: true,
+            read_only: false,
             uninit: false,
         }
     }

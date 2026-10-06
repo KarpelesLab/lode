@@ -177,6 +177,9 @@ pub struct FieldDecl {
     /// `pub name: T`: visible outside the struct's package. A struct's
     /// fields are private without it; payload fields are always visible.
     pub is_pub: bool,
+    /// `pub let name: T`: readable outside the struct's package, but
+    /// assigned only in it (docs/types.md, Structs).
+    pub read_only: bool,
     /// `@uninit name: [N]T`: the span of `@uninit`, a field that `unsafe`
     /// code may leave unwritten in a literal (docs/memory.md,
     /// "Uninitialized buffers").

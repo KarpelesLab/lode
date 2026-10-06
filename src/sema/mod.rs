@@ -1816,6 +1816,7 @@ impl<'a> Checker<'a> {
                 name: f.name.name.clone(),
                 ty,
                 is_pub: f.is_pub,
+                read_only: f.read_only,
                 uninit: f.uninit.is_some(),
             });
         }
@@ -5199,7 +5200,9 @@ impl<'a> Checker<'a> {
             }
         }
 
+        let target_span = target.span;
         let place = self.expr(cx, &target, None)?;
+        self.check_read_only(cx, &place.expr, target_span)?;
         let ty = place.ty();
         let checked = match op {
             None => self.expr(cx, value, Some(ty))?,
