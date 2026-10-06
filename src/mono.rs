@@ -645,11 +645,10 @@ impl Mono<'_> {
     }
 
     /// For a struct with one field `?Box[Self]` (a link of a chain), the
-    /// field's index and `Box.into_inner`, which its destruction loops
-    /// with (see the module docs).
-    fn chain_link(&self, ty: Ty) -> Option<(usize, FuncId)> {
+    /// field's index, which its destruction loops over (see the module
+    /// docs).
+    fn chain_link(&self, ty: Ty) -> Option<usize> {
         let info = self.program.alloc?;
-        let into_inner = info.into_inner?;
         let def = ty.as_struct()?;
         let links: Vec<usize> = (0..def.fields.len())
             .filter(|&k| {
@@ -660,7 +659,7 @@ impl Mono<'_> {
             })
             .collect();
         match links[..] {
-            [k] => Some((k, into_inner)),
+            [k] => Some(k),
             _ => None,
         }
     }
@@ -901,9 +900,9 @@ impl Mono<'_> {
 /// A function that destroys the parts of a value of type `ty`, which has
 /// no `deinit` (see [`Mono::destroy_fn`]): it takes the value `inout`, and
 /// destroys each part that needs destruction. With `chain`, the struct's
-/// field of that index is a link `?Box[Self]`, destroyed by a loop with
-/// `Box.into_inner` (the function given), not by destroying it.
-fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<(usize, FuncId)>) -> Func {
+/// field of that index is a link `?Box[Self]`, destroyed by a loop (see
+/// [`chain_loop`]), not by destroying it.
+fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<usize>) -> Func {
     let usize_ty = Ty::Int(IntTy {
         signed: false,
         bits: 64,
@@ -951,7 +950,7 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<(usize, FuncI
         let fields = |of: &TExpr| -> Vec<TStmt> {
             (0..def.fields.len())
                 .rev()
-                .filter(|&k| def.fields[k].ty.needs_destroy() && Some(k) != chain.map(|c| c.0))
+                .filter(|&k| def.fields[k].ty.needs_destroy() && Some(k) != chain)
                 .map(|k| {
                     destroy(
                         TExprKind::Field(Box::new(of.clone()), k as u32),
@@ -961,8 +960,8 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<(usize, FuncI
                 .collect()
         };
         let mut body = fields(&this);
-        if let Some((k, into_inner)) = chain {
-            body.extend(chain_loop(&mut locals, ty, k, into_inner, &this, &fields));
+        if let Some(k) = chain {
+            body.extend(chain_loop(&mut locals, ty, k, &this, &fields));
         }
         body
     } else {
@@ -1009,14 +1008,15 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<(usize, FuncI
 /// The loop that destroys the chain of boxes from field `k` of `this` (a
 /// struct of type `ty`, whose other fields `fields` destroys), with two
 /// more locals: the link taken out (`$link`, a `?Box[ty]`) and the node
-/// taken out of its box (`$node`). Neither is destroyed as a whole: the
-/// box is freed by `into_inner`, and the node's fields are destroyed but
-/// its link, which goes on to `$link`.
+/// moved out of its box (`$node`). Neither is destroyed as a whole: the
+/// node is read from the box's pointer (its first field), the box's memory
+/// is freed through its handle (its second field), and the node's fields
+/// are destroyed but its link, which goes on to `$link`. No function in
+/// it destroys a box of `ty`, so the call graph has no cycle.
 fn chain_loop(
     locals: &mut Vec<Local>,
     ty: Ty,
     k: usize,
-    into_inner: FuncId,
     this: &TExpr,
     fields: &dyn Fn(&TExpr) -> Vec<TStmt>,
 ) -> Vec<TStmt> {
@@ -1061,13 +1061,40 @@ fn chain_loop(
         kind: TExprKind::Payload(Box::new(local(link, link_ty)), 1, 0),
         ty: box_ty,
     };
-    let mut next = vec![TStmt::Init(
-        node,
-        TExpr {
-            kind: TExprKind::GenericCall(into_inner, vec![ty], vec![boxed]),
-            ty,
-        },
-    )];
+    let box_def = box_ty.as_struct().expect("a box");
+    let part = |i: u32| TExpr {
+        kind: TExprKind::Field(Box::new(boxed.clone()), i),
+        ty: box_def.fields[i as usize].ty,
+    };
+    let usize_ty = Ty::Int(IntTy {
+        signed: false,
+        bits: 64,
+        size: true,
+    });
+    let layout = |align: bool| TExpr {
+        kind: TExprKind::Layout(ty, align),
+        ty: usize_ty,
+    };
+    let bytes = TExpr {
+        kind: TExprKind::Intrinsic(Intrinsic::PtrCast, vec![part(0)]),
+        ty: Ty::ptr(Ty::Int(IntTy::new(false, 8))),
+    };
+    let mut next = vec![
+        TStmt::Init(
+            node,
+            TExpr {
+                kind: TExprKind::Intrinsic(Intrinsic::PtrRead, vec![part(0)]),
+                ty,
+            },
+        ),
+        TStmt::Expr(TExpr {
+            kind: TExprKind::Intrinsic(
+                Intrinsic::HandleFree,
+                vec![part(1), bytes, layout(false), layout(true)],
+            ),
+            ty: Ty::Unit,
+        }),
+    ];
     next.extend(fields(&local(node, ty)));
     next.push(take(&local(node, ty)));
     vec![

@@ -1,0 +1,131 @@
+// stdout: reuse: same class yes, other class no, large yes\n
+// stdout: aligned: 16 64 4096\n
+// stdout: many: 5000 blocks, reused in reverse: yes\n
+// stdout: boxes: 1000 sum 499500, again 499500\n
+package main
+
+import "std/alloc"
+import "std/io"
+import "std/mem"
+import "std/vec"
+
+// The root allocator, `alloc.Heap`, through its handle: blocks of size
+// classes (powers of two, 16 to 2048 bytes) come back to a list per class
+// when they're freed, and are used again; larger blocks are mappings of
+// their own.
+
+fn yes(b: bool) -> str {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+fn reuse() throws(AllocError) {
+	let h = alloc.root()
+	let p = try h.alloc(24, 8)
+	unsafe {
+		h.free(p, 24, 8)
+	}
+	// 20 bytes is in the same class as 24 (32 bytes): the block comes
+	// back.
+	let q = try h.alloc(20, 8)
+	// 100 bytes isn't.
+	let r = try h.alloc(100, 8)
+	unsafe {
+		h.free(r, 100, 8)
+		h.free(q, 20, 8)
+	}
+	// A large block, written and read.
+	let big = try h.alloc(100000, 8)
+	unsafe {
+		let last = big + 99999
+		last.write(7)
+		let ok = last.read() == 7
+		h.free(big, 100000, 8)
+		io.print("reuse: same class {}, other class {}, large {}\n", yes(p == q), yes(q == r), yes(ok))
+	}
+}
+
+// A block is aligned to its class's size, at least the alignment asked.
+fn aligned() throws(AllocError) {
+	let h = alloc.root()
+	let a = try h.alloc(1, 16)
+	let b = try h.alloc(3, 64)
+	let c = try h.alloc(5000, 4096)
+	io.print("aligned: {} {} {}\n", a.addr() % 16 + 16, b.addr() % 64 + 64, c.addr() % 4096 + 4096)
+	unsafe {
+		h.free(a, 1, 16)
+		h.free(b, 3, 64)
+		h.free(c, 5000, 4096)
+	}
+}
+
+const N: usize = 5000
+
+// Many blocks: freed in order, they come back in reverse (each class's
+// list is last in, first out).
+fn many() throws(AllocError) {
+	let h = alloc.root()
+	var first: [N]usize = [0; N]
+	for i in 0..N {
+		let p = try h.alloc(16, 8)
+		first[i] = p.addr()
+	}
+	for i in 0..N {
+		unsafe {
+			h.free(mem.from_addr[u8](first[i]), 16, 8)
+		}
+	}
+	var same = true
+	for i in 0..N {
+		let p = try h.alloc(16, 8)
+		if p.addr() != first[N - 1 - i] {
+			same = false
+		}
+	}
+	io.print("many: {} blocks, reused in reverse: {}\n", N, yes(same))
+}
+
+// Boxes in a vector: destroyed with it, and made again from the blocks it
+// freed.
+fn boxes() uses alloc throws(AllocError) {
+	var total: u64 = 0
+	var again: u64 = 0
+	for round in 0..2 {
+		var xs = vec.ArrayVec[alloc.Box[u64], 1000].new()
+		for i in 0..1000 {
+			xs.push(try alloc.Box.new(u64(i))) catch _ {
+				return
+			}
+		}
+		var sum: u64 = 0
+		for i in 0..1000 {
+			if let b = xs.pop() {
+				sum +%= b.value
+			}
+		}
+		if round == 0 {
+			total = sum
+		} else {
+			again = sum
+		}
+	}
+	io.print("boxes: 1000 sum {}, again {}\n", total, again)
+}
+
+fn main() uses alloc -> u8 {
+	reuse() catch _ {
+		return 1
+	}
+	aligned() catch _ {
+		return 2
+	}
+	many() catch _ {
+		return 3
+	}
+	boxes() catch _ {
+		return 4
+	}
+	return 0
+}

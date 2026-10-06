@@ -1,0 +1,193 @@
+// stdout: counted: [1 2] ~4 ~3 ~2 ~1 failed (out_of_memory) | allocs 3 frees 3\n
+// stdout: nested: 5 6 7 ~7 ~6 ~5 | allocs 1 frees 1, other 1 1\n
+// stdout: kept: 8 ~8 | allocs 1 frees 1\n
+// stdout: clone: 9 9 ~9 ~9 | allocs 2 frees 2\n
+// stdout:  ~0
+package main
+
+import "std/alloc"
+import "std/io"
+
+// An allocator that counts what it allocates and frees, and fails after
+// `limit` allocations: it takes its memory from the root allocator. It's
+// a `static`, so it outlives everything it allocates.
+struct Counting {
+	limit: u32
+	slot: usize
+}
+
+struct Counts {
+	allocs: [2]u32
+	frees: [2]u32
+}
+
+static COUNTS: Counts = Counts{allocs: [0, 0], frees: [0, 0]}
+
+static FIRST: Counting = Counting{limit: 3, slot: 0}
+
+static SECOND: Counting = Counting{limit: 100, slot: 1}
+
+unsafe impl alloc.Allocator for Counting {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		if self.slot >= 2 {
+			throw .out_of_memory
+		}
+		unsafe {
+			if COUNTS.allocs[self.slot] >= self.limit {
+				throw .out_of_memory
+			}
+			COUNTS.allocs[self.slot] +%= 1
+		}
+		return try alloc.root().alloc(size, align)
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		if self.slot < 2 {
+			COUNTS.frees[self.slot] +%= 1
+		}
+		alloc.root().free(p, size, align)
+	}
+}
+
+fn counts() -> Counts {
+	unsafe {
+		return COUNTS
+	}
+}
+
+fn show() {
+	let c = counts()
+	io.print(" | allocs {} frees {}", c.allocs[0], c.frees[0])
+}
+
+// A value that says when it's destroyed.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+impl Clone for Noisy {
+	fn clone(self) -> Noisy {
+		return Noisy{id: self.id}
+	}
+}
+
+// `uses alloc` goes through every function between `main` and the
+// allocation: each declares it.
+fn make(id: u32) uses alloc throws(AllocError) -> alloc.Box[Noisy] {
+	return try alloc.Box.new(Noisy{id: id})
+}
+
+fn first() -> alloc.Handle {
+	unsafe {
+		return alloc.handle(FIRST)
+	}
+}
+
+fn second() -> alloc.Handle {
+	unsafe {
+		return alloc.handle(SECOND)
+	}
+}
+
+// The fourth allocation fails: `AllocError` passes up, and what was
+// allocated is destroyed and freed on the way.
+fn counted() uses alloc throws(AllocError) {
+	with alloc = first() {
+		let a = try make(1)
+		let b = try make(2)
+		io.print(" [{} {}]", a.value.id, b.value.id)
+		let c = try make(3)
+		let d = try make(4)
+		io.print(" unreachable {}", d.value.id)
+	}
+}
+
+// `with` inside `with`: each block allocates from its own; the root's
+// handle installs the root again.
+fn nested() uses alloc throws(AllocError) {
+	with alloc = first() {
+		let a = try make(5)
+		with alloc = second() {
+			let b = try make(6)
+			with alloc = alloc.root() {
+				let c = try make(7)
+				io.print(" {} {} {}", a.value.id, b.value.id, c.value.id)
+			}
+		}
+	}
+}
+
+// A box made in a `with` block frees through its own allocator, wherever
+// it's destroyed.
+fn kept() uses alloc throws(AllocError) -> alloc.Box[Noisy] {
+	with alloc = first() {
+		return try make(8)
+	}
+}
+
+fn clone_in() uses alloc throws(AllocError) {
+	with alloc = first() {
+		let a = try make(9)
+		let b = try a.clone()
+		io.print(" {} {}", a.value.id, b.value.id)
+	}
+}
+
+// Start counting again.
+fn reset() {
+	unsafe {
+		COUNTS.allocs[0] = 0
+		COUNTS.frees[0] = 0
+	}
+}
+
+fn main() uses alloc -> u8 {
+	// From the root allocator, destroyed when `main` ends.
+	let root_box = make(0) catch _ {
+		return 1
+	}
+	io.print("counted:")
+	counted() catch e {
+		match e {
+			out_of_memory => io.print(" failed (out_of_memory)")
+		}
+	}
+	show()
+	io.print("\nnested:")
+	reset()
+	nested() catch _ {
+		return 2
+	}
+	show()
+	let c = counts()
+	io.print(", other {} {}\n", c.allocs[1], c.frees[1])
+	io.print("kept:")
+	reset()
+	let k = kept() catch _ {
+		return 3
+	}
+	io.print(" {}", k.value.id)
+	drop_box(k)
+	show()
+	io.print("\nclone:")
+	reset()
+	clone_in() catch _ {
+		return 4
+	}
+	show()
+	io.print("\n")
+	return 0
+}
+
+// Destroying a box doesn't need the allocator in context: it frees
+// through its own.
+fn drop_box(sink b: alloc.Box[Noisy]) {
+}

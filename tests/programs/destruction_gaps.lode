@@ -1,0 +1,147 @@
+// stdout: literal: ~1 failed | array: ~3 ~2 failed | args: ~5 ~4 ~4 failed\n
+// stdout: variant: ~6 failed | moved: ~7 failed | nested: ~9 ~8 failed | done ~11 ~10\n
+// stdout: set: ~12 failed, unassigned | set ok: 12 ~12\n
+package main
+
+import "std/io"
+
+// A value whose `deinit` says it ran: each must run exactly once.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+fn noisy(id: u32) -> Noisy {
+	return Noisy{id: id}
+}
+
+enum E {
+	bad
+}
+
+fn fail() throws(E) -> Noisy {
+	throw .bad
+}
+
+fn ok(id: u32) throws(E) -> Noisy {
+	return Noisy{id: id}
+}
+
+struct Pair {
+	a: Noisy
+	b: Noisy
+}
+
+enum Either {
+	both(a: Noisy, b: Noisy)
+	neither
+}
+
+fn take2(sink a: Noisy, sink b: Noisy) {
+}
+
+// A value built into a literal, before a `try` in the same expression
+// fails, is destroyed by that exit.
+fn literal() throws(E) {
+	let p = Pair{a: noisy(1), b: try fail()}
+}
+
+fn array() throws(E) {
+	let xs = [noisy(2), noisy(3), try fail()]
+}
+
+// Arguments moved in (`sink`) belong to the call, which never happens.
+fn args() throws(E) {
+	take2(noisy(4), noisy(5))
+	take2(noisy(4), try fail())
+}
+
+fn variant() throws(E) {
+	let e = Either.both(noisy(6), try fail())
+}
+
+// A variable moved into a literal: destroyed once, by the exit.
+fn moved() throws(E) {
+	let x = noisy(7)
+	let p = Pair{a: x, b: try fail()}
+}
+
+// An element built, a struct, is destroyed field by field.
+fn nested() throws(E) {
+	let xs = [Pair{a: try ok(8), b: noisy(9)}, Pair{a: try fail(), b: noisy(99)}]
+}
+
+// Returned, the literal is built aside: the exit destroys what's built,
+// not the result.
+fn built() throws(E) -> Pair {
+	return Pair{a: noisy(10), b: try ok(11)}
+}
+
+// A `set` parameter the callee assigned before it throws is destroyed by
+// the callee: the caller's variable isn't assigned.
+fn fill(set out: Noisy, fail_after: bool) throws(E) {
+	out = noisy(12)
+	if fail_after {
+		throw .bad
+	}
+}
+
+fn set_out() {
+	var n: Noisy
+	fill(&n, true) catch _ {
+		io.print(" failed, unassigned")
+		return
+	}
+	io.print(" unreachable {}", n.id)
+}
+
+fn set_ok() {
+	var n: Noisy
+	fill(&n, false) catch _ {
+		return
+	}
+	io.print(" set ok: {}", n.id)
+}
+
+fn main() {
+	io.print("literal:")
+	literal() catch _ {
+		io.print(" failed")
+	}
+	io.print(" | array:")
+	array() catch _ {
+		io.print(" failed")
+	}
+	io.print(" | args:")
+	args() catch _ {
+		io.print(" failed")
+	}
+	io.print("\nvariant:")
+	variant() catch _ {
+		io.print(" failed")
+	}
+	io.print(" | moved:")
+	moved() catch _ {
+		io.print(" failed")
+	}
+	io.print(" | nested:")
+	nested() catch _ {
+		io.print(" failed")
+	}
+	io.print(" | done")
+	let p = built() catch _ {
+		return
+	}
+	mem_drop(p)
+	io.print("\nset:")
+	set_out()
+	io.print(" |")
+	set_ok()
+	io.print("\n")
+}
+
+fn mem_drop(sink p: Pair) {
+}

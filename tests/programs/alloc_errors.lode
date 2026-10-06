@@ -1,0 +1,153 @@
+// error: `make` allocates (`uses alloc`), so it's only called by a function that declares `uses alloc`
+// error: `alloc.Box.new` allocates (`uses alloc`), so it's only called by a function that declares `uses alloc`
+// error: `with alloc` is only allowed in a function that declares `uses alloc`
+// error: `read` through a raw pointer is unsafe
+// error: `write` through a raw pointer is unsafe
+// error: using the `static` `COUNT` is unsafe
+// error: `b.value` can't be moved out of `b`, a `alloc.Box[Res]`, which has a `deinit`
+// error: `alloc.Box[Point]` has no field `x`
+// error: `alloc.Box[Point]` has no method `length`
+// error: `deinit` can't allocate (`uses alloc`)
+// error: `Plain.name` doesn't match `Named.name`: it allocates (`uses alloc`), and the trait's doesn't
+// error: implementing `alloc.Allocator` is unsafe: write `unsafe impl`
+// error: `x.clone()` allocates (`uses alloc`), so it's only called by a function that declares `uses alloc`
+// error: cloning a `T` can throw `AllocError`, and its error must be handled
+// error: this copies `h`, a read-only parameter, but `Holder` isn't `Copy`
+// error: `==` can't compare values of type `Holder`
+// error: a pointer can't point to a view (`str`)
+// error: `counted` allocates (`uses alloc`), which code run when compiling can't do
+// error: expected `alloc.Handle`, found `u32`
+// help: add `uses alloc` to `no_context`, after its parameters, so its callers know it allocates
+// help: the boxed value is `.value`: `p.value.x`
+// help: the boxed value is `.value`: `p.value.length(...)`
+// help: `Holder` holds a raw pointer, which copying would share: its values are moved, never copied
+package main
+
+import "std/alloc"
+
+fn make() uses alloc throws(AllocError) -> alloc.Box[u32] {
+	return try alloc.Box.new(u32(1))
+}
+
+// Without `uses alloc`, a function allocates through no call.
+fn no_context() throws(AllocError) {
+	let a = try make()
+	let b = try alloc.Box.new(u32(2))
+}
+
+// `with` only replaces a context the function has.
+fn no_with() {
+	with alloc = alloc.root() {
+	}
+}
+
+// A raw pointer is held and compared in safe code; it's used in `unsafe`
+// code only.
+struct Holder {
+	p: *u32
+}
+
+fn use_pointer(h: Holder) -> u32 {
+	h.p.write(1)
+	return h.p.read()
+}
+
+// A struct with a raw pointer field isn't `Copy`, nor `Eq`.
+fn copy_holder(h: Holder) -> bool {
+	let k = h
+	return h == h
+}
+
+static COUNT: u32 = 0
+
+fn statics() -> u32 {
+	return COUNT
+}
+
+struct Res {
+	n: u32
+}
+
+fn Res.deinit(sink self) {
+}
+
+// The boxed value is part of the box: it isn't moved out alone.
+fn box_parts(sink b: alloc.Box[Res]) -> Res {
+	let r = b.value
+	return r
+}
+
+struct Point {
+	x: u32
+}
+
+fn Point.length(self) -> u32 {
+	return self.x
+}
+
+fn box_members(p: alloc.Box[Point]) -> u32 {
+	let x = p.x
+	return p.length()
+}
+
+struct Leaky {
+	n: u32
+}
+
+fn Leaky.deinit(sink self) uses alloc {
+}
+
+trait Named {
+	fn name(self) -> u32
+}
+
+struct Plain {
+	n: u32
+}
+
+impl Named for Plain {
+	fn name(self) uses alloc -> u32 {
+		return self.n
+	}
+}
+
+struct Raw {
+	n: u32
+}
+
+impl alloc.Allocator for Raw {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		throw .out_of_memory
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+	}
+}
+
+// Cloning a type parameter may allocate and fail.
+fn clone_it[T: Clone](x: T) -> T {
+	return x.clone()
+}
+
+struct Viewer {
+	s: *str
+}
+
+// A constant's value can't allocate.
+const ALLOCATED: u32 = counted()
+
+fn counted() uses alloc -> u32 {
+	return 1
+}
+
+fn wrong_handle() uses alloc {
+	with alloc = u32(3) {
+	}
+}
+
+fn main() {
+}

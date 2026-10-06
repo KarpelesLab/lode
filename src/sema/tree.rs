@@ -66,10 +66,9 @@ pub struct AllocInfo {
     /// The root allocator, a `static` (`alloc.ROOT`), and its type.
     pub root: usize,
     pub root_ty: Ty,
-    /// `alloc.Box[T]` as declared, and its `into_inner`, which the
-    /// destruction of a chain of boxes calls.
+    /// `alloc.Box[T]` as declared: its first field is its pointer, its
+    /// second its allocator's handle.
     pub boxed: Ty,
-    pub into_inner: Option<FuncId>,
 }
 
 /// The methods declared in traits, and those each `impl` gives: what a call

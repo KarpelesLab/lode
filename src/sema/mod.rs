@@ -1685,10 +1685,6 @@ impl<'a> Checker<'a> {
         else {
             return;
         };
-        let into_inner = self
-            .methods
-            .get(&(boxed.decl(), "into_inner".to_owned()))
-            .copied();
         let root_ty = match &self.statics[root].decl.ty {
             TypeExpr::Named(id) => match items.get(&id.name) {
                 Some(&Item::Type(t)) => t,
@@ -1702,7 +1698,6 @@ impl<'a> Checker<'a> {
             root,
             root_ty,
             boxed,
-            into_inner,
         });
     }
 

@@ -267,11 +267,12 @@ pub fn Box[T].new(sink v: T) uses alloc throws(AllocError) -> Box[T] {
 
 /// The boxed value, moved out; the box is freed.
 pub fn Box[T].into_inner(sink self) -> T {
+	let p = self.ptr
+	let h = self.alloc
+	mem.forget(self)
 	unsafe {
-		let v = self.ptr.read()
-		self.alloc.free(self.ptr.cast[u8](), size_of[T](), align_of[T]())
-		mem.forget(self)
-		return v
+		defer h.free(p.cast[u8](), size_of[T](), align_of[T]())
+		return p.read()
 	}
 }
 

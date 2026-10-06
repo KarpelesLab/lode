@@ -1,0 +1,162 @@
+// stdout: ints: 1 42 43 | structs: 3 4 7 moved 5 ~5 | nested 6 66 ~6\n
+// stdout: inner: 8 ~8 | clone: clone9 9 109 ~109 ~9 | resources: 10 ~10 | list: 3 2 ~3 ~2 ~1\n
+// stdout: fd: closed\n
+package main
+
+import "std/alloc"
+import "std/io"
+import "std/os"
+
+// `alloc.Box[T]` owns one `T` on the heap: `b.value` is the boxed value,
+// a place; destroying the box destroys it and frees it.
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+fn Point.sum(self) -> u32 {
+	return self.x +% self.y
+}
+
+// A value that says when it's destroyed.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+impl Clone for Noisy {
+	fn clone(self) -> Noisy {
+		io.print(" clone{}", self.id)
+		return Noisy{id: self.id +% 100}
+	}
+}
+
+fn bump(inout x: u32) {
+	x +%= 1
+}
+
+fn ints() uses alloc throws(AllocError) {
+	let a = try alloc.Box.new(u32(1))
+	var b = try alloc.Box[u32].new(41)
+	b.value +%= 1
+	io.print("ints: {} {}", a.value, b.value)
+	bump(&b.value)
+	io.print(" {}", b.value)
+}
+
+fn structs() uses alloc throws(AllocError) {
+	var p = try alloc.Box.new(Point{x: 1, y: 2})
+	p.value.x = 3
+	p.value.y +%= 2
+	io.print(" | structs: {} {} {}", p.value.x, p.value.y, p.value.sum())
+}
+
+// A box moves into a function, which owns it, and back out.
+fn keep(sink b: alloc.Box[Noisy]) -> alloc.Box[Noisy] {
+	return b
+}
+
+fn take_and_drop(sink b: alloc.Box[Noisy]) {
+	io.print(" moved {}", b.value.id)
+}
+
+fn moves() uses alloc throws(AllocError) {
+	let b = try alloc.Box.new(Noisy{id: 5})
+	let c = keep(b)
+	take_and_drop(c)
+	let outer = try alloc.Box.new(try alloc.Box.new(Noisy{id: 6}))
+	io.print(" | nested {}", outer.value.value.id)
+	var n = try alloc.Box.new(try alloc.Box.new(u32(60)))
+	n.value.value +%= 6
+	io.print(" {}", n.value.value)
+}
+
+fn inner() uses alloc throws(AllocError) {
+	let b = try alloc.Box.new(Noisy{id: 8})
+	let v = b.into_inner()
+	io.print("inner: {}", v.id)
+}
+
+fn clones() uses alloc throws(AllocError) {
+	let b = try alloc.Box.new(Noisy{id: 9})
+	let c = try b.clone()
+	io.print(" {} {}", b.value.id, c.value.id)
+}
+
+// A struct holding a box is a resource too, destroyed field by field.
+struct Holder {
+	label: u32
+	item: alloc.Box[Noisy]
+}
+
+fn resources() uses alloc throws(AllocError) {
+	let h = Holder{label: 10, item: try alloc.Box.new(Noisy{id: 10})}
+	io.print(" | resources: {}", h.item.value.id)
+}
+
+// A chain of boxes, destroyed by a loop.
+struct Link {
+	item: Noisy
+	next: ?alloc.Box[Link]
+}
+
+fn list() uses alloc throws(AllocError) {
+	var head: ?alloc.Box[Link] = none
+	for i in 1..4 {
+		let rest = head.take()
+		head = try alloc.Box.new(Link{item: Noisy{id: u32(i)}, next: rest})
+	}
+	if let b = head {
+		io.print(" | list: {}", b.value.item.id)
+		if let c = b.value.next {
+			io.print(" {}", c.value.item.id)
+		}
+	}
+}
+
+// An owned file descriptor, boxed: closed once, when the box is destroyed.
+fn fds() uses alloc throws(AllocError) -> bool {
+	let f = os.open("/dev/null", os.O_RDONLY, 0) catch _ {
+		return false
+	}
+	let b = try alloc.Box.new(f)
+	return b.value.fd >= 3
+}
+
+fn main() uses alloc -> u8 {
+	ints() catch _ {
+		return 1
+	}
+	structs() catch _ {
+		return 2
+	}
+	moves() catch _ {
+		return 3
+	}
+	io.print("\n")
+	inner() catch _ {
+		return 4
+	}
+	io.print(" | clone:")
+	clones() catch _ {
+		return 5
+	}
+	resources() catch _ {
+		return 6
+	}
+	list() catch _ {
+		return 7
+	}
+	io.print("\n")
+	let ok = fds() catch _ {
+		return 8
+	}
+	if ok {
+		io.print("fd: closed\n")
+	}
+	return 0
+}

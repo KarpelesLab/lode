@@ -1,0 +1,58 @@
+// stdout: built 1000000, first 999999\n
+// stdout: destroyed 1000000\n
+package main
+
+import "std/alloc"
+import "std/io"
+
+// A chain of a million boxes, built and destroyed with a constant stack:
+// the destruction of a struct whose field `next` is a `?Box` of itself is
+// a loop, not a recursion (docs/allocation.md, Destroying recursive
+// structures). Recursing would take a frame per node, more than the
+// stack has.
+
+static DESTROYED: u64 = 0
+
+// Counts its destructions.
+struct Tick {
+	n: u64
+}
+
+fn Tick.deinit(sink self) {
+	unsafe {
+		DESTROYED +%= 1
+	}
+}
+
+struct Node {
+	tick: Tick
+	next: ?alloc.Box[Node]
+}
+
+fn build(n: u64) uses alloc throws(AllocError) -> ?alloc.Box[Node] {
+	var head: ?alloc.Box[Node] = none
+	var i: u64 = 0
+	while i < n {
+		let rest = head.take()
+		head = try alloc.Box.new(Node{tick: Tick{n: i}, next: rest})
+		i +%= 1
+	}
+	return head
+}
+
+fn chain() uses alloc throws(AllocError) {
+	let list = try build(1000000)
+	if let b = list {
+		io.print("built 1000000, first {}\n", b.value.tick.n)
+	}
+}
+
+fn main() uses alloc -> u8 {
+	chain() catch _ {
+		return 1
+	}
+	unsafe {
+		io.print("destroyed {}\n", DESTROYED)
+	}
+	return 0
+}
