@@ -525,6 +525,10 @@ const TABLE_SCAN_LIMIT: usize = 4096;
 /// The name of the `syscall` intrinsic (docs/safety.md).
 const SYSCALL: &str = "syscall";
 
+/// `needs_deinit[T]()`: whether destroying a `T` does anything
+/// (docs/allocation.md, Generics).
+const NEEDS_DEINIT: &str = "needs_deinit";
+
 /// The most arguments `syscall` takes after the number (the Linux ABI's six).
 const SYSCALL_MAX_ARGS: usize = 6;
 
@@ -3346,6 +3350,36 @@ impl Checker<'_> {
         let names_fn = |ck: &Self, cx: &FnCx, base: &ast::Expr| {
             ck.names_function(cx, base) || matches!(base.kind, ExprKind::Field(..))
         };
+        // `needs_deinit[T]()`, built in.
+        let needs_deinit = match &callee.kind {
+            ExprKind::Index(base, item) => {
+                Some((&**base, vec![ast::TypeArg::Expr((**item).clone())]))
+            }
+            ExprKind::TypeArgs(base, items) => Some((&**base, items.clone())),
+            _ => None,
+        };
+        if let Some((base, items)) = needs_deinit
+            && let ExprKind::Name(n) = &base.kind
+            && n == NEEDS_DEINIT
+            && cx.lookup(n).is_none()
+            && !self.pkgs[cx.pkg].items.contains_key(n)
+        {
+            let [item] = &items[..] else {
+                self.error(callee.span, "`needs_deinit` takes one type argument");
+                return None;
+            };
+            if !args.is_empty() {
+                self.error(span, "`needs_deinit` takes no arguments");
+                return None;
+            }
+            let ty = self.type_arg(cx, item)?;
+            let kind = if ty.is_generic() {
+                TExprKind::NeedsDeinit(ty)
+            } else {
+                TExprKind::Bool(ty.needs_destroy())
+            };
+            return Some(Checked::new(kind, Ty::Bool, None));
+        }
         let (callee, explicit) = match &callee.kind {
             ExprKind::Index(base, item) if names_fn(self, cx, base) => (
                 &**base,
@@ -3536,6 +3570,30 @@ impl Checker<'_> {
                 let ty = recv.ty();
                 if ty == Ty::Str && member.name == "bytes" {
                     return self.str_bytes(recv, args, span);
+                }
+                // `opt.take()`: the value, leaving `none` (as `mem.take`).
+                if ty.as_optional().is_some() && member.name == "take" {
+                    if !args.is_empty() {
+                        self.error(span, "`take` takes no arguments");
+                        return None;
+                    }
+                    let place =
+                        self.mutable_place(cx, recv.expr, base.span, Changer::Receiver("take"))?;
+                    forget_place(cx, &place);
+                    if !ty.is_copy()
+                        && let Some(l) = super::generic::place_local(cx, &place)
+                    {
+                        Self::invalidate_projections(cx, l);
+                    }
+                    let arg = TExpr {
+                        ty,
+                        kind: TExprKind::Ref(Box::new(place)),
+                    };
+                    return Some(Checked::new(
+                        TExprKind::Intrinsic(Intrinsic::Take, vec![arg]),
+                        ty,
+                        None,
+                    ));
                 }
                 let ordered = ORDERED_METHODS.contains(&member.name.as_str());
                 // On a type parameter, the methods of the built-in trait

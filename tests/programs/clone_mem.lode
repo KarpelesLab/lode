@@ -1,5 +1,6 @@
 // stdout: clone: clone1 clone2 clone3 | 102 103 4 clone5 clone5 ~5 | 105 105 6 ~105 ~105 ~103 ~102 ~3 ~2 ~101 ~1\n
-// stdout: mem: swapped1110 old12 taken ~16 | end ~18 ~15 ~17 ~12 ~13 ~14 ~10 ~11\n
+// stdout: mem: swapped1110 old12 taken ~16 | taken end ~20 ~18 ~15 ~17 ~12 ~13 ~14 ~10 ~11\n
+// stdout: needs: true true false true\n
 package main
 
 import "std/io"
@@ -70,7 +71,17 @@ fn mems() {
 	mem.destroy(x)
 	io.print(" |")
 	mem.forget(noisy(19))
+	var o2: ?Noisy = noisy(20)
+	let t2 = o2.take()
+	if o2 == none {
+		io.print(" taken")
+	}
 	io.print(" end")
+}
+
+// Whether a type's values need destruction, known in each instance.
+fn needs[T]() -> bool {
+	return needs_deinit[T]()
 }
 
 fn main() {
@@ -78,5 +89,5 @@ fn main() {
 	clones()
 	io.print("\nmem:")
 	mems()
-	io.print("\n")
+	io.print("\nneeds: {} {} {} {}\n", needs[Noisy](), needs[Pair](), needs[u32](), needs_deinit[[2]?Noisy]())
 }

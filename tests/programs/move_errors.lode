@@ -15,6 +15,7 @@
 // error: the value of this call, a `Fd`, would be dropped without being destroyed
 // error: a constant's type must be `Copy`, and `Fd` isn't
 // error: an error type must be `Copy`, and `Closing` isn't
+// error: cannot call `take`, which takes `inout self`, on `o`, which is immutable
 // help: `Fd` has a `deinit`: its values are moved, never copied
 // help: or take it as `sink f: Fd`, which moves the caller's value in
 // help: a value can't be moved out of an `inout` or `set` parameter
@@ -175,6 +176,12 @@ fn Closing.deinit(sink self) {
 }
 
 fn throws_closing() throws(Closing) {
+}
+
+// `opt.take()` changes the optional: it must be a variable that can be
+// changed.
+fn take_from(o: ?Fd) -> ?Fd {
+	return o.take()
 }
 
 fn main() {

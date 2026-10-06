@@ -397,6 +397,9 @@ impl Mono<'_> {
         if let TExprKind::Temp(local, _) = e.kind {
             self.destroy_fn(locals[local].ty);
         }
+        if let TExprKind::NeedsDeinit(t) = e.kind {
+            e.kind = TExprKind::Bool(t.subst(map).needs_destroy());
+        }
         // `a.lt(b)` of a type that implements `Ordered` with an `impl`.
         if let TExprKind::Compare(a, _) | TExprKind::Binary(_, a, _) = &e.kind
             && let Some(call) = self.program.dispatch.ordered_expr(e, a.ty.subst(map))

@@ -802,6 +802,7 @@ impl Eval<'_, '_> {
                 self.expr(frame, &args[0])?;
                 Value::Unit
             }
+            TExprKind::NeedsDeinit(t) => Value::Bool(frame.ty(*t).needs_destroy()),
             TExprKind::Clone(inner) => {
                 let v = self.expr(frame, inner)?;
                 self.clone_value(frame.ty(inner.ty), v)?

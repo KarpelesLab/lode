@@ -2027,6 +2027,7 @@ impl FnLower<'_> {
                 return Val::Unit;
             }
             TExprKind::Clone(_) => unreachable!("instances clone by copies and calls"),
+            TExprKind::NeedsDeinit(_) => unreachable!("instances know their types"),
             // Kept in its hidden local, whose value from an earlier time
             // round a loop is destroyed first.
             TExprKind::Temp(local, inner) => {

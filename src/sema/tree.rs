@@ -343,6 +343,10 @@ pub enum TExprKind {
     /// A function of the standard library that the compiler implements
     /// (`@intrinsic`), with its arguments.
     Intrinsic(Intrinsic, Vec<TExpr>),
+    /// `needs_deinit[T]()`: whether destroying a value of the type does
+    /// anything (a `bool`), for a type that mentions type parameters;
+    /// `crate::mono` makes it the literal of each instance.
+    NeedsDeinit(Ty),
     /// `x.clone()` of a value of a type that's `Clone` without an `impl`
     /// of its own: the value read in place, copied (a `Copy` type), or
     /// cloned part by part. `crate::mono` makes it a copy or a call.
@@ -472,6 +476,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Bool(_)
         | TExprKind::Str(_)
         | TExprKind::Table(_)
+        | TExprKind::NeedsDeinit(_)
         | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
         | TExprKind::GenericCall(_, _, items)
@@ -586,6 +591,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Bool(_)
         | TExprKind::Str(_)
         | TExprKind::Table(_)
+        | TExprKind::NeedsDeinit(_)
         | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
         | TExprKind::GenericCall(_, _, items)

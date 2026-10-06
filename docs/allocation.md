@@ -173,8 +173,7 @@ costs a byte and a test.
 
 ### Partial moves and patterns
 
-**Status:** Implemented (M8a), but `opt.take()` (`mem.take(&opt)` does it)
-and `match &x`
+**Status:** Implemented (M8a), but `match &x`
 
 - **No partial moves out of a struct local** (`let n = p.name` where `name`
   needs destruction is an error). `mem.replace(&p.name, v)` and
@@ -252,7 +251,7 @@ error: on that `try`'s error exit, `fa` is already gone.
 
 ### Generics
 
-**Status:** Implemented (M8a), but `needs_deinit[T]()`
+**Status:** Implemented (M8a)
 
 - Generic code destroys `T` values at scope ends like any other values,
   with no bound needed. `mono` instantiates the destruction for each
@@ -986,10 +985,11 @@ What M8a does, and the choices made where the proposal left room:
   `-O0` and `-O2`, and 4 are smaller (`generic_methods`,
   `generic_optionals`, `std_containers`, `trait_ordered`: 96 to 450
   bytes less), from the `sink` parameters read in place.
-- **Not done in M8a.** `needs_deinit[T]()` (no container loops over its
-  elements yet), the built-in `opt.take()` (`mem.take(&opt)` does it),
-  `match &x` (bindings that are `inout` projections), raw pointer fields
-  (M8b). A value built into a literal or into a call's arguments before a
+- **`opt.take()`** on an optional that can be changed gives its value and
+  leaves `none`, as `mem.take(&opt)` does. **`needs_deinit[T]()`** is a
+  `bool` known in each instance: whether destroying a `T` does anything.
+- **Not done in M8a.** `match &x` (bindings that are `inout`
+  projections), raw pointer fields (M8b). A value built into a literal or into a call's arguments before a
   `try` in the same expression fails leaks, as does a `set` parameter the
   callee assigned before it throws: their `deinit` doesn't run, which is
   safe.

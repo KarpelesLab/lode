@@ -174,7 +174,7 @@ Go's vocabulary, which is proven:
   - `replace[T](inout place: T, sink v: T) -> T` puts `v` in `place` and
     returns the old value: `mem.replace(&p.name, v)`.
   - `take[T](inout place: ?T) -> ?T` takes an optional's value and leaves
-    `none`: `mem.take(&slots[i])`.
+    `none`: `mem.take(&slots[i])`. The built-in `opt.take()` does the same.
   - `destroy[T](sink x: T)` destroys `x` now, and `forget[T](sink x: T)`
     ends it without destroying it (its `deinit` never runs: a leak, which
     is safe).
