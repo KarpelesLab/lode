@@ -1,0 +1,181 @@
+// error: `f` is used after it was moved (on some path to here)
+// error: `f` is used after it was moved (on some path to here)
+// error: `f` is used after it was moved (on some path to here)
+// error: this copies `f`, a read-only parameter, but `Fd` isn't `Copy`
+// error: this copies `f`, a parameter the caller keeps, but `Fd` isn't `Copy`
+// error: moving `t.a` out of `t` would leave the rest of `t` behind, and `Fd` isn't `Copy`
+// error: this copies `xs[0]`, a `Fd`, but `Fd` isn't `Copy`
+// error: `w.f` can't be moved out of `w`, a `Wrapped`, which has a `deinit`
+// error: this copies `f`, part of `o`, a read-only parameter, but `Fd` isn't `Copy`
+// error: `v` is used after it was moved (on some path to here)
+// error: `self` can't be moved out of `deinit`
+// error: `f` holds a value, which `fill` would replace without destroying it: a `set` argument of a type that isn't `Copy` must be unassigned
+// error: `f` may be moved already at this exit, where an `errdefer` that moves it runs
+// error: `[value; 2]` copies its value, but `Fd` isn't `Copy`
+// error: the value of this call, a `Fd`, would be dropped without being destroyed
+// error: a constant's type must be `Copy`, and `Fd` isn't
+// error: an error type must be `Copy`, and `Closing` isn't
+// help: `Fd` has a `deinit`: its values are moved, never copied
+// help: or take it as `sink f: Fd`, which moves the caller's value in
+// help: a value can't be moved out of an `inout` or `set` parameter
+// help: a part of a variable isn't moved alone: move `t` whole, or take the part with `mem.replace(&t.a, v)` (`std/mem`)
+// help: an element can't be moved out of its array: take it with `mem.replace(&xs[0], v)` (`std/mem`), or read it in place
+// help: `v` reads part of a variable in place, which was moved or changed since
+// help: an `errdefer` that moves a variable runs only where it's still assigned: don't move `f` after it
+package main
+
+// A type with a `deinit` isn't `Copy`: its values move.
+struct Fd {
+	fd: i32
+}
+
+fn Fd.deinit(sink self) {
+}
+
+fn open() -> Fd {
+	return Fd{fd: 3}
+}
+
+fn close(sink f: Fd) {
+}
+
+fn read(f: Fd) -> i32 {
+	return f.fd
+}
+
+// Use after a move, on every path.
+fn used_after() -> i32 {
+	let f = open()
+	close(f)
+	return read(f)
+}
+
+fn maybe_moved(c: bool) -> i32 {
+	let f = open()
+	if c {
+		close(f)
+	}
+	return read(f)
+}
+
+fn in_loop() {
+	let f = open()
+	for i in 0..2 {
+		close(f)
+	}
+}
+
+// Moving out of a parameter the caller keeps.
+fn copy_param(f: Fd) -> Fd {
+	return f
+}
+
+fn copy_inout(inout f: Fd) -> Fd {
+	return f
+}
+
+// No partial moves.
+struct Two {
+	a: Fd
+	b: Fd
+}
+
+fn partial() -> Fd {
+	let t = Two{a: open(), b: open()}
+	return t.a
+}
+
+fn element() -> Fd {
+	let xs = [open(), open()]
+	return xs[0]
+}
+
+struct Wrapped {
+	f: Fd
+}
+
+fn Wrapped.deinit(sink self) {
+}
+
+fn unwrap(sink w: Wrapped) -> Fd {
+	return w.f
+}
+
+// A pattern binding reads in place: keeping it moves the matched value,
+// which a read-only parameter can't give.
+fn first(o: ?Fd) -> Fd {
+	if let f = o {
+		return f
+	}
+	return open()
+}
+
+// A binding can't be used once what it reads has moved.
+fn stale(sink o: ?Fd) -> i32 {
+	if let v = o {
+		let moved = o
+		return read(v)
+	}
+	return 0
+}
+
+struct Holder {
+	f: Fd
+}
+
+fn Holder.deinit(sink self) {
+	release(self)
+}
+
+fn release(sink h: Holder) {
+}
+
+fn fill(set f: Fd) {
+	f = open()
+}
+
+fn set_assigned() {
+	var f = open()
+	fill(&f)
+}
+
+enum Fail {
+	bad
+}
+
+fn errdefer_then_move(c: bool) throws(Fail) {
+	let f = open()
+	errdefer close(f)
+	close(f)
+	if c {
+		throw .bad
+	}
+}
+
+fn repeat() {
+	let fs = [open(); 2]
+}
+
+fn may_fail() throws(Fail) -> Fd {
+	return open()
+}
+
+fn lost() {
+	may_fail() catch _ {
+	}
+}
+
+const DEFAULT: Fd = Fd{fd: 0}
+
+enum Closing {
+	failed
+}
+
+fn Closing.deinit(sink self) {
+}
+
+fn throws_closing() throws(Closing) {
+}
+
+fn main() {
+}

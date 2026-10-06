@@ -1,0 +1,159 @@
+// stdout: block: ~2 ~1 | nested: inner ~4 outer ~3 |\n
+// stdout: loop: ~11 ~10 ~21 ~20 ~31 ~30 | skip: ~10 ~21 ~20 ~30 | stop: ~11 ~10 ~20 |\n
+// stdout: early: ~42 ~41 5 | late: ~43 ~41 6 |\n
+// stdout: try: d2 ~51 d1 ~50 err | ok: ~52 d2 ~51 d1 ~50 ok |\n
+// stdout: throw: ~61 ~60 |\n
+// stdout: defers: ~73 c ~72 b ~71 a ~70 |\n
+// stdout: catch: handled ~80 |\n
+// stdout: main ends\n
+// stdout:  ~1000
+package main
+
+import "std/io"
+
+// A value that says when it's destroyed.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+fn noisy(id: u32) -> Noisy {
+	return Noisy{id: id}
+}
+
+// Destroyed at the end of their block, last declared first.
+fn block() {
+	io.print("block:")
+	let a = noisy(1)
+	let b = noisy(2)
+}
+
+fn nested() {
+	io.print("nested:")
+	let a = noisy(3)
+	if a.id == 3 {
+		let b = noisy(4)
+		io.print(" inner")
+	}
+	io.print(" outer")
+}
+
+// Each iteration's values are destroyed when it ends, by `continue` or
+// `break` too.
+fn loop_end(skip: u32, stop: u32) {
+	for i in 1..4 {
+		let a = noisy(u32(i) * 10)
+		if u32(i) == skip {
+			continue
+		}
+		if u32(i) == stop {
+			break
+		}
+		let b = noisy(u32(i) * 10 + 1)
+	}
+}
+
+// A `return` destroys what's in scope, after computing its value.
+fn early(c: bool) -> u32 {
+	let a = noisy(41)
+	if c {
+		let b = noisy(42)
+		return 5
+	}
+	let d = noisy(43)
+	return 6
+}
+
+enum Fail {
+	bad
+}
+
+fn check(fail: bool) throws(Fail) {
+	if fail {
+		throw .bad
+	}
+}
+
+// A `try` that fails leaves like a `throw`: what's declared before it is
+// destroyed, interleaved with the `defer` bodies.
+fn tried(fail: bool) throws(Fail) {
+	let a = noisy(50)
+	defer {
+		io.print(" d1")
+	}
+	let b = noisy(51)
+	defer {
+		io.print(" d2")
+	}
+	try check(fail)
+	let c = noisy(52)
+}
+
+fn thrown() throws(Fail) {
+	let a = noisy(60)
+	let b = noisy(61)
+	throw .bad
+}
+
+// `defer` bodies and destruction, in one order: the reverse of the
+// declarations.
+fn defers() {
+	let a = noisy(70)
+	defer {
+		io.print(" a")
+	}
+	let b = noisy(71)
+	defer {
+		io.print(" b")
+	}
+	let c = noisy(72)
+	defer {
+		io.print(" c")
+	}
+	let d = noisy(73)
+}
+
+fn caught() {
+	let a = noisy(80)
+	check(true) catch _ {
+		io.print(" handled")
+	}
+}
+
+fn main() {
+	block()
+	io.print(" | ")
+	nested()
+	io.print(" |\nloop:")
+	loop_end(0, 0)
+	io.print(" | skip:")
+	loop_end(1, 3)
+	io.print(" | stop:")
+	loop_end(0, 2)
+	io.print(" |\nearly:")
+	let x = early(true)
+	io.print(" {} | late:", x)
+	let y = early(false)
+	io.print(" {} |\ntry:", y)
+	tried(true) catch _ {
+		io.print(" err")
+	}
+	io.print(" | ok:")
+	tried(false) catch _ {
+		io.print(" err")
+	}
+	io.print(" ok |\nthrow:")
+	thrown() catch _ {
+	}
+	io.print(" |\ndefers:")
+	defers()
+	io.print(" |\ncatch:")
+	caught()
+	io.print(" |\n")
+	// `main`'s values are destroyed when it returns.
+	let last = noisy(1000)
+	io.print("main ends\n")
+}

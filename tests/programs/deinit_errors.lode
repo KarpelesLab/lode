@@ -1,0 +1,117 @@
+// error: `deinit` can't throw
+// error: `deinit` takes `sink self` and nothing else, and returns nothing
+// error: `deinit` takes `sink self` and nothing else, and returns nothing
+// error: `deinit` takes `sink self` and nothing else, and returns nothing
+// error: `deinit` can't be `unsafe`: destruction runs in safe code
+// error: `deinit` can't have generic parameters of its own
+// error: `deinit` can't add bounds to the type's parameters
+// error: `deinit` can't be called directly
+// error: `Point` is `Copy`, so it's `Clone` already
+// error: `Res.clone` doesn't match `Clone.clone`
+// error: `fd` of `os.Fd` is read-only outside package `std/os`
+// error: `os.Fd` has read-only (`pub let`) fields, so it can only be built in package `std/os`
+// error: `@intrinsic` is only for the functions of the standard library that the compiler implements
+// help: a type whose cleanup can fail offers a method like `close(sink self) throws(E)`, and its `deinit` does the same cleanup and ignores the error
+// help: declare it `fn Extra.deinit(sink self)`
+// help: a value is destroyed when its variable's scope ends; `mem.destroy(x)` (`std/mem`) destroys it earlier
+// help: it's declared `pub let fd`: only code in its package can change it
+package main
+
+import "std/os"
+
+enum Fail {
+	bad
+}
+
+struct Thrower {
+	x: u32
+}
+
+fn Thrower.deinit(sink self) throws(Fail) {
+}
+
+struct Extra {
+	x: u32
+}
+
+fn Extra.deinit(sink self, y: u32) {
+}
+
+struct ReadOnly {
+	x: u32
+}
+
+fn ReadOnly.deinit(self) {
+}
+
+struct Returns {
+	x: u32
+}
+
+fn Returns.deinit(sink self) -> u32 {
+	return self.x
+}
+
+struct Unsafe {
+	x: u32
+}
+
+unsafe fn Unsafe.deinit(sink self) {
+}
+
+struct Generic {
+	x: u32
+}
+
+fn Generic.deinit[T](sink self) {
+}
+
+struct Holder[T] {
+	value: T
+}
+
+fn Holder[T: Copy].deinit(sink self) {
+}
+
+struct Res {
+	x: u32
+}
+
+fn Res.deinit(sink self) {
+}
+
+impl Clone for Res {
+	fn clone(self) -> u32 {
+		return self.x
+	}
+}
+
+struct Point {
+	x: u32
+}
+
+impl Clone for Point {
+	fn clone(self) -> Point {
+		return self
+	}
+}
+
+fn direct() {
+	let r = Res{x: 1}
+	r.deinit()
+}
+
+fn change(inout f: os.Fd) {
+	f.fd = 1
+}
+
+fn forge() -> os.Fd {
+	return os.Fd{fd: 1}
+}
+
+@intrinsic
+fn swap(inout a: u32, inout b: u32) {
+}
+
+fn main() {
+}

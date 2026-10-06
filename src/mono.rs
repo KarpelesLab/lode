@@ -438,17 +438,18 @@ impl Mono<'_> {
                 },
             );
             let ty = e.ty;
-            *e = if ty.is_copy() {
-                inner
-            } else {
-                let f = match self.program.dispatch.clone_impl(ty) {
-                    Some(f) => self.instance(f, ty.type_args().to_vec()),
-                    None => self.clone_fn(ty),
-                };
-                TExpr {
-                    kind: TExprKind::Call(f, vec![inner]),
-                    ty,
-                }
+            if ty.is_copy() {
+                *e = inner;
+                self.expr(e, map, locals);
+                return;
+            }
+            let f = match self.program.dispatch.clone_impl(ty) {
+                Some(f) => self.instance(f, ty.type_args().to_vec()),
+                None => self.clone_fn(ty),
+            };
+            *e = TExpr {
+                kind: TExprKind::Call(f, vec![inner]),
+                ty,
             };
         }
         for sub in subexprs_mut(e) {

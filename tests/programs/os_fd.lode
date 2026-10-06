@@ -1,0 +1,59 @@
+// stdout: opened\n
+// stdout: closed\n
+// stdout: not found: 2\n
+// stdout: bad path: 22\n
+// stdout: moved\n
+package main
+
+import "std/io"
+import "std/os"
+
+// An owned descriptor is closed once: when it's destroyed, or by
+// `os.close`, which reports an error.
+fn open_null() throws(os.Error) -> os.Fd {
+	return try os.open("/dev/null", os.O_WRONLY, 0)
+}
+
+fn errno(e: os.Error) -> u16 {
+	match e {
+		other(n) => return n
+		_ => return 0
+	}
+}
+
+// The descriptor moves out of the function: the caller owns it.
+fn keep(sink f: os.Fd) -> os.Fd {
+	return f
+}
+
+fn main() -> i32 {
+	let f = open_null() catch _ {
+		return 1
+	}
+	// `fd` is `pub let`: read here, assigned only in `std/os`.
+	if f.fd < 3 {
+		return 2
+	}
+	io.File.from_fd(f.fd).write("opened\n") catch _ {
+		return 3
+	}
+	io.print("opened\n")
+	os.close(f) catch _ {
+		return 4
+	}
+	io.print("closed\n")
+	let missing = os.open("/nonexistent/file", os.O_RDONLY, 0) catch e {
+		io.print("not found: {}\n", errno(e))
+		let bad = os.open("a\x00b", os.O_RDONLY, 0) catch e2 {
+			io.print("bad path: {}\n", errno(e2))
+			let g = open_null() catch _ {
+				return 5
+			}
+			let h = keep(g)
+			io.print("moved\n")
+			return 0
+		}
+		return 6
+	}
+	return 7
+}

@@ -1049,6 +1049,21 @@ impl Checker<'_> {
                     }
                     if let Some(&other) = step.others.iter().find(|t| !t.is_copy()) {
                         let (_, other_fix) = not_copy(other);
+                        // A part of a temporary (`f().a`).
+                        if name.starts_with('$') {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    span,
+                                    format!(
+                                        "a part can't be moved out of a temporary `{}`: the rest of it, a `{other}`, isn't `Copy`",
+                                        step.holder
+                                    ),
+                                )
+                                .with_help("store the value in a variable first, then take the part with `mem.replace` (`std/mem`)")
+                                .with_help(other_fix),
+                            );
+                            return None;
+                        }
                         self.diags.push(
                         Diagnostic::error(
                             span,

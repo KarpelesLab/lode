@@ -1,0 +1,159 @@
+// stdout: maybe: take1 ~1 end | end ~1\n
+// stdout: relay: take10 ~10 take11 ~11 take12 ~12 last ~13\n
+// stdout: later: end ~20 | end\n
+// stdout: assign: ~30 | end ~31\n
+// stdout: conventions: ~40 show41 end ~41\n
+// stdout: temporaries: show50 ~50 | id51 ~51 | ~52 | take53 ~53 end\n
+// stdout: errdefer: take60 ~60 failed | ~61 kept60\n
+// stdout:  ~60
+package main
+
+import "std/io"
+
+// A value that says when it's destroyed: each `~n` is printed once.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+fn noisy(id: u32) -> Noisy {
+	return Noisy{id: id}
+}
+
+// `sink`: the value moves in, and is destroyed here unless moved on.
+fn consume(sink n: Noisy) {
+	io.print(" take{}", n.id)
+}
+
+// A read-only parameter reads the caller's value in place.
+fn show(n: Noisy) {
+	io.print(" show{}", n.id)
+}
+
+fn pass_on(sink n: Noisy) -> Noisy {
+	return n
+}
+
+// Moved on some paths only: its drop flag says whether it's destroyed at
+// the end.
+fn maybe(c: bool) {
+	let a = noisy(1)
+	if c {
+		consume(a)
+	}
+	io.print(" end")
+}
+
+// Moved in the loop, assigned again before the next iteration.
+fn relay() {
+	var a = noisy(10)
+	for i in 1..4 {
+		consume(a)
+		a = noisy(10 + u32(i))
+	}
+	io.print(" last")
+}
+
+// Declared without a value: destroyed only if it's assigned.
+fn later(c: bool) {
+	var a: Noisy
+	if c {
+		a = noisy(20)
+	}
+	io.print(" end")
+}
+
+// An assignment destroys the old value, after computing the new one.
+fn assign() {
+	var a = noisy(30)
+	a = noisy(31)
+	io.print(" |")
+	a = pass_on(a)
+	io.print(" end")
+}
+
+fn fill(set n: Noisy, id: u32) {
+	n = noisy(id)
+}
+
+fn renew(inout n: Noisy) {
+	n = noisy(n.id +% 1)
+}
+
+fn conventions() {
+	var a: Noisy
+	fill(&a, 40)
+	renew(&a)
+	show(a)
+	io.print(" end")
+}
+
+struct Tagged {
+	n: Noisy
+	tag: u32
+}
+
+// A temporary is destroyed at the end of its statement, unless it's moved
+// on (a part of it, when the rest is `Copy`).
+fn temporaries() {
+	show(noisy(50))
+	io.print(" |")
+	io.print(" id{}", noisy(51).id)
+	io.print(" |")
+	noisy(52)
+	io.print(" |")
+	consume(Tagged{n: noisy(53), tag: 0}.n)
+	io.print(" end")
+}
+
+enum Fail {
+	bad
+}
+
+fn get(fail: bool, id: u32) throws(Fail) -> Noisy {
+	if fail {
+		throw .bad
+	}
+	return noisy(id)
+}
+
+// `errdefer` moving a variable: it runs only on the exits with an error,
+// where `a` is still assigned. On success, `a` is moved out instead.
+fn both(fail: bool) throws(Fail) -> Noisy {
+	let a = try get(false, 60)
+	errdefer consume(a)
+	let b = try get(fail, 61)
+	return a
+}
+
+fn main() {
+	io.print("maybe:")
+	maybe(true)
+	io.print(" |")
+	maybe(false)
+	io.print("\nrelay:")
+	relay()
+	io.print("\nlater:")
+	later(true)
+	io.print(" |")
+	later(false)
+	io.print("\nassign:")
+	assign()
+	io.print("\nconventions:")
+	conventions()
+	io.print("\ntemporaries:")
+	temporaries()
+	io.print("\nerrdefer:")
+	match both(true) {
+		ok(n) => io.print(" kept{}", n.id)
+		err(e) => io.print(" failed")
+	}
+	io.print(" |")
+	let kept = both(false) catch _ {
+		return
+	}
+	io.print(" kept{}\n", kept.id)
+}

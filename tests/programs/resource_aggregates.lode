@@ -1,0 +1,182 @@
+// stdout: total 3\n
+// stdout: structs: built outer5 ~4 ~3 ~2 ~1\n
+// stdout: enums: two11+12 ~12 ~11 ~10\n
+// stdout: arrays: 20 21 22 | ~20 ~21 ~22\n
+// stdout: optionals: some30 d30 ~30 | d31 ~31\n
+// stdout: generics: 40 41 42 ~42 ~40\n
+// stdout: vectors: ~50 len2 ~52 ~53 ~51\n
+// stdout: results: ok60 ~60 | err\n
+package main
+
+import "std/io"
+import "std/vec"
+
+// A value that says when it's destroyed.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+fn noisy(id: u32) -> Noisy {
+	return Noisy{id: id}
+}
+
+// A struct of resources, without a `deinit` of its own: its fields are
+// destroyed in reverse order. It isn't `Copy`.
+struct Pair {
+	first: Noisy
+	second: Noisy
+}
+
+// With a `deinit`: it runs first, then the fields are destroyed.
+struct Outer {
+	inner: Pair
+	tag: u32
+}
+
+fn Outer.deinit(sink self) {
+	io.print(" outer{}", self.tag)
+}
+
+// An enum of resources: the payload of its variant is destroyed.
+enum Shape {
+	one(a: Noisy)
+	two(a: Noisy, b: Noisy)
+	empty
+}
+
+// A generic container: its `T` is destroyed as each instance's type says.
+struct Box1[T] {
+	value: T
+}
+
+fn Box1[T].new(sink v: T) -> Box1[T] {
+	return Box1{value: v}
+}
+
+// Moving a field out moves the whole value: the rest is `Copy`.
+struct Tagged {
+	n: Noisy
+	tag: u32
+}
+
+fn untag(sink t: Tagged) -> Noisy {
+	return t.n
+}
+
+fn structs() {
+	let p = Pair{first: noisy(1), second: noisy(2)}
+	let o = Outer{inner: Pair{first: noisy(3), second: noisy(4)}, tag: 5}
+	io.print(" built")
+}
+
+fn enums() {
+	let a = Shape.one(noisy(10))
+	let b = Shape.two(noisy(11), noisy(12))
+	let c = Shape.empty
+	match b {
+		two(x, y) => io.print(" two{}+{}", x.id, y.id)
+		one(x) => io.print(" one{}", x.id)
+		empty => io.print(" empty")
+	}
+}
+
+fn arrays() {
+	let xs = [noisy(20), noisy(21), noisy(22)]
+	for x in xs {
+		io.print(" {}", x.id)
+	}
+	io.print(" |")
+}
+
+fn optionals(c: bool) {
+	var o: ?Noisy = none
+	if c {
+		o = noisy(30)
+	}
+	if let n = o {
+		io.print(" some{}", n.id)
+	}
+	let d = o ?? noisy(31)
+	io.print(" d{}", d.id)
+}
+
+fn generics() {
+	let b = Box1.new(noisy(40))
+	let i = Box1.new(u32(41))
+	let n = untag(Tagged{n: noisy(42), tag: 1})
+	io.print(" {} {} {}", b.value.id, i.value, n.id)
+}
+
+// A vector of resources: `push` moves in, `pop` moves out, `put`
+// replaces (destroying the old one), and the rest are destroyed with it.
+fn vectors() {
+	var v = vec.ArrayVec[Noisy, 4].new()
+	for i in 0..3 {
+		v.push(noisy(50 + u32(i))) catch _ {
+		}
+	}
+	let last = v.pop()
+	v.put(0, noisy(53))
+	io.print(" len{}", v.len())
+}
+
+enum Fail {
+	bad
+}
+
+fn get(fail: bool) throws(Fail) -> Noisy {
+	if fail {
+		throw .bad
+	}
+	return noisy(60)
+}
+
+// A call's result, matched: the value in `ok` is destroyed with it.
+fn results(fail: bool) {
+	match get(fail) {
+		ok(n) => io.print(" ok{}", n.id)
+		err(e) => io.print(" err")
+	}
+}
+
+// Moves work at compile time too. Nothing is destroyed there: a value
+// made while compiling holds no resource (docs/allocation.md, When
+// destruction runs).
+fn total() -> u32 {
+	let p = Pair{first: noisy(1), second: noisy(2)}
+	let b = Box1.new(p)
+	var v = vec.ArrayVec[Pair, 2].new()
+	v.push(b.value) catch _ {
+	}
+	let last = v.pop() ?? Pair{first: noisy(0), second: noisy(0)}
+	return last.first.id +% last.second.id
+}
+
+const TOTAL: u32 = total()
+
+fn main() {
+	io.print("total {}\n", TOTAL)
+	io.print("structs:")
+	structs()
+	io.print("\nenums:")
+	enums()
+	io.print("\narrays:")
+	arrays()
+	io.print("\noptionals:")
+	optionals(true)
+	io.print(" |")
+	optionals(false)
+	io.print("\ngenerics:")
+	generics()
+	io.print("\nvectors:")
+	vectors()
+	io.print("\nresults:")
+	results(false)
+	io.print(" |")
+	results(true)
+	io.print("\n")
+}

@@ -881,7 +881,7 @@ impl<'a> Checker<'a> {
                 .or_default()
                 .push((Trait::Clone, *id));
         }
-        if table.is_empty() {
+        if !methods.iter().any(|(n, _)| n == "clone") {
             self.diags.push(
                 Diagnostic::error(
                     head,

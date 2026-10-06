@@ -4085,12 +4085,23 @@ impl<'a> Checker<'a> {
                     value,
                     binding,
                     handler,
-                } => Some(TStmt::Expr(
-                    self.whole(cx, e.span, |ck, cx| {
+                } => {
+                    let c = self.whole(cx, e.span, |ck, cx| {
                         ck.catch(cx, value, binding.as_ref(), handler, false, None)
-                    })?
-                    .expr,
-                )),
+                    })?;
+                    // On success, the value would be lost, not destroyed.
+                    if !c.ty().is_copy() {
+                        self.diags.push(
+                            Diagnostic::error(
+                                e.span,
+                                format!("the value of this call, a `{}`, would be dropped without being destroyed", c.ty()),
+                            )
+                            .with_help("keep it: `let x = f() catch ...`, with a block that leaves"),
+                        );
+                        return None;
+                    }
+                    Some(TStmt::Expr(c.expr))
+                }
                 _ => {
                     self.error(e.span, "this expression has no effect");
                     None

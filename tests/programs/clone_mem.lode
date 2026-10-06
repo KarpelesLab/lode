@@ -1,0 +1,82 @@
+// stdout: clone: clone1 clone2 clone3 | 102 103 4 clone5 clone5 ~5 | 105 105 6 ~105 ~105 ~103 ~102 ~3 ~2 ~101 ~1\n
+// stdout: mem: swapped1110 old12 taken ~16 | end ~18 ~15 ~17 ~12 ~13 ~14 ~10 ~11\n
+package main
+
+import "std/io"
+import "std/mem"
+
+// A value that says when it's destroyed. Its copies are explicit: a type
+// with a `deinit` writes its `clone`.
+struct Noisy {
+	id: u32
+}
+
+fn Noisy.deinit(sink self) {
+	io.print(" ~{}", self.id)
+}
+
+impl Clone for Noisy {
+	fn clone(self) -> Noisy {
+		io.print(" clone{}", self.id)
+		return Noisy{id: self.id +% 100}
+	}
+}
+
+fn noisy(id: u32) -> Noisy {
+	return Noisy{id: id}
+}
+
+// Without a `deinit`, and with `Clone` parts: its `clone` clones each.
+struct Pair {
+	a: Noisy
+	b: Noisy
+	tag: u32
+}
+
+// Generic code clones a `T: Clone`: a copy for plain data.
+fn twice[T: Clone](x: T) -> [2]T {
+	return [x.clone(), x.clone()]
+}
+
+fn clones() {
+	let n = noisy(1)
+	let c = n.clone()
+	let p = Pair{a: noisy(2), b: noisy(3), tag: 4}
+	let q = p.clone()
+	io.print(" | {} {} {}", q.a.id, q.b.id, q.tag)
+	let ns = twice(noisy(5))
+	let xs = twice(u8(6))
+	io.print(" | {} {} {}", ns[0].id, ns[1].id, xs[1])
+}
+
+// `mem` takes parts out of places that can't be moved from: an element,
+// a field of a variable whose other fields need destruction, an `inout`
+// parameter.
+fn mems() {
+	var a = noisy(10)
+	var b = noisy(11)
+	mem.swap(&a, &b)
+	io.print(" swapped{}{}", a.id, b.id)
+	var p = Pair{a: noisy(12), b: noisy(13), tag: 0}
+	let old = mem.replace(&p.a, noisy(14))
+	io.print(" old{}", old.id)
+	var xs = [noisy(15), noisy(16)]
+	let x = mem.replace(&xs[1], noisy(17))
+	var o: ?Noisy = noisy(18)
+	let t = mem.take(&o)
+	if o == none {
+		io.print(" taken")
+	}
+	mem.destroy(x)
+	io.print(" |")
+	mem.forget(noisy(19))
+	io.print(" end")
+}
+
+fn main() {
+	io.print("clone:")
+	clones()
+	io.print("\nmem:")
+	mems()
+	io.print("\n")
+}
