@@ -1,4 +1,4 @@
-// stdout: 1 2 skip 5 | 0 01 | 7 | 3\n
+// stdout: 1 2 skip 5 | 0 01 | 7 | 3 | 18\n
 package main
 
 import "std/io"
@@ -38,6 +38,28 @@ fn first_failure() -> u32 {
 	}
 }
 
+// The same, evaluated when compiling.
+fn count() -> u32 {
+	var n: u32 = 0
+	var skipped: u32 = 0
+	while check(n) catch _ {
+		n = 4
+		skipped = 10
+		continue
+	} {
+		n = n +% 1
+	}
+	var m: u32 = 0
+	while check(m) catch _ {
+		break
+	} {
+		m = m +% 1
+	}
+	return n +% skipped +% m
+}
+
+const COUNTED: u32 = count()
+
 fn main() {
 	let a: [5]u32 = [0, 1, 2, 3, 4]
 	var n: u32 = 0
@@ -74,5 +96,5 @@ fn main() {
 	} {
 		m = m +% 1
 	}
-	io.print("{}\n", m)
+	io.print("{} | {}\n", m, COUNTED)
 }
