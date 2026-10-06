@@ -135,15 +135,21 @@ fn format_count(comptime fmt: str, comptime given: usize) -> usize {
 /// `write_decimal` are made for each type of writer they write to, and a
 /// buffer sized for each format string (its text, and 20 bytes for each
 /// argument) made programs up to 19 KB larger at `-O2`.
+///
+/// `bytes` is `@uninit`: `new` doesn't write it, and `put` reads only
+/// `bytes[..len]`, which it wrote.
 struct Buffered {
 	fd: i32
-	bytes: [PRINT_BUF_SIZE]u8
+	@uninit bytes: [PRINT_BUF_SIZE]u8
 	len: usize
 }
 
 /// An empty buffer for `fd`.
 fn Buffered.new(fd: i32) -> Buffered {
-	return Buffered{fd: fd, bytes: [0; PRINT_BUF_SIZE], len: 0}
+	// Sound: `put` writes each byte before `len` covers it.
+	unsafe {
+		return Buffered{fd: fd, len: 0}
+	}
 }
 
 /// Put `b` after the bytes buffered, writing the buffer each time it's
@@ -184,8 +190,17 @@ impl Writer for Buffered {
 
 /// An open file, by its file descriptor. It doesn't close the file: the
 /// standard ones stay open, and there's no way to open others yet.
+///
+/// Its file descriptor is private: `stdin()`, `stdout()`, `stderr()` and
+/// `File.from_fd(fd)` make one.
 pub struct File {
 	fd: i32
+}
+
+/// The file open as the file descriptor `fd`. Reading or writing a
+/// descriptor that isn't open throws `bad_fd`.
+pub fn File.from_fd(fd: i32) -> File {
+	return File{fd: fd}
 }
 
 /// Standard input.
@@ -223,14 +238,10 @@ pub fn File.write_bytes(self, b: []u8) throws(os.Error) {
 /// Write the bytes written in the buffer `b` to the file, or throw the
 /// error that stopped it.
 pub fn File.write_buf[N: usize](self, b: buf.StackBuf[N]) throws(os.Error) {
-	let start = b.start
-	let end = b.end
-	// A `StackBuf` keeps `start <= end <= N`; its fields are visible, so
-	// that's checked here.
-	if start > end || end > N {
-		throw .io
+	let n = b.write_to(self.fd)
+	if n < 0 {
+		throw os.error(n)
 	}
-	try self.write_bytes(b.bytes[start..end])
 }
 
 /// Something bytes are written to: a file, or a buffer. Generic code takes

@@ -416,16 +416,31 @@ impl Parser {
             if self.at_p(P::RBrace) {
                 break;
             }
-            if self.at_kw(Kw::Pub) {
-                return self.error(
-                    self.span(),
-                    "fields can't be marked `pub`: they're visible wherever the struct is",
-                );
-            }
+            // `@uninit` and `pub`, in either order.
+            let pub_first = self.eat_kw(Kw::Pub);
+            let uninit = if self.at_p(P::At) {
+                let at = self.bump().span;
+                let attr = self.ident("an attribute name")?;
+                if attr.name != "uninit" {
+                    return self.error(
+                        at.to(attr.span),
+                        format!("unknown field attribute `@{}`", attr.name),
+                    );
+                }
+                Some(at.to(attr.span))
+            } else {
+                None
+            };
+            let is_pub = pub_first || self.eat_kw(Kw::Pub);
             let field = self.ident("a field name or `}`")?;
             self.expect_p(P::Colon)?;
             let ty = self.type_expr()?;
-            fields.push(FieldDecl { name: field, ty });
+            fields.push(FieldDecl {
+                is_pub,
+                uninit,
+                name: field,
+                ty,
+            });
             if !matches!(self.peek(), Tok::Newline | Tok::P(P::Semi | P::RBrace)) {
                 return self.expected("a new line after the field");
             }
@@ -468,10 +483,21 @@ impl Parser {
                     if self.eat_p(P::RParen) {
                         break;
                     }
+                    if self.at_kw(Kw::Pub) {
+                        return self.error(
+                            self.span(),
+                            "payload fields can't be marked `pub`: they're visible wherever the enum is",
+                        );
+                    }
                     let field = self.ident("a payload field name")?;
                     self.expect_p(P::Colon)?;
                     let ty = self.type_expr()?;
-                    fields.push(FieldDecl { name: field, ty });
+                    fields.push(FieldDecl {
+                        is_pub: true,
+                        uninit: None,
+                        name: field,
+                        ty,
+                    });
                     self.skip_newlines();
                     if !self.eat_p(P::Comma) {
                         self.skip_newlines();
@@ -2085,6 +2111,27 @@ mod tests {
         let errs = parse_errors("fn f() {\n\tif p == P{x: 2} {\n\t}\n}\n");
         assert!(!errs.is_empty());
         parse_ok("fn f() {\n\tif p == (P{x: 2}) {\n\t}\n\tfor x in [P{x: 1}] {\n\t}\n}\n");
+    }
+
+    #[test]
+    fn field_visibility_and_uninit() {
+        let file = parse_ok("struct S {\n\tpub a: u8\n\t@uninit b: [4]u8\n\tc: u8\n}\n");
+        let Item::Struct(s) = &file.items[0] else {
+            panic!()
+        };
+        let flags: Vec<(bool, bool)> = s
+            .fields
+            .iter()
+            .map(|f| (f.is_pub, f.uninit.is_some()))
+            .collect();
+        assert_eq!(flags, [(true, false), (false, true), (false, false)]);
+        let errs = parse_errors("struct S {\n\t@zeroed b: [4]u8\n}\n");
+        assert_eq!(errs[0], "unknown field attribute `@zeroed`");
+        let errs = parse_errors("enum E {\n\ta(pub x: u8)\n}\n");
+        assert_eq!(
+            errs[0],
+            "payload fields can't be marked `pub`: they're visible wherever the enum is"
+        );
     }
 
     #[test]

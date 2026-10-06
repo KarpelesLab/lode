@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::ast::{self, BinOp, ExprKind, UnOp};
 use crate::diag::Diagnostic;
 use crate::source::Span;
-use crate::types::{IntTy, Len, Primitive, Range, Trait, Ty, primitive};
+use crate::types::{Field, IntTy, Len, Primitive, Range, StructDef, Trait, Ty, primitive};
 
 use super::facts::{self, CondFacts, Env, Form, Linear, Side, Term};
 use super::generic::{
@@ -1343,6 +1343,10 @@ impl Checker<'_> {
             self.error(ty.span(), format!("`{sty}` is not a struct"));
             return None;
         };
+        if def.pkg != cx.pkg && def.fields.iter().any(|f| !f.is_pub) {
+            self.private_literal(&def, sty, span);
+            return None;
+        }
         let mut pre: Vec<Option<Checked>> = inits.iter().map(|_| None).collect();
         let (sty, def) = if sty.is_decl_form() {
             // The fields given once, with known names, fix the arguments.
@@ -1398,25 +1402,67 @@ impl Checker<'_> {
                 None => ok = false,
             }
         }
-        let missing: Vec<String> = def
+        // `unsafe` code may leave an `@uninit` field unwritten.
+        let in_unsafe = cx.unsafe_depth > 0;
+        let missing: Vec<&Field> = def
             .fields
             .iter()
             .zip(&given)
-            .filter(|&(_, &g)| !g)
-            .map(|(f, _)| format!("`{}`", f.name))
+            .filter(|&(f, &g)| !g && !(f.uninit && in_unsafe))
+            .map(|(f, _)| f)
             .collect();
         if !missing.is_empty() {
             let s = if missing.len() == 1 { "" } else { "s" };
+            let names: Vec<String> = missing.iter().map(|f| format!("`{}`", f.name)).collect();
+            let help = match missing.iter().find(|f| f.uninit) {
+                Some(f) => format!(
+                    "`{}` is `@uninit`: only `unsafe` code may leave it out",
+                    f.name
+                ),
+                None => "every field must be given a value; there are no defaults".to_owned(),
+            };
             self.diags.push(
                 Diagnostic::error(
                     span,
-                    format!("missing field{s} {} in this `{sty}`", missing.join(", ")),
+                    format!("missing field{s} {} in this `{sty}`", names.join(", ")),
                 )
-                .with_help("every field must be given a value; there are no defaults"),
+                .with_help(help),
             );
             ok = false;
         }
         ok.then(|| Checked::new(TExprKind::StructLit(out), sty, None))
+    }
+
+    /// Report a literal of a struct with private fields outside its
+    /// package, pointing to a public function of that package that makes
+    /// one without `self` (`new` if there's one).
+    fn private_literal(&mut self, def: &StructDef, sty: Ty, span: Span) {
+        let decl = sty.decl();
+        let mut makers: Vec<(bool, usize, &str)> = self
+            .sigs
+            .iter()
+            .filter(|sig| {
+                sig.pkg == def.pkg && sig.is_pub && !sig.has_self && sig.ret.decl() == decl
+            })
+            .map(|sig| {
+                let last = sig.name.rsplit('.').next().unwrap_or_default();
+                (last != "new", sig.params.len(), sig.name.as_str())
+            })
+            .collect();
+        makers.sort();
+        let mut d = Diagnostic::error(
+            span,
+            format!(
+                "`{}` has private fields, so it can only be built in package `{}`",
+                def.name, self.pkgs[def.pkg].path
+            ),
+        );
+        if let Some(&(_, params, name)) = makers.first() {
+            let pkg = def.name.rsplit_once('.').map_or("", |(p, _)| p);
+            let args = if params == 0 { "" } else { "..." };
+            d = d.with_help(format!("use `{pkg}.{name}({args})`"));
+        }
+        self.diags.push(d);
     }
 
     /// The element type and length (`None` for a slice) that an array literal
@@ -2323,6 +2369,19 @@ impl Checker<'_> {
                     self.error(member.span, format!("`{}` has no field `{name}`", b.ty()));
                     return None;
                 };
+                if def.pkg != cx.pkg && !def.fields[i].is_pub {
+                    self.diags.push(
+                        Diagnostic::error(
+                            member.span,
+                            format!("`{name}` is a private field of `{}`", def.name),
+                        )
+                        .with_help(format!(
+                            "only code in package `{}` can use it",
+                            self.pkgs[def.pkg].path
+                        )),
+                    );
+                    return None;
+                }
                 // An integer field of a local, through fields only, is a term.
                 let term = match type_range(fty) {
                     Some(_) => field_term(&b.expr, i),
@@ -2700,7 +2759,11 @@ impl Checker<'_> {
                         span,
                         format!("`{}` can't compare values of type `{ty}`", op.as_str()),
                     );
-                    if ty.as_param().is_some() {
+                    if let Some(field) = ty.uninit_field().filter(|_| !ordered) {
+                        d = d.with_help(format!(
+                            "its field `{field}` is `@uninit`, so `==` could read bytes never written: compare with a method of `{ty}`"
+                        ));
+                    } else if ty.as_param().is_some() {
                         d = if !ordered {
                             d.with_help(format!("add the bound `[{ty}: Eq]`"))
                         } else if ty.satisfies(Trait::Ordered) {

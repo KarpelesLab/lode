@@ -1,0 +1,46 @@
+// error: an `@uninit` field can't be `pub`
+// error: an `@uninit` field must be an array of integers, not `bool`
+// error: `buf.StackBuf` has private fields, so it can only be built in package `std/buf`
+// error: `bytes` is a private field of `buf.StackBuf`
+// error: `end` is a private field of `buf.StackBuf`
+// error: `==` can't compare values of type `buf.StackBuf[4]`
+// error: `fd` is a private field of `io.File`
+// error: `io.File` has private fields, so it can only be built in package `std/io`
+// error: `count` is a private field of `vec.ArrayVec`
+// error: missing field `data` in this `Raw`
+// error: `==` can't compare values of type `Raw`
+package main
+
+import "std/buf"
+import "std/io"
+import "std/vec"
+
+// A struct of this package: its private fields are visible here.
+struct Raw {
+	@uninit data: [16]u8
+	len: usize
+}
+
+struct Bad {
+	pub @uninit a: [2]u8
+	@uninit b: bool
+}
+
+fn main() {
+	var b = buf.StackBuf{bytes: [0; 4], start: 0, end: 0}
+	let c = buf.StackBuf[4].new()
+	let x = c.bytes[0]
+	let e = c.end
+	let same = c == buf.StackBuf[4].new()
+	let fd = io.stdout().fd
+	let f = io.File{fd: 1}
+	let v = vec.ArrayVec[u8, 2].new()
+	let n = v.count
+	// Only `unsafe` code may leave `data` unwritten.
+	let r = Raw{len: 0}
+	var s: Raw
+	unsafe {
+		s = Raw{len: 0}
+	}
+	let t = s == s
+}

@@ -17,7 +17,7 @@ fn main() -> u8 {
 		return 3
 	}
 	// Not an open file descriptor.
-	let bad = io.File{fd: 99}
+	let bad = io.File.from_fd(99)
 	bad.write("lost") catch e {
 		match e {
 			bad_fd => return 0

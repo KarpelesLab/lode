@@ -13,8 +13,26 @@ const GEO: &str = "\
 package geo
 
 pub struct Point {
-	x: i32
-	y: i32
+	pub x: i32
+	pub y: i32
+}
+
+/// A public struct with a private field.
+pub struct Counter {
+	pub step: u8
+	count: u32
+}
+
+pub fn Counter.new(step: u8) -> Counter {
+	return Counter{step: step, count: 0}
+}
+
+pub fn Counter.bump(inout self) {
+	self.count +%= u32(self.step)
+}
+
+pub fn Counter.total(self) -> u32 {
+	return self.count
 }
 
 struct Secret {
@@ -370,4 +388,141 @@ fn main() -> i32 {
         "`geo.Point` has no method `s`",
     ];
     assert_eq!(errors, expected);
+}
+
+#[test]
+fn private_fields() {
+    let main = "\
+package main
+
+import \"std/geo\"
+
+fn main() -> u32 {
+	var c = geo.Counter.new(3)
+	c.bump()
+	c.step = 4
+	c.bump()
+	// `==` compares the private fields too, without showing them.
+	if c == geo.Counter.new(4) {
+		return 100
+	}
+	return c.total() +% u32(c.step)
+}
+";
+    let program = check("private-fields", main).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "private-fields"), 11);
+    }
+    let errors = check(
+        "private-fields-errors",
+        "package main\n\nimport \"std/geo\"\n\n\
+         fn main() -> u32 {\n\tvar c = geo.Counter{step: 1, count: 2}\n\
+         \tvar d = geo.Counter.new(1)\n\td.count = 5\n\td.count += 1\n\
+         \tbump(&d.count)\n\treturn d.count\n}\n\n\
+         fn bump(inout n: u32) {\n}\n",
+    )
+    .expect_err("fails to check");
+    let expected = [
+        "`geo.Counter` has private fields, so it can only be built in package `std/geo`",
+        "`count` is a private field of `geo.Counter`",
+        "`count` is a private field of `geo.Counter`",
+        "`count` is a private field of `geo.Counter`",
+        "`count` is a private field of `geo.Counter`",
+    ];
+    assert_eq!(errors, expected);
+}
+
+const STORE: &str = "\
+package store
+
+/// Up to 8 bytes, of which only the first `n` are ever written.
+pub struct Bytes {
+	@uninit b: [8]u8
+	n: usize
+}
+
+pub fn Bytes.new() -> Bytes {
+	unsafe {
+		return Bytes{n: 0}
+	}
+}
+
+pub fn Bytes.push(inout self, x: u8) {
+	if self.n < 8 {
+		self.b[self.n] = x
+		self.n += 1
+	}
+}
+
+pub fn Bytes.sum(self) -> u8 {
+	var s: u8 = 0
+	for i in 0..self.n {
+		if i < 8 {
+			s +%= self.b[i]
+		}
+	}
+	return s
+}
+
+pub fn Bytes.safe() -> Bytes {
+	return Bytes{n: 0}
+}
+
+pub struct Wrong {
+	pub @uninit a: [4]u8
+	@uninit b: u8
+}
+
+/// Computed while compiling: the bytes left out are zeros there.
+pub const START: Bytes = make()
+
+fn make() -> Bytes {
+	var b = Bytes.new()
+	b.push(7)
+	return b
+}
+";
+
+#[test]
+fn uninit_fields() {
+    let main = "\
+package main
+
+import \"std/store\"
+
+fn main() -> u8 {
+	var b = store.Bytes.new()
+	b.push(30)
+	b.push(12)
+	let copy = b
+	var c = store.START
+	c.push(1)
+	return copy.sum() +% c.sum()
+}
+";
+    let errors = check_with("uninit", main, &[("store", STORE)]).expect_err("fails to check");
+    let expected = [
+        "an `@uninit` field can't be `pub`",
+        "an `@uninit` field must be an array of integers, not `u8`",
+        "missing field `b` in this `store.Bytes`",
+    ];
+    assert_eq!(errors, expected);
+    let store = STORE
+        .split("pub fn Bytes.safe")
+        .next()
+        .expect("text")
+        .to_owned()
+        + &STORE[STORE.find("/// Computed").expect("text")..];
+    let program = check_with("uninit-ok", main, &[("store", &store)]).expect("checks");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "uninit"), 50);
+    }
+    let errors = check_with(
+        "uninit-eq",
+        "package main\n\nimport \"std/store\"\n\n\
+         fn main() {\n\tlet same = store.Bytes.new() == store.Bytes.new()\n}\n",
+        &[("store", &store)],
+    )
+    .expect_err("fails to check");
+    assert_eq!(errors, ["`==` can't compare values of type `store.Bytes`"]);
 }

@@ -352,6 +352,12 @@ impl Ty {
         }
     }
 
+    /// For a struct, its first `@uninit` field's name.
+    pub fn uninit_field(self) -> Option<String> {
+        let def = self.as_struct()?;
+        def.fields.iter().find(|f| f.uninit).map(|f| f.name.clone())
+    }
+
     /// Whether this type implements the built-in trait `t`
     /// (docs/generics.md, Built-in traits).
     pub fn satisfies(self, t: Trait) -> bool {
@@ -364,6 +370,9 @@ impl Ty {
                 Ty::Int(_) | Ty::Bool | Ty::Ptr(_) => true,
                 Ty::Array(_) => self.as_array().expect("an array").0.satisfies(t),
                 Ty::Optional(_) => self.as_optional().expect("an optional").satisfies(t),
+                // An `@uninit` field may hold bytes never written, which
+                // `==` must not read.
+                Ty::Struct(_) if self.uninit_field().is_some() => false,
                 Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|m| m.satisfies(t)),
                 _ => false,
             },
@@ -728,10 +737,7 @@ impl Ty {
             return Some(def);
         }
         if let Some((ok, err)) = self.as_result() {
-            let field = |name: &str, ty| Field {
-                name: name.to_owned(),
-                ty,
-            };
+            let field = |name: &str, ty| Field::public(name, ty);
             let ok_fields = if ok == Ty::Unit {
                 Vec::new()
             } else {
@@ -776,10 +782,7 @@ impl Ty {
                 },
                 Variant {
                     name: "some".to_owned(),
-                    fields: vec![Field {
-                        name: "value".to_owned(),
-                        ty: inner,
-                    }],
+                    fields: vec![Field::public("value", inner)],
                     value: 1,
                 },
             ],
@@ -906,8 +909,8 @@ fn subst_fields(fields: &[Field], with: &impl Fn(Ty) -> Option<Ty>) -> Vec<Field
     fields
         .iter()
         .map(|f| Field {
-            name: f.name.clone(),
             ty: f.ty.subst(with),
+            ..f.clone()
         })
         .collect()
 }
@@ -934,6 +937,26 @@ pub struct StructDef {
 pub struct Field {
     pub name: String,
     pub ty: Ty,
+    /// Visible outside the declaring package: a struct's `pub` field, and
+    /// every payload field.
+    pub is_pub: bool,
+    /// Declared `@uninit`: `unsafe` code may leave it unwritten in a
+    /// literal, so the struct isn't `Eq` (docs/memory.md, "Uninitialized
+    /// buffers").
+    pub uninit: bool,
+}
+
+impl Field {
+    /// A field visible everywhere, always initialized: a payload field, or
+    /// a field of a built-in struct.
+    pub fn public(name: impl Into<String>, ty: Ty) -> Field {
+        Field {
+            name: name.into(),
+            ty,
+            is_pub: true,
+            uninit: false,
+        }
+    }
 }
 
 impl StructDef {
@@ -1710,10 +1733,7 @@ mod tests {
         let u8_ = Ty::Int(IntTy::new(false, 8));
         let a = Ty::new_struct("P".into(), 0, false, Vec::new());
         let b = Ty::new_struct("P".into(), 1, true, Vec::new());
-        let fields = vec![Field {
-            name: "x".into(),
-            ty: u8_,
-        }];
+        let fields = vec![Field::public("x", u8_)];
         a.set_fields(fields.clone());
         b.set_fields(fields);
         assert_ne!(a, b);
@@ -1801,10 +1821,7 @@ mod tests {
                 },
                 Variant {
                     name: "b".into(),
-                    fields: vec![Field {
-                        name: "x".into(),
-                        ty: u8_,
-                    }],
+                    fields: vec![Field::public("x", u8_)],
                     value: 1,
                 },
             ],

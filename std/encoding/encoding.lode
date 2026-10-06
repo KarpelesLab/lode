@@ -28,8 +28,8 @@ pub trait Encoding {
 
 /// A rune and the number of bytes it took.
 pub struct Decoded[R] {
-	rune: R
-	len: usize
+	pub rune: R
+	pub len: usize
 }
 
 /// The number of runes in `bytes`, or `none` if it isn't valid in `E`.

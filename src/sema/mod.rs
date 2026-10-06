@@ -1746,9 +1746,14 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let ty = self.field_type(&mut cx, &f.ty, "struct");
+            if let Some(at) = f.uninit {
+                self.check_uninit_field(f, at, ty);
+            }
             fields.push(Field {
                 name: f.name.name.clone(),
                 ty,
+                is_pub: f.is_pub,
+                uninit: f.uninit.is_some(),
             });
         }
         fields
@@ -1767,6 +1772,29 @@ impl<'a> Checker<'a> {
     /// The type of a field of a `what` (a struct or a payload), which must
     /// be one that can be stored. A field whose type is in error gets the
     /// type `()`, so later checks see no more problems with it.
+    /// An `@uninit` field must be private and an array of integers: only
+    /// its package's methods can read it, and an integer of it read before
+    /// it's written is merely unknown (docs/safety.md, "The trusted
+    /// boundary").
+    fn check_uninit_field(&mut self, f: &ast::FieldDecl, at: Span, ty: Ty) {
+        if f.is_pub {
+            self.diags.push(
+                Diagnostic::error(at, "an `@uninit` field can't be `pub`").with_help(
+                    "only the struct's package may read it, after writing the part it reads",
+                ),
+            );
+        }
+        let ints = ty
+            .as_array()
+            .is_some_and(|(elem, _)| matches!(elem, Ty::Int(_)));
+        if ty != Ty::Unit && !ints {
+            self.error(
+                f.ty.span(),
+                format!("an `@uninit` field must be an array of integers, not `{ty}`"),
+            );
+        }
+    }
+
     fn field_type(&mut self, cx: &mut FnCx, t: &TypeExpr, what: &str) -> Ty {
         let Some(ty) = self.resolve_type(cx, t) else {
             return Ty::Unit;
@@ -1871,10 +1899,7 @@ impl<'a> Checker<'a> {
                             continue;
                         }
                         let ty = self.field_type(&mut cx, &f.ty, "payload");
-                        fields.push(Field {
-                            name: f.name.name.clone(),
-                            ty,
-                        });
+                        fields.push(Field::public(f.name.name.clone(), ty));
                     }
                 }
                 None => {}

@@ -643,9 +643,20 @@ impl Eval<'_, '_> {
                 }
             }
             TExprKind::StructLit(fields) => {
-                let mut vs = vec![Value::Unit; fields.len()];
+                let def = frame.ty(e.ty).as_struct().expect("a struct");
+                let mut vs = vec![Value::Unit; def.fields.len()];
                 for (k, v) in fields {
                     vs[*k as usize] = self.expr(frame, v)?;
+                }
+                // An `@uninit` field `unsafe` code left out: an array of
+                // integers, zeros while compiling, which its package never
+                // reads before writing.
+                for (k, f) in def.fields.iter().enumerate() {
+                    if f.uninit && !fields.iter().any(|(i, _)| *i as usize == k) {
+                        let (_, n) = f.ty.as_known_array().expect("an array");
+                        self.alloc(n)?;
+                        vs[k] = Value::Array(Rc::new(vec![Value::Int(0); n as usize]));
+                    }
                 }
                 Value::Struct(Rc::new(vs))
             }

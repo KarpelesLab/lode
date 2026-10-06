@@ -140,10 +140,7 @@ pub fn types() -> TargetTypes {
         let arch = make_enum("Arch", ARCH_NAMES);
         let endian = make_enum("Endian", ENDIAN_NAMES);
         let target = Ty::new_struct("target.Target".to_owned(), usize::MAX, true, Vec::new());
-        let field = |name: &str, ty| Field {
-            name: name.to_owned(),
-            ty,
-        };
+        let field = |name: &str, ty| Field::public(name, ty);
         target.set_fields(vec![
             field(FIELD_NAMES[0], os),
             field(FIELD_NAMES[1], arch),

@@ -840,6 +840,14 @@ mod tests {
     }
 
     #[test]
+    fn field_visibility_and_uninit() {
+        assert_eq!(
+            fmt("struct S {\n  @ uninit   a :[4]u8\npub    b:u8\n}\n"),
+            "struct S {\n\t@uninit a: [4]u8\n\tpub b: u8\n}\n"
+        );
+    }
+
+    #[test]
     fn comptime() {
         assert_eq!(
             fmt(

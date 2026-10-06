@@ -1,6 +1,8 @@
 /// Fixed-capacity byte buffers.
 package buf
 
+import "std/os"
+
 /// What a buffer's operations throw.
 pub enum Error {
 	/// There's no room left at that end.
@@ -13,24 +15,32 @@ pub enum Error {
 /// every access is proven. The buffer lives where it's declared, on the
 /// stack for a local.
 ///
-/// `new` still fills the storage with zeros: until fields can be private,
-/// any code could read the bytes outside the written part
-/// (docs/memory.md, "Uninitialized buffers").
+/// Its fields are private, and its storage is `@uninit`: `new` and
+/// `new_end` don't write it, and this package reads only the bytes written
+/// (docs/memory.md, "Uninitialized buffers"). So `StackBuf` isn't `Eq`:
+/// `==` would compare the bytes never written too.
 pub struct StackBuf[N: usize] {
-	bytes: [N]u8
+	@uninit bytes: [N]u8
 	start: usize
 	end: usize
 }
 
 /// An empty buffer that `push` fills from the front of its storage.
 pub fn StackBuf[N].new() -> StackBuf[N] {
-	return StackBuf{bytes: [0; N], start: 0, end: 0}
+	// Sound: `bytes` is read only in `start..end`, which `push` and
+	// `push_front` write before they move `start` or `end`.
+	unsafe {
+		return StackBuf{start: 0, end: 0}
+	}
 }
 
 /// An empty buffer that `push_front` fills from the back of its storage,
 /// such as for the digits of a number, last digit first.
 pub fn StackBuf[N].new_end() -> StackBuf[N] {
-	return StackBuf{bytes: [0; N], start: N, end: N}
+	// Sound, as in `new`.
+	unsafe {
+		return StackBuf{start: N, end: N}
+	}
 }
 
 /// The number of bytes written.
@@ -73,4 +83,14 @@ pub fn StackBuf[N].get(self, i: usize) -> ?u8 {
 		return none
 	}
 	return self.bytes[at]
+}
+
+/// Write the bytes written to the file descriptor `fd`, as `os.write_all`
+/// does: returns 0, or the negative error number of the first failure.
+/// (`io.File.write_buf` calls it: only this package sees the bytes.)
+pub fn StackBuf[N].write_to(self, fd: i32) -> isize {
+	if self.start > self.end || self.end > N {
+		return 0
+	}
+	return os.write_all(fd, self.bytes[self.start..self.end])
 }
