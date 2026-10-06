@@ -115,7 +115,8 @@ pub fn declared(items: &[ast::Item]) -> Vec<&str> {
             ast::Item::Fn(_)
             | ast::Item::If(_)
             | ast::Item::CompileError(_)
-            | ast::Item::Impl(_) => None,
+            | ast::Item::Impl(_)
+            | ast::Item::Oom(_) => None,
         })
         .collect()
 }

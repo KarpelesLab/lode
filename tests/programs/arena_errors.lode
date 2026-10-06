@@ -1,0 +1,133 @@
+// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: a `defer` body can't allocate from `arena`, the allocator of the `with` around it
+// error: `with alloc` takes an `alloc.Handle`, or a counted allocator, found `alloc.FixedBuf`
+// error: calling the `unsafe fn` `alloc.current` is unsafe
+// error: calling the `unsafe fn` `arena.handle` is unsafe
+// error: `with alloc = ...` takes a variable holding the `alloc.Arena`
+// error: calling the `unsafe fn` `alloc.FixedBuf.new` is unsafe
+// error: taking an array's or slice's raw pointer is unsafe
+// help: the block borrows `arena` while it allocates: change or move it after the last allocation, or after the block
+// help: a handle of another allocator is made by `unsafe` code, `alloc.handle(a)`, which promises the allocator outlives what it allocates
+package main
+
+import "std/alloc"
+import "std/mem"
+
+// A counted allocator can't end while `with` allocates from it: the
+// block borrows it, as a view borrows what it views (docs/allocation.md,
+// Allocators that end).
+
+fn destroyed() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		var xs = List[u32].new()
+		try xs.push(1)
+		mem.destroy(arena)
+		try xs.push(2)
+	}
+}
+
+fn reset_inside() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		var xs = List[u32].new()
+		arena.reset()
+		try xs.push(2)
+	}
+}
+
+fn replace(inout a: alloc.Arena) uses alloc throws(AllocError) {
+	a = try alloc.Arena.new()
+	let b = try Box[u32].new(1)
+}
+
+// The call allocates from `arena` while it changes `arena`.
+fn passed_inout() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		try replace(&arena)
+	}
+}
+
+fn consume(sink a: alloc.Arena) uses alloc throws(AllocError) {
+	mem.destroy(a)
+	let b = try Box[u32].new(1)
+}
+
+fn passed_sink() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		try consume(arena)
+	}
+}
+
+// On some path only.
+fn maybe(c: bool) uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		if c {
+			mem.destroy(arena)
+		}
+		let b = try Box[u32].new(1)
+	}
+}
+
+fn note() uses alloc {
+	let b = Box[u32].new(1) catch _ {
+		return
+	}
+}
+
+// A `defer` runs when the block is left: by then, the arena may have
+// changed.
+fn deferred() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		defer note()
+	}
+}
+
+// A fixed buffer over the stack is no `with` allocator in safe code.
+fn fixed() uses alloc {
+	var buf: [64]u8 = [0; 64]
+	let f = alloc.FixedBuf.new(buf.ptr, buf.len) else {
+		return
+	}
+	with alloc = f {
+	}
+}
+
+// A handle of the context, or of an arena, kept as a value could outlive
+// the arena: only `unsafe` code takes one.
+fn current() uses alloc -> alloc.Handle {
+	return alloc.current()
+}
+
+fn handle_value() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena.handle() {
+	}
+}
+
+fn temporary() uses alloc throws(AllocError) {
+	with alloc = try alloc.Arena.new() {
+	}
+}
+
+// Changing the arena after its last allocation in the block is fine.
+fn fine() uses alloc throws(AllocError) -> List[u32] {
+	var arena = try alloc.Arena.new()
+	var xs = List[u32].new()
+	with alloc = arena {
+		try xs.push(1)
+		mem.destroy(arena)
+	}
+	return xs
+}
+
+fn main() {
+}

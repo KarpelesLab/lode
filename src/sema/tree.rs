@@ -39,6 +39,11 @@ pub struct Program {
     pub statics: Vec<Static>,
     /// What the compiler knows of `std/alloc`, if the program imports it.
     pub alloc: Option<AllocInfo>,
+    /// Whether the main package says `@oom(abort)` (docs/allocation.md, Out
+    /// of memory): `AllocError` never happens. `crate::mono` makes a
+    /// function that throws only `AllocError` not throw, and making an
+    /// `AllocError` call `alloc.out_of_memory()`, which ends the process.
+    pub oom_abort: bool,
 }
 
 /// A `static`: a global initialized when compiling (docs/memory.md,
@@ -69,6 +74,9 @@ pub struct AllocInfo {
     /// `alloc.Box[T]` as declared: its first field is its pointer, its
     /// second its allocator's handle.
     pub boxed: Ty,
+    /// `alloc.out_of_memory()`, which ends the process: what making an
+    /// `AllocError` does under `@oom(abort)`.
+    pub oom: Option<FuncId>,
 }
 
 /// The methods declared in traits, and those each `impl` gives: what a call
@@ -462,6 +470,9 @@ pub enum Intrinsic {
     AllocRoot,
     /// `alloc.handle(a)`: a handle of the allocator `a` (unsafe).
     AllocHandle,
+    /// `alloc.handle_at(p)`: a handle of the allocator `p` points to
+    /// (unsafe): the handle of a counted allocator's control block.
+    AllocHandleAt,
     /// `h.alloc(size, align)`, `h.resize(p, old, new, align)` and
     /// `h.free(p, size, align)` on an `alloc.Handle`: the method of the
     /// allocator it names (`crate::mono` makes them calls).

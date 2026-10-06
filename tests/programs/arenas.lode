@@ -1,0 +1,290 @@
+// stdout: returned: live 1, sum 4950 | parent 3 0\n
+// stdout: list destroyed | parent 3 3\n
+// stdout: kept: hello world, live 1 | parent 6 3\n
+// stdout: owner destroyed: hello world | parent 6 3\n
+// stdout: strings destroyed | parent 6 6\n
+// stdout: deferred: 1 2 3 | parent 9 6\n
+// stdout: after defer | parent 9 9\n
+// stdout: nested: outer 3, inner 1 | parent 13 9\n
+// stdout: nested destroyed | parent 13 13\n
+// stdout: reset: false true, 4 4 | parent 16 13\n
+// stdout: counted: 3 live 1 | wrapped 1 0 | parent 17 16\n
+// stdout: counted destroyed | wrapped 1 1 | parent 17 17\n
+// stdout: fixed: 10 20 30, room 448\n
+// stdout: static fixed: 7 8, full\n
+// stdout: boxed: 9 | parent 20 17\n
+// stdout: box destroyed | parent 20 20\n
+// stdout: done | parent 20 20\n
+package main
+
+import "std/alloc"
+import "std/io"
+import "std/mem"
+
+// Allocators that end (docs/allocation.md): an arena's memory lives until
+// the arena and everything allocated from it have ended; a counted
+// allocator wraps any allocator so; a fixed buffer is used through
+// `unsafe` code. A parent allocator counts what they take from it.
+
+// An allocator that counts its allocations and frees, over the root.
+struct Counting {
+	slot: usize
+}
+
+static ALLOCS: [2]u32 = [0, 0]
+
+static FREES: [2]u32 = [0, 0]
+
+static PARENT: Counting = Counting{slot: 0}
+
+unsafe impl alloc.Allocator for Counting {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		if self.slot >= 2 {
+			throw .out_of_memory
+		}
+		unsafe {
+			ALLOCS[self.slot] +%= 1
+			return try alloc.ROOT.alloc(size, align)
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		if self.slot < 2 {
+			FREES[self.slot] +%= 1
+		}
+		alloc.ROOT.free(p, size, align)
+	}
+}
+
+fn parent() -> alloc.Handle {
+	unsafe {
+		return alloc.handle(PARENT)
+	}
+}
+
+fn counts(slot: usize) -> [2]u32 {
+	if slot >= 2 {
+		return [0, 0]
+	}
+	unsafe {
+		return [ALLOCS[slot], FREES[slot]]
+	}
+}
+
+fn show(what: str) {
+	let c = counts(0)
+	io.print("{} | parent {} {}\n", what, c[0], c[1])
+}
+
+// A list made in an arena and returned: the arena ends with the function,
+// its memory with the list.
+fn build(n: u32) uses alloc throws(AllocError) -> List[u32] {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		var xs = List[u32].new()
+		for i in 0..n {
+			try xs.push(i)
+		}
+		io.print("returned: live {}, ", arena.live())
+		return xs
+	}
+}
+
+fn returned() uses alloc throws(AllocError) {
+	let xs = try build(100)
+	var t: u32 = 0
+	for x in xs {
+		t +%= x
+	}
+	io.print("sum {}", t)
+	show("")
+	mem.destroy(xs)
+	show("list destroyed")
+}
+
+// Strings made in an arena, kept in an outer list through `inout`, and
+// the arena destroyed first: its memory stays while they're alive.
+fn fill(inout out: List[String]) uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		var s = try String.from("hello")
+		try s.push_str(" world")
+		try out.push(s)
+		io.print("kept:")
+		for w in out {
+			io.print(" {}", w)
+		}
+		io.print(", live {}", arena.live())
+	}
+	show("")
+}
+
+fn kept() uses alloc throws(AllocError) {
+	// The outer list's own storage comes from the root.
+	var words = List[String].new()
+	with alloc = alloc.root() {
+		try words.reserve(1)
+	}
+	try fill(&words)
+	let all = words.as_slice()
+	io.print("owner destroyed:")
+	for w in all {
+		io.print(" {}", w)
+	}
+	show("")
+	mem.destroy(words)
+	show("strings destroyed")
+}
+
+fn print_all(xs: List[u32]) {
+	io.print("deferred:")
+	for x in xs {
+		io.print(" {}", x)
+	}
+	show("")
+}
+
+fn three(inout xs: List[u32]) uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		try xs.push(1)
+		try xs.push(2)
+		try xs.push(3)
+	}
+}
+
+// A `defer` that reads a list from an arena, after the arena has ended.
+fn deferred() uses alloc throws(AllocError) {
+	var xs = List[u32].new()
+	defer print_all(xs)
+	try three(&xs)
+}
+
+// An arena made in an arena counts as one of its allocations.
+fn nested() uses alloc throws(AllocError) {
+	var outer = try alloc.Arena.new()
+	with alloc = outer {
+		var inner = try alloc.Arena.new()
+		with alloc = inner {
+			let b = try Box[u64].new(5)
+			io.print("nested: outer {}, inner {}", outer.live(), inner.live())
+			show("")
+		}
+	}
+}
+
+// `reset` reuses the memory once nothing from the arena is alive.
+fn resetting() uses alloc throws(AllocError) {
+	var arena = try alloc.Arena.new()
+	var xs = List[u64].new()
+	with alloc = arena {
+		try xs.push(4)
+	}
+	let busy = arena.reset()
+	let first = xs.get(0) ?? 0
+	mem.destroy(xs)
+	let free = arena.reset()
+	var ys = List[u64].new()
+	with alloc = arena {
+		try ys.push(4)
+	}
+	io.print("reset: {} {}, {} {}", busy, free, first, ys.get(0) ?? 0)
+	show("")
+}
+
+// Any allocator, counted: here one that counts in slot 1, over the root.
+fn counted() uses alloc throws(AllocError) {
+	var c = try alloc.Counted.new(Counting{slot: 1})
+	var xs = List[u8].new()
+	with alloc = c {
+		try xs.push(3)
+	}
+	let w = counts(1)
+	io.print("counted: {} live {} | wrapped {} {}", xs.get(0) ?? 0, c.live(), w[0], w[1])
+	show("")
+	mem.destroy(c)
+	mem.destroy(xs)
+	let w2 = counts(1)
+	io.print("counted destroyed | wrapped {} {}", w2[0], w2[1])
+	show("")
+}
+
+// A fixed buffer over an array on the stack: only `unsafe` code makes a
+// handle of it, promising nothing it allocates outlives the array.
+fn fixed() uses alloc throws(AllocError) {
+	var buf: [64]u64 = [0; 64]
+	unsafe {
+		let f = alloc.FixedBuf.new(buf.ptr.cast[u8](), 512) else {
+			return
+		}
+		with alloc = alloc.handle(f) {
+			var xs = List[u64].new()
+			try xs.reserve(4)
+			try xs.push(10)
+			try xs.push(20)
+			try xs.push(30)
+			io.print("fixed: {} {} {}, room {}\n", xs.get(0) ?? 0, xs.get(1) ?? 0, xs.get(2) ?? 0, f.room())
+		}
+	}
+}
+
+// Over a `static` array, which never ends.
+static MEMORY: [8]u64 = [0; 8]
+
+fn static_fixed() uses alloc throws(AllocError) {
+	unsafe {
+		let f = alloc.FixedBuf.new(MEMORY.ptr.cast[u8](), 64) else {
+			return
+		}
+		with alloc = alloc.handle(f) {
+			let a = try Box[u64].new(7)
+			let b = try Box[u64].new(8)
+			io.print("static fixed: {} {}", a.value, b.value)
+			let c = Box[[4]u64].new([0; 4]) catch _ {
+				io.print(", full\n")
+				return
+			}
+		}
+	}
+}
+
+// A box from an arena that has ended.
+fn boxed() uses alloc throws(AllocError) -> Box[u64] {
+	var arena = try alloc.Arena.new()
+	with alloc = arena {
+		return try Box[u64].new(9)
+	}
+}
+
+fn run() uses alloc throws(AllocError) {
+	with alloc = parent() {
+		try returned()
+		try kept()
+		try deferred()
+		show("after defer")
+		try nested()
+		show("nested destroyed")
+		try resetting()
+		try counted()
+		try fixed()
+		try static_fixed()
+		let b = try boxed()
+		io.print("boxed: {}", b.value)
+		show("")
+		mem.destroy(b)
+		show("box destroyed")
+	}
+	show("done")
+}
+
+fn main() uses alloc -> u8 {
+	run() catch _ {
+		io.print("out of memory\n")
+		return 1
+	}
+	return 0
+}

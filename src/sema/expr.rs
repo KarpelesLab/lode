@@ -649,6 +649,18 @@ impl Checker<'_> {
             let range = Some(c.int_range());
             return Some(c.converted(target, range));
         }
+        // A member of a union of error types where the union is expected:
+        // the union's variant for it.
+        if let Some(members) = target.union_members()
+            && let Some(k) = members.iter().position(|&m| m == c.ty())
+        {
+            let value = self.kept(cx, c, span)?;
+            return Some(Checked::new(
+                TExprKind::Variant(k as u32, vec![value.expr]),
+                target,
+                None,
+            ));
+        }
         // A list where a slice of its element type is expected: a view of
         // its elements.
         if self.is_list(c.ty()) && target.as_slice() == c.ty().type_args().first().copied() {
@@ -1240,6 +1252,44 @@ impl Checker<'_> {
         cx: &mut FnCx,
     ) -> Option<Checked> {
         match expected.map(under_optionals) {
+            // A union of error types: the variant of the one member that
+            // has it, as a value of the union.
+            Some(ty @ Ty::Enum(_)) if let Some(members) = ty.union_members() => {
+                let having: Vec<usize> = (0..members.len())
+                    .filter(|&k| {
+                        members[k]
+                            .as_enum()
+                            .is_some_and(|d| d.variant(&name.name).is_some())
+                    })
+                    .collect();
+                let [k] = having[..] else {
+                    let msg = if having.is_empty() {
+                        format!("no member of `{ty}` has a variant `{}`", name.name)
+                    } else {
+                        let names: Vec<String> = having
+                            .iter()
+                            .map(|&k| format!("`{}`", members[k]))
+                            .collect();
+                        format!(
+                            "`.{}` is a variant of several members of `{ty}`: {}",
+                            name.name,
+                            super::name_list(&names)
+                        )
+                    };
+                    self.diags.push(
+                        Diagnostic::error(name.span, msg)
+                            .with_help(format!("name the error type: `E.{}`", name.name)),
+                    );
+                    return None;
+                };
+                let c = self.enum_variant(cx, members[k], name, args, span, None)?;
+                let c = self.kept(cx, c, span)?;
+                Some(Checked::new(
+                    TExprKind::Variant(k as u32, vec![c.expr]),
+                    ty,
+                    None,
+                ))
+            }
             Some(ty @ Ty::Enum(_)) => self.enum_variant(cx, ty, name, args, span, None),
             other => {
                 let found = match other {
@@ -1314,7 +1364,10 @@ impl Checker<'_> {
         self.check_not_in_defer(cx, span, "`try`")?;
         let c = self.throwing_call(cx, call, "try", expected)?;
         let (value, err) = c.ty().as_result().expect("a result");
-        match cx.throws {
+        // Under `@oom(abort)`, `AllocError` never happens: a call that
+        // throws only it needs no function that throws around it.
+        let own = match cx.throws {
+            None if self.oom_abort && err == Ty::alloc_error() => err,
             None => {
                 self.diags.push(
                     Diagnostic::error(span, "`try` can only be used in a function that throws")
@@ -1324,29 +1377,136 @@ impl Checker<'_> {
                 );
                 return None;
             }
-            Some(own) if own != err => {
-                self.diags.push(
-                    Diagnostic::error(
-                        span,
-                        format!(
-                            "`try` can't pass on an error of type `{err}` from a function that throws `{own}`"
-                        ),
-                    )
-                    .with_help(format!(
-                        "convert it: `... catch e {{ throw .name(...) }}` with a variant of `{own}`"
-                    )),
-                );
-                return None;
+            Some(own) => own,
+        };
+        let conversion = if own == err {
+            None
+        } else {
+            match self.error_conversion(err, own) {
+                Ok(plan) => Some(plan),
+                Err(missing) => {
+                    let what = if missing == err {
+                        format!("an error of type `{err}`")
+                    } else {
+                        format!("an error of type `{err}`, whose `{missing}` isn't in `{own}`,")
+                    };
+                    self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!("`try` can't pass on {what} from a function that throws `{own}`"),
+                        )
+                        .with_help(format!(
+                            "convert it: `... catch e {{ throw ... }}` with a value of `{own}`, or add `{missing}` to the function's `throws(A | B)`"
+                        )),
+                    );
+                    return None;
+                }
             }
-            Some(_) => {}
-        }
+        };
         self.defer_moves_at(cx, 0, true, Some(span));
         let known = c.payload.clone();
-        let mut out = Checked::new(TExprKind::Try(Box::new(c.expr)), value, None);
+        let kind = match conversion {
+            None => TExprKind::Try(Box::new(c.expr)),
+            // The error converted, then passed on: `catch e { throw ... }`.
+            Some(plan) => {
+                cx.scopes.push(HashMap::new());
+                let binding = self.declare(cx, "$error", err, false);
+                let handler = self.convert_error(cx, binding, err, own, &plan);
+                cx.scopes.pop();
+                TExprKind::Catch {
+                    call: Box::new(c.expr),
+                    binding: Some(binding),
+                    handler: Handler::Block(handler),
+                }
+            }
+        };
+        let mut out = Checked::new(kind, value, None);
         if let Some(k) = known {
             attach_facts(&mut out, value, k.0, k.1);
         }
         Some(out)
+    }
+
+    /// How `try` converts an error of type `from` into one of type `to`
+    /// (docs/errors.md, Error sets): for each member of `from` (itself if
+    /// it isn't a union), what it becomes in `to`. Every member must be
+    /// one of `to`'s, but `AllocError` under `@oom(abort)`, which never
+    /// happens. Otherwise, the member that isn't.
+    fn error_conversion(&self, from: Ty, to: Ty) -> Result<Vec<Converted>, Ty> {
+        let targets = to.error_members();
+        let union = to.union_members().is_some();
+        from.error_members()
+            .into_iter()
+            .map(|m| match targets.iter().position(|&t| t == m) {
+                Some(k) if union => Ok(Converted::Member(k as u32)),
+                Some(_) => Ok(Converted::Same),
+                None if self.oom_abort && m == Ty::alloc_error() => Ok(Converted::Abort),
+                None => Err(m),
+            })
+            .collect()
+    }
+
+    /// The statements that throw the error in `binding` (of type `from`)
+    /// as one of type `to`, by `plan` (see [`Checker::error_conversion`]):
+    /// a `match` over a union's members, each thrown as what it becomes.
+    fn convert_error(
+        &mut self,
+        cx: &mut FnCx,
+        binding: LocalId,
+        from: Ty,
+        to: Ty,
+        plan: &[Converted],
+    ) -> Vec<TStmt> {
+        let local = |l: LocalId, ty: Ty| TExpr {
+            kind: TExprKind::Local(l),
+            ty,
+        };
+        let throw = |this: &Self, value: TExpr, how: Converted| -> TStmt {
+            match how {
+                Converted::Same => TStmt::Throw(value),
+                Converted::Member(k) => TStmt::Throw(TExpr {
+                    kind: TExprKind::Variant(k, vec![value]),
+                    ty: to,
+                }),
+                Converted::Abort => TStmt::Expr(this.out_of_memory()),
+            }
+        };
+        let Some(members) = from.union_members() else {
+            return vec![throw(self, local(binding, from), plan[0])];
+        };
+        let arms = members
+            .iter()
+            .zip(plan)
+            .enumerate()
+            .map(|(k, (&m, &how))| {
+                let part = self.declare(cx, "$member", m, false);
+                let payload = TExpr {
+                    kind: TExprKind::Payload(Box::new(local(binding, from)), k as u32, 0),
+                    ty: m,
+                };
+                TArm {
+                    variants: vec![k as u32],
+                    body: vec![TStmt::Init(part, payload), throw(self, local(part, m), how)],
+                }
+            })
+            .collect();
+        vec![TStmt::Match {
+            value: local(binding, from),
+            arms,
+        }]
+    }
+
+    /// A call of `alloc.out_of_memory()`, which ends the process: what
+    /// making an `AllocError` does under `@oom(abort)`.
+    pub(super) fn out_of_memory(&self) -> TExpr {
+        let f = self
+            .alloc
+            .and_then(|a| a.oom)
+            .expect("`@oom(abort)` loads `std/alloc`");
+        TExpr {
+            kind: TExprKind::Call(f, Vec::new()),
+            ty: Ty::Never,
+        }
     }
 
     /// `call catch e { ... }`, `call catch _ { ... }` or `call catch value`:
@@ -3897,7 +4057,11 @@ impl Checker<'_> {
                     if allocates && !cx.uses_alloc {
                         self.alloc_needed(cx, &name, span);
                     }
-                    if throws && !handled {
+                    if allocates {
+                        self.context_used(cx, span);
+                    }
+                    // Under `@oom(abort)`, `AllocError` never happens.
+                    if throws && !handled && !self.oom_abort {
                         self.diags.push(
                             Diagnostic::error(
                                 span,
@@ -4023,9 +4187,14 @@ impl Checker<'_> {
         if self.sigs[id].uses_alloc && !cx.uses_alloc {
             self.alloc_needed(cx, &name, span);
         }
+
         let (params, sig_ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
         let throws = self.sigs[id].throws;
-        if throws.is_some() && !handled {
+        // Under `@oom(abort)`, a call that throws only `AllocError` never
+        // fails: it may be left unhandled (docs/allocation.md, Out of
+        // memory).
+        let never_fails = self.oom_abort && throws == Some(Ty::alloc_error());
+        if throws.is_some() && !handled && !never_fails {
             // Reported, then checked as if passed on, to go on checking.
             self.diags.push(
                 Diagnostic::error(
@@ -4338,6 +4507,11 @@ impl Checker<'_> {
             }
         }
         cx.call_sets = sets;
+        // The call allocates from the context, with what it changed or
+        // moved (a counted allocator a `with` borrows can't be one).
+        if self.sigs[id].uses_alloc {
+            self.context_used(cx, span);
+        }
         // A changed place that isn't a term has no value known any more.
         for &k in &changed_k {
             if let Some(v) = &arg_vals[k].value
@@ -5063,4 +5237,17 @@ pub(super) fn attach_facts(c: &mut Checked, ty: Ty, range: Option<Range>, known:
         c.upper = refine::known_upper(&known);
     }
     c.known = known;
+}
+
+/// What one member of an error type becomes when `try` converts it (see
+/// [`Checker::error_conversion`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Converted {
+    /// The same type: thrown as it is.
+    Same,
+    /// The union's variant of this number.
+    Member(u32),
+    /// `AllocError` under `@oom(abort)`: it never happens; the process
+    /// ends.
+    Abort,
 }

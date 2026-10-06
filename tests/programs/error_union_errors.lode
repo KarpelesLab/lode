@@ -1,0 +1,105 @@
+// error: `try` can't pass on an error of type `Other` from a function that throws `A | B`
+// error: `try` can't pass on an error of type `A | Other`, whose `Other` isn't in `A | B`, from a function that throws `A | B`
+// error: `try` can't pass on an error of type `A | B`, whose `B` isn't in `A`, from a function that throws `A`
+// error: this `match` doesn't handle the variant `B` of `A | B`
+// error: `A` is in this union twice
+// error: an error type must be an enum, found `u32`
+// error: `.shared` is a variant of several members of `A | B`: `A`, `B`
+// error: no member of `A | B` has a variant `missing`
+// error: `Other` is not one of the error types of `A | B`
+// error: a union of error types can't have a member that depends on a type parameter (`Wrap[T]`) yet
+// error: expected `A | B`, found `A | Other`
+// help: add `Other` to the function's `throws(A | B)`
+package main
+
+enum A {
+	a
+	shared
+}
+
+enum B {
+	b
+	shared
+}
+
+enum Other {
+	o
+}
+
+fn a() throws(A) {
+	throw .a
+}
+
+fn other() throws(Other) {
+	throw .o
+}
+
+fn a_or_other() throws(A | Other) {
+	throw .o
+}
+
+fn both() throws(A | B) {
+	try a()
+	// Not a member.
+	try other()
+	// A member that isn't one.
+	try a_or_other()
+}
+
+// A union doesn't convert into one of its members.
+fn narrow() throws(A) {
+	try both()
+}
+
+fn not_all() {
+	both() catch e {
+		match e {
+			A(x) => {
+			}
+		}
+	}
+}
+
+fn twice() throws(A | A) {
+}
+
+fn not_enum() throws(A | u32) {
+}
+
+fn ambiguous() throws(A | B) {
+	throw .shared
+}
+
+fn unknown() throws(A | B) {
+	throw .missing
+}
+
+fn not_member() {
+	both() catch e {
+		match e {
+			A => {
+			}
+			Other => {
+			}
+			B => {
+			}
+		}
+	}
+}
+
+enum Wrap[T: Copy] {
+	w(v: T)
+}
+
+fn generic[T: Copy]() throws(A | Wrap[T]) {
+}
+
+// `throw` takes a member, or the union itself, not another union.
+fn rethrow() throws(A | B) {
+	a_or_other() catch e {
+		throw e
+	}
+}
+
+fn main() {
+}

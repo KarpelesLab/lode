@@ -159,3 +159,29 @@ pub fn format[..A: io.Format](comptime fmt: str, args: ..A) uses alloc throws(Al
 	try write_fmt(&s, fmt, ..args)
 	return s
 }
+
+/// Write the format string `fmt` to `f`, each `{}` replaced by the next
+/// argument, as `io.print` writes them, but in one write: the text is
+/// formatted into a new string first (`format`), then written whole. It
+/// fails as either can: `AllocError` when there's no memory for the text,
+/// `os.Error` when the write fails.
+pub fn print_to[..A: io.Format](f: io.File, comptime fmt: str, args: ..A) uses alloc throws(os.Error | AllocError) {
+	let s = try format(fmt, ..args)
+	try f.write(s.as_str())
+}
+
+/// Read `f` to its end, appending what it reads to `out`: the number of
+/// bytes read. It fails as reading or growing `out` can: `os.Error` or
+/// `AllocError`, with what was read before kept in `out`.
+pub fn read_all(f: io.File, inout out: list.List[u8]) uses alloc throws(os.Error | AllocError) -> usize {
+	var total: usize = 0
+	var chunk: [4096]u8 = [0; 4096]
+	loop {
+		let n = try f.read(&chunk)
+		if n == 0 {
+			return total
+		}
+		try out.extend(chunk[..n])
+		total +|= n
+	}
+}

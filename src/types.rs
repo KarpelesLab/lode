@@ -336,6 +336,58 @@ impl Ty {
         })
     }
 
+    /// The union of the error types `members`, `throws(A | B)`
+    /// (docs/errors.md, Error sets): an enum the compiler makes, with one
+    /// variant per member, named as the member is shown, whose one payload
+    /// field (`error`) is a value of it. The members are concrete enums,
+    /// at least two and all different; their order doesn't matter: the
+    /// variants are sorted by name, so `A | B` and `B | A` are the same
+    /// type.
+    pub fn union(members: &[Ty]) -> Ty {
+        let mut members = members.to_vec();
+        members.sort_by_cached_key(|m| m.to_string());
+        let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&ty) = tables.unions.get(&members) {
+            return ty;
+        }
+        drop(tables);
+        let name = members
+            .iter()
+            .map(Ty::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let ty = Ty::new_enum(name, usize::MAX, true, Vec::new());
+        let variants = members
+            .iter()
+            .enumerate()
+            .map(|(k, &m)| Variant {
+                name: m.to_string(),
+                fields: vec![Field::public("error", m)],
+                value: k as i128,
+            })
+            .collect();
+        ty.set_variants(IntTy::new(false, 8), false, variants);
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        tables.union_members.insert(ty, members.clone());
+        *tables.unions.entry(members).or_insert(ty)
+    }
+
+    /// The members of a union of error types (see [`Ty::union`]), in the
+    /// order of its variants.
+    pub fn union_members(self) -> Option<Vec<Ty>> {
+        if !matches!(self, Ty::Enum(_)) {
+            return None;
+        }
+        let tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        tables.union_members.get(&self).cloned()
+    }
+
+    /// The error types a value of this error type can be: its members for
+    /// a union, or itself.
+    pub fn error_members(self) -> Vec<Ty> {
+        self.union_members().unwrap_or_else(|| vec![self])
+    }
+
     /// Whether a value of this type can be copied implicitly (the built-in
     /// trait `Copy`). Plain data is; a struct or an enum with a `deinit`
     /// isn't, nor a type parameter without the bound `Copy`, nor the
@@ -1591,6 +1643,10 @@ struct Interner {
     /// The type parameters standing for associated types and constants of
     /// type parameters, by parameter, trait and name.
     projections: HashMap<(Ty, Trait, String), Ty>,
+    /// The unions of error types, by their sorted members, and the
+    /// members of each.
+    unions: HashMap<Vec<Ty>, Ty>,
+    union_members: HashMap<Ty, Vec<Ty>>,
 }
 
 impl Default for Interner {
@@ -1608,6 +1664,8 @@ impl Default for Interner {
             traits: Vec::new(),
             impls: HashMap::new(),
             projections: HashMap::new(),
+            unions: HashMap::new(),
+            union_members: HashMap::new(),
         }
     }
 }

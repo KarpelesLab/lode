@@ -7,7 +7,8 @@
 //!
 //! A package that may use a name of the prelude (`Box`) also loads the
 //! package the name comes from, before itself: see [`crate::prelude`] for
-//! when it may.
+//! when it may. A root file that says `@oom(abort)` loads `std/alloc`,
+//! whose `out_of_memory` ends the process.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,6 +45,14 @@ pub fn load(map: &mut SourceMap, root: FileId, std_root: &Path) -> (Vec<Package>
         .as_ref()
         .map_or_else(|| "main".to_owned(), |p| p.name.clone());
     loader.imports_of(&file);
+    // `@oom(abort)` ends the process through `std/alloc`'s
+    // `out_of_memory` (docs/allocation.md, Out of memory).
+    if let Some(o) = file.items.iter().find_map(|item| match item {
+        ast::Item::Oom(o) if o.abort => Some(o),
+        _ => None,
+    }) {
+        loader.require("std/alloc", o.span);
+    }
     let parsed = [(file, uses)];
     loader.prelude_of(&parsed);
     let [(file, _)] = parsed;

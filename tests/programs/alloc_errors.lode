@@ -16,7 +16,7 @@
 // error: `==` can't compare values of type `Holder`
 // error: a pointer can't point to a view (`str`)
 // error: `counted` allocates (`uses alloc`), which code run when compiling can't do
-// error: expected `alloc.Handle`, found `u32`
+// error: `with alloc` takes an `alloc.Handle`, or a counted allocator, found `u32`
 // error: `h.alloc` allocates (`uses alloc`), so it's only called by a function that declares `uses alloc`
 // error: the methods of `Box` (from the prelude) can only be declared in package `std/alloc`
 // help: add `uses alloc` to `no_context`, after its parameters, so its callers know it allocates

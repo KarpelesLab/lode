@@ -1,0 +1,118 @@
+// exit: 134
+// stdout: 1 7 hi\n
+// stdout: total 6\n
+// stdout: empty\n
+// stdout: caught nothing, matched ok\n
+// stdout: pushed 0 1 2 3 4 5 6 7
+package main
+
+import "std/alloc"
+import "std/io"
+
+// The out-of-memory policy (docs/allocation.md, Out of memory): under
+// `@oom(abort)`, `AllocError` never happens. Allocation failure ends the
+// process (status 134, `out of memory` on standard error), a call that
+// throws only `AllocError` needs no `try`, and `ParseError | AllocError`
+// is `ParseError`. The standard library is the same source as under the
+// default policy.
+@oom(abort)
+
+enum ParseError {
+	empty
+}
+
+// An allocator that fails after `limit` allocations.
+struct Failing {
+	limit: u32
+}
+
+static COUNT: u32 = 0
+
+static FAILING: Failing = Failing{limit: 2}
+
+unsafe impl alloc.Allocator for Failing {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		unsafe {
+			if COUNT >= self.limit {
+				throw .out_of_memory
+			}
+			COUNT +%= 1
+			return try alloc.ROOT.alloc(size, align)
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		alloc.ROOT.free(p, size, align)
+	}
+}
+
+fn failing() -> alloc.Handle {
+	unsafe {
+		return alloc.handle(FAILING)
+	}
+}
+
+// Library code, written for the default policy: with `try`.
+fn parse(n: u32) uses alloc throws(ParseError | AllocError) -> List[u32] {
+	if n == 0 {
+		throw .empty
+	}
+	var xs = List[u32].new()
+	for i in 0..n {
+		try xs.push(i)
+	}
+	return xs
+}
+
+// Under `@oom(abort)`, `try` converts `ParseError | AllocError` into
+// `ParseError`.
+fn total(n: u32) uses alloc throws(ParseError) -> u32 {
+	let xs = try parse(n)
+	var t: u32 = 0
+	for x in xs {
+		t +%= x
+	}
+	return t
+}
+
+fn main() uses alloc -> u8 {
+	// No `try`: these can't fail.
+	var xs = List[u32].new()
+	xs.push(5)
+	let b = Box[u32].new(7)
+	let s = String.from("hi")
+	io.print("{} {} {}\n", xs.len, b.value, s)
+	let t = total(4) catch e {
+		return 1
+	}
+	io.print("total {}\n", t)
+	total(0) catch e {
+		match e {
+			empty => io.print("empty\n")
+		}
+	}
+	// `try`, `catch` and `match` on a call that can't fail are allowed.
+	try xs.push(6)
+	xs.push(7) catch _ {
+		io.print("unreachable\n")
+	}
+	io.print("caught nothing, ")
+	match Box[u32].new(8) {
+		ok(c) => io.print("matched ok\n")
+		err(e) => io.print("unreachable\n")
+	}
+	// The third allocation fails: the process ends.
+	io.print("pushed")
+	with alloc = failing() {
+		var ys = List[u64].new()
+		for i in 0..100 {
+			ys.push(i)
+			io.print(" {}", i)
+		}
+	}
+	return 0
+}

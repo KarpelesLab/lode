@@ -1,0 +1,25 @@
+// error: the program's `@oom` policy is set twice
+// error: `try` can't pass on an error of type `AllocError` from a function that throws `ParseError`
+// error: `xs.push` can throw, and its error must be handled
+package main
+
+// Under the default policy (`@oom(error)`, as the first line says),
+// `AllocError` is an error like any other: it must be handled, and isn't
+// dropped from a union.
+@oom(error)
+
+@oom(abort)
+
+enum ParseError {
+	empty
+}
+
+fn parse() uses alloc throws(ParseError) -> List[u32] {
+	var xs = List[u32].new()
+	try xs.push(1)
+	xs.push(2)
+	return xs
+}
+
+fn main() {
+}

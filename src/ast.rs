@@ -49,6 +49,18 @@ pub enum Item {
     /// `static NAME: T = value`: a mutable global, used only in `unsafe`
     /// code (docs/memory.md, Globals).
     Static(StaticDecl),
+    /// `@oom(abort)` or `@oom(error)` on a line of its own: the program's
+    /// out-of-memory policy, in the main package (docs/allocation.md, Out
+    /// of memory).
+    Oom(OomDecl),
+}
+
+/// `@oom(policy)`: whether allocation failure aborts the process
+/// (`abort`) or throws `AllocError` (`error`, the default).
+#[derive(Debug)]
+pub struct OomDecl {
+    pub abort: bool,
+    pub span: Span,
 }
 
 /// `static NAME: T = value` at package level: a global initialized when
@@ -274,10 +286,11 @@ pub struct GenericParam {
 }
 
 /// The `throws` clause of a function: `throws(E)` names the error type,
-/// `throws` alone asks for it to be inferred.
+/// `throws(A | B)` a union of error types, and `throws` alone asks for it
+/// to be inferred (no types).
 #[derive(Debug)]
 pub struct Throws {
-    pub ty: Option<TypeExpr>,
+    pub types: Vec<TypeExpr>,
     pub span: Span,
 }
 

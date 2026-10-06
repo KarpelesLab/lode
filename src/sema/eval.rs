@@ -814,6 +814,7 @@ impl Eval<'_, '_> {
                 Intrinsic::AllocCurrent
                 | Intrinsic::AllocRoot
                 | Intrinsic::AllocHandle
+                | Intrinsic::AllocHandleAt
                 | Intrinsic::HandleAlloc
                 | Intrinsic::HandleResize
                 | Intrinsic::HandleFree

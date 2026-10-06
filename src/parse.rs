@@ -312,7 +312,8 @@ impl Parser {
     }
 
     /// `@comptime_budget(n)` on its own line, then the `const` it applies
-    /// to; or `@intrinsic`, then the function it applies to.
+    /// to; `@intrinsic`, then the function it applies to; or `@oom(abort)`
+    /// (or `error`) alone.
     fn attributed_item(&mut self) -> PResult<Item> {
         let at = self.bump().span; // @
         let name = self.ident("an attribute name")?;
@@ -333,6 +334,25 @@ impl Parser {
             let mut f = self.fn_decl(is_pub, is_unsafe, start)?;
             f.intrinsic = true;
             return Ok(Item::Fn(f));
+        }
+        if name.name == "oom" {
+            self.expect_p(P::LParen)?;
+            let policy = self.ident("`abort` or `error`")?;
+            self.expect_p(P::RParen)?;
+            let abort = match policy.name.as_str() {
+                "abort" => true,
+                "error" => false,
+                other => {
+                    return self.error(
+                        policy.span,
+                        format!("unknown out-of-memory policy `{other}`: it's `@oom(abort)` or `@oom(error)`"),
+                    );
+                }
+            };
+            return Ok(Item::Oom(OomDecl {
+                abort,
+                span: at.to(self.prev_span()),
+            }));
         }
         if name.name != "comptime_budget" {
             return self.error(
@@ -724,15 +744,17 @@ impl Parser {
         };
         let throws = if self.at_kw(Kw::Throws) {
             let start = self.bump().span;
-            let ty = if self.eat_p(P::LParen) {
-                let ty = self.type_expr()?;
+            // `throws(E)`, or a union `throws(A | B)`.
+            let mut types = Vec::new();
+            if self.eat_p(P::LParen) {
+                types.push(self.type_expr()?);
+                while self.eat_p(P::Pipe) {
+                    types.push(self.type_expr()?);
+                }
                 self.expect_p(P::RParen)?;
-                Some(ty)
-            } else {
-                None
-            };
+            }
             Some(Throws {
-                ty,
+                types,
                 span: start.to(self.prev_span()),
             })
         } else {
@@ -1555,6 +1577,20 @@ impl Parser {
         let name = match self.peek().clone() {
             Tok::Ident(n) if n == "_" => return Ok(Pattern::Wildcard(self.bump().span)),
             Tok::Ident(_) if *self.peek_at(1) != Tok::P(P::Dot) => self.ident("a variant name")?,
+            // `pkg.Error(e)`: a member of a union of error types, named
+            // by its type (`pkg.MAX` alone is a value).
+            Tok::Ident(_)
+                if matches!(self.peek_at(2), Tok::Ident(_))
+                    && *self.peek_at(3) == Tok::P(P::LParen) =>
+            {
+                let pkg = self.ident("a package name")?;
+                self.bump(); // .
+                let name = self.ident("a type name")?;
+                Ident {
+                    name: format!("{}.{}", pkg.name, name.name),
+                    span: pkg.span.to(name.span),
+                }
+            }
             // The variants of an optional are `none` and `some`.
             Tok::Kw(Kw::None) => Ident {
                 name: "none".to_owned(),
@@ -2365,7 +2401,7 @@ mod tests {
         let Item::Fn(f) = &file.items[0] else {
             panic!()
         };
-        assert!(matches!(&f.throws, Some(Throws { ty: Some(_), .. })));
+        assert!(matches!(&f.throws, Some(Throws { types, .. }) if types.len() == 1));
         let s = &f.body.stmts;
         assert!(
             matches!(&s[0], Stmt::Defer { on_error: false, body, .. } if body.stmts.len() == 1)
@@ -2425,7 +2461,7 @@ mod tests {
         let Item::Fn(g) = &file.items[1] else {
             panic!()
         };
-        assert!(matches!(&g.throws, Some(Throws { ty: None, .. })));
+        assert!(matches!(&g.throws, Some(Throws { types, .. }) if types.is_empty()));
         let errs = parse_errors(
             "fn f() -> u32 throws(E) {\n}\nfn g() {\n\tf() catch {\n\t}\n\
              \tlet p = f() catch P{x: 1}\n\tlet q = f() catch (P{x: 1})\n}\n",

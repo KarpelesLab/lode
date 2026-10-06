@@ -140,6 +140,7 @@ pub fn instantiate(program: &Program) -> Instances {
             types: Vec::new(),
             dispatch: [None; METHODS],
         }),
+        throws: None,
     };
     let main = match program.main {
         Some(main) => {
@@ -159,14 +160,12 @@ pub fn instantiate(program: &Program) -> Instances {
     let mut origin = vec![0; m.funcs.len()];
     loop {
         while let Some((orig, args, throws, id)) = m.work.pop() {
-            let mut f = m.make(orig, &args);
             // A call through a trait whose method throws expects a result:
             // the impl's method that doesn't throw is made to, never
-            // throwing.
-            if let Some(err) = throws {
-                f.throws = Some(err);
-                f.symbol.push_str("<throws>");
-            }
+            // throwing (and so is a function that throws only
+            // `AllocError` under `@oom(abort)`, where a result is
+            // expected).
+            let f = m.make(orig, &args, throws);
             origin.resize(m.funcs.len(), 0);
             origin[id] = orig;
             m.funcs[id] = Some(f);
@@ -291,6 +290,9 @@ struct Mono<'p> {
     statics: Vec<bool>,
     /// The allocator context, if the program imports `std/alloc`.
     alloc: Option<AllocState>,
+    /// The error type of the function being made, if it throws (after the
+    /// `oom` policy).
+    throws: Option<Ty>,
 }
 
 impl Mono<'_> {
@@ -313,8 +315,9 @@ impl Mono<'_> {
         id
     }
 
-    /// The instance of function `orig` for the type arguments `args`.
-    fn make(&mut self, orig: FuncId, args: &[Ty]) -> Func {
+    /// The instance of function `orig` for the type arguments `args`; made
+    /// to throw `forced` if it's given.
+    fn make(&mut self, orig: FuncId, args: &[Ty], forced: Option<Ty>) -> Func {
         let f = &self.program.funcs[orig];
         debug_assert_eq!(f.type_params.len(), args.len());
         let params = f.type_params.clone();
@@ -376,7 +379,14 @@ impl Mono<'_> {
             .collect();
         body.extend(f.body.iter().cloned());
         self.span = f.span;
-        self.block(&mut body, &map, &locals);
+        let throws = match forced {
+            Some(err) => {
+                symbol.push_str("<throws>");
+                Some(err)
+            }
+            None => self.policy(f.throws.map(|t| t.subst(&map))),
+        };
+        self.block_in(throws, &mut body, &map, &locals);
         Func {
             name: f.name.clone(),
             symbol,
@@ -385,12 +395,63 @@ impl Mono<'_> {
             value_params: Vec::new(),
             params: f.params.clone(),
             ret: f.ret.subst(&map),
-            throws: f.throws.map(|t| t.subst(&map)),
+            throws,
             locals,
             body,
             span: f.span,
             template: false,
             uses_alloc: f.uses_alloc,
+        }
+    }
+
+    /// The error type a function declared to throw `err` throws: `None`
+    /// for `AllocError` under `@oom(abort)`, where it never happens
+    /// (docs/allocation.md, Out of memory).
+    fn policy(&self, err: Option<Ty>) -> Option<Ty> {
+        err.filter(|&e| !(self.program.oom_abort && e == Ty::alloc_error()))
+    }
+
+    /// The error type the instance of `g` with the type arguments `types`
+    /// throws, after the policy.
+    fn throws_of(&self, g: FuncId, types: &[Ty]) -> Option<Ty> {
+        let f = &self.program.funcs[g];
+        let map = |t: Ty| f.type_params.iter().position(|&p| p == t).map(|k| types[k]);
+        self.policy(f.throws.map(|t| t.subst(&map)))
+    }
+
+    /// [`Mono::block`], in a function that throws `throws`.
+    fn block_in(
+        &mut self,
+        throws: Option<Ty>,
+        stmts: &mut Vec<TStmt>,
+        map: &impl Fn(Ty) -> Option<Ty>,
+        locals: &[Local],
+    ) {
+        let outer = std::mem::replace(&mut self.throws, throws);
+        self.block(stmts, map, locals);
+        self.throws = outer;
+    }
+
+    /// A call of `alloc.out_of_memory()`, as a value of type `ty`: what
+    /// making an `AllocError`, or throwing one from a function that
+    /// doesn't throw any more, does under `@oom(abort)`.
+    fn out_of_memory(&mut self, ty: Ty) -> TExpr {
+        let f = self
+            .program
+            .alloc
+            .and_then(|a| a.oom)
+            .expect("`@oom(abort)` loads `std/alloc`");
+        let id = self.instance(f, Vec::new());
+        let call = TExpr {
+            kind: TExprKind::Call(id, Vec::new()),
+            ty: Ty::Never,
+        };
+        if ty == Ty::Never {
+            return call;
+        }
+        TExpr {
+            kind: TExprKind::Never(Box::new(call)),
+            ty,
         }
     }
 
@@ -465,7 +526,7 @@ impl Mono<'_> {
         for (m, id) in pending {
             let mut f = self.dispatch_parts(m);
             let locals = f.locals.clone();
-            self.block(&mut f.body, &|_| None, &locals);
+            self.block_in(f.throws, &mut f.body, &|_| None, &locals);
             self.funcs[id] = Some(f);
         }
         true
@@ -535,7 +596,7 @@ impl Mono<'_> {
             kind: TExprKind::Field(Box::new(local(0)), k),
             ty: usize_ty,
         };
-        let throws = (m == 0 || m == 3).then(Ty::alloc_error);
+        let throws = self.policy((m == 0 || m == 3).then(Ty::alloc_error));
         let call_of = |k: usize, ty: Ty| -> Vec<TStmt> {
             let (f, type_args) = self.allocator_method(ty, m);
             let callee = &self.program.funcs[f];
@@ -617,8 +678,8 @@ impl Mono<'_> {
             return (false, false);
         }
         if let Some(f) = self.program.dispatch.clone_impl(ty) {
-            let f = &self.program.funcs[f];
-            return (f.uses_alloc, f.throws.is_some());
+            let throws = self.throws_of(f, &ty.type_args());
+            return (self.program.funcs[f].uses_alloc, throws.is_some());
         }
         let parts = match ty {
             Ty::Array(_) => vec![ty.as_array().expect("an array").0],
@@ -647,6 +708,22 @@ impl Mono<'_> {
     fn stmt(&mut self, s: &mut TStmt, map: &impl Fn(Ty) -> Option<Ty>, locals: &[Local]) {
         for e in stmt_exprs_mut(s) {
             self.expr(e, map, locals);
+        }
+        // Under `@oom(abort)`, a function that threw only `AllocError`
+        // doesn't throw: what it threw ends the process.
+        if self.throws.is_none()
+            && let TStmt::Throw(e) = s
+        {
+            let value = std::mem::replace(
+                e,
+                TExpr {
+                    kind: TExprKind::Bool(false),
+                    ty: Ty::Bool,
+                },
+            );
+            let end = self.out_of_memory(Ty::Never);
+            *s = TStmt::Block(vec![TStmt::Expr(value), TStmt::Expr(end)]);
+            return;
         }
         // What the statement destroys.
         let destroyed = match s {
@@ -689,7 +766,7 @@ impl Mono<'_> {
             chain,
         );
         let locals = f.locals.clone();
-        self.block(&mut f.body, &|_| None, &locals);
+        self.block_in(None, &mut f.body, &|_| None, &locals);
         self.funcs[id] = Some(f);
         id
     }
@@ -742,7 +819,7 @@ impl Mono<'_> {
         f.uses_alloc = allocates;
         f.throws = throws.then(Ty::alloc_error);
         let locals = f.locals.clone();
-        self.block(&mut f.body, &|_| None, &locals);
+        self.block_in(f.throws, &mut f.body, &|_| None, &locals);
         self.funcs[id] = Some(f);
         id
     }
@@ -763,6 +840,9 @@ impl Mono<'_> {
             );
             *e = inner;
             e.ty = e.ty.subst(map);
+        }
+        if self.program.oom_abort && self.oom_abort_expr(e, map) {
+            return;
         }
         if let TExprKind::Temp(local, _) = e.kind {
             self.destroy_fn(locals[local].ty);
@@ -787,8 +867,8 @@ impl Mono<'_> {
                 let types: Vec<Ty> = types.iter().map(|t| t.subst(map)).collect();
                 // A trait's method runs the method of `Self`'s impl.
                 let (g, types) = self.program.dispatch.resolve(*f, &types);
-                let throws = match (e.ty.as_result(), &self.program.funcs[g].throws) {
-                    (Some((_, err)), None) if g != *f => Some(err),
+                let throws = match e.ty.as_result() {
+                    Some((_, err)) if self.throws_of(g, &types).is_none() => Some(err),
                     _ => None,
                 };
                 let id = self.instance_throwing(g, types, throws);
@@ -796,7 +876,13 @@ impl Mono<'_> {
                 e.kind = TExprKind::Call(id, std::mem::take(args));
             }
             TExprKind::Call(f, _) => {
-                *f = self.instance(*f, Vec::new());
+                // Where a result is expected of a function that throws
+                // only `AllocError`, under `@oom(abort)`: made to throw.
+                let throws = match e.ty.as_result() {
+                    Some((_, err)) if self.throws_of(*f, &[]).is_none() => Some(err),
+                    _ => None,
+                };
+                *f = self.instance_throwing(*f, Vec::new(), throws);
                 self.root_called |= Some(*f) == self.root;
             }
             TExprKind::Str(id) => self.strings[*id] = true,
@@ -837,7 +923,7 @@ impl Mono<'_> {
             }
             let f = match self.program.dispatch.clone_impl(ty) {
                 Some(f) => {
-                    let adapt = wants && self.program.funcs[f].throws.is_none();
+                    let adapt = wants && self.throws_of(f, &ty.type_args()).is_none();
                     self.instance_throwing(f, ty.type_args().to_vec(), adapt.then(Ty::alloc_error))
                 }
                 None => self.clone_fn(ty, wants),
@@ -859,6 +945,7 @@ impl Mono<'_> {
             k @ (Intrinsic::AllocCurrent
             | Intrinsic::AllocRoot
             | Intrinsic::AllocHandle
+            | Intrinsic::AllocHandleAt
             | Intrinsic::HandleAlloc
             | Intrinsic::HandleResize
             | Intrinsic::HandleFree
@@ -873,9 +960,14 @@ impl Mono<'_> {
                 Intrinsic::HandleResize => 1,
                 Intrinsic::HandleFree => 2,
                 Intrinsic::HandleGrow => 3,
-                Intrinsic::AllocHandle => {
-                    // Another allocator type, for the handles of `a`.
+                Intrinsic::AllocHandle | Intrinsic::AllocHandleAt => {
+                    // Another allocator type, for the handles of `a` (or
+                    // of what `p` points to).
                     let ty = args[0].ty.subst(map);
+                    let ty = match k {
+                        Intrinsic::AllocHandleAt => ty.as_ptr().expect("a pointer"),
+                        _ => ty,
+                    };
                     let a = self.alloc.as_mut().expect("checked");
                     if !a.types.iter().any(|&(t, _)| t == ty) {
                         a.types.push((ty, [None; METHODS]));
@@ -894,7 +986,7 @@ impl Mono<'_> {
                     let (root, root_ty) = (a.info.root, a.info.root_ty);
                     let (g, type_args) = self.allocator_method(root_ty, m);
                     let adapt =
-                        e.ty.as_result().is_some() && self.program.funcs[g].throws.is_none();
+                        e.ty.as_result().is_some() && self.throws_of(g, &type_args).is_none();
                     args[0] = TExpr {
                         kind: TExprKind::Static(root),
                         ty: root_ty,
@@ -904,11 +996,66 @@ impl Mono<'_> {
                     self.dispatch_fn(m)
                 };
                 e.kind = TExprKind::Call(f, args);
+                // Under `@oom(abort)` the dispatch doesn't throw: where a
+                // result is expected, it's `ok`.
+                if !via_root
+                    && let Some((ok, _)) = e.ty.as_result()
+                    && self.policy(Some(Ty::alloc_error())).is_none()
+                {
+                    for sub in subexprs_mut(e) {
+                        self.expr(sub, map, locals);
+                    }
+                    let call = TExpr {
+                        kind: std::mem::replace(&mut e.kind, TExprKind::Bool(false)),
+                        ty: ok,
+                    };
+                    e.kind = TExprKind::Variant(0, vec![call]);
+                    return;
+                }
             }
         }
         for sub in subexprs_mut(e) {
             self.expr(sub, map, locals);
         }
+    }
+
+    /// Under `@oom(abort)` (docs/allocation.md, Out of memory): `try` or
+    /// `catch` on a call that throws only `AllocError` is the call, which
+    /// doesn't throw; making an `AllocError`, or throwing one from a
+    /// function that doesn't throw any more, ends the process. Whether `e`
+    /// became such an end, with nothing left to make concrete.
+    fn oom_abort_expr(&mut self, e: &mut TExpr, map: &impl Fn(Ty) -> Option<Ty>) -> bool {
+        loop {
+            let inner = match &mut e.kind {
+                TExprKind::Try(inner) => inner,
+                TExprKind::Catch { call, .. } => call,
+                _ => break,
+            };
+            let Some((ok, err)) = inner.ty.subst(map).as_result() else {
+                break;
+            };
+            if err != Ty::alloc_error() {
+                break;
+            }
+            let mut call = std::mem::replace(
+                &mut **inner,
+                TExpr {
+                    kind: TExprKind::Bool(false),
+                    ty: Ty::Bool,
+                },
+            );
+            call.ty = ok;
+            *e = call;
+        }
+        let ends = match &e.kind {
+            TExprKind::Variant(..) => e.ty == Ty::alloc_error(),
+            TExprKind::Throw(_) => self.throws.is_none(),
+            _ => false,
+        };
+        if ends {
+            *e = self.out_of_memory(e.ty);
+        }
+        ends
     }
 
     /// How a type argument is written in a symbol: as in the source, with

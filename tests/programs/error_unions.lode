@@ -1,0 +1,150 @@
+// stdin: 12 7 0 250 50\n
+// stdout: 12: ok 12\n
+// stdout: 7: bad digit at 7\n
+// stdout: 0: empty\n
+// stdout: 250: too big (limit 100)\n
+// stdout: 50: too big (limit 49)\n
+// stdout: none: ok\n
+// stdout: read 14 bytes, 5 numbers, total 312\n
+// stdout: sum 312\n
+package main
+
+import "std/io"
+import "std/os"
+import "std/string"
+
+// Error-set unions (docs/errors.md, Error sets): `throws(A | B)`, `try`
+// converting a member or a smaller union into a larger one, `match` by
+// member type, and `.name` of a member's variant.
+
+enum ParseError {
+	empty
+	bad_digit(at: u32)
+}
+
+enum LimitError {
+	too_big(limit: u32)
+}
+
+fn parse(n: u32) throws(ParseError) -> u32 {
+	if n == 0 {
+		throw .empty
+	}
+	if n == 7 {
+		throw .bad_digit(7)
+	}
+	return n
+}
+
+fn limit(n: u32, max: u32) throws(LimitError) -> u32 {
+	if n > max {
+		throw .too_big(max)
+	}
+	return n
+}
+
+// `try` passes on a member's error as the union's.
+fn checked(n: u32) throws(ParseError | LimitError) -> u32 {
+	let a = try parse(n)
+	let b = try limit(a, 100)
+	if b == 50 {
+		// `.too_big` is a variant of one member: `LimitError`.
+		throw .too_big(49)
+	}
+	return b
+}
+
+// The order of the members doesn't matter, and a larger union takes a
+// smaller one.
+fn layered(n: u32) throws(LimitError | os.Error | ParseError) -> u32 {
+	return try checked(n)
+}
+
+// Through one more layer, rethrowing the union as it is.
+fn outer(n: u32) throws(ParseError | os.Error | LimitError) -> u32 {
+	let v = layered(n) catch e {
+		throw e
+	}
+	return v
+}
+
+fn show(n: u32) {
+	let v = outer(n) catch e {
+		match e {
+			ParseError(p) => match p {
+				empty => io.print("{}: empty\n", n)
+				bad_digit(at) => io.print("{}: bad digit at {}\n", n, at)
+			}
+			LimitError(l) => match l {
+				too_big(max) => io.print("{}: too big (limit {})\n", n, max)
+			}
+			os.Error => io.print("{}: os error\n", n)
+		}
+		return
+	}
+	io.print("{}: ok {}\n", n, v)
+}
+
+// A `match` on the result of a call that throws a union.
+fn none_failed() -> bool {
+	match checked(12) {
+		ok(v) => return v == 12
+		err(e) => return false
+	}
+}
+
+// The numbers of standard input, read whole into a list
+// (`string.read_all`, which throws `os.Error | AllocError`).
+fn numbers() uses alloc throws(os.Error | AllocError | ParseError) -> List[u32] {
+	var text = List[u8].new()
+	let n = try string.read_all(io.stdin(), &text)
+	var out = List[u32].new()
+	var v: u32 = 0
+	var digits = false
+	for c in text {
+		if c >= '0' && c <= '9' {
+			v = v *| 10 +| u32(c - '0')
+			digits = true
+		} else if digits {
+			try out.push(v)
+			v = 0
+			digits = false
+		}
+	}
+	try string.print_to(io.stdout(), "read {} bytes, {} numbers, ", n, out.len)
+	return out
+}
+
+// Parsing errors count as 0.
+fn total() uses alloc throws(os.Error | AllocError | ParseError) -> u32 {
+	let xs = try numbers()
+	var t: u32 = 0
+	for x in xs {
+		t +%= parse(x) catch 0
+	}
+	return t
+}
+
+fn main() uses alloc -> u8 {
+	show(12)
+	show(7)
+	show(0)
+	show(250)
+	show(50)
+	if none_failed() {
+		io.print("none: ok\n")
+	}
+	let t = total() catch e {
+		match e {
+			AllocError => io.print("no memory\n")
+			os.Error(o) => io.print("read failed\n")
+			ParseError => io.print("parse failed\n")
+		}
+		return 1
+	}
+	io.print("total {}\n", t)
+	string.print_to(io.stdout(), "sum {}\n", t) catch _ {
+		return 2
+	}
+	return 0
+}

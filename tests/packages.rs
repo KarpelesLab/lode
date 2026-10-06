@@ -631,3 +631,26 @@ fn the_prelude_is_found_in_the_library() {
         ],
     );
 }
+
+#[test]
+fn the_oom_policy_is_the_main_packages() {
+    // A library can't set the program's out-of-memory policy: its code
+    // compiles under both (docs/allocation.md, Out of memory).
+    let errors = check_with(
+        "oom-library",
+        "package main\n\nimport \"std/lib\"\n\nfn main() {\n}\n",
+        &[("lib", "package lib\n\n@oom(abort)\n\npub fn f() {\n}\n")],
+    )
+    .expect_err("fails to check");
+    assert_eq!(errors, ["`@oom` is only allowed in the main package"]);
+
+    let errors = check(
+        "oom-unknown",
+        "package main\n\n@oom(panic)\n\nfn main() {\n}\n",
+    )
+    .expect_err("fails to parse");
+    assert_eq!(
+        errors,
+        ["unknown out-of-memory policy `panic`: it's `@oom(abort)` or `@oom(error)`"]
+    );
+}

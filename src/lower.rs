@@ -2490,7 +2490,7 @@ impl FnLower<'_> {
             }
             // A handle of the allocator `a`: its type's number and its
             // address.
-            TExprKind::Intrinsic(Intrinsic::AllocHandle, args) => {
+            TExprKind::Intrinsic(k @ (Intrinsic::AllocHandle | Intrinsic::AllocHandleAt), args) => {
                 let a = &args[0];
                 if !self.dynamic {
                     // A handle of the root itself, which holds nothing.
@@ -2498,21 +2498,23 @@ impl FnLower<'_> {
                     let ir_ty = self.ir_ty(e.ty);
                     return Val::Mem(self.b.alloca(ir_ty));
                 }
-                let addr = match self.expr(a) {
-                    Val::Mem(p) => p,
-                    Val::One(v) => {
+                let (addr, ty) = match (k, self.expr(a)) {
+                    // `handle_at(p)`: the address is the pointer's value.
+                    (Intrinsic::AllocHandleAt, v) => (v.one(), a.ty.as_ptr().expect("a pointer")),
+                    (_, Val::Mem(p)) => (p, a.ty),
+                    (_, Val::One(v)) => {
                         let ir_ty = self.t.of(a.ty);
                         let tmp = self.b.alloca(ir_ty);
                         self.b.store(ir_ty, tmp, v, align_of(a.ty));
-                        tmp
+                        (tmp, a.ty)
                     }
-                    other => unreachable!("an allocator is a value, found {other:?}"),
+                    (_, other) => unreachable!("an allocator is a value, found {other:?}"),
                 };
                 let number = self
                     .reach
                     .allocators
                     .iter()
-                    .position(|&t| t == a.ty)
+                    .position(|&t| t == ty)
                     .expect("an allocator type of the program");
                 let ir_ty = self.ir_ty(e.ty);
                 let h = self.b.alloca(ir_ty);

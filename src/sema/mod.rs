@@ -68,6 +68,8 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         deinits: HashSet::new(),
         statics: Vec::new(),
         alloc: None,
+        oom_abort: false,
+        oom_span: None,
         list: None,
         prelude: HashMap::new(),
         sources: packages
@@ -94,6 +96,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
             deinits: HashMap::new(),
             statics: Vec::new(),
             alloc: None,
+            oom_abort: false,
         };
         return (program, ck.diags);
     }
@@ -195,6 +198,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         deinits,
         statics,
         alloc: ck.alloc,
+        oom_abort: ck.oom_abort,
     };
     (program, ck.diags)
 }
@@ -413,6 +417,11 @@ struct Checker<'a> {
     statics: Vec<StaticInfo<'a>>,
     /// What the compiler knows of `std/alloc`, if it's loaded.
     alloc: Option<AllocInfo>,
+    /// Whether the main package says `@oom(abort)`: allocation failure
+    /// ends the process, and `AllocError` never happens (docs/allocation.md,
+    /// Out of memory). Where it says so.
+    oom_abort: bool,
+    oom_span: Option<Span>,
     /// `std/list`'s `List`, as declared, if it's loaded: `xs[i]`,
     /// slicing, `for` and passing a list as a slice work on its elements
     /// ([`TExprKind::Elements`]).
@@ -468,6 +477,12 @@ struct FnCx {
     /// The view locals made unusable by a change of what they borrow from:
     /// that variable, and where it changed, for the message.
     stale: HashMap<LocalId, views::Stale>,
+    /// The hidden local holding the handle of each `with alloc = ...`
+    /// around the current point, innermost last. One that borrows from a
+    /// counted allocator (`with alloc = arena`) has an entry in
+    /// `borrows`, and is made unassigned when the allocator changes:
+    /// allocating after that is an error ([`Checker::context_used`]).
+    with_handles: Vec<LocalId>,
     /// The function being checked (`None` for a constant or a declaration).
     func: Option<FuncId>,
     /// The generic parameters of a generic function (or of the struct or
@@ -642,6 +657,7 @@ impl FnCx {
             expr_depth: 0,
             borrows: HashMap::new(),
             stale: HashMap::new(),
+            with_handles: Vec::new(),
             func: None,
             type_params: Vec::new(),
             value_locals: Vec::new(),
@@ -1597,6 +1613,30 @@ impl<'a> Checker<'a> {
                             });
                             continue;
                         }
+                        // The out-of-memory policy: the main package's.
+                        ast::Item::Oom(o) => {
+                            if pkg + 1 != packages.len() {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        o.span,
+                                        "`@oom` is only allowed in the main package",
+                                    )
+                                    .with_help("the policy is the program's: the package with `main` sets it, and a library's code compiles under both"),
+                                );
+                            } else if let Some(first) = self.oom_span {
+                                self.diags.push(
+                                    Diagnostic::error(
+                                        o.span,
+                                        "the program's `@oom` policy is set twice",
+                                    )
+                                    .with_note(first, "it's set here first"),
+                                );
+                            } else {
+                                self.oom_span = Some(o.span);
+                                self.oom_abort = o.abort;
+                            }
+                            continue;
+                        }
                         // Methods and associated functions are found
                         // through their type, once types are known.
                         ast::Item::Fn(f) if f.owner.is_some() => {
@@ -1803,12 +1843,17 @@ impl<'a> Checker<'a> {
             },
             _ => return,
         };
+        let oom = match items.get("out_of_memory") {
+            Some(&Item::Func(f)) => Some(f),
+            _ => None,
+        };
         self.alloc = Some(AllocInfo {
             allocator,
             handle,
             root,
             root_ty,
             boxed,
+            oom,
         });
     }
 
@@ -2163,7 +2208,8 @@ impl<'a> Checker<'a> {
             ("std/alloc", None, "current") => Some(Intrinsic::AllocCurrent),
             ("std/alloc", None, "root") => Some(Intrinsic::AllocRoot),
             ("std/alloc", None, "handle") => Some(Intrinsic::AllocHandle),
-            ("std/alloc", Some("Handle"), "alloc") => Some(Intrinsic::HandleAlloc),
+            ("std/alloc", None, "handle_at") => Some(Intrinsic::AllocHandleAt),
+            ("std/alloc", Some("Handle"), "alloc" | "raw_alloc") => Some(Intrinsic::HandleAlloc),
             ("std/alloc", Some("Handle"), "resize") => Some(Intrinsic::HandleResize),
             ("std/alloc", Some("Handle"), "free") => Some(Intrinsic::HandleFree),
             ("std/alloc", Some("Handle"), "grow") => Some(Intrinsic::HandleGrow),
@@ -3228,40 +3274,66 @@ impl<'a> Checker<'a> {
         self.error(p.name.span, why);
     }
 
-    /// The error type of a `throws` clause: an enum.
+    /// The error type of a `throws` clause: an enum, or a union of
+    /// several (`throws(A | B)`, docs/errors.md, Error sets).
     fn error_type(&mut self, cx: &mut FnCx, t: &ast::Throws) -> Option<Ty> {
-        let Some(te) = &t.ty else {
+        if t.types.is_empty() {
             self.diags.push(
                 Diagnostic::error(
                     t.span,
                     "inferred error sets (`throws` without a type) are not supported by the compiler yet",
                 )
-                .with_help("name the error type, an enum: `throws(E)`"),
-            );
-            return None;
-        };
-        let ty = self.resolve_type(cx, te)?;
-        if ty.as_enum().is_none() {
-            self.diags.push(
-                Diagnostic::error(
-                    te.span(),
-                    format!("an error type must be an enum, found `{ty}`"),
-                )
-                .with_help("declare the errors as the variants of an enum: `enum E { ... }`"),
+                .with_help("name the error type, an enum: `throws(E)`, or several: `throws(A | B)`"),
             );
             return None;
         }
-        if !ty.is_copy() {
-            self.diags.push(
-                Diagnostic::error(
-                    te.span(),
-                    format!("an error type must be `Copy`, and `{ty}` isn't"),
-                )
-                .with_help("an error is dropped by `catch v` and `catch _`: it can't hold a value that needs destruction"),
-            );
-            return None;
+        let union = t.types.len() > 1;
+        let mut members: Vec<Ty> = Vec::new();
+        for te in &t.types {
+            let ty = self.resolve_type(cx, te)?;
+            if ty.as_enum().is_none() {
+                self.diags.push(
+                    Diagnostic::error(
+                        te.span(),
+                        format!("an error type must be an enum, found `{ty}`"),
+                    )
+                    .with_help("declare the errors as the variants of an enum: `enum E { ... }`"),
+                );
+                return None;
+            }
+            if !ty.is_copy() {
+                self.diags.push(
+                    Diagnostic::error(
+                        te.span(),
+                        format!("an error type must be `Copy`, and `{ty}` isn't"),
+                    )
+                    .with_help("an error is dropped by `catch v` and `catch _`: it can't hold a value that needs destruction"),
+                );
+                return None;
+            }
+            if union && ty.is_generic() {
+                self.diags.push(
+                    Diagnostic::error(
+                        te.span(),
+                        format!("a union of error types can't have a member that depends on a type parameter (`{ty}`) yet"),
+                    )
+                    .with_help("name concrete error types in `throws(A | B)`"),
+                );
+                return None;
+            }
+            if members.contains(&ty) {
+                self.diags.push(
+                    Diagnostic::error(te.span(), format!("`{ty}` is in this union twice"))
+                        .with_help("name each error type once: `throws(A | B)`"),
+                );
+                return None;
+            }
+            members.push(ty);
         }
-        Some(ty)
+        if !union {
+            return members.pop();
+        }
+        Some(Ty::union(&members))
     }
 
     /// Look up `name` in package `pkg` as seen from `cx`'s package, reporting
@@ -4800,15 +4872,167 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        let h = self.expr(cx, value, Some(info.handle))?;
+        // `with alloc = arena`: a counted allocator of `std/alloc`, held
+        // in a variable, which the block borrows while it allocates.
+        let mut roots = None;
+        let h = match self.counted_allocator(cx, value) {
+            Some(place) => {
+                let r = self.view_roots(cx, &place);
+                if r.temp || r.locals.is_empty() {
+                    self.diags.push(
+                        Diagnostic::error(
+                            value.span,
+                            format!("`with alloc = ...` takes a variable holding the `{}`", place.ty),
+                        )
+                        .with_help("the block borrows the allocator while it allocates: keep it in a variable first (`var arena = try alloc.Arena.new()`)"),
+                    );
+                    return None;
+                }
+                roots = Some(r.locals);
+                // Its handle, `unsafe` to take: the checker makes sure the
+                // allocator doesn't change while the block allocates.
+                let call = ast::Expr {
+                    kind: ExprKind::Call(
+                        Box::new(ast::Expr {
+                            kind: ExprKind::Field(
+                                Box::new(value.clone()),
+                                ast::Ident {
+                                    name: "handle".to_owned(),
+                                    span: value.span,
+                                },
+                            ),
+                            span: value.span,
+                        }),
+                        Vec::new(),
+                    ),
+                    span: value.span,
+                };
+                cx.unsafe_depth += 1;
+                let h = self.expr(cx, &call, Some(info.handle));
+                cx.unsafe_depth -= 1;
+                h?
+            }
+            None => self.expr(cx, value, Some(info.handle))?,
+        };
+        if self.is_counted(h.ty()) {
+            self.diags.push(
+                Diagnostic::error(
+                    value.span,
+                    format!("`with alloc = ...` takes a variable holding the `{}`", h.ty()),
+                )
+                .with_help("the block borrows the allocator while it allocates: keep it in a variable first (`var arena = try alloc.Arena.new()`)"),
+            );
+            return None;
+        }
+        if h.ty() != info.handle && h.ty() != Ty::Never {
+            self.diags.push(
+                Diagnostic::error(
+                    value.span,
+                    format!("`with alloc` takes an `alloc.Handle`, or a counted allocator, found `{}`", h.ty()),
+                )
+                .with_help("a counted allocator (`alloc.Arena`, `alloc.Counted[A]`) is given as it is: `with alloc = arena`")
+                .with_help("a handle of another allocator is made by `unsafe` code, `alloc.handle(a)`, which promises the allocator outlives what it allocates"),
+            );
+            return None;
+        }
         let h = self.coerce(cx, h, info.handle, value.span)?;
         let local = self.declare(cx, "$with", info.handle, false);
         cx.env.assign(local, None);
+        if let Some(r) = roots {
+            cx.borrows.insert(local, r);
+        }
+        cx.with_handles.push(local);
         let stmts = self.block(cx, &body.stmts);
+        cx.with_handles.pop();
         Some(TStmt::Block(vec![
             TStmt::Init(local, h.expr),
             TStmt::With(local, stmts),
         ]))
+    }
+
+    /// The checked `value` of `with alloc = value`, if it's a counted
+    /// allocator of `std/alloc` (a struct of it with an `unsafe fn
+    /// handle(self) -> alloc.Handle`: `Arena`, `Counted[A]`).
+    fn counted_allocator(&mut self, cx: &mut FnCx, value: &ast::Expr) -> Option<TExpr> {
+        let ExprKind::Name(_) = &value.kind else {
+            return None;
+        };
+        self.counted_allocator_type(cx, value)?;
+        let c = self.expr(cx, value, None)?;
+        Some(c.expr)
+    }
+
+    /// The type of the variable `value` names, if it's a counted allocator
+    /// (see [`Checker::counted_allocator`]).
+    fn counted_allocator_type(&self, cx: &FnCx, value: &ast::Expr) -> Option<Ty> {
+        let ExprKind::Name(name) = &value.kind else {
+            return None;
+        };
+        let &local = cx.scopes.iter().rev().find_map(|s| s.get(name))?;
+        let ty = cx.locals[local].ty;
+        self.is_counted(ty).then_some(ty)
+    }
+
+    /// Whether `ty` is a counted allocator of `std/alloc` (see
+    /// [`Checker::counted_allocator`]).
+    fn is_counted(&self, ty: Ty) -> bool {
+        let (Some(info), Some(def)) = (self.alloc, ty.as_struct()) else {
+            return false;
+        };
+        if self.pkgs.get(def.pkg).is_none_or(|p| p.path != "std/alloc") {
+            return false;
+        }
+        self.methods
+            .get(&(ty.decl(), "handle".to_owned()))
+            .is_some_and(|&f| self.sigs[f].is_unsafe && self.sigs[f].ret == info.handle)
+    }
+
+    /// The allocator in context is used at `span` (a call that allocates):
+    /// a counted allocator that a `with alloc = arena` around it borrows
+    /// must not have changed (on some path to here), and a `defer` body
+    /// can't allocate from one declared outside it, since it runs when the
+    /// block is left, after the allocator may have changed.
+    pub(super) fn context_used(&mut self, cx: &FnCx, span: Span) {
+        let Some(&h) = cx.with_handles.last() else {
+            return;
+        };
+        let Some(roots) = cx.borrows.get(&h) else {
+            return;
+        };
+        let Some(&root) = roots.iter().next() else {
+            return;
+        };
+        let name = cx.locals[root].name.clone();
+        if cx.defer_depth > 0 && h < cx.defer_floor {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!("a `defer` body can't allocate from `{name}`, the allocator of the `with` around it: it runs when the block is left, after `{name}` may have changed"),
+                )
+                .with_help(
+                    "allocate before the `defer`, or in a `with alloc = ...` block inside its body",
+                ),
+            );
+            return;
+        }
+        if !cx.env.is_uninit(h) {
+            return;
+        }
+        let mut d = Diagnostic::error(
+            span,
+            format!("this allocates from `{name}` after `{name}` changed or was moved (on some path to here), in the `with alloc = {name}` block"),
+        )
+        .with_help(format!(
+            "the block borrows `{name}` while it allocates: change or move it after the last allocation, or after the block"
+        ));
+        if let Some(&(_, how, at)) = cx.stale.get(&h) {
+            let what = match how {
+                views::Change::Changed => "changes here",
+                views::Change::Moved => "is moved here",
+            };
+            d = d.with_note(at, format!("`{name}` {what}"));
+        }
+        self.diags.push(d);
     }
 
     /// The facts after statements that branch: `envs` are the facts at the
@@ -4855,6 +5079,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
+        let def_is_union = ty.union_members().is_some();
         let mut before = Vec::new();
         let matched = self.scrutinee(cx, checked, value.span, &mut before)?;
         let entry = cx.env.clone();
@@ -4879,7 +5104,30 @@ impl<'a> Checker<'a> {
             let mut variants = Vec::new();
             let mut bindings: Vec<(&ast::Ident, u32, Ty)> = Vec::new();
             let alternatives = arm.pattern.alternatives();
-            for pattern in alternatives {
+            // A member of a union of error types written `pkg.Error`,
+            // without a binding: as `pkg.Error(...)` is.
+            let members_named: Vec<Option<ast::Pattern>> = alternatives
+                .iter()
+                .map(|pattern| match pattern {
+                    ast::Pattern::Value(e) if def_is_union => match &e.kind {
+                        ExprKind::Field(base, name) => match &base.kind {
+                            ExprKind::Name(pkg) => Some(ast::Pattern::Variant {
+                                name: ast::Ident {
+                                    name: format!("{pkg}.{}", name.name),
+                                    span: e.span,
+                                },
+                                bindings: None,
+                                span: e.span,
+                            }),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            for (pattern, named) in alternatives.iter().zip(&members_named) {
+                let pattern = named.as_ref().unwrap_or(pattern);
                 match pattern {
                     ast::Pattern::Value(_) | ast::Pattern::Range(..) | ast::Pattern::Or(..) => {
                         self.diags.push(
@@ -4904,9 +5152,8 @@ impl<'a> Checker<'a> {
                         name,
                         bindings: names,
                         ..
-                    } => match def.variant(&name.name) {
+                    } => match self.match_variant(cx, ty, &def, name) {
                         None => {
-                            self.error(name.span, format!("`{ty}` has no variant `{}`", name.name));
                             ok = false;
                         }
                         Some((v, variant)) => {
@@ -5042,6 +5289,50 @@ impl<'a> Checker<'a> {
             arms: tarms,
         });
         Some(one_stmt(before))
+    }
+
+    /// The variant of `ty` (an enum, an optional or a result, declared as
+    /// `def`) that the pattern's `name` names, and its number; reported if
+    /// there's none. A member of a union of error types is named by its
+    /// type, as the code names it (`ParseError`, `os.Error`).
+    fn match_variant<'d>(
+        &mut self,
+        cx: &mut FnCx,
+        ty: Ty,
+        def: &'d crate::types::EnumDef,
+        name: &ast::Ident,
+    ) -> Option<(usize, &'d Variant)> {
+        if let Some(found) = def.variant(&name.name) {
+            return Some(found);
+        }
+        let Some(members) = ty.union_members() else {
+            self.error(name.span, format!("`{ty}` has no variant `{}`", name.name));
+            return None;
+        };
+        let ident = |n: &str| ast::Ident {
+            name: n.to_owned(),
+            span: name.span,
+        };
+        let te = match name.name.split_once('.') {
+            Some((pkg, item)) => TypeExpr::Qualified(ident(pkg), ident(item)),
+            None => TypeExpr::Named(ident(&name.name)),
+        };
+        let member = self.resolve_type(cx, &te)?;
+        match members.iter().position(|&m| m == member) {
+            Some(k) => Some((k, &def.variants[k])),
+            None => {
+                self.diags.push(
+                    Diagnostic::error(
+                        name.span,
+                        format!("`{member}` is not one of the error types of `{ty}`"),
+                    )
+                    .with_help(
+                        "a pattern of a union of error types names one of its members: `E(e) =>`",
+                    ),
+                );
+                None
+            }
+        }
     }
 
     /// `match value { ... }` on an integer or a `bool` (`checked`), as a

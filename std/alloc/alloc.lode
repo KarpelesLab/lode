@@ -74,6 +74,15 @@ unsafe fn copy(to: *u8, from: *u8, n: usize) {
 	}
 }
 
+/// End the process because memory ran out: what making an `AllocError`
+/// does in a program whose main package says `@oom(abort)`
+/// (docs/allocation.md, Out of memory). It writes `out of memory` to
+/// standard error, then ends the process with status 134, as `os.abort()`.
+pub fn out_of_memory() -> never {
+	os.write_all(2, "out of memory\n".bytes())
+	os.abort()
+}
+
 /// A handle of an allocator: which allocator it is, and where. It's what
 /// `with alloc = h` takes and `current()` gives, and what a value that
 /// owns memory keeps, to free it.
@@ -90,8 +99,14 @@ pub struct Handle {
 
 /// The handle of the allocator in context: the root allocator, or the one
 /// a `with alloc = h` around the call installs.
+///
+/// The caller must ensure the handle is used only while the allocator
+/// lives: within the function, or kept with an allocation made through
+/// it, which keeps a counted allocator alive (a `List` keeps its
+/// allocator's handle with its storage). An arena's handle kept without
+/// an allocation could outlive the arena.
 @intrinsic
-pub fn current() uses alloc -> Handle {
+pub unsafe fn current() uses alloc -> Handle {
 }
 
 /// The handle of the root allocator, `ROOT`, which never ends.
@@ -110,11 +125,30 @@ pub fn root() -> Handle {
 pub unsafe fn handle[A: Allocator](a: A) -> Handle {
 }
 
+/// A handle of the allocator `p` points to: how a counted allocator's
+/// handle is made, from its control block.
+///
+/// The caller must ensure the allocator at `p` outlives every allocation
+/// made through the handle, and doesn't move meanwhile.
+@intrinsic
+pub unsafe fn handle_at[A: Allocator](p: *A) -> Handle {
+}
+
 /// `size` bytes, aligned to `align`, from the handle's allocator.
 /// Allocating, through the context or a handle, is for a function that
 /// declares `uses alloc`.
 @intrinsic
 pub fn Handle.alloc(self, size: usize, align: usize) uses alloc throws(AllocError) -> *u8 {
+}
+
+/// `size` bytes, aligned to `align`, from the handle's allocator, without
+/// the allocator context: for an allocator that takes its memory from
+/// another (its parent), whose methods don't declare `uses alloc`.
+///
+/// The caller must ensure the handle's allocator is alive: a counted
+/// allocator holding one of its allocations, for instance.
+@intrinsic
+pub unsafe fn Handle.raw_alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
 }
 
 /// Grow or shrink the block of `old` bytes at `p`, in place: whether the
@@ -326,8 +360,9 @@ pub struct Box[T] {
 
 /// A box holding `v`, from the allocator in context.
 pub fn Box[T].new(sink v: T) uses alloc throws(AllocError) -> Box[T] {
-	let h = current()
+	// Sound: the box keeps the handle with the allocation it made.
 	unsafe {
+		let h = current()
 		let raw = try h.alloc(size_of[T](), align_of[T]())
 		let p = raw.cast[T]()
 		p.write(v)
@@ -358,5 +393,426 @@ pub fn Box[T].deinit(sink self) {
 impl[T: Clone] Clone for Box[T] {
 	fn clone(self) uses alloc throws(AllocError) -> Box[T] {
 		return try Box.new(try self.value.clone())
+	}
+}
+
+/// The control block of a counted allocator (docs/allocation.md,
+/// Allocators that end): the allocator `inner`, which `handle_at` makes
+/// handles of, and what releasing it needs. It's on its parent's memory,
+/// in one block with the count before it: the allocations from `inner`
+/// not freed yet, plus one while the owner (`Counted`, `Arena`) lives.
+/// The last of them to end, the owner's `deinit` or the last `free`,
+/// destroys `inner` and frees the block. So a handle kept with an
+/// allocation is always valid, and an arena's memory lives until its last
+/// allocation is freed.
+struct Control[A: Allocator] {
+	/// The count, at the start of the block.
+	count: *usize
+	/// This control block.
+	me: *Control[A]
+	/// The allocator the block came from, its size and its alignment.
+	parent: Handle
+	size: usize
+	align: usize
+	inner: A
+}
+
+/// Where the control block of `A` starts in its block, after the count:
+/// the size of a `usize`, rounded up to the control block's alignment.
+fn control_offset[A: Allocator]() -> usize {
+	return align_up(size_of[usize](), align_of[Control[A]]())
+}
+
+/// Destroy the control block at `c` (and its allocator), and free its
+/// block, once nothing counts on it.
+///
+/// The caller must ensure the count is 0: neither the owner nor an
+/// allocation from it remains.
+unsafe fn release[A: Allocator](c: *Control[A]) {
+	// The control block, moved out: `inner` is destroyed when `block`
+	// ends, after the block's memory is freed.
+	let block = c.read()
+	block.parent.free(block.count.cast[u8](), block.size, block.align)
+}
+
+/// One less on the count at `count`, and the control block `c` released
+/// if that was the last.
+///
+/// The caller must ensure `count` and `c` are a live control block's,
+/// and that what ends was counted.
+unsafe fn count_down[A: Allocator](count: *usize, c: *Control[A]) {
+	let n = count.read() -% 1
+	count.write(n)
+	if n == 0 {
+		release[A](c)
+	}
+}
+
+/// Every allocation through a counted handle counts.
+unsafe impl[A: Allocator] Allocator for Control[A] {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		let p = try self.inner.alloc(size, align)
+		// Sound: the count is the live control block's.
+		unsafe {
+			self.count.write(self.count.read() +% 1)
+		}
+		return p
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return self.inner.resize(p, old, new, align)
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		self.inner.free(p, size, align)
+		// Nothing reads `self` after this: it may be released.
+		count_down[A](self.count, self.me)
+	}
+
+	unsafe fn grow(self, p: *u8, old: usize, new: usize, align: usize) throws(AllocError) -> *u8 {
+		return try self.inner.grow(p, old, new, align)
+	}
+}
+
+/// A counted allocator (docs/allocation.md, Allocators that end): the
+/// allocator `A`, in a control block on the memory of the allocator in
+/// context when it's made, with a count of its live allocations. It isn't
+/// `Copy`: it's the owner. Destroying it releases `A` (and its memory)
+/// only when nothing allocated from it is alive; otherwise the last
+/// `free` does. `with alloc = c { ... }` allocates from it in a block,
+/// where `c` can't change or move while it's allocated from. A value
+/// allocated from it keeps it alive, wherever the value goes.
+pub struct Counted[A: Allocator] {
+	ctl: *Control[A]
+	count: *usize
+}
+
+/// `a`, counted, in a control block from the allocator in context (`a`
+/// is destroyed if there's no memory for it).
+pub fn Counted[A: Allocator].new(sink a: A) uses alloc throws(AllocError) -> Counted[A] {
+	let off = control_offset[A]()
+	let size = off +| size_of[Control[A]]()
+	var align = align_of[Control[A]]()
+	if align < align_of[usize]() {
+		align = align_of[usize]()
+	}
+	// Sound: the block holds the count, then the control block, each
+	// aligned; the control block keeps the handle with the block.
+	unsafe {
+		let h = current()
+		let raw = try h.alloc(size, align)
+		let count = raw.cast[usize]()
+		count.write(1)
+		let c = (raw + off).cast[Control[A]]()
+		c.write(Control{count: count, me: c, parent: h, size: size, align: align, inner: a})
+		return Counted{ctl: c, count: count}
+	}
+}
+
+/// The handle of the counted allocator, which `with alloc = c` installs.
+///
+/// The caller must ensure the handle is used only while `self` lives and
+/// doesn't change, or kept with an allocation made through it (which
+/// keeps the control block alive).
+pub unsafe fn Counted[A: Allocator].handle(self) -> Handle {
+	return handle_at[Control[A]](self.ctl)
+}
+
+/// How many allocations from it are alive.
+pub fn Counted[A: Allocator].live(self) -> usize {
+	// Sound: the count is the live control block's, at least 1 while the
+	// owner lives.
+	unsafe {
+		return self.count.read() -% 1
+	}
+}
+
+/// The owner ends: the allocator is released now if nothing allocated
+/// from it is alive, or else by the last `free`.
+pub fn Counted[A: Allocator].deinit(sink self) {
+	// Sound: the owner's one is taken off the count once.
+	unsafe {
+		count_down[A](self.count, self.ctl)
+	}
+}
+
+/// The address `at` rounded up to `align` (a power of two), or 0 if that
+/// overflows.
+fn align_up(at: usize, align: usize) -> usize {
+	let up = at +% (align -% 1)
+	if up < at {
+		return 0
+	}
+	return up & ~(align -% 1)
+}
+
+/// The header of each chunk of a `Bump`: the address of the chunk before
+/// it (0 for none), and its size.
+struct Chunk {
+	prev: usize
+	size: usize
+}
+
+/// What a bump allocator changes as it allocates: where its next block
+/// goes, the end of its current chunk (or buffer), the address of that
+/// chunk (0 for none), and the size of the next chunk it takes.
+struct BumpState {
+	next: usize
+	end: usize
+	chunk: usize
+	grow: usize
+}
+
+/// The smallest chunk a `Bump` takes, and the largest it doubles to.
+const BUMP_FIRST: usize = 4096
+
+const BUMP_MAX: usize = 1048576
+
+/// The size and alignment of a chunk's header, which its blocks follow.
+const CHUNK_HEADER: usize = 16
+
+/// A bump allocator: blocks are carved one after the other from chunks it
+/// takes from its parent (4 KiB first, then twice as large each time, up
+/// to 1 MiB, or as large as a block needs). Freeing a block gives it back
+/// only when it's the last one carved; the chunks are freed when it's
+/// destroyed. Its state is in a block of its own, since its methods take
+/// `self` read-only. It's only used counted, as an `Arena`.
+struct Bump {
+	st: *BumpState
+	parent: Handle
+}
+
+/// A bump allocator with no chunk yet, whose state comes from the
+/// allocator in context, as its chunks will.
+fn Bump.new() uses alloc throws(AllocError) -> Bump {
+	// Sound: the state is written before it's used, and the bump keeps
+	// the handle with the state's block.
+	unsafe {
+		let h = current()
+		let st = try h.alloc(size_of[BumpState](), align_of[BumpState]())
+		let p = st.cast[BumpState]()
+		p.write(BumpState{next: 0, end: 0, chunk: 0, grow: BUMP_FIRST})
+		return Bump{st: p, parent: h}
+	}
+}
+
+/// Carve `size` bytes aligned to `align` from the state at `st`: the
+/// block, or `none` when the chunk (or buffer) has no room left.
+///
+/// The caller must ensure `st` is a live state.
+unsafe fn carve(st: *BumpState, size: usize, align: usize) -> ?*u8 {
+	var s = st.read()
+	let at = align_up(s.next, align)
+	if s.chunk == 0 || at == 0 || at > s.end || s.end - at < size {
+		return none
+	}
+	s.next = at +% size
+	st.write(s)
+	return mem.from_addr[u8](at)
+}
+
+/// Grow or shrink the block of `old` bytes at `p` in place: the last
+/// block carved, when its chunk has room; any other block shrinks.
+///
+/// The caller must ensure `st` is a live state, and `p` a block from it.
+unsafe fn resize_last(st: *BumpState, p: *u8, old: usize, new: usize) -> bool {
+	var s = st.read()
+	let at = p.addr()
+	if at +% old == s.next && at <= s.end && s.end - at >= new {
+		s.next = at +% new
+		st.write(s)
+		return true
+	}
+	return new <= old
+}
+
+/// Give back the block of `size` bytes at `p`, if it's the last carved.
+///
+/// The caller must ensure `st` is a live state, and `p` a block from it
+/// that nothing uses any more.
+unsafe fn free_last(st: *BumpState, p: *u8, size: usize) {
+	var s = st.read()
+	if p.addr() +% size == s.next {
+		s.next = p.addr()
+		st.write(s)
+	}
+}
+
+unsafe impl Allocator for Bump {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		// Sound: the state is the bump's, and every block is carved from
+		// a chunk it holds.
+		unsafe {
+			if let p = carve(self.st, size, align) {
+				return p
+			}
+			// A new chunk, with room for the block after its header.
+			var s = self.st.read()
+			let need = size +| align +| CHUNK_HEADER
+			var n = s.grow
+			if n < need {
+				n = need
+			}
+			let c = try self.parent.raw_alloc(n, CHUNK_HEADER)
+			c.cast[Chunk]().write(Chunk{prev: s.chunk, size: n})
+			s.chunk = c.addr()
+			s.next = c.addr() +% CHUNK_HEADER
+			s.end = c.addr() +% n
+			if s.grow < BUMP_MAX {
+				s.grow = s.grow *| 2
+			}
+			self.st.write(s)
+			return carve(self.st, size, align) ?? throw .out_of_memory
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return resize_last(self.st, p, old, new)
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		free_last(self.st, p, size)
+	}
+}
+
+/// Free every chunk from `chunk` back (by their headers' `prev`) to
+/// `parent`, but the one at `keep`.
+///
+/// The caller must ensure the chunks are a bump's, from `parent`, and
+/// that nothing uses them any more (but `keep`).
+unsafe fn free_chunks(parent: Handle, chunk: usize, keep: usize) {
+	var c = chunk
+	while c != 0 {
+		let p = mem.from_addr[u8](c)
+		let h = p.cast[Chunk]().read()
+		if c != keep {
+			parent.free(p, h.size, CHUNK_HEADER)
+		}
+		c = h.prev
+	}
+}
+
+/// Free the chunks and the state.
+fn Bump.deinit(sink self) {
+	// Sound: a bump is destroyed when nothing it gave is used.
+	unsafe {
+		let s = self.st.read()
+		free_chunks(self.parent, s.chunk, 0)
+		self.parent.free(self.st.cast[u8](), size_of[BumpState](), align_of[BumpState]())
+	}
+}
+
+/// An arena (docs/allocation.md, Allocators that end): a bump allocator,
+/// counted. Allocating from it is a few instructions; freeing a block
+/// gives nothing back (but the last block), and the arena's memory is
+/// freed at once, when the arena and everything allocated from it have
+/// all ended. `with alloc = arena { ... }` allocates from it in a block;
+/// a value made there can leave the block, and the arena's function, and
+/// it keeps the arena's memory alive.
+///
+///     var arena = try alloc.Arena.new()
+///     with alloc = arena {
+///         let words = try split_words(text)   // allocates in the arena
+///     }
+pub struct Arena {
+	counted: Counted[Bump]
+	st: *BumpState
+	parent: Handle
+}
+
+/// A new arena: its state and control block come from the allocator in
+/// context, and so do its chunks, as it needs them.
+pub fn Arena.new() uses alloc throws(AllocError) -> Arena {
+	let b = try Bump.new()
+	let st = b.st
+	let parent = b.parent
+	return Arena{counted: try Counted.new(b), st: st, parent: parent}
+}
+
+/// The handle of the arena, which `with alloc = arena` installs.
+///
+/// The caller must ensure the handle is used only while the arena lives
+/// and doesn't change, or kept with an allocation made through it.
+pub unsafe fn Arena.handle(self) -> Handle {
+	return self.counted.handle()
+}
+
+/// How many allocations from the arena are alive.
+pub fn Arena.live(self) -> usize {
+	return self.counted.live()
+}
+
+/// Reuse the arena's memory: when nothing allocated from it is alive,
+/// every chunk but the last is freed, and blocks are carved from the
+/// start of that one again. Whether it could (`false`, and nothing done,
+/// while an allocation is alive).
+pub fn Arena.reset(inout self) -> bool {
+	if self.counted.live() != 0 {
+		return false
+	}
+	// Sound: nothing carved from the chunks is used any more.
+	unsafe {
+		var s = self.st.read()
+		if s.chunk != 0 {
+			free_chunks(self.parent, s.chunk, s.chunk)
+			let header = mem.from_addr[Chunk](s.chunk)
+			let size = header.read().size
+			header.write(Chunk{prev: 0, size: size})
+			s.next = s.chunk +% CHUNK_HEADER
+		}
+		self.st.write(s)
+	}
+	return true
+}
+
+/// A fixed buffer: an allocator over memory the caller gives, which
+/// carves blocks one after the other from it, and gives back only the
+/// last block carved. Its state is at the start of the buffer. It doesn't
+/// end on its own: over a `static` array it never does; over an array on
+/// the stack it ends with its frame, so `unsafe` code makes its handles
+/// (`alloc.handle(f)`) and promises that nothing it allocates outlives the
+/// buffer (docs/allocation.md, Allocators that end).
+pub struct FixedBuf {
+	st: *BumpState
+}
+
+/// A fixed buffer over the `n` bytes at `p`, the first 32 of which hold
+/// its state; `none` if `p` isn't aligned to 8 or `n` is less than 32.
+///
+/// The caller must ensure the `n` bytes at `p` are used by nothing else,
+/// for as long as the buffer and what it allocates are used.
+pub unsafe fn FixedBuf.new(p: *u8, n: usize) -> ?FixedBuf {
+	if p.addr() & 7 != 0 || n < size_of[BumpState]() {
+		return none
+	}
+	let st = p.cast[BumpState]()
+	let start = p.addr() +% size_of[BumpState]()
+	st.write(BumpState{next: start, end: p.addr() +% n, chunk: p.addr(), grow: 0})
+	return FixedBuf{st: st}
+}
+
+/// How many bytes are left at its end.
+pub fn FixedBuf.room(self) -> usize {
+	// Sound: the state is the buffer's.
+	unsafe {
+		let s = self.st.read()
+		return s.end -% s.next
+	}
+}
+
+unsafe impl Allocator for FixedBuf {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		// Sound: the state is the buffer's.
+		unsafe {
+			return carve(self.st, size, align) ?? throw .out_of_memory
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return resize_last(self.st, p, old, new)
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		free_last(self.st, p, size)
 	}
 }
