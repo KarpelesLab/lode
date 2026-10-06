@@ -123,7 +123,7 @@ Slicing `a[i..j]` compiles only when the checker proves
   `Box[T]`; M8c, views returned from functions (rule 2 of
   [memory.md](memory.md#views)), `List[T]` and `String`; M8d, error-set
   unions, the `oom` policy and arenas. Its open questions are in
-  [allocation.md](allocation.md#7-questions-for-the-user).
+  [allocation.md](allocation.md#7-decisions).
 - **Checker: filling buffers.** A plain array must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read.
   `StackBuf[N]`, option 3 of

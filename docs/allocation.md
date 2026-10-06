@@ -9,7 +9,7 @@ memory.md; [`Copy` and moves](generics.md#copy-and-moves-in-generic-code) in
 generics.md; [error sets](errors.md#error-sets); and the proof checker of
 [safety.md](safety.md). Each section lists the options, the trade-offs and a
 recommendation. The decisions only the user can make are collected at the
-end, in [Questions for the user](#7-questions-for-the-user).
+end, in [Decisions](#7-decisions).
 
 Everything here is **Proposed** unless a section says otherwise. Nothing is
 implemented yet.
@@ -914,9 +914,10 @@ After M8: `Map[K, V]`, linear types if wanted, `Box[dyn Trait]`, the region
 check for stack buffers, refinements on `inout` results, allocation at
 compile time (an evaluator heap whose values can't be a constant's value).
 
-## 7. Questions for the user
+## 7. Decisions
 
-**Status:** Open; each has a recommended answer
+**Status:** Decided 2026-10-06 by the user for 3 (with `pub let`), 5, 8 and
+11; the others keep the recommended answer unless the user changes them.
 
 1. **Destruction is a method, `fn T.deinit(sink self)`**, not a `Drop`
    trait; it can't throw or allocate
@@ -926,8 +927,8 @@ compile time (an evaluator heap whose values can't be a constant's value).
 3. **Fields are private to their package by default**, with `pub` and
    `pub let` (read-only outside), and literals of structs with private
    fields only in their package ([Field visibility](#field-visibility)).
-   *Decided and implemented* for private fields and `pub`; `pub let` is
-   still *recommended*.
+   *Decided:* private fields and `pub` are implemented; `pub let` is
+   decided, to implement in M8a.
 4. **Containers store their allocator**, a word that's zero-sized when the
    program never uses `with`
    ([Who frees](#who-frees-containers-remember-their-allocator)).
@@ -936,7 +937,7 @@ compile time (an evaluator heap whose values can't be a constant's value).
    lives until its last allocation is freed; stack-backed buffers aren't
    `with` allocators in safe code
    ([Allocators that end](#allocators-that-end-arenas-and-fixed-buffers)).
-   This is the main safety decision of M8. *Recommended.*
+   This is the main safety decision of M8. *Decided.*
 6. **The context is a hidden parameter** of `uses alloc` functions only,
    omitted when no `with` is reachable, and dispatched over the program's
    allocator types otherwise ([Lowering](#lowering-the-context)); **the
@@ -946,7 +947,7 @@ compile time (an evaluator heap whose values can't be a constant's value).
    inference ([Out of memory](#out-of-memory)). *Recommended.*
 8. **`xs[i]` works on `List`** through a sealed, std-only projection to a
    slice, consistent with "no operator overloading" because it means
-   exactly slice indexing ([`List[T]`](#listt)). *Recommended.*
+   exactly slice indexing ([`List[T]`](#listt)). *Decided.*
 9. **The explicit copy is `x.clone()`** from a `Clone` trait, rather than
    memory.md's `x.copy()` ([Explicit copies](#explicit-copies)).
    *Recommended, weakly: a naming choice.*
@@ -954,5 +955,4 @@ compile time (an evaluator heap whose values can't be a constant's value).
     *Recommended.*
 11. **A small prelude**: `Box`, `List`, `String`, `AllocError` and the
     built-in traits usable without an import, from `std/core`, rather than
-    `list.List[u32]` everywhere. *Recommended; if not, M8 ships them as
-    `std/box`, `std/list`, `std/string`, `std/alloc`.*
+    `list.List[u32]` everywhere. *Decided.*
