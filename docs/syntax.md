@@ -120,7 +120,7 @@ fn main() {
 | Generic parameters | `fn max[T: Ordered](sink a: T, sink b: T) -> T` |
 | Parameter conventions | `inout x: T`, `sink x: T`, `set x: T`, passed `f(&x)` (see below) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
-| Visibility | `pub` (default is package-private) |
+| Visibility | `pub` (default is package-private), on declarations and struct fields |
 | Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
 | Refinement | `i: usize where i < buf.len` ([safety.md](safety.md#refinements-in-types)) |
 | Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
@@ -197,8 +197,8 @@ struct Point {
 }
 
 pub struct Rect {
-	min: Point
-	max: Point
+	pub min: Point
+	pub max: Point
 }
 
 fn width(r: Rect) -> i32 {
@@ -219,12 +219,17 @@ fn main() -> i32 {
 ```
 
 - A declaration lists one field per line, `name: Type`. `pub struct` makes
-  the struct usable from other packages.
+  the struct usable from other packages. A field is private to the
+  package unless it's marked `pub`: `pub min: Point`
+  ([types.md](types.md#structs)).
+- `@uninit name: [N]T` marks a private array that `unsafe` code may leave
+  out of a literal ([memory.md](memory.md#uninitialized-buffers)). It
+  can't be `pub`.
 - `Name{field: value, ...}` is a literal. Every field is given exactly once,
   in any order. The values are evaluated in the order they're written. A
   literal can span lines, with a comma after each field, the last one too.
 - `pkg.Name` is another package's struct, in a type or a literal:
-  `geo.Point{x: 1, y: 2}`.
+  `geo.Point{x: 1, y: 2}`. A literal of it needs every field to be `pub`.
 - `p.x` is a field. `p.x = v` and `p.a.b op= v` assign to a field of a `var`
   struct; fields and indexes mix: `ps[i].x`, `p.steps[i]`.
 - In the header of `if`, `while` and `for`, a `{` after a name starts the

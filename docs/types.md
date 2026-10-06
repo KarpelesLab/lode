@@ -193,11 +193,35 @@ let p = Point{x: 1, y: 2}
 - A struct holds its fields by value, so it can't contain itself, directly or
   through other structs or arrays. A field can't be a view (`str`, `[]T`):
   views are never stored in structs ([memory.md](memory.md#views)).
-- **Open:** field visibility. Today a struct's fields are visible wherever
-  the struct is, and `pub` applies to the whole struct. Private fields (for
-  types that keep an invariant) are likely to come with methods. M8
-  proposes private by default, with `pub` and `pub let` (read-only
-  outside the package) ([allocation.md](allocation.md#field-visibility)).
+- **Decided:** field visibility. A field is private to the struct's
+  package unless it's marked `pub`, as in Go and Rust:
+
+  ```
+  pub struct StackBuf[N: usize] {
+  	@uninit bytes: [N]u8
+  	start: usize
+  	end: usize
+  }
+
+  pub struct Decoded[R] {
+  	pub rune: R
+  	pub len: usize
+  }
+  ```
+
+  Outside the package, a private field can't be read, assigned or passed
+  with `&`, and a struct with a private field can't be built with a
+  literal: its package's functions make it (`buf.StackBuf[64].new()`).
+  Inside the package, every field is visible, to methods and to any other
+  function. So a type keeps its invariants with private fields and
+  methods, and the checker doesn't need to know them. M8 proposes
+  `pub let` too, read-only outside the package
+  ([allocation.md](allocation.md#field-visibility)).
+- `==` (derived `Eq`) compares private fields too, from any package: it
+  says whether two values are equal, not what they hold. A struct with an
+  `@uninit` field isn't `Eq` at all ([memory.md](memory.md#uninitialized-buffers)).
+- Enum payload fields are always visible: `match` binds them. An enum
+  that hides its payload wraps it in a struct with private fields.
 
 #### In the compiler today
 
@@ -219,16 +243,30 @@ let p = Point{x: 1, y: 2}
 - Structs have methods ([Methods](#methods)): `p.length()`, `p.scale(2)`,
   `Point.origin()`.
 - `a == b` and `a != b` work on two structs of the same type: they compare
-  every field, recursively. Every field type supported today has `==`, so
-  every struct does. Equality is automatic for now; whether it should be
+  every field, recursively, private ones too. Every field type supported
+  today has `==`, so every struct does, except one with an `@uninit`
+  field. Equality is automatic for now; whether it should be
   opt-in is still Open (see [Operators](#operators)). `<` and the other
   orderings don't apply to structs.
+- Field visibility as decided above: `pub name: T` is visible everywhere,
+  any other field only in the struct's package. Outside it, reading,
+  assigning or passing a private field is an error ("`len` is a private
+  field of `buf.StackBuf`"), and so is a literal of a struct with one
+  ("`buf.StackBuf` has private fields, so it can only be built in package
+  `std/buf`", with a hint to a public function of that package that
+  returns one, `new` first). A method of another package's trait,
+  implemented in that package, sees only the `pub` fields. Generic code
+  can't reach fields through a type parameter, so visibility is checked
+  where the struct is named.
+- `@uninit name: [N]T`, with `T` an integer type, marks a private array
+  that `unsafe` code may leave out of a literal
+  ([memory.md](memory.md#uninitialized-buffers)).
 - In memory, fields are laid out in declaration order with natural
   alignment (LatticeFoundry's struct layout). This is not a promise: see the
   unspecified field order above.
 - Another package's public struct is `pkg.Name`, in types and in literals
-  (`geo.Point{x: 1, y: 2}`). Using a struct that isn't `pub` from another
-  package is an error.
+  (`geo.Point{x: 1, y: 2}`, if `x` and `y` are `pub`). Using a struct
+  that isn't `pub` from another package is an error.
 - The proof checker knows the integer fields of struct locals
   ([safety.md](safety.md#the-fact-language)): after `if p.x < 10`, `p.x + 1`
   is proven.

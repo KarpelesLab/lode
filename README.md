@@ -61,7 +61,10 @@ What works:
   read-only data, whose elements' range the checker knows
 - structs (`struct Point { ... }`, `Point{x: 1, y: 2}`, `p.x`, `ps[i].x += 1`)
   with value semantics: `let q = p` copies, and structs and arrays are passed
-  and returned by value; `==` compares structs and arrays field by field
+  and returned by value; `==` compares structs and arrays field by field;
+  fields are private to their package unless marked `pub` (`pub x: i32`),
+  so a type with private fields is made and changed only by its package's
+  functions ([docs/types.md](docs/types.md#structs))
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
   `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and
@@ -112,14 +115,18 @@ What works:
 - packages: `import "std/..."`, `pub`, `pkg.name`; `std/math` (`min`,
   `max`, `clamp`, `abs`) and `std/slices` (`sort`, `is_sorted`) for any
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
-  (bytes) and `std/vec.ArrayVec[T, N]`; `io.Writer`, implemented by files
+  (bytes, whose storage isn't filled when it's made) and
+  `std/vec.ArrayVec[T, N]`; `io.Writer`, implemented by files
   and buffers; `std/encoding` (UTF-8 and ASCII over bytes)
 - `unsafe` blocks and functions, raw pointers (`*u8`, `s.ptr` of a string,
-  array or slice), the `syscall` intrinsic
+  array or slice), the `syscall` intrinsic, and `@uninit` fields, private
+  arrays that `unsafe` code may leave unwritten in a literal
+  ([docs/memory.md](docs/memory.md#uninitialized-buffers))
 - output: `io.print("x = {}\n", x)` with a format string checked when
   compiling, for integers, `bool`, `str` and types with an `impl
   io.Format`, and `io.eprint` for standard error, which ignore errors
-  and make one `write` per call (through a 256-byte buffer);
+  and make one `write` per call (through a 256-byte buffer, not filled
+  first);
   `io.write_fmt(&w, fmt, ...)` to any `io.Writer`, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`

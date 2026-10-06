@@ -46,7 +46,7 @@ pretend otherwise:
 | Float to int | Always defined: saturating, and NaN gives 0. No proof needed. | [types.md](types.md#floats) |
 | Use after free, double free, dangling reference | Ruled out by the memory model. | [memory.md](memory.md) |
 | Data race | Ruled out by exclusivity and `Send`-like rules. | [concurrency.md](concurrency.md) |
-| Uninitialized read | Every variable is definitely assigned before use (flow analysis, as in Go and Rust). | [memory.md](memory.md#uninitialized-buffers) |
+| Uninitialized read | Every variable is definitely assigned before use (flow analysis, as in Go and Rust). An `@uninit` field is the one exception, inside `unsafe`. | [memory.md](memory.md#uninitialized-buffers) |
 | Unhandled error | A `throws` call must be handled with `try`, `catch` or `match`. | [errors.md](errors.md) |
 | Non-exhaustive match | Compile error. | [types.md](types.md#enums-sum-types) |
 
@@ -567,9 +567,29 @@ Rules:
   should be one command.
 
 What's unsafe so far (implemented): calling `syscall` or an `unsafe fn`,
-reading the raw pointer of a `str`, an array or a slice (`s.ptr`), and
-pointer arithmetic (`p + n`).
+reading the raw pointer of a `str`, an array or a slice (`s.ptr`),
+pointer arithmetic (`p + n`), and leaving an `@uninit` field out of a
+struct literal.
 Holding or comparing a pointer is safe; only using it isn't.
+
+Leaving an `@uninit` field unwritten
+([memory.md](memory.md#uninitialized-buffers)) promises this: **the
+struct's package never reads an element of that field that wasn't
+written since the value was made.** The compiler checks the rest:
+
+- The field is private, so no other package reads it, and `==` doesn't
+  apply to the struct, so no derived code reads it either.
+- Copying the struct copies the unwritten elements without using them,
+  which is defined (they're poison in LatticeFoundry, and storing poison
+  is not undefined behavior).
+
+So the promise covers every read of the field in its package's code, safe
+code included: a method that reads `bytes[i]` must know `i` was written,
+which is usually the range a pair of private fields keeps, as
+`StackBuf`'s `start..end`. Breaking it reads poison: a branch on it is
+undefined behavior, and output of it can leak old stack contents. The
+`unsafe` block that makes the value is where an auditor starts, and the
+struct's doc comment says what keeps the promise.
 
 Low-level operations are **compiler intrinsics**, not asm in the standard
 library:

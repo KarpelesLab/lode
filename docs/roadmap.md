@@ -124,11 +124,12 @@ Slicing `a[i..j]` compiles only when the checker proves
   [memory.md](memory.md#views)), `List[T]` and `String`; M8d, error-set
   unions, the `oom` policy and arenas. Its open questions are in
   [allocation.md](allocation.md#7-questions-for-the-user).
-- **Checker: filling buffers.** A buffer must be filled before use
-  (`[0; 21]`), even when only the part that's written is ever read. The
-  options are in [memory.md](memory.md#uninitialized-buffers): option 3's
-  type, `StackBuf[N]`, exists, and stops filling once fields can be
-  private (M8a).
+- **Checker: filling buffers.** A plain array must be filled before use
+  (`[0; 21]`), even when only the part that's written is ever read.
+  `StackBuf[N]`, option 3 of
+  [memory.md](memory.md#uninitialized-buffers), doesn't fill its storage
+  (private fields and an `@uninit` field). Option 2, for plain arrays, may
+  come later.
 - **After M7**, in the order of [generics.md](generics.md#after-m7), with
   the allocator context moved first as M8: `dyn Trait`; `Send`/`Sync` with
   the concurrency work; `Str[E]`; error-set unions with generic errors

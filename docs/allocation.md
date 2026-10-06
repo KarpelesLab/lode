@@ -31,8 +31,8 @@ implemented yet.
   `throw`, a failed `try`, `break`, `continue`), in reverse order
   (`run_defers` in `src/lower.rs`). `os.exit` runs none of them.
 - Raw pointers exist only to integers (`*u8`), only `unsafe` code uses
-  them, and a struct can't hold one. Struct fields are visible wherever
-  the struct is.
+  them, and a struct can't hold one. Struct fields are private to their
+  package unless marked `pub` (decided and implemented 2026-10-06).
 - `uses` and `where` are reserved words, rejected by the parser.
   Refinements (`where`) are being implemented now, including refinements
   of struct fields that every value of the struct keeps.
@@ -264,7 +264,8 @@ error: on that `try`'s error exit, `fa` is already gone.
 
 ### Field visibility
 
-**Status:** Proposed (types.md lists it as Open)
+**Status:** Decided (2026-10-06): option 1, implemented
+([types.md](types.md#structs)); `pub let` is still proposed
 
 A type that keeps an invariant (a `List`'s pointer, length and capacity, an
 owned file descriptor) needs fields that code outside the package can't
@@ -841,9 +842,9 @@ step's tests run under `cargo test`; the ones about system calls use
 
 ### M8a: resource types, destruction and moves
 
-- Field visibility: private by default, `pub`, `pub let`; literals of
-  structs with private fields only in their package. std and tests gain
-  `pub` where fields are used across packages.
+- Field visibility: `pub let`. (Private by default, `pub`, and literals
+  of structs with private fields only in their package are done: std and
+  tests have `pub` where fields are used across packages.)
 - `fn T.deinit(sink self)`: declaration rules, generated destruction,
   `needs_deinit`, `is_copy` false for types that need destruction.
 - Moves for every non-`Copy` type (`consume` beyond `Ty::Param`), pattern
@@ -925,7 +926,8 @@ compile time (an evaluator heap whose values can't be a constant's value).
 3. **Fields are private to their package by default**, with `pub` and
    `pub let` (read-only outside), and literals of structs with private
    fields only in their package ([Field visibility](#field-visibility)).
-   This changes existing code mechanically. *Recommended.*
+   *Decided and implemented* for private fields and `pub`; `pub let` is
+   still *recommended*.
 4. **Containers store their allocator**, a word that's zero-sized when the
    program never uses `with`
    ([Who frees](#who-frees-containers-remember-their-allocator)).

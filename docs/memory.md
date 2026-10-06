@@ -311,8 +311,8 @@ yet (its result would hold a view in memory).
 
 ## Uninitialized buffers
 
-**Status:** Leaning to option 3; its type is implemented, its storage is
-still filled (see [In the compiler today](#in-the-compiler-today-1) below)
+**Status:** Decided: option 3; implemented (see
+[In the compiler today](#in-the-compiler-today-1) below)
 
 Every variable is assigned before use, and an array is assigned whole, so a
 buffer that's filled piece by piece has to be filled first: `std/io`'s
@@ -350,33 +350,62 @@ must not depend on the optimizer. The options:
    whatever was on the stack before (an information leak, as with
    uninitialized buffers in C), and it hides bugs instead of rejecting them.
 
-Leaning: 3 once generics land, possibly with 2 later for code that wants
-plain arrays; 4 only inside `unsafe`, if at all.
+Decided (2026-10-06): 3. Types like `StackBuf` keep the written range in
+private fields, and only their own package's code, which promises with
+`unsafe` to read nothing else, can leave storage unwritten. Option 2 may
+come later for code that wants plain arrays. Option 4 is not planned.
 
 ### In the compiler today
 
-**Status:** Option 3's type is implemented (M7b); its storage is still
-filled
+**Status:** Implemented
+
+A struct field declared `@uninit` may be left unwritten:
+
+```
+pub struct StackBuf[N: usize] {
+	@uninit bytes: [N]u8
+	start: usize
+	end: usize
+}
+
+pub fn StackBuf[N].new() -> StackBuf[N] {
+	unsafe {
+		return StackBuf{start: 0, end: 0}
+	}
+}
+```
+
+- The field is an array of integers, and private: it can't be `pub`
+  ([types.md](types.md#structs)). So only the struct's package reads it.
+- A literal may leave it out only in `unsafe` code (an `unsafe` block or
+  an `unsafe fn`). Elsewhere, leaving it out is the usual missing-field
+  error. The `unsafe` is a promise, stated in
+  [safety.md](safety.md#the-trusted-boundary): the package never reads an
+  element of it before writing it.
+- A struct with an `@uninit` field isn't `Eq`, and neither is anything
+  that holds one: `==` would compare the elements never written.
+- Copying the struct (`let c = b`, passing or returning it) copies the
+  unwritten elements too. That's defined: in LatticeFoundry, memory never
+  written reads as poison, and poison stored somewhere is still poison.
+  Only using it (a branch, an address, a divisor, output) is wrong, and
+  the promise rules that out.
+- In a function run while compiling, the elements left out are zeros.
 
 `std/buf.StackBuf[N]` is option 3's type
 ([packages.md](packages.md#the-standard-library-in-the-compiler-today)):
 bytes written at the back with `push`, or at the front with `push_front`,
-only the written part is read (`get`, `len`, `io.File.write_buf`), and every
-access is proven. (`io.Format` for integers doesn't use one: it cost 640
-bytes more than a plain `[21]u8`, see
+only the written part `bytes[start..end]` is read (`get`, `len`,
+`write_to`, and `io.File.write_buf` through it), and every access is
+proven. `new` and `new_end` don't write the storage. `print`'s 256-byte
+buffer is `@uninit` the same way. (`io.Format` for integers doesn't use a
+`StackBuf`: it cost 640 bytes more than a plain `[21]u8`, which is still
+filled, see
 [packages.md](packages.md#the-standard-library-in-the-compiler-today).)
-Two things keep it from skipping the fill:
 
-- **Fields aren't private.** Any code can read `b.bytes[i]` outside the
-  written part, so the bytes there must have a value.
-- **No way to leave storage unwritten.** Even in `unsafe` code, every
-  variable and field is assigned before use; an `unsafe` "uninitialized"
-  value (option 4, inside `unsafe` only) doesn't exist.
-
-So `StackBuf[N].new()` fills its `N` bytes once, as `[0; N]` did. Once
-fields can be private, `new` can leave them unwritten through such an
-`unsafe` value, and the fill goes away with no change to code that uses
-`StackBuf`.
+Without the fill, a program that prints a formatted value is 96 bytes
+smaller at `-O2` (and `-O0`), and one using `StackBuf`s 380 to 820 bytes
+smaller. Hello world, which has no buffer, is still 577 bytes and two
+system calls.
 
 ## Destruction
 

@@ -930,8 +930,9 @@ proposal left room:
   (`io.print_int` built its digits in a `StackBuf[21]` at first, and went
   back to a plain array: 640 bytes less at `-O2`.) Every access in
   them is proven. Without refinements, each method checks the invariant it
-  needs (`end <= N`), and without private fields, `StackBuf` still fills
-  its storage when it's made ([memory.md](memory.md#uninitialized-buffers)).
+  needs (`end <= N`). `StackBuf`'s fields are private and its storage
+  `@uninit`, so it doesn't fill its storage when it's made
+  ([memory.md](memory.md#uninitialized-buffers)).
   `ArrayVec` keeps its elements as `[N]?T`, so it needs no value to fill
   empty slots with, and `T: Copy` to make them `none`.
 
@@ -1267,8 +1268,9 @@ proposal left room:
     first piece of text in `new` was ~350 bytes larger per program;
     writing a piece larger than the buffer directly, rather than a
     buffer at a time, ~150 bytes larger.
-    The buffer is still zeroed for each print, until uninitialized
-    buffers ([memory.md](memory.md#uninitialized-buffers)).
+    The buffer was zeroed for each print until it became `@uninit`
+    ([memory.md](memory.md#uninitialized-buffers)), which saved 96
+    bytes per program that formats a value.
   - **`f() catch _ {}` lowers to no branch.** Ignoring a result branched
     on its tag to two blocks that both go on (the backend doesn't fold a
     `cond_br` whose targets are the same block); now the call's result is

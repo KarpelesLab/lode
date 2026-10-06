@@ -19,7 +19,8 @@ Go's vocabulary, which is proven:
 - A **module** is a versioned tree of packages with a manifest at its root
   (`lode.mod`, name Open).
 - Visibility: `pub` exports from a package. Everything else is private to the
-  package.
+  package, a struct's fields included: `pub name: T` exports a field
+  ([types.md](types.md#structs)).
 - No import cycles between packages.
 
 ## The standard library in the compiler today
@@ -32,7 +33,9 @@ Go's vocabulary, which is proven:
   `package x`. Imports are followed transitively; a cycle is an error.
 - Other imports (anything outside `std/`) aren't supported yet.
 - Only `pub` items can be used from another package, as `pkg.name`, and
-  only `pub` methods: `pkg.Type.new()`, `value.method()`. A `pub trait` is
+  only `pub` methods: `pkg.Type.new()`, `value.method()`, and only `pub`
+  fields: `value.field`, and literals of structs whose fields are all
+  `pub`. A `pub trait` is
   used as `pkg.Trait` in a bound or an `impl`; an `impl`'s methods are as
   visible as its trait.
 - Linker symbols are `<import path>.<name>` (`std/os.write_all`), and
@@ -74,9 +77,10 @@ Go's vocabulary, which is proven:
     and `other(errno)` for any other number. `error(n)` converts a failed
     call's result to an `Error`.
 - `std/io`:
-  - `File`, an open file: a struct holding its file descriptor,
-    `File{fd: i32}`. It doesn't close the file (there's no way to open one
-    yet). `stdin()`, `stdout()` and `stderr()` return the standard ones.
+  - `File`, an open file: a struct holding its file descriptor in a
+    private field. It doesn't close the file (there's no way to open one
+    yet). `stdin()`, `stdout()` and `stderr()` return the standard ones,
+    and `File.from_fd(fd: i32)` any other.
   - `File.read(self, inout buf: []u8) throws(os.Error) -> usize` reads into
     `buf` once and returns the number of bytes read: 0 only at the end of
     the input (or for an empty `buf`), and possibly fewer than `buf.len`
@@ -118,7 +122,8 @@ Go's vocabulary, which is proven:
     `write` system call. A format that's only text is written as it is,
     with no buffer: `io.print("hello world\n")` is that `write` and no
     formatting code. Any other format is put together in a buffer of
-    `io.PRINT_BUF_SIZE` (256) bytes on the stack and written at the end; a
+    `io.PRINT_BUF_SIZE` (256) bytes on the stack, not filled first
+    (`@uninit`), and written at the end; a
     print longer than that is written 256 bytes at a time, each time the
     buffer is full. `eprint` writes to standard error the same way.
   - `write_fmt[W: Writer, ..A: Format](inout w: W, comptime fmt: str, args:
@@ -152,18 +157,21 @@ Go's vocabulary, which is proven:
   - `is_sorted(xs: []T) -> bool`.
 - `std/buf`, fixed-capacity byte buffers:
   - `StackBuf[N: usize]`, a buffer of at most `N` bytes written at either
-    end, stored in place (on the stack for a local). The bytes written so
-    far are `bytes[start..end]`, and only those are read.
+    end, stored in place (on the stack for a local). Its fields are
+    private: the bytes written so far are `bytes[start..end]`, and only
+    those are read. It isn't `Eq`.
   - `StackBuf[N].new()` makes an empty one that `push` fills from the
     front of its storage; `StackBuf[N].new_end()` one that `push_front`
-    fills from the back, such as for digits, last first. Both still fill
-    the storage with zeros once
+    fills from the back, such as for digits, last first. Neither writes
+    the storage: it's `@uninit`
     ([memory.md](memory.md#uninitialized-buffers)).
   - `push(inout self, b: u8) throws(Error)` writes `b` after the bytes
     written, `push_front` before them; each throws `buf.Error.full` when
     there's no room at that end.
   - `len(self) -> usize` and `get(self, i: usize) -> ?u8` (byte `i` of the
-    written part, `none` past it) read it; `io.File.write_buf` writes it.
+    written part, `none` past it) read it; `write_to(self, fd: i32) ->
+    isize` writes it to a file descriptor as `os.write_all` does (0 or a
+    negative error number), and `io.File.write_buf` calls it.
 - `std/vec`, fixed-capacity vectors:
   - `ArrayVec[T: Copy, N: usize]`, a list of at most `N` elements of type
     `T`, stored in place: no allocation. Its slots are `[N]?T`, so it needs
@@ -175,9 +183,10 @@ Go's vocabulary, which is proven:
     `put(inout self, i: usize, v: T) -> bool`, which replaces element `i`.
   - `var v = vec.ArrayVec[u16, 8].new()`, or `var v: vec.ArrayVec[u16, 8] =
     vec.ArrayVec.new()`.
-- Every access in `std/buf` and `std/vec` is proven. Without refinements,
-  each method checks the bound it relies on (`end <= N`), since the
-  fields are visible and could have been changed.
+- Every access in `std/buf` and `std/vec` is proven. Their fields are
+  private, so only their own methods change them; without refinements,
+  each method still checks the bound it relies on (`end <= N`) for the
+  checker.
 - `std/encoding`, character encodings over bytes, beside the built-in
   `str` ([strings.md](strings.md)):
   - `Encoding`, a trait with an associated type `Rune` (`Copy + Eq`), an
@@ -185,7 +194,7 @@ Go's vocabulary, which is proven:
     `decode(bytes: []u8) -> ?Decoded[Rune]` (the first rune and its length
     in bytes), `encode(r: Rune, set out: [MAX_LEN]u8) -> usize` and
     `validate(bytes: []u8) -> bool` (a default).
-  - `Decoded[R]`, a rune and its length: `rune: R`, `len: usize`.
+  - `Decoded[R]`, a rune and its length: `pub rune: R`, `pub len: usize`.
   - `Utf8` (`Rune` is `u32`, `MAX_LEN` 4; overlong forms, surrogates and
     values above U+10FFFF are invalid) and `Ascii` (`u8`, 1). An encoding
     is a type, never a value: `encoding.Utf8.decode(b)`. They're enums of
