@@ -172,8 +172,10 @@ struct SumIr {
 /// What leaving a statement list runs, registered as it's lowered.
 #[derive(Clone)]
 enum Defer {
-    /// A `defer` body, and whether it's an `errdefer`.
-    Body(Rc<[TStmt]>, bool),
+    /// A `defer` body, whether it's an `errdefer`, and how many handles
+    /// were in context where it was written (its calls use the
+    /// innermost of those, wherever it runs).
+    Body(Rc<[TStmt]>, bool, usize),
     /// The destruction of a local that owns its value (`TStmt::Drop`).
     Drop(LocalId),
     /// The destruction of a part of an aggregate being built, at this
@@ -1734,12 +1736,16 @@ impl FnLower<'_> {
             let entries = self.defers[scope].clone();
             for entry in entries.iter().rev() {
                 match entry {
-                    Defer::Body(_, true) if !error => {}
-                    Defer::Body(body, _) => {
+                    Defer::Body(_, true, _) if !error => {}
+                    Defer::Body(body, _, ctx) => {
                         // The body can't leave its own statements, so the
                         // defers registered while lowering it are its own.
+                        // It runs in the context it was written in, outside
+                        // the `with` blocks an exit leaves.
                         let depth = self.defers.len();
+                        let inner = self.ctx.split_off((*ctx).min(self.ctx.len()));
                         self.stmts(body);
+                        self.ctx.extend(inner);
                         debug_assert_eq!(depth, self.defers.len());
                     }
                     Defer::Drop(local) => self.destroy_local(*local, false),
@@ -2162,8 +2168,9 @@ impl FnLower<'_> {
             TStmt::Return(value) => self.return_value(value.as_ref()),
             TStmt::Throw(e) => self.throw(e),
             TStmt::Defer { body, on_error } => {
+                let ctx = self.ctx.len();
                 let scope = self.defers.last_mut().expect("in a statement list");
-                scope.push(Defer::Body(Rc::from(body.clone()), *on_error));
+                scope.push(Defer::Body(Rc::from(body.clone()), *on_error, ctx));
             }
             TStmt::Drop { local, init } => {
                 self.set_flag(*local, *init);

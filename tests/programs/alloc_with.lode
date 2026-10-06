@@ -2,6 +2,7 @@
 // stdout: nested: 5 6 7 ~7 ~6 ~5 | allocs 1 frees 1, other 1 1\n
 // stdout: kept: 8 ~8 | allocs 1 frees 1\n
 // stdout: clone: 9 9 ~9 ~9 | allocs 2 frees 2\n
+// stdout: defer: in 1 ~10 noted ~20 | allocs 1 frees 1\n
 // stdout: a box is 24 bytes, a handle 16\n
 // stdout:  ~0
 package main
@@ -145,6 +146,25 @@ fn clone_in() uses alloc throws(AllocError) {
 	}
 }
 
+// A `defer` runs in the context it's written in, even at an exit from
+// inside a `with` block: `note` allocates from the root.
+fn note() uses alloc {
+	let b = make(20) catch _ {
+		io.print(" failed")
+		return
+	}
+	io.print(" noted")
+}
+
+fn deferred() uses alloc throws(AllocError) {
+	defer note()
+	with alloc = first() {
+		let a = try make(10)
+		io.print(" in {}", a.value.id -% 9)
+		return
+	}
+}
+
 // Start counting again.
 fn reset() {
 	unsafe {
@@ -185,6 +205,12 @@ fn main() uses alloc -> u8 {
 	reset()
 	clone_in() catch _ {
 		return 4
+	}
+	show()
+	io.print("\ndefer:")
+	reset()
+	deferred() catch _ {
+		return 5
 	}
 	show()
 	io.print("\n")

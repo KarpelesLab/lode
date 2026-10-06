@@ -1038,7 +1038,8 @@ What M8b does, and the choices made where the proposal left room:
 - **`with alloc = h { ... }`** is only allowed in a function that declares
   `uses alloc`, with `h` an `alloc.Handle`. It's an ordinary block:
   `defer`, destruction and every exit work as in any block, and the
-  context is the outer one again after it.
+  context is the outer one again after it. A `defer` body runs in the
+  context it's written in, also at an exit from inside a `with` block.
 - **Handles** (`std/alloc`). `alloc.current()` (`uses alloc`) is the
   context's; `alloc.root()` the root allocator's; and `unsafe
   alloc.handle(a)` one of the allocator `a`, a struct or an enum: its
