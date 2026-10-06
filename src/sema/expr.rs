@@ -252,6 +252,8 @@ struct Access<'e> {
     path: Vec<Step>,
     write: bool,
     place: &'e TExpr,
+    /// Whether it's the place an assignment stores to.
+    target: bool,
 }
 
 /// The variable and the steps a place like `a[i].x` is made of, if `e` is
@@ -315,6 +317,7 @@ fn accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
                     path,
                     write: true,
                     place,
+                    target: false,
                 });
             }
         }
@@ -329,6 +332,7 @@ fn accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
                     path,
                     write: false,
                     place: e,
+                    target: false,
                 });
             }
             None => {
@@ -697,7 +701,41 @@ impl Checker<'_> {
     /// expression (with `&`, or as the receiver of a method that takes
     /// `inout self`) can't overlap anything else the expression uses.
     fn check_exclusive(&mut self, cx: &FnCx, e: &TExpr, span: Span) {
+        self.check_exclusive_in(cx, None, e, span);
+    }
+
+    /// Exclusivity for `target = value` (docs/memory.md, Exclusivity): the
+    /// place assigned, with the indexes in it, is used by the statement as
+    /// much as `value` is. So `value` can't change, or move, what the
+    /// target is part of (`xs[0] = drain(&xs)`, `b.value = f(&b)`), nor a
+    /// variable an index of it reads (`a[i] = f(&i)`): the target's
+    /// address, its index's proof and the old value it destroys were all
+    /// worked out from what the variable was before `value` ran. As for
+    /// `target op= value`, which reads the target in `value`.
+    pub(super) fn check_assign_exclusive(
+        &mut self,
+        cx: &FnCx,
+        target: &TExpr,
+        value: &TExpr,
+        span: Span,
+    ) {
+        self.check_exclusive_in(cx, Some(target), value, span);
+    }
+
+    fn check_exclusive_in(&mut self, cx: &FnCx, target: Option<&TExpr>, e: &TExpr, span: Span) {
         let mut found = Vec::new();
+        if let Some(target) = target {
+            index_accesses(target, &mut found);
+            if let Some((local, path)) = place_path(target) {
+                found.push(Access {
+                    local,
+                    path,
+                    write: false,
+                    place: target,
+                    target: true,
+                });
+            }
+        }
         accesses(e, &mut found);
         // A view local used in the expression uses what it borrows from
         // (docs/memory.md, Views): a call that changes that, or moves it,
@@ -715,12 +753,25 @@ impl Checker<'_> {
                         path: Vec::new(),
                         write: false,
                         place: a.place,
+                        target: a.target,
                     })
             })
             .collect();
         let mut moved = Vec::new();
         moved_locals(e, &mut moved);
         for l in moved {
+            if let Some(t) = found.iter().find(|a| a.target && a.local == l) {
+                let name = &cx.locals[l].name;
+                let text = place_text(cx, t.place).unwrap_or_else(|| name.clone());
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{name}` is moved by the assigned value, so `{text}` can't be assigned"),
+                    )
+                    .with_help("the place assigned is part of the statement: compute the value into a variable first (`let v = ...`), then assign it"),
+                );
+                return;
+            }
             if let Some(v) = viewed.iter().find(|v| v.local == l) {
                 let name = &cx.locals[l].name;
                 let view = place_text(cx, v.place).unwrap_or_else(|| "a view".to_owned());
@@ -755,6 +806,10 @@ impl Checker<'_> {
                 format!(
                     "`{wt}` and `{ot}` are both passed `inout` or `set` in this expression, and may overlap"
                 )
+            } else if other.target {
+                format!(
+                    "`{wt}` is passed `inout` or `set` in the value assigned to `{ot}`, which is part of the same statement"
+                )
             } else {
                 format!(
                     "`{wt}` is passed `inout` or `set`, so `{ot}` can't be used in the same expression"
@@ -763,6 +818,11 @@ impl Checker<'_> {
             let mut d = Diagnostic::error(span, msg).with_help(
                 "a place passed `inout` or `set` (with `&`, or to a method that takes `inout self`) needs exclusive access: nothing else in the expression may use it",
             );
+            if other.target {
+                d = d.with_help(format!(
+                    "the place assigned, and the indexes in it, count as used by the value: compute the value into a variable first (`let v = ...`), then assign `{ot}`"
+                ));
+            }
             if place_path(other.place).is_some_and(|(root, _)| root != other.local) {
                 d = d.with_help(format!("`{ot}` views `{}`", cx.locals[other.local].name));
             }

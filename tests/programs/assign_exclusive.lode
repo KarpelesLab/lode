@@ -1,0 +1,66 @@
+// stdout: 10 2 3 | 7 1 | 5 6 | 11 | 4 3\n
+package main
+
+import "std/io"
+import "std/mem"
+
+struct Pair {
+	x: u32
+	y: u32
+}
+
+fn next(inout n: u32) -> u32 {
+	n = n +% 1
+	return n
+}
+
+fn count(inout xs: List[u32]) uses alloc -> u32 {
+	xs.push(5) catch _ {}
+	return 3
+}
+
+fn main() uses alloc {
+	// The value changes another variable than the target's.
+	var xs = List[u32].new()
+	xs.extend([1, 2, 3]) catch _ {}
+	var n: u32 = 9
+	if xs.len > 0 {
+		xs[0] = next(&n)
+	}
+	io.print("{} {} {} | ", xs.get(0) ?? 0, xs.get(1) ?? 0, xs.get(2) ?? 0)
+
+	// Different fields of one struct.
+	var p = Pair{x: 0, y: 6}
+	p.x = next(&p.y)
+	p.y = 1
+	io.print("{} {} | ", p.x, p.y)
+
+	// Different constant indexes of one array, and a read of the target.
+	var a: [2]u32 = [4, 5]
+	a[0] = next(&a[1])
+	a[1] = a[0]
+	a[0] = 5
+	io.print("{} {} | ", a[0], a[1])
+
+	// A whole variable is assigned once the value is computed.
+	var ys = List[u32].new()
+	var k: u32 = 0
+	k = count(&ys)
+	var b = Box[u32].new(8) catch _ {
+		return
+	}
+	b = mem.replace(&b, Box[u32].new(1) catch _ {
+		return
+	})
+	b.value = b.value +% k
+	io.print("{} | ", b.value)
+
+	// The value is computed first, into a variable.
+	var zs = List[u32].new()
+	zs.extend([1, 2]) catch _ {}
+	let v = count(&zs)
+	if zs.len > 1 {
+		zs[1] = v +% 1
+	}
+	io.print("{} {}\n", zs.get(1) ?? 0, zs.len)
+}

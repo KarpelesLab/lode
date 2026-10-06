@@ -1,0 +1,158 @@
+// error: `xs` is passed `inout` or `set` in the value assigned to `xs[1]`, which is part of the same statement
+// error: `rs` is passed `inout` or `set` in the value assigned to `rs[0]`, which is part of the same statement
+// error: `b` is passed `inout` or `set` in the value assigned to `b.value`, which is part of the same statement
+// error: `p` is passed `inout` or `set` in the value assigned to `p.l[0]`, which is part of the same statement
+// error: `p.l` is passed `inout` or `set` in the value assigned to `p.l[0]`, which is part of the same statement
+// error: `ys` is passed `inout` or `set` in the value assigned to `ys[0]`, which is part of the same statement
+// error: `bs` is passed `inout` or `set` in the value assigned to `bs[0].value`, which is part of the same statement
+// error: `i` is passed `inout` or `set`, so `i` can't be used in the same expression
+// error: `ms` is moved by the assigned value, so `ms[0]` can't be assigned
+// error: `a` is passed `inout` or `set` in the value assigned to `a[0]`, which is part of the same statement
+// error: `s` is passed `inout` or `set` in the value assigned to `s[0]`, which is part of the same statement
+// error: `xs` is passed `inout` or `set` in the value assigned to `xs[0]`, which is part of the same statement
+// help: the place assigned, and the indexes in it, count as used by the value
+package main
+
+import "std/mem"
+
+struct Res {
+	n: u32
+}
+
+fn Res.deinit(sink self) {
+}
+
+// Reallocates the list's elements.
+fn grow(inout xs: List[u32]) uses alloc -> u32 {
+	xs.extend([3, 4, 5]) catch _ {}
+	return 7
+}
+
+// Destroys the list's elements.
+fn drain(inout xs: List[Res]) -> Res {
+	xs.clear()
+	return Res{n: 9}
+}
+
+// Replaces the box.
+fn swapbox(inout b: Box[[4]u32]) uses alloc -> [4]u32 {
+	let nb = Box[[4]u32].new([0; 4]) catch _ {
+		return [0; 4]
+	}
+	b = nb
+	return [1; 4]
+}
+
+struct Holder {
+	l: List[Res]
+	n: u32
+}
+
+fn clear_ret(inout p: Holder) -> Res {
+	p.l.clear()
+	return Res{n: 1}
+}
+
+fn clear_list(inout l: List[Res]) -> Res {
+	l.clear()
+	return Res{n: 2}
+}
+
+fn bump(inout i: usize) -> u32 {
+	i = i +% 100
+	return 0
+}
+
+fn keep(sink xs: List[Res]) -> Res {
+	return Res{n: 3}
+}
+
+fn zero(inout a: [4]u32) -> u32 {
+	a = [0; 4]
+	return 1
+}
+
+fn clear_all(inout s: []Res) -> Res {
+	return Res{n: 4}
+}
+
+fn main() uses alloc {
+	var xs = List[u32].new()
+	xs.extend([1, 2]) catch _ {}
+	if xs.len > 1 {
+		xs[1] = grow(&xs)
+	}
+
+	var rs = List[Res].new()
+	rs.push(Res{n: 1}) catch _ {}
+	if rs.len > 0 {
+		rs[0] = drain(&rs)
+	}
+
+	var b = Box[[4]u32].new([1, 2, 3, 4]) catch _ {
+		return
+	}
+	b.value = swapbox(&b)
+
+	var p = Holder{l: List[Res].new(), n: 0}
+	p.l.push(Res{n: 1}) catch _ {}
+	if p.l.len > 0 {
+		p.l[0] = clear_ret(&p)
+	}
+	if p.l.len > 0 {
+		p.l[0] = clear_list(&p.l)
+	}
+
+	// A method that takes `inout self` changes the receiver.
+	var ys = List[Res].new()
+	ys.push(Res{n: 1}) catch _ {}
+	if ys.len > 0 {
+		ys[0] = ys.pop() ?? Res{n: 0}
+	}
+
+	// A whole variable is assigned after the value is computed: fine.
+	var q: ?Res = Res{n: 1}
+	q = mem.take(&q)
+
+	var bs = List[Box[[4]u32]].new()
+	if bs.len > 0 {
+		bs[0].value = four(mem.replace(&bs, List[Box[[4]u32]].new()))
+	}
+
+	// An index the value changes.
+	var a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	if i < 4 {
+		a[i] = bump(&i)
+	}
+
+	// A move of the list.
+	var ms = List[Res].new()
+	ms.push(Res{n: 1}) catch _ {}
+	if ms.len > 0 {
+		ms[0] = keep(ms)
+	}
+
+	a[0] = zero(&a)
+	a[1] = a[2]
+}
+
+fn four(sink xs: List[Box[[4]u32]]) -> [4]u32 {
+	return [0; 4]
+}
+
+fn pop_of(sink xs: List[Res]) -> Res {
+	return Res{n: 5}
+}
+
+fn change(inout s: []Res) {
+	if s.len > 0 {
+		s[0] = clear_all(&s)
+	}
+}
+
+fn take_list(inout xs: List[Res]) {
+	if xs.len > 0 {
+		xs[0] = pop_of(mem.replace(&xs, List[Res].new()))
+	}
+}

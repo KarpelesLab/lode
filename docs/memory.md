@@ -120,6 +120,21 @@ storage, and what the checker knows about a variable read earlier in the
 expression would be stale after the call changes it. It's stricter than
 Swift's, which allows `add(&x, x)`; write `let k = x` first.
 
+In an assignment to a part of a variable, `place = value` (an element, a
+field, a box's value, at any depth), the place and the indexes in it are
+uses of the same expression as `value`, as they are in `place op= value`.
+So `value` can't pass `&` (or as an `inout self` receiver, or to
+`opt.take()`) anything that overlaps the place or a variable an index of it
+reads, and can't move the place's variable: `xs[0] = drain(&xs)`,
+`b.value = f(&b)`, `p.l[0] = clear(&p)`, `a[i] = f(&i)` and
+`xs[0] = keep(xs)` are errors (the place's address, its index's proof and
+the old value it destroys come from the variable as it was before `value`
+ran), while `p.x = next(&p.y)`, `a[0] = next(&a[1])` and `a[0] = a[1]` are
+fine. Write `let v = drain(&xs)` first. Assigning a whole variable,
+`x = f(&x)`, is fine: the value is computed first, then the old one is
+destroyed and the variable assigned, and nothing about it was worked out
+before.
+
 ### In the checker
 
 After a call, the checker forgets what it knew about each place passed

@@ -6069,7 +6069,14 @@ impl<'a> Checker<'a> {
     ) -> Option<TStmt> {
         let ty = place.ty();
         let checked = match op {
-            None => self.expr(cx, value, Some(ty))?,
+            None => {
+                let checked = self.expr(cx, value, Some(ty))?;
+                // The place is computed before the value, and its old value
+                // destroyed after: the value can't change what it's part of.
+                // (`op=` reads the target in the value, which checks it.)
+                self.check_assign_exclusive(cx, &place.expr, &checked.expr, span);
+                checked
+            }
             Some(op) => {
                 let combined = ast::Expr {
                     kind: ExprKind::Binary(op, Box::new(target), Box::new(value.clone())),
