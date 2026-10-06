@@ -1,6 +1,6 @@
 // stdout: ints: 1 42 43 | structs: 3 4 7 moved 5 ~5 | nested 6 66 ~6\n
 // stdout: inner: 8 ~8 | clone: clone9 9 109 ~109 ~9 | resources: 10 ~10 | list: 3 2 ~3 ~2 ~1\n
-// stdout: fd: closed, a box is 8 bytes\n
+// stdout: fd: closed, a box is 8 bytes, root 42\n
 package main
 
 import "std/alloc"
@@ -118,6 +118,19 @@ fn list() uses alloc throws(AllocError) {
 	}
 }
 
+// A handle of the root itself installs nothing new: boxes stay one
+// pointer.
+fn root_again() uses alloc throws(AllocError) -> u32 {
+	var h: alloc.Handle
+	unsafe {
+		h = alloc.handle(alloc.ROOT)
+	}
+	with alloc = h {
+		let b = try alloc.Box.new(u32(42))
+		return b.value
+	}
+}
+
 // An owned file descriptor, boxed: closed once, when the box is destroyed.
 fn fds() uses alloc throws(AllocError) -> bool {
 	let f = os.open("/dev/null", os.O_RDONLY, 0) catch _ {
@@ -157,8 +170,11 @@ fn main() uses alloc -> u8 {
 	}
 	// With only the root allocator, a box is one pointer: its handle is
 	// zero-sized.
+	let root = root_again() catch _ {
+		return 9
+	}
 	if ok {
-		io.print("fd: closed, a box is {} bytes\n", size_of[alloc.Box[u64]]())
+		io.print("fd: closed, a box is {} bytes, root {}\n", size_of[alloc.Box[u64]](), root)
 	}
 	return 0
 }

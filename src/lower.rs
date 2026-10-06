@@ -2417,6 +2417,12 @@ impl FnLower<'_> {
             // address.
             TExprKind::Intrinsic(Intrinsic::AllocHandle, args) => {
                 let a = &args[0];
+                if !self.dynamic {
+                    // A handle of the root itself, which holds nothing.
+                    self.expr(a);
+                    let ir_ty = self.ir_ty(e.ty);
+                    return Val::Mem(self.b.alloca(ir_ty));
+                }
                 let addr = match self.expr(a) {
                     Val::Mem(p) => p,
                     Val::One(v) => {

@@ -103,8 +103,8 @@ const ALLOC_METHODS: [&str; 3] = ["alloc", "resize", "free"];
 struct AllocState {
     info: AllocInfo,
     /// The allocator types reached, the root's first, each with the
-    /// instances of its methods once made.
-    types: Vec<(Ty, Option<[FuncId; 3]>)>,
+    /// instances of the methods the dispatch functions call, once made.
+    types: Vec<(Ty, [Option<FuncId>; 3])>,
     /// The dispatch function of each method, once a call needs it.
     dispatch: [Option<FuncId>; 3],
 }
@@ -378,7 +378,7 @@ impl Mono<'_> {
     fn root_allocator(&mut self) -> Ty {
         let a = self.alloc.as_mut().expect("`std/alloc` is loaded");
         if a.types.is_empty() {
-            a.types.push((a.info.root_ty, None));
+            a.types.push((a.info.root_ty, [None; 3]));
         }
         self.statics[a.info.root] = true;
         a.info.root_ty
@@ -392,19 +392,30 @@ impl Mono<'_> {
     }
 
     /// The next step of the allocator context, once the instances so far
-    /// are made: the methods of the allocator types reached, then the
-    /// dispatch functions. Whether it made anything.
+    /// are made: the methods the dispatch functions call, of each
+    /// allocator type reached, then the dispatch functions. Only the
+    /// methods called are made: a program that never resizes has no
+    /// `resize`. Whether it made anything.
     fn alloc_step(&mut self) -> bool {
         let Some(a) = &self.alloc else {
             return false;
         };
-        if let Some(k) = a.types.iter().position(|(_, m)| m.is_none()) {
-            let ty = a.types[k].0;
-            let methods = [0, 1, 2].map(|m| {
+        let missing: Vec<(usize, usize, Ty)> = a
+            .types
+            .iter()
+            .enumerate()
+            .flat_map(|(k, &(ty, made))| {
+                (0..3)
+                    .filter(move |&m| a.dispatch[m].is_some() && made[m].is_none())
+                    .map(move |m| (k, m, ty))
+            })
+            .collect();
+        if !missing.is_empty() {
+            for (k, m, ty) in missing {
                 let f = self.allocator_method(ty, m);
-                self.instance(f, ty.type_args().to_vec())
-            });
-            self.alloc.as_mut().expect("checked").types[k].1 = Some(methods);
+                let id = self.instance(f, ty.type_args().to_vec());
+                self.alloc.as_mut().expect("checked").types[k].1[m] = Some(id);
+            }
             return true;
         }
         let pending: Vec<(usize, FuncId)> = a
@@ -826,7 +837,7 @@ impl Mono<'_> {
                     let ty = args[0].ty.subst(map);
                     let a = self.alloc.as_mut().expect("checked");
                     if !a.types.iter().any(|&(t, _)| t == ty) {
-                        a.types.push((ty, None));
+                        a.types.push((ty, [None; 3]));
                     }
                     3
                 }
