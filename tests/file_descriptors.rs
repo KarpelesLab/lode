@@ -177,3 +177,43 @@ fn main() -> i32 {
         ],
     );
 }
+
+#[test]
+fn a_boxed_descriptor_is_closed_once() {
+    let source = r#"package main
+
+import "std/alloc"
+import "std/io"
+import "std/os"
+
+// A box owns its descriptor: destroying the box closes it, then frees it.
+fn boxed() uses alloc throws(AllocError) {
+	let f = os.open("/dev/null", os.O_RDONLY, 0) catch _ {
+		return
+	}
+	let b = try alloc.Box.new(f)
+	io.print("boxed")
+	let moved = b
+	io.print(".")
+}
+
+fn main() uses alloc -> i32 {
+	boxed() catch _ {
+		return 1
+	}
+	io.print("!")
+	return 0
+}
+"#;
+    check(
+        "a_boxed_descriptor_is_closed_once",
+        source,
+        &[
+            "open /dev/null = 3",
+            "write 1 \"boxed\"",
+            "write 1 \".\"",
+            "close 3 = 0",
+            "write 1 \"!\"",
+        ],
+    );
+}

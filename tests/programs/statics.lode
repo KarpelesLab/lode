@@ -1,0 +1,46 @@
+// stdout: 16 1001 108 7 true\n
+// A `static` is a global initialized when compiling: in `.data` when its
+// value isn't all zeros. Only `unsafe` code uses one: reads it, assigns
+// it, passes it `&`, or matches on it.
+package main
+
+import "std/io"
+
+enum Mode {
+	off
+	on(level: u8)
+}
+
+struct Config {
+	name: [4]u8
+	mode: Mode
+	limit: u32
+	flag: bool
+}
+
+static CONFIG: Config = Config{name: [108, 111, 100, 101], mode: .on(7), limit: 1000, flag: true}
+
+static TOTAL: u64 = 5
+
+fn bump(inout x: u64) {
+	x +%= 1
+}
+
+fn main() -> u8 {
+	unsafe {
+		TOTAL +%= 10
+		bump(&TOTAL)
+		CONFIG.limit +%= 1
+		var level: u8 = 0
+		match CONFIG.mode {
+			on(l) => level = l
+			off => level = 0
+		}
+		io.print("{} {} {} {} {}\n", TOTAL, CONFIG.limit, CONFIG.name[0], level, CONFIG.flag)
+		CONFIG.mode = .off
+		if CONFIG.mode == Mode.off {
+			return 0
+		}
+	}
+	return 1
+}
