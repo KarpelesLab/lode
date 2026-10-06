@@ -1,8 +1,8 @@
-// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
-// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
-// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
-// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
-// error: this allocates from `arena` after `arena` changed or was moved (on some path to here), in the `with alloc = arena` block
+// error: this allocates from the allocator of the `with` around it after `arena`, which the block borrows, changed or was moved (on some path to here)
+// error: this allocates from the allocator of the `with` around it after `arena`, which the block borrows, changed or was moved (on some path to here)
+// error: this allocates from the allocator of the `with` around it after `arena`, which the block borrows, changed or was moved (on some path to here)
+// error: this allocates from the allocator of the `with` around it after `arena`, which the block borrows, changed or was moved (on some path to here)
+// error: this allocates from the allocator of the `with` around it after `arena`, which the block borrows, changed or was moved (on some path to here)
 // error: a `defer` body can't allocate from `arena`, the allocator of the `with` around it
 // error: `with alloc` takes an `alloc.Handle`, or a counted allocator, found `alloc.FixedBuf`
 // error: calling the `unsafe fn` `alloc.current` is unsafe

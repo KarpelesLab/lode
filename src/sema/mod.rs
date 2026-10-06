@@ -5020,7 +5020,7 @@ impl<'a> Checker<'a> {
         }
         let mut d = Diagnostic::error(
             span,
-            format!("this allocates from `{name}` after `{name}` changed or was moved (on some path to here), in the `with alloc = {name}` block"),
+            format!("this allocates from the allocator of the `with` around it after `{name}`, which the block borrows, changed or was moved (on some path to here)"),
         )
         .with_help(format!(
             "the block borrows `{name}` while it allocates: change or move it after the last allocation, or after the block"
