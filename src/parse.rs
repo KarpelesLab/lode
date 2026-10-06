@@ -303,10 +303,24 @@ impl Parser {
     }
 
     /// `@comptime_budget(n)` on its own line, then the `const` it applies
-    /// to.
+    /// to; or `@intrinsic`, then the function it applies to.
     fn attributed_item(&mut self) -> PResult<Item> {
         let at = self.bump().span; // @
         let name = self.ident("an attribute name")?;
+        if name.name == "intrinsic" {
+            self.skip_newlines();
+            let start = self.span();
+            let is_pub = self.eat_kw(Kw::Pub);
+            if !self.at_kw(Kw::Fn) {
+                return self.error(
+                    at.to(name.span),
+                    "`@intrinsic` applies to a function declaration, on the next line",
+                );
+            }
+            let mut f = self.fn_decl(is_pub, false, start)?;
+            f.intrinsic = true;
+            return Ok(Item::Fn(f));
+        }
         if name.name != "comptime_budget" {
             return self.error(
                 at.to(name.span),
@@ -729,6 +743,7 @@ impl Parser {
                 ret_refine,
                 span: start.to(body.span),
                 body,
+                intrinsic: false,
             },
             has_body,
         ))

@@ -1619,16 +1619,17 @@ impl Checker<'_> {
         let elem = v.ty();
         self.check_elem(elem, "arrays", value.span)?;
         self.check_literal_len(n, want_len, expected, span)?;
-        if !elem.is_copy() {
-            let mut params = Vec::new();
-            elem.params(&mut params);
-            let param = params.into_iter().find(|p| !p.is_copy()).unwrap_or(elem);
+        // `[none; N]` holds nothing to copy, whatever the optional's type.
+        let none = elem.as_optional().is_some()
+            && matches!(&v.expr.kind, TExprKind::Variant(0, p) if p.is_empty());
+        if !elem.is_copy() && !none {
+            let (param, fix) = super::generic::not_copy(elem);
             self.diags.push(
                 Diagnostic::error(
                     value.span,
                     format!("`[value; {n}]` copies its value, but `{param}` isn't `Copy`"),
                 )
-                .with_help(format!("add the bound `[{param}: Copy]`")),
+                .with_help(fix),
             );
             return None;
         }
@@ -3557,6 +3558,19 @@ impl Checker<'_> {
                 {
                     return self.ordered_method(cx, recv, member, args, span);
                 }
+                // `x.clone()` of a type that's `Clone` without an `impl`.
+                if found.is_none() && member.name == "clone" && ty.satisfies(Trait::Clone) {
+                    if !args.is_empty() {
+                        self.error(span, "`clone` takes no arguments");
+                        return None;
+                    }
+                    let recv = self.temp(cx, recv);
+                    return Some(Checked::new(
+                        TExprKind::Clone(Box::new(recv.expr)),
+                        ty,
+                        None,
+                    ));
+                }
                 if found.is_none() && ty.as_param().is_some() {
                     self.diags.push(
                         Diagnostic::error(
@@ -4010,6 +4024,9 @@ impl Checker<'_> {
                 None => c,
             }
         };
+        if let Some(k) = self.sigs[id].intrinsic {
+            return Some(Checked::new(TExprKind::Intrinsic(k, targs), ret, None));
+        }
         if !generic {
             return Some(finish(Checked::new(TExprKind::Call(id, targs), ret, None)));
         }

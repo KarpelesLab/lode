@@ -77,6 +77,7 @@ pub fn instantiate(program: &Program) -> Instances {
         root: None,
         root_called: false,
         destroy: HashMap::new(),
+        clones: HashMap::new(),
         made: Vec::new(),
         span: program.funcs.first().map(|f| f.span).unwrap_or_default(),
     };
@@ -192,7 +193,9 @@ struct Mono<'p> {
     root_called: bool,
     /// The destruction of each type, as in [`Instances::destroy`].
     destroy: HashMap<Ty, FuncId>,
-    /// The destructions made here (see [`Mono::destroy_fn`]).
+    /// The clones made here, by type (see [`Mono::clone_fn`]).
+    clones: HashMap<Ty, FuncId>,
+    /// The destructions and clones made here (see [`Mono::destroy_fn`]).
     made: Vec<FuncId>,
     /// The span of the function being made, for the destructions it
     /// makes (their debug information).
@@ -356,6 +359,24 @@ impl Mono<'_> {
         id
     }
 
+    /// The function that clones a value of type `ty`, a struct, an enum,
+    /// an optional or an array without a `deinit` or an `impl Clone` of its
+    /// own, whose parts are `Clone`: made here, it clones each part.
+    fn clone_fn(&mut self, ty: Ty) -> FuncId {
+        if let Some(&id) = self.clones.get(&ty) {
+            return id;
+        }
+        let id = self.funcs.len();
+        self.funcs.push(None);
+        self.clones.insert(ty, id);
+        self.made.push(id);
+        let mut f = clone_parts(ty, format!("{}.$clone", self.type_symbol(ty)), self.span);
+        let locals = f.locals.clone();
+        self.block(&mut f.body, &|_| None, &locals);
+        self.funcs[id] = Some(f);
+        id
+    }
+
     fn expr(&mut self, e: &mut TExpr, map: &impl Fn(Ty) -> Option<Ty>, locals: &[Local]) {
         e.ty = e.ty.subst(map);
         // A move or a temporary of a type that needs no destruction is its
@@ -406,6 +427,29 @@ impl Mono<'_> {
                 ..
             } => self.block(body, map, locals),
             _ => {}
+        }
+        // `x.clone()`: the copy, or a call of the type's `clone`.
+        if let TExprKind::Clone(inner) = &mut e.kind {
+            let inner = std::mem::replace(
+                &mut **inner,
+                TExpr {
+                    kind: TExprKind::Bool(false),
+                    ty: Ty::Bool,
+                },
+            );
+            let ty = e.ty;
+            *e = if ty.is_copy() {
+                inner
+            } else {
+                let f = match self.program.dispatch.clone_impl(ty) {
+                    Some(f) => self.instance(f, ty.type_args().to_vec()),
+                    None => self.clone_fn(ty),
+                };
+                TExpr {
+                    kind: TExprKind::Call(f, vec![inner]),
+                    ty,
+                }
+            };
         }
         for sub in subexprs_mut(e) {
             self.expr(sub, map, locals);
@@ -535,6 +579,102 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span) -> Func {
         value_params: Vec::new(),
         params: vec![0],
         ret: Ty::Unit,
+        throws: None,
+        locals,
+        body,
+        span,
+        template: false,
+    }
+}
+
+/// A function that clones a value of type `ty` part by part (see
+/// [`Mono::clone_fn`]): it takes the value read-only, and returns a struct
+/// literal, a variant or an array literal of its parts' clones.
+fn clone_parts(ty: Ty, symbol: String, span: Span) -> Func {
+    let locals = vec![Local {
+        name: "self".to_owned(),
+        ty,
+        mutable: false,
+        convention: Some(Convention::Let),
+        drop_flag: false,
+    }];
+    let this = TExpr {
+        kind: TExprKind::Local(0),
+        ty,
+    };
+    let clone = |kind: TExprKind, ty: Ty| TExpr {
+        kind: TExprKind::Clone(Box::new(TExpr { kind, ty })),
+        ty,
+    };
+    let value = |kind: TExprKind| TStmt::Return(Some(TExpr { kind, ty }));
+    let body = if let Some((elem, n)) = ty.as_known_array() {
+        let usize_ty = Ty::Int(IntTy {
+            signed: false,
+            bits: 64,
+            size: true,
+        });
+        let elems = (0..n)
+            .map(|k| {
+                let index = TExpr {
+                    kind: TExprKind::Int(i128::from(k)),
+                    ty: usize_ty,
+                };
+                clone(
+                    TExprKind::Index(Box::new(this.clone()), Box::new(index)),
+                    elem,
+                )
+            })
+            .collect();
+        vec![value(TExprKind::ArrayLit(elems))]
+    } else if let Some(def) = ty.as_struct() {
+        let fields = def
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(k, f)| {
+                (
+                    k as u32,
+                    clone(TExprKind::Field(Box::new(this.clone()), k as u32), f.ty),
+                )
+            })
+            .collect();
+        vec![value(TExprKind::StructLit(fields))]
+    } else {
+        let def = ty
+            .sum()
+            .expect("a struct, an enum, an optional or an array");
+        let arms = def
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(v, variant)| {
+                let payload = variant
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| {
+                        clone(
+                            TExprKind::Payload(Box::new(this.clone()), v as u32, k as u32),
+                            f.ty,
+                        )
+                    })
+                    .collect();
+                TArm {
+                    variants: vec![v as u32],
+                    body: vec![value(TExprKind::Variant(v as u32, payload))],
+                }
+            })
+            .collect();
+        vec![TStmt::Match { value: this, arms }]
+    };
+    Func {
+        name: format!("{ty}.$clone"),
+        symbol,
+        type_params: Vec::new(),
+        owner_params: 0,
+        value_params: Vec::new(),
+        params: vec![0],
+        ret: ty,
         throws: None,
         locals,
         body,

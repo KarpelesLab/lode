@@ -1,6 +1,8 @@
 /// Fixed-capacity vectors.
 package vec
 
+import "std/mem"
+
 /// What a vector's operations throw.
 pub enum Error {
 	/// The vector holds `N` elements already.
@@ -11,10 +13,11 @@ pub enum Error {
 /// stack for a local): no allocation. The first `count` slots hold the
 /// elements, the others are `none`.
 ///
-/// The elements must be `Copy` for now: an empty slot is a `none` copied
-/// into each, and a `T` that isn't `Copy` can't be moved out of a slot
-/// (docs/generics.md, `Copy` and moves).
-pub struct ArrayVec[T: Copy, N: usize] {
+/// `T` can be any type: an element that isn't `Copy` (a type with a
+/// `deinit`, like `os.Fd`) is moved in by `push` and out by `pop`, and the
+/// elements left are destroyed with the vector (docs/allocation.md,
+/// Generics). `get` copies, so it needs `T: Copy`.
+pub struct ArrayVec[T, N: usize] {
 	slots: [N]?T
 	count: usize where count <= N
 }
@@ -29,8 +32,9 @@ pub fn ArrayVec[T, N].len(self) -> usize {
 	return self.count
 }
 
-/// Add `v` at the end, or throw `full` if there are `N` elements already.
-pub fn ArrayVec[T, N].push(inout self, v: T) throws(Error) {
+/// Add `v` at the end, or throw `full` if there are `N` elements already
+/// (`v` is destroyed then).
+pub fn ArrayVec[T, N].push(inout self, sink v: T) throws(Error) {
 	if self.count >= N {
 		throw .full
 	}
@@ -44,23 +48,22 @@ pub fn ArrayVec[T, N].pop(inout self) -> ?T {
 		return none
 	}
 	let last = self.count - 1
-	let v = self.slots[last]
-	self.slots[last] = none
+	let v = mem.take(&self.slots[last])
 	self.count = last
 	return v
 }
 
-/// Element `i` (0 is the first), or `none` past the last.
-pub fn ArrayVec[T, N].get(self, i: usize) -> ?T {
+/// A copy of element `i` (0 is the first), or `none` past the last.
+pub fn ArrayVec[T: Copy, N].get(self, i: usize) -> ?T {
 	if i >= self.count {
 		return none
 	}
 	return self.slots[i]
 }
 
-/// Replace element `i` with `v`; `false` (and no change) if there's no
-/// element `i`.
-pub fn ArrayVec[T, N].put(inout self, i: usize, v: T) -> bool {
+/// Replace element `i` with `v`, destroying the one it replaces; `false`
+/// (and no change, `v` destroyed) if there's no element `i`.
+pub fn ArrayVec[T, N].put(inout self, i: usize, sink v: T) -> bool {
 	if i >= self.count {
 		return false
 	}

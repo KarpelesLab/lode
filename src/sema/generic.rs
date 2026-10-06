@@ -1002,8 +1002,12 @@ impl Checker<'_> {
         };
         let local = path.root;
         let (param, fix) = not_copy(e.ty);
-        let text = place_text(cx, e).unwrap_or_else(|| "this value".to_owned());
         let name = cx.locals[local].name.clone();
+        let mut text = place_text(cx, e).unwrap_or_else(|| "this value".to_owned());
+        if path.binding && !text.starts_with(name.as_str()) {
+            // Shown as "`v`, part of `o`,".
+            text = format!("{text}`, part of `{name}");
+        }
         if path.through_index {
             let mut d = Diagnostic::error(
                 span,
@@ -1249,6 +1253,8 @@ impl Checker<'_> {
 struct MovePath {
     root: LocalId,
     through_index: bool,
+    /// Whether a pattern binding is on the way.
+    binding: bool,
     /// From the local outwards: each struct or variant's payload a part is
     /// taken out of.
     steps: Vec<MoveStep>,
@@ -1269,16 +1275,22 @@ fn moved_path(cx: &FnCx, e: &TExpr) -> Option<MovePath> {
     let shown = |base: &TExpr| place_text(cx, base).unwrap_or_else(|| "the temporary".to_owned());
     match &e.kind {
         TExprKind::Local(l) => match cx.projections.get(l) {
-            Some(place) => moved_path(cx, place),
+            Some(place) => {
+                let mut p = moved_path(cx, place)?;
+                p.binding = true;
+                Some(p)
+            }
             None => Some(MovePath {
                 root: *l,
                 through_index: false,
+                binding: false,
                 steps: Vec::new(),
             }),
         },
         TExprKind::Temp(l, _) => Some(MovePath {
             root: *l,
             through_index: false,
+            binding: false,
             steps: Vec::new(),
         }),
         TExprKind::Field(base, i) => {

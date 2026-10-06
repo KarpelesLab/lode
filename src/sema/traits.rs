@@ -170,7 +170,7 @@ impl<'a> Checker<'a> {
                 _ => format!("unknown trait `{text}`"),
             };
             self.diags.push(Diagnostic::error(b.span(), msg).with_help(
-                "a bound is a trait: a built-in one (`Eq`, `Ordered`, `Copy`, `Integer`, `Unsigned`, `Signed`) or one declared with `trait`",
+                "a bound is a trait: a built-in one (`Eq`, `Ordered`, `Copy`, `Clone`, `Integer`, `Unsigned`, `Signed`) or one declared with `trait`",
             ));
         }
         found
@@ -356,7 +356,7 @@ impl<'a> Checker<'a> {
                     );
                     continue;
                 }
-                Trait::Ordered | Trait::User(_) => {}
+                Trait::Ordered | Trait::Clone | Trait::User(_) => {}
             }
             let Some((ty, params, bounds)) = self.impl_type(decl, pkg, file) else {
                 continue;
@@ -771,8 +771,9 @@ impl<'a> Checker<'a> {
             let methods = self.impls[k].methods.clone();
             match tr {
                 Trait::Ordered => self.check_ordered_impl(k, ty, &methods),
+                Trait::Clone => self.check_clone_impl(k, ty, &methods),
                 Trait::User(_) => self.check_user_impl(k, tr, ty, &methods),
-                _ => unreachable!("only `Ordered` and user traits have impls"),
+                _ => unreachable!("only `Ordered`, `Clone` and user traits have impls"),
             }
         }
     }
@@ -835,6 +836,61 @@ impl<'a> Checker<'a> {
             );
         }
         self.dispatch.impls.insert((Trait::Ordered, decl), table);
+    }
+
+    /// The method of an `impl Clone`: `clone(self) -> Self`. A `Copy` type
+    /// is `Clone` already: its clone is the copy.
+    fn check_clone_impl(&mut self, k: usize, ty: Ty, methods: &[(String, FuncId)]) {
+        let decl = ty.decl();
+        let head = self.impls[k].decl.span_head();
+        if ty.is_copy() {
+            self.diags.push(
+                Diagnostic::error(head, format!("`{ty}` is `Copy`, so it's `Clone` already"))
+                    .with_help("its clone is the copy: remove the `impl`"),
+            );
+            return;
+        }
+        let mut table = HashMap::new();
+        for (name, id) in methods {
+            let sig = &self.sigs[*id];
+            if name != "clone" {
+                let span = sig.span;
+                self.diags.push(
+                    Diagnostic::error(span, format!("`{name}` is not a method of `Clone`"))
+                        .with_help("`impl Clone` has one method, `fn clone(self) -> Self`"),
+                );
+                continue;
+            }
+            let ok = sig.has_self
+                && sig.params.len() == 1
+                && sig.params[0].1 == Convention::Let
+                && sig.ret == ty
+                && sig.throws.is_none()
+                && sig.type_params.len() == sig.owner_params;
+            if !ok {
+                let span = sig.span;
+                self.diags.push(
+                    Diagnostic::error(span, format!("`{ty}.clone` doesn't match `Clone.clone`"))
+                        .with_help("declare it `fn clone(self) -> Self`"),
+                );
+                continue;
+            }
+            table.insert(name.clone(), *id);
+            self.impl_methods
+                .entry((decl, name.clone()))
+                .or_default()
+                .push((Trait::Clone, *id));
+        }
+        if table.is_empty() {
+            self.diags.push(
+                Diagnostic::error(
+                    head,
+                    format!("the `impl` of `Clone` for `{ty}` has no `clone`"),
+                )
+                .with_help("add `fn clone(self) -> Self`"),
+            );
+        }
+        self.dispatch.impls.insert((Trait::Clone, decl), table);
     }
 
     /// The methods of an impl of a trait declared in Lode.
@@ -1301,6 +1357,15 @@ impl Dispatch {
             }
             None => (f, types.to_vec()),
         }
+    }
+
+    /// The `clone` of the `impl Clone` for the named type of `ty`, if it
+    /// has one.
+    pub fn clone_impl(&self, ty: Ty) -> Option<FuncId> {
+        self.impls
+            .get(&(Trait::Clone, ty.decl()))
+            .and_then(|m| m.get("clone"))
+            .copied()
     }
 
     /// For `a.cmp(b)` or `a.lt(b)` (`method`) on a struct or an enum `ty`

@@ -1,0 +1,48 @@
+/// Values that own resources: moving, swapping, replacing and destroying
+/// them (docs/allocation.md, Partial moves and patterns).
+///
+/// A value whose type isn't `Copy` moves, and nothing is moved out of a
+/// variable part by part, out of an element, or out of a place passed
+/// `inout`. These functions take a part out by putting another value in its
+/// place: `mem.replace(&p.name, v)`, `mem.take(&xs[i])`.
+package mem
+
+/// Exchange the values of `a` and `b`. Nothing is destroyed.
+///
+/// The compiler implements it: it swaps the two places' bytes.
+@intrinsic
+pub fn swap[T](inout a: T, inout b: T) {
+}
+
+/// End `x` without destroying it: its `deinit` never runs. That's safe, a
+/// leak (docs/allocation.md, When destruction runs); it's what a type's
+/// own method uses when it releases the value's resources itself, as
+/// `os.close` does.
+///
+/// The compiler implements it: `x` is moved in, and nothing destroys it.
+@intrinsic
+pub fn forget[T](sink x: T) {
+}
+
+/// Put `v` in `place`, and return the value that was there, which isn't
+/// destroyed.
+pub fn replace[T](inout place: T, sink v: T) -> T {
+	var old = v
+	swap(&place, &old)
+	return old
+}
+
+/// Take the value out of the optional `place`, which is `none` after it:
+/// `mem.take(&slots[i])`.
+///
+/// The compiler implements it: it copies the optional, then writes `none`
+/// in its place (the code `replace(&place, none)` would be, without the
+/// copies in between).
+@intrinsic
+pub fn take[T](inout place: ?T) -> ?T {
+}
+
+/// Destroy `x` now, rather than at the end of its variable's scope: it's
+/// moved in, and destroyed when this function returns.
+pub fn destroy[T](sink x: T) {
+}

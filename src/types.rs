@@ -380,6 +380,18 @@ impl Ty {
                 _ => false,
             },
             Trait::Ordered => matches!(self, Ty::Int(_) | Ty::Bool) || self.has_impl(t),
+            Trait::Clone => {
+                self.is_copy()
+                    || self.has_impl(t)
+                    || match self {
+                        Ty::Array(_) => self.as_array().expect("an array").0.satisfies(t),
+                        Ty::Optional(_) => self.as_optional().expect("an optional").satisfies(t),
+                        Ty::Struct(_) | Ty::Enum(_) => {
+                            !self.has_deinit() && self.members().iter().all(|m| m.satisfies(t))
+                        }
+                        _ => false,
+                    }
+            }
             Trait::Integer => matches!(self, Ty::Int(_)),
             Trait::Unsigned => matches!(self, Ty::Int(it) if !it.signed),
             Trait::Signed => matches!(self, Ty::Int(it) if it.signed),
@@ -1104,19 +1116,25 @@ pub enum Trait {
     Unsigned,
     /// The signed integer types. Sealed.
     Signed,
+    /// Explicit copies, `x.clone()` (docs/allocation.md, Explicit copies):
+    /// a `Copy` type's is the copy; a struct or an enum without a `deinit`
+    /// whose parts are `Clone` gets one that clones each; another type
+    /// implements it with `impl Clone for T`.
+    Clone,
     /// A trait declared in Lode.
     User(u32),
 }
 
 impl Trait {
     /// The traits built into the compiler.
-    pub const ALL: [Trait; 6] = [
+    pub const ALL: [Trait; 7] = [
         Trait::Eq,
         Trait::Ordered,
         Trait::Copy,
         Trait::Integer,
         Trait::Unsigned,
         Trait::Signed,
+        Trait::Clone,
     ];
 
     /// Its name as shown in messages: `Ordered`, or `io.Writer` for a trait
@@ -1129,6 +1147,7 @@ impl Trait {
             Trait::Integer => "Integer".to_owned(),
             Trait::Unsigned => "Unsigned".to_owned(),
             Trait::Signed => "Signed".to_owned(),
+            Trait::Clone => "Clone".to_owned(),
             Trait::User(_) => self.def().expect("a declared trait").name.clone(),
         }
     }
@@ -1146,17 +1165,19 @@ impl Trait {
             Trait::Integer => 8,
             Trait::Unsigned => 16,
             Trait::Signed => 32,
+            Trait::Clone => 64,
             Trait::User(_) => 0,
         }
     }
 
-    /// A built-in trait and its supertraits: `Ordered: Eq`, `Integer:
-    /// Ordered + Copy`, `Unsigned: Integer`, `Signed: Integer`.
+    /// A built-in trait and its supertraits: `Ordered: Eq`, `Copy: Clone`,
+    /// `Integer: Ordered + Copy`, `Unsigned: Integer`, `Signed: Integer`.
     fn closure(self) -> u8 {
-        let integer =
-            Trait::Integer.bit() | Trait::Ordered.bit() | Trait::Eq.bit() | Trait::Copy.bit();
+        let copy = Trait::Copy.bit() | Trait::Clone.bit();
+        let integer = Trait::Integer.bit() | Trait::Ordered.bit() | Trait::Eq.bit() | copy;
         match self {
-            Trait::Eq | Trait::Copy => self.bit(),
+            Trait::Eq | Trait::Clone => self.bit(),
+            Trait::Copy => copy,
             Trait::Ordered => self.bit() | Trait::Eq.bit(),
             Trait::Integer => integer,
             Trait::Unsigned | Trait::Signed => self.bit() | integer,

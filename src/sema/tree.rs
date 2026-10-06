@@ -340,6 +340,13 @@ pub enum TExprKind {
     /// at its end, or at an exit before. Of its value's type, which isn't
     /// `Copy`.
     Temp(LocalId, Box<TExpr>),
+    /// A function of the standard library that the compiler implements
+    /// (`@intrinsic`), with its arguments.
+    Intrinsic(Intrinsic, Vec<TExpr>),
+    /// `x.clone()` of a value of a type that's `Clone` without an `impl`
+    /// of its own: the value read in place, copied (a `Copy` type), or
+    /// cloned part by part. `crate::mono` makes it a copy or a call.
+    Clone(Box<TExpr>),
     /// An operation whose proof obligation (overflow, an index in bounds,
     /// a lossless conversion...) wasn't proven, in code that only runs at
     /// compile time: a constant's value or an `if comptime` condition. The
@@ -363,6 +370,17 @@ pub enum TExprKind {
         values: Vec<TExpr>,
         span: Span,
     },
+}
+
+/// The functions the compiler implements (see [`TExprKind::Intrinsic`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intrinsic {
+    /// `mem.swap(&a, &b)`: exchange two places' values.
+    Swap,
+    /// `mem.forget(x)`: `x` is moved in, and never destroyed.
+    Forget,
+    /// `mem.take(&opt)`: the optional's value, leaving `none`.
+    Take,
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -459,6 +477,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::GenericCall(_, _, items)
         | TExprKind::ArrayLit(items)
         | TExprKind::Syscall(items)
+        | TExprKind::Intrinsic(_, items)
         | TExprKind::Variant(_, items) => items.iter().collect(),
         TExprKind::Binary(_, l, r)
         | TExprKind::And(l, r)
@@ -490,6 +509,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Never(inner)
         | TExprKind::Move(inner, _)
         | TExprKind::Temp(_, inner)
+        | TExprKind::Clone(inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
@@ -571,6 +591,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::GenericCall(_, _, items)
         | TExprKind::ArrayLit(items)
         | TExprKind::Syscall(items)
+        | TExprKind::Intrinsic(_, items)
         | TExprKind::Variant(_, items) => items.iter_mut().collect(),
         TExprKind::Binary(_, l, r)
         | TExprKind::And(l, r)
@@ -602,6 +623,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Never(inner)
         | TExprKind::Move(inner, _)
         | TExprKind::Temp(_, inner)
+        | TExprKind::Clone(inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {

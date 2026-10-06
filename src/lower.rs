@@ -134,8 +134,8 @@ use latticefoundry::support::StrInterner;
 
 use crate::mono::{self, Instances};
 use crate::sema::{
-    CmpOp, Convention, Func, Handler, Local, LocalId, Mode, Program, TBinOp, TExpr, TExprKind,
-    TStmt, TUnOp,
+    CmpOp, Convention, Func, Handler, Intrinsic, Local, LocalId, Mode, Program, TBinOp, TExpr,
+    TExprKind, TStmt, TUnOp,
 };
 use crate::source::{FileId, SourceMap};
 use crate::types::{IntTy, Ty};
@@ -822,6 +822,77 @@ fn uses_in_place(place: &TExpr, packed: &mut [bool]) {
     }
 }
 
+/// Which locals of `f` the body may change in place: assigned whole, or a
+/// part of them assigned or passed with `&` (or as an `inout self`).
+fn written_locals(f: &Func) -> Vec<bool> {
+    fn root(mut e: &TExpr) -> Option<LocalId> {
+        loop {
+            match &e.kind {
+                TExprKind::Local(l) => return Some(*l),
+                TExprKind::Field(base, _)
+                | TExprKind::Index(base, _)
+                | TExprKind::Payload(base, ..)
+                | TExprKind::Slice(base, ..)
+                | TExprKind::ToSlice(base) => e = base,
+                _ => return None,
+            }
+        }
+    }
+    fn in_expr(e: &TExpr, out: &mut [bool]) {
+        if let TExprKind::Ref(place) = &e.kind
+            && let Some(l) = root(place)
+        {
+            out[l] = true;
+        }
+        if let TExprKind::Catch {
+            handler: Handler::Block(body),
+            ..
+        } = &e.kind
+        {
+            in_stmts(body, out);
+        }
+        for sub in crate::sema::subexprs(e) {
+            in_expr(sub, out);
+        }
+    }
+    fn in_stmts(stmts: &[TStmt], out: &mut [bool]) {
+        for s in stmts {
+            match s {
+                TStmt::Assign(l, _) => out[*l] = true,
+                TStmt::Store(place, _) => {
+                    if let Some(l) = root(place) {
+                        out[l] = true;
+                    }
+                }
+                _ => {}
+            }
+            for e in crate::sema::stmt_exprs(s) {
+                in_expr(e, out);
+            }
+            match s {
+                TStmt::If(_, then, otherwise) => {
+                    in_stmts(then, out);
+                    in_stmts(otherwise, out);
+                }
+                TStmt::While(_, body)
+                | TStmt::For { body, .. }
+                | TStmt::Loop(body)
+                | TStmt::Block(body)
+                | TStmt::Defer { body, .. } => in_stmts(body, out),
+                TStmt::Match { arms, .. } => {
+                    for arm in arms {
+                        in_stmts(&arm.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = vec![false; f.locals.len()];
+    in_stmts(&f.body, &mut out);
+    out
+}
+
 /// The most scalars a split local has ([`split_locals`]).
 const SPLIT_LIMIT: usize = 16;
 
@@ -1165,14 +1236,19 @@ impl FnLower<'_> {
         }
         let packed = packed_locals(f);
         let split = split_locals(f);
+        let written = written_locals(f);
         self.names = vec![0; f.locals.len()];
         count_names(&f.body, &mut self.names, &mut Vec::new());
         for (local, param) in f.locals.iter().zip(&params) {
             match *param {
                 // A parameter in memory is the caller's value, read (or for
                 // `inout` and `set`, written) in place. A `sink` one is the
-                // callee's own copy.
-                Some(Val::Mem(p)) if local.convention != Some(Convention::Sink) => {
+                // callee's own copy, unless the callee never changes it: the
+                // caller's value is moved in, or can't change during the
+                // call (exclusivity), so it's read in place too.
+                Some(Val::Mem(p))
+                    if local.convention != Some(Convention::Sink) || !written[self.slots.len()] =>
+                {
                     self.slots.push(Slot::Mem(p));
                     continue;
                 }
@@ -1386,6 +1462,33 @@ impl FnLower<'_> {
                 }
             }
         }
+    }
+
+    /// `mem.swap(&a, &b)`: exchange the values of the places `a` and `b`
+    /// (`&` arguments), which don't overlap.
+    fn swap(&mut self, a: &TExpr, b: &TExpr) {
+        let (TExprKind::Ref(pa), TExprKind::Ref(pb)) = (&a.kind, &b.kind) else {
+            unreachable!("`swap` takes two places")
+        };
+        let ty = pa.ty;
+        if ty.in_memory() {
+            let x = self.place(pa);
+            let y = self.place(pb);
+            let ir_ty = self.ir_ty(ty);
+            let tmp = self.b.alloca(ir_ty);
+            self.copy(tmp, x, ty);
+            self.copy(x, y, ty);
+            self.copy(y, tmp, ty);
+            return;
+        }
+        // A scalar's place is its address.
+        let x = self.expr(a).one();
+        let y = self.expr(b).one();
+        let ir_ty = self.t.of(ty);
+        let vx = self.b.load(ir_ty, x, align_of(ty));
+        let vy = self.b.load(ir_ty, y, align_of(ty));
+        self.b.store(ir_ty, x, vy, align_of(ty));
+        self.b.store(ir_ty, y, vx, align_of(ty));
     }
 
     /// Set the drop flag of `local`, if it has one, to `value`.
@@ -1914,6 +2017,22 @@ impl FnLower<'_> {
                 self.set_flag(*local, false);
                 return v;
             }
+            TExprKind::Intrinsic(Intrinsic::Swap, args) => {
+                self.swap(&args[0], &args[1]);
+                return Val::Unit;
+            }
+            TExprKind::Intrinsic(Intrinsic::Take, _) => {
+                let ir_ty = self.ir_ty(e.ty);
+                let tmp = self.b.alloca(ir_ty);
+                self.fill(tmp, e);
+                return Val::Mem(tmp);
+            }
+            // The value is moved in, and nothing destroys it.
+            TExprKind::Intrinsic(Intrinsic::Forget, args) => {
+                self.expr(&args[0]);
+                return Val::Unit;
+            }
+            TExprKind::Clone(_) => unreachable!("instances clone by copies and calls"),
             // Kept in its hidden local, whose value from an earlier time
             // round a loop is destroyed first.
             TExprKind::Temp(local, inner) => {
@@ -3230,6 +3349,15 @@ impl FnLower<'_> {
             }
             TExprKind::EnumFrom(x) => self.enum_from(dst, e.ty, x),
             TExprKind::Compare(a, b) => self.compare(dst, e.ty, a, b),
+            // The optional is copied, and `none` written in its place.
+            TExprKind::Intrinsic(Intrinsic::Take, args) => {
+                let TExprKind::Ref(place) = &args[0].kind else {
+                    unreachable!("`take` takes a place")
+                };
+                let src = self.place(place);
+                self.copy(dst, src, e.ty);
+                self.store_tag(src, e.ty, 0);
+            }
             TExprKind::ArrayRepeat(value) => {
                 let (elem, n) = e.ty.as_known_array().expect("an array");
                 let v = self.expr(value);

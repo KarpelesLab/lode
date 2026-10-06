@@ -17,7 +17,7 @@
 
 use std::rc::Rc;
 
-use super::{Checker, FuncId, Handler, LocalId, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
+use super::{Checker, FuncId, Handler, Intrinsic, LocalId, TBinOp, TExpr, TExprKind, TStmt, TUnOp};
 use crate::diag::Diagnostic;
 use crate::sema::tree::{CmpOp, Mode};
 use crate::source::Span;
@@ -775,6 +775,37 @@ impl Eval<'_, '_> {
             // Values are abstract here: a move or a temporary is its value
             // (see `TStmt::Drop` in `Eval::stmt`).
             TExprKind::Move(inner, _) | TExprKind::Temp(_, inner) => self.expr(frame, inner)?,
+            TExprKind::Intrinsic(Intrinsic::Swap, args) => {
+                let places = args
+                    .iter()
+                    .map(|a| match &a.kind {
+                        TExprKind::Ref(place) => self.place(frame, place),
+                        _ => unreachable!("`swap` takes two places"),
+                    })
+                    .collect::<R<Vec<Place>>>()?;
+                let a = self.load(frame, &places[0]);
+                let b = self.load(frame, &places[1]);
+                self.store(frame, &places[0], b)?;
+                self.store(frame, &places[1], a)?;
+                Value::Unit
+            }
+            TExprKind::Intrinsic(Intrinsic::Take, args) => {
+                let TExprKind::Ref(place) = &args[0].kind else {
+                    unreachable!("`take` takes a place")
+                };
+                let place = self.place(frame, place)?;
+                let v = self.load(frame, &place);
+                self.store(frame, &place, Value::variant_of(0, Vec::new()))?;
+                v
+            }
+            TExprKind::Intrinsic(Intrinsic::Forget, args) => {
+                self.expr(frame, &args[0])?;
+                Value::Unit
+            }
+            TExprKind::Clone(inner) => {
+                let v = self.expr(frame, inner)?;
+                self.clone_value(frame.ty(inner.ty), v)?
+            }
             TExprKind::Never(inner) => {
                 self.expr(frame, inner)?;
                 return fail("a `never` function returned");
@@ -1008,6 +1039,62 @@ impl Eval<'_, '_> {
             (Some(_), Ok(v)) => Value::variant_of(0, vec![v]),
             (Some(_), Err(e)) => Value::variant_of(1, vec![e]),
             (None, Err(_)) => unreachable!("only a function that throws can throw"),
+        })
+    }
+
+    /// A call of `f`, with its type arguments, whose parameters are all
+    /// passed by value: `args`, of the parameters' types `tys`.
+    fn call_values(&mut self, f: FuncId, types: Vec<Ty>, args: Vec<(Value, Ty)>) -> R<Value> {
+        let exprs: Vec<TExpr> = args.iter().map(|(v, t)| materialize(v, *t)).collect();
+        let mut frame = Frame {
+            locals: Vec::new(),
+            subst: Vec::new(),
+        };
+        self.call(&mut frame, f, types, &exprs)
+    }
+
+    /// `v.clone()`, for a value `v` of type `ty`: its type's `impl Clone`
+    /// runs, or else each part is cloned (a copy for a `Copy` part).
+    fn clone_value(&mut self, ty: Ty, v: Value) -> R<Value> {
+        if ty.is_copy() {
+            return Ok(v);
+        }
+        if let Some(f) = self.ck.dispatch.clone_impl(ty) {
+            let types = ty.type_args().to_vec();
+            return self.call_values(f, types, vec![(v, ty)]);
+        }
+        let clone_all = |ev: &mut Self, vs: &[Value], tys: &[Ty]| -> R<Vec<Value>> {
+            vs.iter()
+                .zip(tys)
+                .map(|(v, &t)| ev.clone_value(t, v.clone()))
+                .collect()
+        };
+        Ok(match (&v, ty) {
+            (Value::Struct(fields), _) => {
+                let tys: Vec<Ty> = ty
+                    .as_struct()
+                    .expect("a struct")
+                    .fields
+                    .iter()
+                    .map(|f| f.ty)
+                    .collect();
+                Value::Struct(std::rc::Rc::new(clone_all(self, fields, &tys)?))
+            }
+            (Value::Variant(k, fields), _) => {
+                let def = ty.sum().expect("an enum or an optional");
+                let tys: Vec<Ty> = def.variants[*k as usize]
+                    .fields
+                    .iter()
+                    .map(|f| f.ty)
+                    .collect();
+                Value::Variant(*k, std::rc::Rc::new(clone_all(self, fields, &tys)?))
+            }
+            (Value::Array(xs), _) => {
+                let (elem, _) = ty.as_array().expect("an array");
+                let tys = vec![elem; xs.len()];
+                Value::Array(std::rc::Rc::new(clone_all(self, xs, &tys)?))
+            }
+            _ => v,
         })
     }
 

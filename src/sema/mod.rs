@@ -235,6 +235,8 @@ struct Sig {
     /// For a function with `comptime` parameters or a pack: the kind of
     /// each parameter. Its calls are calls of its expansions.
     template: Option<comptime::Template>,
+    /// For a function the compiler implements (`@intrinsic`): which.
+    intrinsic: Option<Intrinsic>,
     /// The refinement of each parameter (docs/safety.md, Refinements in
     /// types), and of the result.
     refines: Vec<Option<Rc<refine::Refine>>>,
@@ -1897,6 +1899,33 @@ impl<'a> Checker<'a> {
         Some(ty)
     }
 
+    /// Which function the compiler implements, for a declaration marked
+    /// `@intrinsic`: only in the standard library, by its name.
+    fn intrinsic(&mut self, cx: &FnCx, f: &ast::FnDecl) -> Option<Intrinsic> {
+        if !f.intrinsic {
+            return None;
+        }
+        if !self.pkgs[cx.pkg].path.starts_with("std/") || f.owner.is_some() {
+            self.error(
+                f.name.span,
+                "`@intrinsic` is only for the functions of the standard library that the compiler implements",
+            );
+            return None;
+        }
+        match f.name.name.as_str() {
+            "swap" => Some(Intrinsic::Swap),
+            "forget" => Some(Intrinsic::Forget),
+            "take" => Some(Intrinsic::Take),
+            other => {
+                self.error(
+                    f.name.span,
+                    format!("the compiler has no intrinsic `{other}`"),
+                );
+                None
+            }
+        }
+    }
+
     /// Check the declaration of `fn T.deinit(sink self)`, function `id`:
     /// `sink self` and nothing else, no result, no error, no parameters or
     /// bounds of its own, not `unsafe` (docs/allocation.md, Declaring
@@ -2897,6 +2926,7 @@ impl<'a> Checker<'a> {
             pkg: cx.pkg,
             template: (is_template && cx.expanding.is_none())
                 .then_some(comptime::Template { kinds }),
+            intrinsic: self.intrinsic(cx, f),
             name,
             params,
             has_self,
@@ -3195,7 +3225,8 @@ impl<'a> Checker<'a> {
         // A trait's required method has no body: an impl's replaces it in
         // every call. A template isn't checked on its own: its expansions
         // are.
-        let template = self.sigs[id].template.is_some();
+        // An intrinsic's body isn't used: its calls are the compiler's.
+        let template = self.sigs[id].template.is_some() || self.sigs[id].intrinsic.is_some();
         if template || matches!(self.members.get(&id), Some(traits::Member::Trait(_, false))) {
             return Func {
                 symbol,
@@ -3568,11 +3599,15 @@ impl<'a> Checker<'a> {
         for m in moves {
             if cx.env.is_uninit(m.local) && !out.contains(&m.local) {
                 let name = &cx.locals[m.local].name;
-                let what = if m.on_error { "errdefer" } else { "defer" };
+                let (what, an) = if m.on_error {
+                    ("errdefer", "an")
+                } else {
+                    ("defer", "a")
+                };
                 let d = match at {
                     Some(at) => Diagnostic::error(
                         at,
-                        format!("`{name}` may be moved already at this exit, where a `{what}` that moves it runs"),
+                        format!("`{name}` may be moved already at this exit, where {an} `{what}` that moves it runs"),
                     )
                     .with_note(m.span, format!("the `{what}` moves `{name}` here")),
                     None => Diagnostic::error(
@@ -3581,7 +3616,7 @@ impl<'a> Checker<'a> {
                     ),
                 };
                 self.diags.push(d.with_help(format!(
-                    "a `{what}` that moves a variable runs only where it's still assigned: don't move `{name}` after it"
+                    "{an} `{what}` that moves a variable runs only where it's still assigned: don't move `{name}` after it"
                 )));
             }
             out.push(m.local);

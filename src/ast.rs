@@ -230,6 +230,10 @@ pub struct FnDecl {
     pub ret_refine: Option<Expr>,
     pub body: Block,
     pub span: Span,
+    /// `@intrinsic` on the line before: a function of the standard library
+    /// that the compiler implements (`mem.swap`, `mem.forget`); its body is
+    /// empty and not used.
+    pub intrinsic: bool,
 }
 
 /// A generic parameter, `T` or `T: Ordered + Copy`: its name and the

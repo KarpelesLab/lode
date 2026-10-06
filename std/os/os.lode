@@ -8,15 +8,21 @@
 /// (`lode check --targets=aarch64-linux`).
 package os
 
+import "std/mem"
+
 if comptime target.os == .linux {
 	/// The system call numbers, which differ between architectures.
 	if comptime target.arch == .x86_64 {
 		const SYS_READ = 0
 		const SYS_WRITE = 1
+		const SYS_CLOSE = 3
+		const SYS_OPENAT = 257
 		const SYS_EXIT_GROUP = 231
 	} else if comptime target.arch == .aarch64 {
 		const SYS_READ = 63
 		const SYS_WRITE = 64
+		const SYS_OPENAT = 56
+		const SYS_CLOSE = 57
 		const SYS_EXIT_GROUP = 94
 	} else {
 		compile_error("std/os: Linux on this architecture is not supported yet")
@@ -74,6 +80,133 @@ if comptime target.os == .linux {
 	pub const STDIN: i32 = 0
 	pub const STDOUT: i32 = 1
 	pub const STDERR: i32 = 2
+
+	/// The flags of `open`, joined with `|`: one of `O_RDONLY`, `O_WRONLY`
+	/// and `O_RDWR`, and any of the others. The same on every architecture
+	/// Lode supports.
+	pub const O_RDONLY: u32 = 0
+	pub const O_WRONLY: u32 = 1
+	pub const O_RDWR: u32 = 2
+	/// Create the file if it doesn't exist, with the permissions `mode`.
+	pub const O_CREAT: u32 = 0o100
+	/// With `O_CREAT`: fail if the file exists.
+	pub const O_EXCL: u32 = 0o200
+	/// Make an existing regular file empty.
+	pub const O_TRUNC: u32 = 0o1000
+	/// Write at the end of the file.
+	pub const O_APPEND: u32 = 0o2000
+	/// Close the descriptor if the process runs another program.
+	pub const O_CLOEXEC: u32 = 0o2000000
+
+	/// `openat`'s directory for a relative path: the working directory.
+	const AT_FDCWD: isize = -100
+
+	/// The longest path, with the 0 after it, that the kernel takes.
+	pub const PATH_MAX: usize = 4096
+
+	/// `ENAMETOOLONG`: a path of `PATH_MAX` bytes or more.
+	const ENAMETOOLONG: isize = 36
+
+	/// `EINVAL`: a path with a 0 byte in it.
+	const EINVAL: isize = 22
+
+	/// A file descriptor that this value owns: destroying it closes the
+	/// descriptor (docs/allocation.md, M8a). It isn't `Copy`, so there's
+	/// one owner, and the descriptor is closed once.
+	///
+	/// `fd` is the descriptor's number, read-only outside this package:
+	/// `io.File.from_fd(f.fd)` reads and writes it. Such a `File` borrows
+	/// it, and is only valid while `f` is: after `f` is destroyed, the
+	/// number may name another file.
+	pub struct Fd {
+		pub let fd: i32
+	}
+
+	/// Close the descriptor, ignoring an error: `close` reports it.
+	pub fn Fd.deinit(sink self) {
+		unsafe {
+			syscall(SYS_CLOSE, self.fd)
+		}
+	}
+
+	/// The descriptor `fd`, owned from now on: destroying the result closes
+	/// it.
+	///
+	/// The caller must ensure that nothing else closes `fd`.
+	pub unsafe fn Fd.own(fd: i32) -> Fd {
+		return Fd{fd: fd}
+	}
+
+	/// Open the file at `path` with `flags` (`O_RDONLY`, `O_WRONLY | O_CREAT
+	/// | O_TRUNC`, ...), creating it with the permissions `mode` (`0o644`)
+	/// if `flags` has `O_CREAT`. The descriptor has `O_CLOEXEC`, and is
+	/// closed when the result is destroyed (or by `close`).
+	///
+	/// A path relative to the working directory is fine. The kernel needs a
+	/// 0 after the path, so it's copied to a buffer on the stack first: a
+	/// path of `PATH_MAX` bytes or more throws `.other(36)` (`ENAMETOOLONG`),
+	/// and one with a 0 byte in it `.other(22)` (`EINVAL`).
+	pub fn open(path: str, flags: u32, mode: u32) throws(Error) -> Fd {
+		var c = CPath.new()
+		let n = c.fill(path.bytes())
+		if n < 0 {
+			throw error(n)
+		}
+		var r: isize
+		unsafe {
+			r = syscall(SYS_OPENAT, AT_FDCWD, c.bytes.ptr, flags | O_CLOEXEC, mode)
+		}
+		if r < 0 {
+			throw error(r)
+		}
+		if r > 0x7fffffff {
+			throw .io
+		}
+		return Fd{fd: i32(r)}
+	}
+
+	/// Close `f`, and throw the error the kernel reports (`EIO` for a write
+	/// that failed late, on some file systems). The descriptor is closed
+	/// either way (Linux doesn't keep it open after an error).
+	pub fn close(sink f: Fd) throws(Error) {
+		let fd = f.fd
+		mem.forget(f)
+		var r: isize
+		unsafe {
+			r = syscall(SYS_CLOSE, fd)
+		}
+		if r < 0 {
+			throw error(r)
+		}
+	}
+
+	/// A path with a 0 after it, for `open`: `bytes[..len + 1]`.
+	struct CPath {
+		@uninit bytes: [PATH_MAX]u8
+	}
+
+	/// An empty path buffer, not written yet.
+	fn CPath.new() -> CPath {
+		// Sound: `fill` writes the bytes the kernel reads, up to the 0.
+		unsafe {
+			return CPath{}
+		}
+	}
+
+	/// Copy `b` and a 0 after it: 0, or a negative error number.
+	fn CPath.fill(inout self, b: []u8) -> isize {
+		if b.len >= PATH_MAX {
+			return -ENAMETOOLONG
+		}
+		for i in 0..b.len {
+			if b[i] == 0 {
+				return -EINVAL
+			}
+			self.bytes[i] = b[i]
+		}
+		self.bytes[b.len] = 0
+		return 0
+	}
 
 	/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of
 	/// bytes read (0 at the end of the input, possibly fewer than `len`), or a
