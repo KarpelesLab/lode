@@ -904,6 +904,9 @@ impl Mono<'_> {
         if let Some(inner) = ty.as_optional() {
             return format!("?{}", self.type_symbol(inner));
         }
+        if let Some(to) = ty.as_ptr() {
+            return format!("*{}", self.type_symbol(to));
+        }
         ty.to_string()
     }
 }
