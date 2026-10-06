@@ -1531,12 +1531,6 @@ impl FnLower<'_> {
         self.b.call(callee, &[addr], self.t.void);
     }
 
-    /// Destroy the value of `local`, of a type that needs destruction,
-    /// before it's assigned: always, or if it holds one (its drop flag).
-    fn destroy_old(&mut self, local: LocalId) {
-        self.destroy_local(local, false);
-    }
-
     /// `return value`: write it (as `ok(value)` in a function that throws),
     /// or pack it, run every `defer`, and return.
     fn return_value(&mut self, value: Option<&TExpr>) {
@@ -1799,7 +1793,7 @@ impl FnLower<'_> {
                 };
                 // The new value first, then the old one is destroyed.
                 let src = self.place(e);
-                self.destroy_old(*local);
+                self.destroy_local(*local, false);
                 self.copy(dst, src, e.ty);
                 self.set_flag(*local, true);
             }
@@ -2039,7 +2033,7 @@ impl FnLower<'_> {
                 let Slot::Mem(dst) = self.slots[*local] else {
                     unreachable!("a temporary that needs destruction is in memory")
                 };
-                self.destroy_old(*local);
+                self.destroy_local(*local, false);
                 self.fill(dst, inner);
                 self.set_flag(*local, true);
                 return Val::Mem(dst);
