@@ -390,6 +390,29 @@ pub enum Stmt {
     },
 }
 
+impl Stmt {
+    /// The statement's span.
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::ComptimeLet { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::Loop { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::Break(span)
+            | Stmt::Continue(span)
+            | Stmt::Match { span, .. }
+            | Stmt::Throw { span, .. }
+            | Stmt::Defer { span, .. } => *span,
+            Stmt::Expr(e) => e.span,
+            Stmt::If(i) => i.span,
+            Stmt::Unsafe(b) => b.span,
+        }
+    }
+}
+
 /// `pattern => body` in a `match`. A body written as a single statement is
 /// a block of that statement.
 #[derive(Clone, Debug)]

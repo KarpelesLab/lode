@@ -176,6 +176,10 @@ pub enum TStmt {
         body: Vec<TStmt>,
         on_error: bool,
     },
+    /// Where the statements after it come from, up to the next one: the
+    /// checker puts one before each statement it checks. It does nothing;
+    /// lowering uses it for debug information (`lode build -g`).
+    Loc(Span),
 }
 
 /// One arm of a [`TStmt::Match`]: the variants it handles (by index) and
@@ -390,9 +394,12 @@ pub fn stmt_exprs(s: &TStmt) -> Vec<&TExpr> {
         TStmt::Store(place, e) => vec![place, e],
         TStmt::Return(e) => e.iter().collect(),
         TStmt::For { start, end, .. } => vec![start, end],
-        TStmt::Loop(_) | TStmt::Break | TStmt::Continue | TStmt::Block(_) | TStmt::Defer { .. } => {
-            Vec::new()
-        }
+        TStmt::Loop(_)
+        | TStmt::Break
+        | TStmt::Continue
+        | TStmt::Block(_)
+        | TStmt::Defer { .. }
+        | TStmt::Loc(_) => Vec::new(),
     }
 }
 
@@ -470,9 +477,12 @@ pub fn stmt_exprs_mut(s: &mut TStmt) -> Vec<&mut TExpr> {
         TStmt::Store(place, e) => vec![place, e],
         TStmt::Return(e) => e.iter_mut().collect(),
         TStmt::For { start, end, .. } => vec![start, end],
-        TStmt::Loop(_) | TStmt::Break | TStmt::Continue | TStmt::Block(_) | TStmt::Defer { .. } => {
-            Vec::new()
-        }
+        TStmt::Loop(_)
+        | TStmt::Break
+        | TStmt::Continue
+        | TStmt::Block(_)
+        | TStmt::Defer { .. }
+        | TStmt::Loc(_) => Vec::new(),
     }
 }
 
@@ -494,7 +504,8 @@ pub fn stmt_blocks_mut(s: &mut TStmt) -> Vec<&mut Vec<TStmt>> {
         | TStmt::Return(_)
         | TStmt::Throw(_)
         | TStmt::Break
-        | TStmt::Continue => Vec::new(),
+        | TStmt::Continue
+        | TStmt::Loc(_) => Vec::new(),
     }
 }
 

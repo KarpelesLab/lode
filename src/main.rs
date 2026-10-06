@@ -11,9 +11,9 @@ const USAGE: &str = "\
 lode: the Lode compiler
 
 usage:
-  lode build <file.lode> [-o <output>] [-O0|-O1|-O2|-O3] [--emit=ir]
+  lode build <file.lode> [-o <output>] [-O0|-O1|-O2|-O3] [-g] [--emit=ir]
              [--stack-usage]
-  lode run <file.lode> [-O0|-O1|-O2|-O3]
+  lode run <file.lode> [-O0|-O1|-O2|-O3] [-g]
   lode check <file.lode> [--targets=<target,...>|--targets=all]
   lode targets
   lode fmt [--check] <files or directories...>
@@ -22,7 +22,9 @@ usage:
   build   compile to a static x86-64 Linux executable
           (--emit=ir prints the LatticeFoundry IR instead;
           --stack-usage prints each function's stack frame and the
-          worst-case stack depth, or why there is no bound)
+          worst-case stack depth, or why there is no bound;
+          -g includes debug information: DWARF source lines and
+          functions, for gdb)
   run     build to a temporary file, run it, exit with its status
   check   check the program without generating code, for x86_64-linux
           or for each of --targets (all: every target the compiler
@@ -71,6 +73,8 @@ struct Options {
     opt: OptLevel,
     emit_ir: bool,
     stack_usage: bool,
+    /// `-g`: debug information.
+    debug: bool,
     /// `--targets=...`, for `lode check`.
     targets: Option<Vec<&'static Target>>,
 }
@@ -107,6 +111,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
     let mut opt = OptLevel::O0;
     let mut emit_ir = false;
     let mut stack_usage = false;
+    let mut debug = false;
     let mut targets = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -114,6 +119,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "-o" => output = Some(it.next().ok_or("`-o` needs a path")?.clone()),
             "--emit=ir" => emit_ir = true,
             "--stack-usage" => stack_usage = true,
+            "-g" => debug = true,
             flag if flag.starts_with("--targets=") => {
                 targets = Some(parse_targets(&flag["--targets=".len()..])?)
             }
@@ -132,6 +138,7 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
         opt,
         emit_ir,
         stack_usage,
+        debug,
         targets,
     })
 }
@@ -202,6 +209,9 @@ fn check(args: &[String]) -> Result<ExitCode, String> {
     let mut opts = parse_options(args)?;
     let targets = opts.targets.take();
     build_only(&opts, "check")?;
+    if opts.debug {
+        return Err("`-g` is for `lode build` and `lode run`, not `lode check`".to_owned());
+    }
     let (mut files, root) = load(&opts.input)?;
     if let Some(targets) = targets {
         return Ok(check_targets(&mut files, root, &targets));
@@ -260,6 +270,9 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     if opts.emit_ir && opts.stack_usage {
         return Err("`--stack-usage` needs machine code, not `--emit=ir`".to_owned());
     }
+    if opts.emit_ir && opts.debug {
+        return Err("`-g` needs machine code, not `--emit=ir`".to_owned());
+    }
     let (mut files, root) = load(&opts.input)?;
     if opts.emit_ir {
         return Ok(match lode::compile_ir(&mut files, root, opts.opt) {
@@ -272,7 +285,10 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
             Err(e) => report(&files, e),
         });
     }
-    let build_options = lode::BuildOptions { opt: opts.opt };
+    let build_options = lode::BuildOptions {
+        opt: opts.opt,
+        debug: opts.debug,
+    };
     let exe = match lode::build(&mut files, root, &build_options) {
         Ok(exe) => exe,
         Err(e) => return Ok(report(&files, e)),
@@ -291,7 +307,10 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     check_only(&opts)?;
     build_only(&opts, "run")?;
     let (mut files, root) = load(&opts.input)?;
-    let build_options = lode::BuildOptions { opt: opts.opt };
+    let build_options = lode::BuildOptions {
+        opt: opts.opt,
+        debug: opts.debug,
+    };
     let image = match lode::build(&mut files, root, &build_options) {
         Ok(exe) => {
             warn(&files, &exe.warnings);

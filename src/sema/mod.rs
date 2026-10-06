@@ -3081,6 +3081,9 @@ impl<'a> Checker<'a> {
                 let local = self.declare(cx, &name.name, Ty::Unit, *mutable);
                 cx.failed.insert(local);
             }
+            if checked.is_some() {
+                out.push(TStmt::Loc(s.span()));
+            }
             out.extend(checked);
         }
         cx.scopes.pop();
@@ -4208,7 +4211,9 @@ impl<'a> Checker<'a> {
         let otherwise = match &i.otherwise {
             None => Vec::new(),
             Some(ast::Else::Block(b)) => self.block(cx, &b.stmts),
-            Some(ast::Else::If(inner)) => vec![self.if_stmt(cx, inner)],
+            Some(ast::Else::If(inner)) => {
+                vec![TStmt::Loc(inner.span), self.if_stmt(cx, inner)]
+            }
         };
         cx.scopes.pop();
         let else_env = std::mem::take(&mut cx.env);
@@ -5043,7 +5048,9 @@ impl<'a> Checker<'a> {
             Some(false) => match &i.otherwise {
                 None => Vec::new(),
                 Some(ast::Else::Block(b)) => self.block(cx, &b.stmts),
-                Some(ast::Else::If(inner)) => vec![self.if_stmt(cx, inner)],
+                Some(ast::Else::If(inner)) => {
+                    vec![TStmt::Loc(inner.span), self.if_stmt(cx, inner)]
+                }
             },
             None => Vec::new(),
         };
@@ -5110,7 +5117,9 @@ impl<'a> Checker<'a> {
         let otherwise = match &i.otherwise {
             None => Vec::new(),
             Some(ast::Else::Block(b)) => self.block(cx, &b.stmts),
-            Some(ast::Else::If(inner)) => vec![self.if_stmt(cx, inner)],
+            Some(ast::Else::If(inner)) => {
+                vec![TStmt::Loc(inner.span), self.if_stmt(cx, inner)]
+            }
         };
         let else_env = std::mem::take(&mut cx.env);
 

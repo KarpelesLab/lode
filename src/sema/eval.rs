@@ -400,6 +400,9 @@ impl Eval<'_, '_> {
     }
 
     fn stmt(&mut self, frame: &mut Frame, s: &TStmt) -> R<()> {
+        if let TStmt::Loc(_) = s {
+            return Ok(());
+        }
         self.step()?;
         match s {
             TStmt::Init(l, e) | TStmt::Assign(l, e) => {
@@ -467,6 +470,7 @@ impl Eval<'_, '_> {
                     i += 1;
                 }
             }
+            TStmt::Loc(_) => {}
             TStmt::Break => return Err(Exit::Break),
             TStmt::Continue => return Err(Exit::Continue),
             TStmt::Block(body) => self.block(frame, body)?,

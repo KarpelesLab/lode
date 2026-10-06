@@ -125,6 +125,7 @@ use crate::sema::{
     CmpOp, Convention, Func, Handler, Local, LocalId, Mode, Program, TBinOp, TExpr, TExprKind,
     TStmt, TUnOp,
 };
+use crate::source::{FileId, SourceMap};
 use crate::types::{IntTy, Ty};
 
 /// The IR layout of an enum or an optional (see the module docs).
@@ -190,6 +191,29 @@ pub struct Lowered {
     /// The functions defined, and whether each is internal (only called
     /// from the module: optimization may leave it unreferenced).
     pub funcs: Vec<(IrFunc, bool)>,
+    /// With debug information ([`lower_debug`]), the source line of each
+    /// IR line number: line `n` is `(file, line)` at index `n - 1`. IR
+    /// line numbers stand for a file and a line, as LatticeFoundry's
+    /// debug information only has one source file. Empty otherwise.
+    pub lines: Vec<(FileId, u32)>,
+}
+
+/// The IR line numbers given so far, for debug information (see
+/// [`Lowered::lines`]).
+#[derive(Default)]
+struct Lines {
+    ids: HashMap<(FileId, u32), u32>,
+    table: Vec<(FileId, u32)>,
+}
+
+impl Lines {
+    /// The IR line number of `line` (1-based) of `file`.
+    fn id(&mut self, file: FileId, line: u32) -> u32 {
+        *self.ids.entry((file, line)).or_insert_with(|| {
+            self.table.push((file, line));
+            self.table.len() as u32
+        })
+    }
 }
 
 /// IR types for every Lode type, interned up front (the function builder
@@ -339,6 +363,18 @@ enum Slot {
 /// Every function but the entry has internal linkage: nothing outside the
 /// program calls it, so the backend may drop it once it's inlined.
 pub fn lower(program: &Program, name: &str) -> Lowered {
+    lower_with(program, name, None)
+}
+
+/// [`lower`], with source lines for debug information: each instruction
+/// gets the IR line number ([`Lowered::lines`]) of the statement it's
+/// from, and each function the one of its declaration.
+pub fn lower_debug(program: &Program, name: &str, files: &SourceMap) -> Lowered {
+    lower_with(program, name, Some(files))
+}
+
+fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lowered {
+    let mut lines = Lines::default();
     let mut syms = StrInterner::new();
     let mut module = Module::new(name.to_owned());
     let t = {
@@ -441,6 +477,9 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             result_ty: f.result_ty(),
             packed: returns_packed(f.result_ty()),
             throws: f.throws.is_some(),
+            files,
+            lines: &mut lines,
+            line: 0,
         }
         .function(f);
     }
@@ -457,6 +496,13 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
             funcs.push((entry, false));
             let ret = reach.funcs[main].ret;
             let mut b = module.build(entry);
+            if let Some(files) = files {
+                let span = reach.funcs[main].span;
+                let (line, _) = files.get(span.file).line_col(span.start);
+                let id = lines.id(span.file, line);
+                b.set_decl_line(id);
+                b.set_line(id);
+            }
             b.create_entry_block();
             let callee = b.func_ref(ids[main].expect("main is reached"));
             let result = b.call(callee, &[], t.of(ret));
@@ -476,6 +522,7 @@ pub fn lower(program: &Program, name: &str) -> Lowered {
         tables,
         warnings: program.warnings.clone(),
         funcs,
+        lines: lines.table,
     }
 }
 
@@ -548,6 +595,12 @@ struct FnLower<'a> {
     packed: bool,
     /// Whether the function throws (and returns a result).
     throws: bool,
+    /// The sources, when building with debug information.
+    files: Option<&'a SourceMap>,
+    /// The IR line numbers of the program.
+    lines: &'a mut Lines,
+    /// The IR line number of the instructions made now (0: none).
+    line: u32,
 }
 
 /// The most scalar copies an array copy or fill is unrolled into; longer
@@ -683,7 +736,7 @@ fn uses_in_stmts(stmts: &[TStmt], packed: &mut [bool]) {
                     uses_in_stmts(&arm.body, packed);
                 }
             }
-            TStmt::Break | TStmt::Continue => {}
+            TStmt::Break | TStmt::Continue | TStmt::Loc(_) => {}
         }
     }
 }
@@ -832,7 +885,7 @@ fn split_in_stmts(stmts: &[TStmt], memory: &mut [bool]) {
                 }
                 split_copied(e, memory);
             }
-            TStmt::Return(None) | TStmt::Break | TStmt::Continue => {}
+            TStmt::Return(None) | TStmt::Break | TStmt::Continue | TStmt::Loc(_) => {}
             TStmt::Expr(e) => split_in_expr(e, memory),
             TStmt::If(c, then, otherwise) => {
                 split_in_expr(c, memory);
@@ -1046,6 +1099,10 @@ fn const_bits(v: i128, t: IntTy) -> i64 {
 
 impl FnLower<'_> {
     fn function(mut self, f: &Func) {
+        self.at(f.span.start, f.span.file);
+        if self.line != 0 {
+            self.b.set_decl_line(self.line);
+        }
         let entry = self.b.create_entry_block();
         // The IR parameters: the result's storage first, if it's in memory,
         // then each parameter's parts.
@@ -1136,6 +1193,8 @@ impl FnLower<'_> {
         }
         self.stmts(&f.body);
         if !self.terminated {
+            // At the closing brace.
+            self.at(f.span.end.saturating_sub(1), f.span.file);
             if f.ret == Ty::Unit {
                 self.return_value(None);
             } else {
@@ -1187,6 +1246,24 @@ impl FnLower<'_> {
         }
     }
 
+    /// Give the instructions made from now on the line of `offset` in
+    /// `file`, when building with debug information.
+    fn at(&mut self, offset: u32, file: FileId) {
+        if let Some(files) = self.files {
+            let (line, _) = files.get(file).line_col(offset);
+            let id = self.lines.id(file, line);
+            self.set_line(id);
+        }
+    }
+
+    /// Give the instructions made from now on the IR line number `line`.
+    fn set_line(&mut self, line: u32) {
+        if line != 0 {
+            self.line = line;
+            self.b.set_line(line);
+        }
+    }
+
     fn start_block(&mut self, block: BlockId) {
         self.b.switch_to(block);
         self.terminated = false;
@@ -1196,6 +1273,10 @@ impl FnLower<'_> {
     fn stmts(&mut self, stmts: &[TStmt]) {
         self.defers.push(Vec::new());
         for s in stmts {
+            if let TStmt::Loc(span) = s {
+                self.at(span.start, span.file);
+                continue;
+            }
             if self.terminated {
                 // Code after a `return`/`break`: give it a fresh (unreachable) block.
                 let dead = self.b.create_block(&[]);
@@ -1584,9 +1665,11 @@ impl FnLower<'_> {
                 };
                 let more = self.b.icmp(pred, i, end);
                 self.b.cond_br(more, body_bb, &[], exit, &[]);
+                let line = self.line;
                 self.loop_body(body_bb, latch, exit, body);
                 // The counter is below `end`, so adding one can't overflow.
                 self.start_block(latch);
+                self.set_line(line);
                 let i = self.load(*var).one();
                 let one = self.b.const_i64(self.t.int(it), 1);
                 let flags = if it.signed {
@@ -1611,6 +1694,8 @@ impl FnLower<'_> {
                 self.terminated = true;
             }
             TStmt::Block(body) => self.stmts(body),
+            // Handled by `stmts`.
+            TStmt::Loc(_) => {}
             TStmt::Match { value, arms } => {
                 let tag = self.tag_of(value);
                 let blocks: Vec<BlockId> = arms.iter().map(|_| self.b.create_block(&[])).collect();

@@ -17,6 +17,7 @@
 //! reported as "not supported by the compiler yet".
 
 pub mod ast;
+pub mod debug;
 pub mod diag;
 pub mod fmt;
 pub mod lex;
@@ -138,9 +139,30 @@ fn check_packages(packages: &[load::Package], target: &Target) -> (sema::Program
 
 /// Compile a program to a verified, optimized IR module.
 pub fn compile_ir(files: &mut SourceMap, root: FileId, opt: OptLevel) -> Result<Lowered, Error> {
+    compile_ir_with(files, root, opt, false)
+}
+
+/// [`compile_ir`]; with `debug`, its instructions have source lines
+/// ([`Lowered::lines`]).
+pub fn compile_ir_with(
+    files: &mut SourceMap,
+    root: FileId,
+    opt: OptLevel,
+    debug: bool,
+) -> Result<Lowered, Error> {
     let program = check(files, root)?;
-    let mut lowered = lower::lower(&program, &files.get(root).name);
+    let name = &files.get(root).name;
+    let mut lowered = if debug {
+        lower::lower_debug(&program, name, files)
+    } else {
+        lower::lower(&program, name)
+    };
     verify_module(&lowered.module, "lowered")?;
+    let decl_lines: Vec<_> = lowered
+        .funcs
+        .iter()
+        .map(|&(id, _)| (id, lowered.module.function(id).decl_line))
+        .collect();
     pipeline::optimize(&mut lowered.module, opt);
     if opt != OptLevel::O0 {
         // The pipeline ends with an inlining round and no `simplify_cfg`:
@@ -155,6 +177,18 @@ pub fn compile_ir(files: &mut SourceMap, root: FileId, opt: OptLevel) -> Result<
         );
         drop_unreferenced(&mut lowered);
         verify_module(&lowered.module, "optimized")?;
+        if debug {
+            // LF's passes rebuild the functions they change without their
+            // declaration lines (or their instructions' lines).
+            for (id, line) in decl_lines {
+                let f = lowered.module.function(id);
+                if f.decl_line != line && !f.is_declaration() {
+                    let mut f = f.clone();
+                    f.decl_line = line;
+                    lowered.module.replace_function(id, f);
+                }
+            }
+        }
     }
     Ok(lowered)
 }
@@ -208,6 +242,9 @@ pub fn ir_text(files: &mut SourceMap, root: FileId, opt: OptLevel) -> Result<Str
 pub struct BuildOptions {
     /// The optimization level.
     pub opt: OptLevel,
+    /// Whether to include debug information: DWARF line tables and
+    /// functions, section headers and a symbol table ([`debug`]).
+    pub debug: bool,
 }
 
 /// A built program.
@@ -236,24 +273,43 @@ pub fn build(
             "this program has no `main` function",
         )]));
     }
-    let lowered = compile_ir(files, root, options.opt)?;
+    let lowered = compile_ir_with(files, root, options.opt, options.debug)?;
     let entry = lowered
         .entry
         .clone()
         .expect("a program with `main` has an entry");
-    let compiled =
-        x86_64::compile_module_with(&lowered.module, &lowered.syms, &CodegenOptions::default());
-    let mut object = compiled.object;
+    let codegen = CodegenOptions::default();
+    let (mut object, stack) = if options.debug {
+        // LF's DWARF is for one file, its lines the IR line numbers:
+        // replaced by Lode's, over the program's files.
+        let comp_dir = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_default();
+        let source = x86_64::DebugSource {
+            file_name: files.get(root).name.clone(),
+            comp_dir: comp_dir.clone(),
+        };
+        let compiled =
+            x86_64::compile_module_debug_with(&lowered.module, &lowered.syms, &source, &codegen);
+        let object = debug::rewrite(&compiled.object, &lowered.lines, files, root, &comp_dir)
+            .map_err(Error::Backend)?;
+        (object, compiled.stack)
+    } else {
+        let compiled = x86_64::compile_module_with(&lowered.module, &lowered.syms, &codegen);
+        (compiled.object, compiled.stack)
+    };
     emit_rodata(&mut object, &lowered.strings, &lowered.tables);
     let link_options = ImageOptions {
         entry: entry.clone(),
+        debug: options.debug,
         ..ImageOptions::default()
     };
     let image = link::link_executable(vec![object], &link_options)
         .map_err(|e| Error::Backend(format!("link error: {e}")))?;
     Ok(Executable {
         image,
-        stack: StackReport::new(compiled.stack, entry),
+        stack: StackReport::new(stack, entry),
         warnings: lowered.warnings,
     })
 }
@@ -265,7 +321,15 @@ pub fn build_executable(
     root: FileId,
     opt: OptLevel,
 ) -> Result<Vec<u8>, Error> {
-    build(files, root, &BuildOptions { opt }).map(|e| e.image)
+    build(
+        files,
+        root,
+        &BuildOptions {
+            opt,
+            ..BuildOptions::default()
+        },
+    )
+    .map(|e| e.image)
 }
 
 /// Define the symbols of the string literals and of the array constants

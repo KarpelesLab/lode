@@ -103,7 +103,7 @@ Lode is now Lode's own work.
 | SIMD vectors (SSE2, NEON, scalar fallback) | `0.0.2` | SIMD types |
 | PE/COFF and Mach-O objects, Win64 calling convention, raw binary / Intel HEX | `0.0.2` | Windows and macOS layers |
 | Shared libraries and position-independent code (`--shared`, `--pie`) | `0.0.2` | C-ABI libraries |
-| DWARF debug info with source lines (`-g`) | since `0.0.0` | Lode doesn't emit line numbers yet |
+| DWARF debug info with source lines (`-g`) | since `0.0.0` | Used: `lode build -g` ([debug information](#debug-information)) |
 
 ### Still open
 
@@ -125,10 +125,56 @@ Lode is now Lode's own work.
   once more, then the internal functions nothing reaches become
   declarations, which emit no code. Over the test programs that's 27% less
   code; it belongs in LF's pipeline.
+- **Source lines through the optimizer.** LF's passes rebuild the
+  functions they change (`Module::map_function`) without their
+  instructions' lines or their declaration line: after `-O1`, every
+  `inst_line` is `None` and `decl_line` is `None`. Lode puts the
+  declaration lines back after optimizing; the instructions' lines are
+  lost, so optimized code has no line table beyond each function's
+  entry. Reproduced by building `f(x) = x * (2 + 3)` with `set_decl_line(3)`
+  and `set_line(4)`/`set_line(5)`, then `pipeline::optimize(&mut m,
+  OptLevel::O1)`: `(Some(3), [Some(4), Some(5), Some(5)])` becomes `(None,
+  [None, None])`. Inlined code would also need its callee's lines (or
+  `DW_TAG_inlined_subroutine`).
+- **Debug information for several files.** LF's DWARF has one source file
+  per object, and a line is a `u32`. Lode works around it
+  ([debug information](#debug-information)).
 
 ### Resolved open questions in LF, from Lode's side
 - **Exceptions / unwinding:** Lode doesn't need unwinding. Errors are return
   values ([errors.md](errors.md)).
+
+## Debug information
+
+**Status:** Implemented (lines and functions)
+
+`lode build -g` (and `lode run -g`) emits DWARF 4 for gdb and other
+debuggers, and links with LF's `ImageOptions::debug` (section headers,
+`.symtab`, the `.debug_*` sections). Without `-g`, nothing changes: the
+image is byte for byte the same.
+
+- **Spans.** The checker puts a `TStmt::Loc(span)` before each statement
+  it checks (and before an `else if`), in the one place that checks
+  statement lists. It does nothing anywhere else; lowering sets the
+  current line from it. A function's span gives its declaration line, and
+  the instructions made for its parameters; the implicit return at the
+  end of a function is at its closing brace; a `for` loop's increment is
+  at the `for`.
+- **Files.** LF's DWARF knows one file, so an IR line number stands for a
+  file and a line: lowering numbers the `(file, line)` pairs it uses
+  (`Lowered::lines`). LF compiles with its DWARF (`compile_module_debug_with`),
+  then `src/debug.rs` reads LF's line table back (which code is at which
+  IR line, function by function) and replaces LF's debug sections with
+  its own: one compile unit, the line table over every source file, the
+  user's and the standard library's, and a `DW_TAG_subprogram` per
+  function, named by its symbol (`main.main`, `std/os.write_all`).
+- **Covered:** stopping on a function or a line, backtraces, stepping by
+  line, at `-O0`. At `-O1` and above, functions only (their address range
+  and declaration line), until LF keeps lines through its passes (above).
+- **Not yet:** local variables and parameters (`DW_TAG_variable`,
+  locations), types (`DW_TAG_base_type`, structs, enums), inlined
+  functions, columns, a `DW_AT_language` (gdb treats the code as C), and
+  other targets than x86-64 Linux.
 
 ## Optimization profiles
 

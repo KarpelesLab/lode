@@ -9,7 +9,11 @@ use lode::{BuildOptions, Executable};
 fn build(name: &str, text: &str, opt: OptLevel) -> Executable {
     let mut files = SourceMap::new();
     let root = files.add(SourceFile::new(name, text.to_owned()));
-    match lode::build(&mut files, root, &BuildOptions { opt }) {
+    let options = BuildOptions {
+        opt,
+        ..BuildOptions::default()
+    };
+    match lode::build(&mut files, root, &options) {
         Ok(exe) => exe,
         Err(e) => panic!("{name} failed to build: {e:?}"),
     }

@@ -176,6 +176,7 @@ target/debug/lode run program.lode        # build, run, exit with its status
 target/debug/lode build program.lode -O2  # write ./program
 target/debug/lode build program.lode --emit=ir
 target/debug/lode build program.lode --stack-usage  # frames, worst-case stack
+target/debug/lode build program.lode -g   # with debug information, for gdb
 target/debug/lode check program.lode
 target/debug/lode check program.lode --targets=all  # for each target (see `lode targets`)
 target/debug/lode fmt program.lode        # rewrite in canonical form
@@ -184,6 +185,15 @@ target/debug/lode fmt --check std/        # list non-canonical .lode files, exit
 
 The canonical format is described in
 [docs/syntax.md](docs/syntax.md#formatting).
+
+`-g` (for `build` and `run`) adds DWARF debug information: source lines
+for every function, the standard library's included, and the functions
+by their Lode names. In gdb, `break main.main` (or
+`break std/os.write_all`), `break program.lode:12`, `bt`, `next` and
+`step` work. Variables and types aren't described yet, and at `-O1` and above
+only the functions are, at their declarations: LatticeFoundry's passes
+drop the instructions' lines ([docs/backend.md](docs/backend.md#debug-information)).
+Without `-g` the executable is unchanged.
 
 ## Working on the compiler
 
