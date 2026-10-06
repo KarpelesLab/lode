@@ -1056,8 +1056,8 @@ What M8b does, and the choices made where the proposal left room:
   type an `alloc.handle(a)` in the instances `main` reaches makes a handle
   of. With the root's only, `alloc.Handle` has no fields (a box is one
   pointer), a `uses alloc` function takes no hidden parameter, and a call
-  through a handle calls the root's method (`alloc.root().alloc(...)`
-  directly). Otherwise a handle is two words, its type's number among the
+  through a handle is a direct call of the root's method, with `alloc.ROOT`
+  as `self`. Otherwise a handle is two words, its type's number among the
   allocator types and its address; a `uses alloc` function takes the
   address of the handle in context as a last hidden parameter, which
   `main` makes the root's and `with` replaces; and a call through a handle
@@ -1142,10 +1142,11 @@ What M8b does, and the choices made where the proposal left room:
   same at `-O0` and `-O2`; `clone_mem`, whose generic clone now throws,
   changed its source (8,978 bytes at `-O2`, from 7,282). Importing
   `std/alloc` and declaring `uses alloc` in a program that doesn't
-  allocate changes nothing. A program that boxes a `u32` is 3,048 bytes at
+  allocate changes nothing. A program that boxes a `u32` is 2,872 bytes at
   `-O2`, with two system calls (`mmap` of one chunk, `exit`) and a stack
-  bound of 432 bytes; `alloc_chain.lode` (a million boxes) is 6,664
-  bytes, `box.lode` 15,617 and `alloc_with.lode` 12,024.
+  bound of 368 bytes; `alloc_chain.lode` (a million boxes) is 6,496
+  bytes, `box.lode` 15,911 and `alloc_with.lode` (another allocator, so
+  handles and a hidden parameter) 12,024.
 - **Not done in M8b.** `mem.view` (M8c); `@root_allocator`; the prelude
   (question 11): `Box` is `alloc.Box`, as loading `std/alloc` into every
   program would load `std/os`, which compiles only for Linux; counted

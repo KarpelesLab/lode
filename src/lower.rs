@@ -519,6 +519,18 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
         .alloc
         .filter(|_| !reach.allocators.is_empty())
         .and_then(|info| static_globals[info.root]);
+    // With only the root allocator, a call through a handle is a call of
+    // the root's method, directly: the dispatch functions aren't made.
+    let redirect: HashMap<usize, usize> = if dynamic {
+        HashMap::new()
+    } else {
+        reach
+            .dispatch
+            .iter()
+            .copied()
+            .filter(|&(d, root)| reach.funcs[d].result_ty() == reach.funcs[root].result_ty())
+            .collect()
+    };
 
     let internal = FuncAttrs::new(Linkage::Internal, Visibility::Default);
     let ids: Vec<Option<IrFunc>> = reach
@@ -526,6 +538,9 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
         .iter()
         .enumerate()
         .map(|(i, f)| {
+            if redirect.contains_key(&i) {
+                return None;
+            }
             let is_entry = direct_entry == Some(i);
             let (params, ret) = t.signature(f, dynamic && f.uses_alloc && !is_entry);
             let ret = if is_entry { t.i64 } else { ret };
@@ -553,6 +568,7 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
             tables: &table_globals,
             statics: &static_globals,
             root_static,
+            redirect: &redirect,
             handle: program.alloc.map(|a| a.handle),
             ctx: Vec::new(),
             dynamic,
@@ -825,6 +841,9 @@ struct FnLower<'a> {
     statics: &'a [Option<GlobalId>],
     /// The root allocator's global, if the program allocates.
     root_static: Option<GlobalId>,
+    /// The dispatch functions called as the root allocator's method they
+    /// call, with the root as `self` (with no other allocator type).
+    redirect: &'a HashMap<usize, usize>,
     /// `alloc.Handle`, if the program imports `std/alloc`.
     handle: Option<Ty>,
     /// The addresses of the handles in context, innermost last (with a
@@ -2725,6 +2744,10 @@ impl FnLower<'_> {
     fn call(&mut self, f: usize, args: &[TExpr], ret: Ty, dst: Option<ValueId>) -> Val {
         let packed = returns_packed(ret);
         let mut values: Vec<ValueId> = dst.filter(|_| !packed).into_iter().collect();
+        // A call through a handle, with no allocator but the root: the
+        // root's method, on `alloc.ROOT` (the handle holds nothing).
+        let root = self.redirect.get(&f).copied();
+        let f = root.unwrap_or(f);
         // An argument moved in (`sink`) belongs to the call: until it's
         // made, an argument after it that leaves early destroys it.
         let later = later_leaves(args.iter());
@@ -2737,6 +2760,11 @@ impl FnLower<'_> {
         let pending = self.defers.last().map_or(0, Vec::len);
         for (k, a) in args.iter().enumerate() {
             let v = self.expr(a);
+            if root.is_some() && k == 0 {
+                let g = self.root_static.expect("the root allocator is used");
+                values.push(self.b.global_ref(g));
+                continue;
+            }
             if let Val::Mem(addr) = v
                 && later[k]
                 && owned.get(k).copied().unwrap_or(false)

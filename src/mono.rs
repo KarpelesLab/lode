@@ -47,8 +47,9 @@
 //! is a call of a function made here (`std/alloc.Handle.$alloc`) that
 //! calls the method of the handle's allocator type: a test of the handle's
 //! number, one direct call per type (closed-world dispatch, no function
-//! pointers). With only the root, it calls the root's method, and handles
-//! hold nothing; a call through `alloc.root()` calls it directly.
+//! pointers). With only the root, handles hold nothing, and lowering calls
+//! the root's method instead ([`Instances::dispatch`]); a call through
+//! `alloc.root()` calls it directly here.
 
 use std::collections::HashMap;
 
@@ -79,6 +80,10 @@ pub struct Instances {
     pub destroy: HashMap<Ty, FuncId>,
     /// `statics[i]`: whether an instance uses `static` `i`.
     pub statics: Vec<bool>,
+    /// Each dispatch function made (a call through a handle), with the
+    /// root allocator's method it calls for the root: with no other
+    /// allocator type, lowering calls that method instead, directly.
+    pub dispatch: Vec<(FuncId, FuncId)>,
     /// The program's allocator types, the root's first (empty for a
     /// program that never allocates). A handle's number is the index of
     /// its allocator's type here; with only the root, handles are
@@ -205,6 +210,19 @@ pub fn instantiate(program: &Program) -> Instances {
             .map(|(ty, id)| (ty, new_id[id]))
             .collect(),
         statics: m.statics,
+        dispatch: m
+            .alloc
+            .as_ref()
+            .map(|a| {
+                (0..3)
+                    .filter_map(|k| {
+                        let d = a.dispatch[k]?;
+                        let root = a.types.first()?.1[k]?;
+                        Some((new_id[d], new_id[root]))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         allocators: m
             .alloc
             .map(|a| a.types.iter().map(|&(t, _)| t).collect())
