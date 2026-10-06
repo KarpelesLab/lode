@@ -1469,6 +1469,22 @@ impl FnLower<'_> {
     /// `call catch ...`, of type `ty`.
     fn catch(&mut self, call: &TExpr, binding: Option<usize>, handler: &Handler, ty: Ty) -> Val {
         let (_, err) = call.ty.as_result().expect("a result");
+        // `f() catch _ {}` ignores the result: no branch on it (two
+        // branches to the same place that the backend doesn't merge yet,
+        // after each argument of `io.print`).
+        if binding.is_none()
+            && ty == Ty::Unit
+            && matches!(handler, Handler::Block(b) if b.is_empty())
+        {
+            if returns_packed(call.ty) {
+                self.pack(call);
+            } else {
+                let ir_ty = self.ir_ty(call.ty);
+                let tmp = self.b.alloca(ir_ty);
+                self.fill(tmp, call);
+            }
+            return Val::Unit;
+        }
         // Where the value goes: a temporary in memory, or the join
         // block's parameter.
         let scalar = ty != Ty::Unit && !ty.in_memory();
