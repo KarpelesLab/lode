@@ -796,12 +796,10 @@ impl Checker<'_> {
     /// if `e` names one.
     fn refine_const(&mut self, cx: &mut FnCx, e: &ast::Expr) -> Option<i128> {
         let id = match &e.kind {
-            ExprKind::Name(name) if cx.lookup(name).is_none() => {
-                match self.pkgs[cx.pkg].items.get(name) {
-                    Some(&Item::Const(id)) => id,
-                    _ => return None,
-                }
-            }
+            ExprKind::Name(name) if cx.lookup(name).is_none() => match self.unqualified(cx, name) {
+                Some(&Item::Const(id)) => id,
+                _ => return None,
+            },
             ExprKind::Field(base, member) => {
                 let ExprKind::Name(pkg_name) = &base.kind else {
                     return None;
@@ -1070,7 +1068,7 @@ impl Checker<'_> {
         t: &ast::TypeExpr,
     ) -> Option<(Ty, Option<Rc<Refine>>)> {
         let item = match t {
-            ast::TypeExpr::Named(id) => match self.pkgs[cx.pkg].items.get(&id.name) {
+            ast::TypeExpr::Named(id) => match self.unqualified(cx, &id.name) {
                 Some(&Item::Refined(k)) => Some(k),
                 _ => None,
             },

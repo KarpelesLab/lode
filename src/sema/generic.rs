@@ -521,7 +521,7 @@ impl Checker<'_> {
     pub(super) fn names_function(&self, cx: &FnCx, e: &ast::Expr) -> bool {
         match &e.kind {
             ExprKind::Name(n) if cx.lookup(n).is_none() => {
-                matches!(self.pkgs[cx.pkg].items.get(n), Some(Item::Func(_)))
+                matches!(self.unqualified(cx, n), Some(Item::Func(_)))
             }
             ExprKind::Field(base, member) => match &base.kind {
                 ExprKind::Name(p) => self.imported(cx, p).is_some_and(|pkg| {
@@ -622,7 +622,7 @@ impl Checker<'_> {
         if let ExprKind::Name(n) = &e.kind
             && cx.lookup(n).is_none()
             && (primitive(n, self.ptr_bits).is_some()
-                || matches!(self.pkgs[cx.pkg].items.get(n), Some(Item::Type(_))))
+                || matches!(self.unqualified(cx, n), Some(Item::Type(_))))
         {
             self.diags.push(
                 Diagnostic::error(

@@ -592,3 +592,42 @@ fn main() -> u8 {
     .expect_err("fails to check");
     assert_eq!(errors, ["`==` can't compare values of type `store.Bytes`"]);
 }
+
+/// The prelude's `Box` is `std/alloc`'s (here the test library's): a
+/// package that names it, standard or not, loads `std/alloc` before
+/// itself, without importing it (docs/packages.md, The prelude).
+#[test]
+fn the_prelude_is_found_in_the_library() {
+    const ALLOC: &str = "package alloc\n\npub struct Box {\n\tpub v: i32\n}\n";
+    const SHELF: &str = "package shelf\n\npub fn put(v: i32) -> Box {\n\treturn Box{v: v}\n}\n";
+    let main = "package main\n\nimport \"std/shelf\"\n\n\
+                fn main() -> i32 {\n\tlet b: Box = shelf.put(5)\n\treturn b.v\n}\n";
+    let program =
+        check_with("prelude", main, &[("alloc", ALLOC), ("shelf", SHELF)]).expect("checks");
+    let alloc = program.packages.iter().position(|p| p == "std/alloc");
+    let shelf = program.packages.iter().position(|p| p == "std/shelf");
+    assert!(alloc.is_some() && alloc < shelf, "{:?}", program.packages);
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(run(&program, "prelude"), 5);
+    }
+
+    // What `std/alloc` imports can't use the prelude's `Box`.
+    let errors = check_with(
+        "prelude-cycle",
+        "package main\n\nimport \"std/alloc\"\n\nfn main() {\n}\n",
+        &[
+            (
+                "alloc",
+                "package alloc\n\nimport \"std/shelf\"\n\npub struct Box {\n\tpub v: i32\n}\n",
+            ),
+            ("shelf", SHELF),
+        ],
+    )
+    .expect_err("fails to load");
+    assert_eq!(
+        errors,
+        [
+            "the prelude's `Box` is in package `std/alloc`, which this package is part of or a dependency of"
+        ],
+    );
+}

@@ -1,0 +1,21 @@
+// stdout: 3 boxed 4\n
+package main
+
+import "std/alloc"
+import Box "std/io"
+
+// A file that imports a package as `Box` doesn't see the prelude's `Box`
+// (docs/packages.md, The prelude): `Box.print` is `io.print`, even though
+// `std/alloc` is loaded. Its box is `alloc.Box`.
+
+fn boxed(v: u32) uses alloc throws(AllocError) -> alloc.Box[u32] {
+	return try alloc.Box.new(v)
+}
+
+fn main() uses alloc -> u8 {
+	let b = boxed(4) catch _ {
+		return 1
+	}
+	Box.print("{} boxed {}\n", u32(3), b.value)
+	return 0
+}

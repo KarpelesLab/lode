@@ -622,7 +622,8 @@ outside, as memory.md decides for shared structures. They need:
 
 ### `Box[T]`
 
-**Status:** Implemented (M8b), as `alloc.Box` until the prelude
+**Status:** Implemented (M8b); in the prelude, so `Box` needs no import
+([Decision 11](#7-decisions))
 
 An owning pointer: one `T` on the heap (memory.md,
 [Owning pointers are values](memory.md#owning-pointers-are-values)).
@@ -1148,11 +1149,24 @@ What M8b does, and the choices made where the proposal left room:
   bound of 368 bytes; `alloc_chain.lode` (a million boxes) is 6,496
   bytes, `box.lode` 15,911 and `alloc_with.lode` (another allocator, so
   handles and a hidden parameter) 12,024.
-- **Not done in M8b.** `mem.view` (M8c); `@root_allocator`; the prelude
-  (question 11): `Box` is `alloc.Box`, as loading `std/alloc` into every
-  program would load `std/os`, which compiles only for Linux; counted
+- **Not done in M8b.** `mem.view` (M8c); `@root_allocator`; counted
   allocators, so `alloc.handle` is `unsafe` (M8d); the iterative
-  destruction of chains through an enum.
+  destruction of chains through an enum. The prelude came just after.
+- **The prelude** (Decision 11), after M8b: `Box` names `alloc.Box`
+  without an import, in every package, unless a local, an item of the
+  package or an import of that name hides it. Loading `std/alloc` into
+  every program would load `std/os`, which compiles only for Linux, and
+  break `lode check --targets` for programs that don't allocate; so the
+  prelude is lazy: the loader loads `std/alloc` only for a package whose
+  tokens may use `Box` (an identifier not after a `.`, in a file that
+  doesn't import a package as `Box`, in a package that doesn't declare
+  `Box`). The scan is conservative (a local named `Box` counts) and the
+  same for every target. A program that doesn't name `Box` loads and
+  builds exactly as before: hello world is 577 bytes, and checks for
+  `wasm32` and `avr`. One that does, checked for those, gets `std/os:
+  unsupported target`. The rules are in
+  [packages.md](packages.md#the-prelude); the table, one line per name, is
+  `src/prelude.rs`, where `List` and `String` go when M8c adds them.
 
 ### M8c: views from functions, `List` and `String`
 
@@ -1234,5 +1248,7 @@ context's part of 6 with a handle of two words until counted allocators
 11. **A small prelude**: `Box`, `List`, `String`, `AllocError` and the
     built-in traits usable without an import, from `std/core`, rather than
     `list.List[u32]` everywhere. *Decided; `AllocError` is built in (M8b),
-    `Box` is `alloc.Box` until the prelude is loaded only by programs that
-    use it.*
+    `Box` is in the prelude, whose packages are loaded only by the
+    programs that use their names ([packages.md](packages.md#the-prelude));
+    `List` and `String` join it with M8c. There's no `std/core`: each name
+    comes from the package that declares it.*

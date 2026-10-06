@@ -1021,7 +1021,7 @@ impl Checker<'_> {
         (name == super::COMPILE_ERROR || name == super::COMPILE_ERROR_AT)
             && cx.lookup(name).is_none()
             && !matches!(
-                self.pkgs[cx.pkg].items.get(name),
+                self.unqualified(cx, name),
                 Some(Item::Func(_) | Item::Const(_) | Item::Type(_) | Item::Trait(_))
             )
     }

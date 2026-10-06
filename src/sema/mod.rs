@@ -67,6 +67,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         deinits: HashSet::new(),
         statics: Vec::new(),
         alloc: None,
+        prelude: HashMap::new(),
         sources: packages
             .iter()
             .flat_map(|p| &p.files)
@@ -410,6 +411,9 @@ struct Checker<'a> {
     statics: Vec<StaticInfo<'a>>,
     /// What the compiler knows of `std/alloc`, if it's loaded.
     alloc: Option<AllocInfo>,
+    /// The items of the prelude whose packages are loaded, by name (see
+    /// [`Checker::unqualified`]).
+    prelude: HashMap<&'static str, Item>,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -1404,9 +1408,16 @@ impl<'a> Checker<'a> {
     }
 
     /// The name shown in messages for a type declared in package `pkg`:
-    /// `Point`, or `os.Stat` for a type of an imported package.
+    /// `Point`, `os.Stat` for a type of an imported package, or `Box` for
+    /// one of the prelude, which every package can name so.
     fn shown_name(packages: &[Package], pkg: usize, name: &str) -> String {
-        if pkg == packages.len().saturating_sub(1) {
+        let path = packages[pkg].path.as_str();
+        if let Some(e) = crate::prelude::PRELUDE
+            .iter()
+            .find(|e| e.package == path && e.item == name)
+        {
+            e.name.to_owned()
+        } else if pkg == packages.len().saturating_sub(1) {
             name.to_owned()
         } else {
             let last = packages[pkg].path.rsplit('/').next().unwrap_or_default();
@@ -1594,6 +1605,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        self.collect_prelude();
         // A package that can't be compiled for the target said so: what uses
         // it would only give errors that follow from that one.
         if self.package_error {
@@ -1952,7 +1964,23 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 None => {
-                    self.error(t.span, format!("unknown type `{}`", t.name));
+                    match crate::prelude::entry(&t.name) {
+                        Some(e) if self.unqualified_in(pkg, file, &t.name).is_some() => {
+                            self.diags.push(
+                                Diagnostic::error(
+                                    owner.span(),
+                                    format!(
+                                        "the methods of `{}` (from the prelude) can only be declared in package `{}`, which declares it",
+                                        t.name, e.package
+                                    ),
+                                )
+                                .with_help(
+                                    "every method of a type is declared next to the type (docs/types.md, Methods)",
+                                ),
+                            );
+                        }
+                        _ => self.error(t.span, format!("unknown type `{}`", t.name)),
+                    }
                     return None;
                 }
             },
@@ -2695,7 +2723,7 @@ impl<'a> Checker<'a> {
                     );
                     None
                 }
-                None => match self.pkgs[cx.pkg].items.get(&id.name) {
+                None => match self.unqualified(cx, &id.name) {
                     Some(Item::Type(ty)) => Some(*ty),
                     Some(Item::Refined(_)) => {
                         self.refined_here(id.span, &id.name);
@@ -3146,7 +3174,17 @@ impl<'a> Checker<'a> {
             self.error(span, format!("package `{path}` has no `{name}`"));
             return None;
         };
-        let is_pub = match item {
+        if pkg != cx.pkg && !self.item_is_pub(item) {
+            let path = self.pkgs[pkg].path.clone();
+            self.error(span, format!("`{name}` is private to package `{path}`"));
+            return None;
+        }
+        Some(item)
+    }
+
+    /// Whether `item` is visible outside its package.
+    fn item_is_pub(&self, item: Item) -> bool {
+        match item {
             Item::Func(id) => self.sigs[id].is_pub,
             Item::Const(id) => self.consts[id].decl.is_pub,
             Item::Type(ty) => match ty.as_struct() {
@@ -3156,13 +3194,47 @@ impl<'a> Checker<'a> {
             Item::Trait(t) => self.traits[self.trait_index[&t]].decl.is_pub,
             Item::Refined(k) => self.refined_types[k].decl.is_pub,
             Item::Static(k) => self.statics[k].decl.is_pub,
-        };
-        if pkg != cx.pkg && !is_pub {
-            let path = self.pkgs[pkg].path.clone();
-            self.error(span, format!("`{name}` is private to package `{path}`"));
-            return None;
         }
-        Some(item)
+    }
+
+    /// The items of the prelude ([`crate::prelude`]) whose packages are
+    /// loaded: the loader loads them for the packages that may use them.
+    fn collect_prelude(&mut self) {
+        for entry in crate::prelude::PRELUDE {
+            let Some(pkg) = self.pkgs.iter().position(|p| p.path == entry.package) else {
+                continue;
+            };
+            // (A standard library without the item, from `$LODE_STD`, leaves
+            // the name unknown.)
+            if let Some(&item) = self.pkgs[pkg].items.get(entry.item)
+                && self.item_is_pub(item)
+            {
+                self.prelude.insert(entry.name, item);
+            }
+        }
+    }
+
+    /// The item an unqualified `name` names in package `pkg`, from `file`:
+    /// the package's own, or else the prelude's, unless the file imports a
+    /// package under that name. Locals, type parameters and built-in names
+    /// are the caller's to look up first (docs/packages.md, The prelude).
+    fn unqualified_in(&self, pkg: usize, file: FileId, name: &str) -> Option<&Item> {
+        self.pkgs[pkg].items.get(name).or_else(|| {
+            let imported = self
+                .imports
+                .get(&file)
+                .is_some_and(|m| m.contains_key(name));
+            if imported {
+                None
+            } else {
+                self.prelude.get(name)
+            }
+        })
+    }
+
+    /// [`Checker::unqualified_in`] `cx`'s package and file.
+    fn unqualified(&self, cx: &FnCx, name: &str) -> Option<&Item> {
+        self.unqualified_in(cx.pkg, cx.file, name)
     }
 
     /// The package an import name refers to in `cx`'s file, unless a local
@@ -3627,7 +3699,7 @@ impl<'a> Checker<'a> {
     /// Report an assignment to `name`, which is not a variable: a constant,
     /// or nothing known.
     fn unknown_target(&mut self, cx: &FnCx, name: &str, span: Span) {
-        if let Some(Item::Const(_)) = self.pkgs[cx.pkg].items.get(name) {
+        if let Some(Item::Const(_)) = self.unqualified(cx, name) {
             self.diags.push(
                 Diagnostic::error(
                     span,
@@ -4255,7 +4327,7 @@ impl<'a> Checker<'a> {
                 };
                 // A `static`, assigned like a place.
                 if cx.lookup(name).is_none()
-                    && let Some(Item::Static(_)) = self.pkgs[cx.pkg].items.get(name)
+                    && let Some(Item::Static(_)) = self.unqualified(cx, name)
                 {
                     return self.place_assign(cx, target, *op, value, *span);
                 }
@@ -5899,7 +5971,7 @@ impl<'a> Checker<'a> {
         };
         // A `static` of the package, or a local.
         let local = cx.lookup(name);
-        if local.is_none() && !matches!(self.pkgs[cx.pkg].items.get(name), Some(Item::Static(_))) {
+        if local.is_none() && !matches!(self.unqualified(cx, name), Some(Item::Static(_))) {
             self.unknown_target(cx, name, root.span);
             return None;
         }

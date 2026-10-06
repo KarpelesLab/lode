@@ -25,6 +25,7 @@ pub mod load;
 pub mod lower;
 pub mod mono;
 pub mod parse;
+pub mod prelude;
 pub mod sema;
 pub mod source;
 pub mod stack;

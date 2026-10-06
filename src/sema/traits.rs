@@ -130,7 +130,7 @@ impl<'a> Checker<'a> {
     ) -> Option<Trait> {
         let name = &b.name.name;
         let found = match &b.pkg {
-            None => match self.pkgs[pkg].items.get(name) {
+            None => match self.unqualified_in(pkg, file, name) {
                 Some(&Item::Trait(t)) => Some(t),
                 Some(_) => None,
                 None => Trait::from_name(name),
@@ -164,7 +164,7 @@ impl<'a> Checker<'a> {
         };
         if found.is_none() {
             let text = b.text();
-            let msg = match self.pkgs[pkg].items.get(name) {
+            let msg = match self.unqualified_in(pkg, file, name) {
                 Some(_) if b.pkg.is_none() => format!("`{text}` is not a trait"),
                 _ if b.pkg.is_some() => format!("`{text}` is not a trait"),
                 _ => format!("unknown trait `{text}`"),
@@ -1184,13 +1184,11 @@ impl<'a> Checker<'a> {
     /// imported package, or a built-in one.
     pub(super) fn names_trait(&self, cx: &FnCx, e: &ast::Expr) -> Option<Trait> {
         match &e.kind {
-            ast::ExprKind::Name(n) if cx.lookup(n).is_none() => {
-                match self.pkgs[cx.pkg].items.get(n) {
-                    Some(&Item::Trait(t)) => Some(t),
-                    Some(_) => None,
-                    None => Trait::from_name(n),
-                }
-            }
+            ast::ExprKind::Name(n) if cx.lookup(n).is_none() => match self.unqualified(cx, n) {
+                Some(&Item::Trait(t)) => Some(t),
+                Some(_) => None,
+                None => Trait::from_name(n),
+            },
             ast::ExprKind::Field(base, member) => match &base.kind {
                 ast::ExprKind::Name(p) => {
                     let pkg = self.imported(cx, p)?;
@@ -1225,7 +1223,7 @@ impl<'a> Checker<'a> {
         if self.imported(cx, name).is_some() {
             return None;
         }
-        match self.pkgs[cx.pkg].items.get(name) {
+        match self.unqualified(cx, name) {
             Some(&Item::Type(ty)) if !ty.is_decl_form() => Some(ty),
             _ => None,
         }

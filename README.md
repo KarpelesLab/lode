@@ -75,13 +75,17 @@ What works:
   [docs/allocation.md](docs/allocation.md#m8a-in-the-compiler))
 - allocation: `fn f() uses alloc throws(AllocError)` declares that `f`
   allocates, and a function without `uses alloc` can't call it;
-  `alloc.Box.new(v)` boxes a value on the heap, `b.value` is the boxed
-  value (a place), and destroying the box frees it, through the allocator
-  it came from; `with alloc = h { ... }` installs another allocator for a
+  `Box.new(v)` boxes a value on the heap (`Box` is in the prelude: no
+  import), `b.value` is the boxed value (a place), and destroying the box
+  frees it, through the allocator it came from; `with alloc = h { ... }` installs another allocator for a
   block. The root allocator, `std/alloc`'s `Heap` (size classes, `mmap`),
   is written in Lode. A program that doesn't allocate pays nothing, and one
   with only the root allocator passes no context and keeps no handle in
   its boxes ([docs/allocation.md](docs/allocation.md#m8b-in-the-compiler))
+- the prelude: `Box`, `AllocError`, `Ordering` and the built-in traits
+  need no import; a program loads `std/alloc` for `Box` only if it may use
+  the name, so one that doesn't still checks for every target
+  ([docs/packages.md](docs/packages.md#the-prelude))
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
   `?T` with `none`, `if let`, `let ... else` and `??`; `.dot` and

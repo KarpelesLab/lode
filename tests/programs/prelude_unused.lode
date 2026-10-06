@@ -1,0 +1,19 @@
+// exit: 7
+package main
+
+// No prelude name reaches the prelude here, so it loads no package: the
+// program checks for every target (tests/targets.rs). Its own `Box` hides
+// the prelude's (docs/packages.md, The prelude).
+
+struct Box {
+	v: u32
+}
+
+fn Box.open(self) -> u32 {
+	return self.v
+}
+
+fn main() -> u32 {
+	let b = Box{v: 7}
+	return b.open()
+}

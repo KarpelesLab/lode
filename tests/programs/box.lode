@@ -7,8 +7,9 @@ import "std/alloc"
 import "std/io"
 import "std/os"
 
-// `alloc.Box[T]` owns one `T` on the heap: `b.value` is the boxed value,
-// a place; destroying the box destroys it and frees it.
+// `Box[T]` (from the prelude: no import names it, and it is `alloc.Box`)
+// owns one `T` on the heap: `b.value` is the boxed value, a place;
+// destroying the box destroys it and frees it.
 
 struct Point {
 	x: u32
@@ -40,8 +41,8 @@ fn bump(inout x: u32) {
 }
 
 fn ints() uses alloc throws(AllocError) {
-	let a = try alloc.Box.new(u32(1))
-	var b = try alloc.Box[u32].new(41)
+	let a = try Box.new(u32(1))
+	var b = try Box[u32].new(41)
 	b.value +%= 1
 	io.print("ints: {} {}", a.value, b.value)
 	bump(&b.value)
@@ -49,40 +50,41 @@ fn ints() uses alloc throws(AllocError) {
 }
 
 fn structs() uses alloc throws(AllocError) {
-	var p = try alloc.Box.new(Point{x: 1, y: 2})
+	var p = try Box.new(Point{x: 1, y: 2})
 	p.value.x = 3
 	p.value.y +%= 2
 	io.print(" | structs: {} {} {}", p.value.x, p.value.y, p.value.sum())
 }
 
-// A box moves into a function, which owns it, and back out.
+// A box moves into a function, which owns it, and back out. `alloc.Box`
+// is the same type as `Box`.
 fn keep(sink b: alloc.Box[Noisy]) -> alloc.Box[Noisy] {
 	return b
 }
 
-fn take_and_drop(sink b: alloc.Box[Noisy]) {
+fn take_and_drop(sink b: Box[Noisy]) {
 	io.print(" moved {}", b.value.id)
 }
 
 fn moves() uses alloc throws(AllocError) {
-	let b = try alloc.Box.new(Noisy{id: 5})
+	let b = try Box.new(Noisy{id: 5})
 	let c = keep(b)
 	take_and_drop(c)
-	let outer = try alloc.Box.new(try alloc.Box.new(Noisy{id: 6}))
+	let outer = try Box.new(try Box.new(Noisy{id: 6}))
 	io.print(" | nested {}", outer.value.value.id)
-	var n = try alloc.Box.new(try alloc.Box.new(u32(60)))
+	var n = try Box.new(try Box.new(u32(60)))
 	n.value.value +%= 6
 	io.print(" {}", n.value.value)
 }
 
 fn inner() uses alloc throws(AllocError) {
-	let b = try alloc.Box.new(Noisy{id: 8})
+	let b = try Box.new(Noisy{id: 8})
 	let v = b.into_inner()
 	io.print("inner: {}", v.id)
 }
 
 fn clones() uses alloc throws(AllocError) {
-	let b = try alloc.Box.new(Noisy{id: 9})
+	let b = try Box.new(Noisy{id: 9})
 	let c = try b.clone()
 	io.print(" {} {}", b.value.id, c.value.id)
 }
@@ -90,25 +92,25 @@ fn clones() uses alloc throws(AllocError) {
 // A struct holding a box is a resource too, destroyed field by field.
 struct Holder {
 	label: u32
-	item: alloc.Box[Noisy]
+	item: Box[Noisy]
 }
 
 fn resources() uses alloc throws(AllocError) {
-	let h = Holder{label: 10, item: try alloc.Box.new(Noisy{id: 10})}
+	let h = Holder{label: 10, item: try Box.new(Noisy{id: 10})}
 	io.print(" | resources: {}", h.item.value.id)
 }
 
 // A chain of boxes, destroyed by a loop.
 struct Link {
 	item: Noisy
-	next: ?alloc.Box[Link]
+	next: ?Box[Link]
 }
 
 fn list() uses alloc throws(AllocError) {
-	var head: ?alloc.Box[Link] = none
+	var head: ?Box[Link] = none
 	for i in 1..4 {
 		let rest = head.take()
-		head = try alloc.Box.new(Link{item: Noisy{id: u32(i)}, next: rest})
+		head = try Box.new(Link{item: Noisy{id: u32(i)}, next: rest})
 	}
 	if let b = head {
 		io.print(" | list: {}", b.value.item.id)
@@ -126,7 +128,7 @@ fn root_again() uses alloc throws(AllocError) -> u32 {
 		h = alloc.handle(alloc.ROOT)
 	}
 	with alloc = h {
-		let b = try alloc.Box.new(u32(42))
+		let b = try Box.new(u32(42))
 		return b.value
 	}
 }
@@ -136,7 +138,7 @@ fn fds() uses alloc throws(AllocError) -> bool {
 	let f = os.open("/dev/null", os.O_RDONLY, 0) catch _ {
 		return false
 	}
-	let b = try alloc.Box.new(f)
+	let b = try Box.new(f)
 	return b.value.fd >= 3
 }
 

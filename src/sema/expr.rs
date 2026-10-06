@@ -565,15 +565,13 @@ impl Checker<'_> {
             ExprKind::Char(c) => Some(i128::from(*c)),
             ExprKind::Paren(inner) => self.untyped_int(cx, inner),
             ExprKind::Unary(UnOp::Neg, inner) => self.untyped_int(cx, inner).map(|v| -v),
-            ExprKind::Name(name) if cx.lookup(name).is_none() => {
-                match self.pkgs[cx.pkg].items.get(name) {
-                    Some(&Item::Const(id)) => match self.const_value(id)? {
-                        ConstVal::Untyped(v) => Some(v),
-                        ConstVal::Typed(..) | ConstVal::Table(..) | ConstVal::Expr(_) => None,
-                    },
-                    _ => None,
-                }
-            }
+            ExprKind::Name(name) if cx.lookup(name).is_none() => match self.unqualified(cx, name) {
+                Some(&Item::Const(id)) => match self.const_value(id)? {
+                    ConstVal::Untyped(v) => Some(v),
+                    ConstVal::Typed(..) | ConstVal::Table(..) | ConstVal::Expr(_) => None,
+                },
+                _ => None,
+            },
             ExprKind::Field(base, member) => {
                 let ExprKind::Name(pkg_name) = &base.kind else {
                     return None;
@@ -880,7 +878,7 @@ impl Checker<'_> {
                 {
                     return Some(Some(p));
                 }
-                match self.pkgs[cx.pkg].items.get(name) {
+                match self.unqualified(cx, name) {
                     Some(&Item::Type(ty)) => Some(Some(ty)),
                     None if name == "Ordering" => Some(Some(Ty::ordering())),
                     None if name == "AllocError" => Some(Some(Ty::alloc_error())),
@@ -999,7 +997,7 @@ impl Checker<'_> {
     pub(super) fn generic_literal(&self, cx: &FnCx, e: &ast::Expr) -> bool {
         let names_generic = |t: &ast::Expr| {
             let item = match &t.kind {
-                ExprKind::Name(n) if cx.lookup(n).is_none() => self.pkgs[cx.pkg].items.get(n),
+                ExprKind::Name(n) if cx.lookup(n).is_none() => self.unqualified(cx, n),
                 ExprKind::Field(base, member) => match &base.kind {
                     ExprKind::Name(p) => self
                         .imported(cx, p)
@@ -2234,7 +2232,7 @@ impl Checker<'_> {
             c.term = type_range(ty).map(|_| Linear::of(term));
             return Some(c);
         }
-        if let Some(&item) = self.pkgs[cx.pkg].items.get(name) {
+        if let Some(&item) = self.unqualified(cx, name) {
             return self.item_value(cx, item, name, span);
         }
         if name == super::TARGET && self.imported(cx, name).is_none() {
@@ -2285,7 +2283,7 @@ impl Checker<'_> {
             // A failed local: its error is reported.
             return cx.failed.contains(&local);
         }
-        if self.pkgs[cx.pkg].items.contains_key(name) || self.imported(cx, name).is_some() {
+        if self.unqualified(cx, name).is_some() || self.imported(cx, name).is_some() {
             return false;
         }
         let mut d = Diagnostic::error(base.span, format!("unknown package or variable `{name}`"));
@@ -3641,10 +3639,10 @@ impl Checker<'_> {
                 if let Some(ty) = Self::type_param(cx, name) {
                     return self.param_conversion(cx, ty, args, span);
                 }
-                if let Some(&Item::Func(id)) = self.pkgs[cx.pkg].items.get(name) {
+                if let Some(&Item::Func(id)) = self.unqualified(cx, name) {
                     self.callable(id, callee.span)?;
                     (id, name.clone())
-                } else if let Some(&Item::Type(ty)) = self.pkgs[cx.pkg].items.get(name) {
+                } else if let Some(&Item::Type(ty)) = self.unqualified(cx, name) {
                     if ty.as_enum().is_some() {
                         return self.enum_from(cx, ty, args, span);
                     }
@@ -3653,7 +3651,7 @@ impl Checker<'_> {
                         format!("`{name}` is a struct; build one with `{name}{{...}}`"),
                     );
                     return None;
-                } else if let Some(&Item::Refined(k)) = self.pkgs[cx.pkg].items.get(name) {
+                } else if let Some(&Item::Refined(k)) = self.unqualified(cx, name) {
                     return self.refined_conversion(cx, k, name, callee.span, args, span);
                 } else if primitive(name, self.ptr_bits).is_some() {
                     return self.conversion(cx, name, callee.span, args, span);

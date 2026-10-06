@@ -2,7 +2,6 @@
 // stdout: destroyed 1000000\n
 package main
 
-import "std/alloc"
 import "std/io"
 
 // A chain of a million boxes, built and destroyed with a constant stack:
@@ -26,15 +25,15 @@ fn Tick.deinit(sink self) {
 
 struct Node {
 	tick: Tick
-	next: ?alloc.Box[Node]
+	next: ?Box[Node]
 }
 
-fn build(n: u64) uses alloc throws(AllocError) -> ?alloc.Box[Node] {
-	var head: ?alloc.Box[Node] = none
+fn build(n: u64) uses alloc throws(AllocError) -> ?Box[Node] {
+	var head: ?Box[Node] = none
 	var i: u64 = 0
 	while i < n {
 		let rest = head.take()
-		head = try alloc.Box.new(Node{tick: Tick{n: i}, next: rest})
+		head = try Box.new(Node{tick: Tick{n: i}, next: rest})
 		i +%= 1
 	}
 	return head

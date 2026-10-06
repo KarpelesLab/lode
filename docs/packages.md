@@ -221,7 +221,8 @@ Go's vocabulary, which is proven:
     throws(AllocError) -> Box[T]`, `b.value` (the boxed value, a place),
     `into_inner(sink self) -> T`, and a `deinit` that destroys the value
     and frees it through the box's handle. `Clone` when `T` is. A chain of
-    boxes (`next: ?Box[Self]`) is destroyed by a loop.
+    boxes (`next: ?Box[Self]`) is destroyed by a loop. `Box` is in the
+    prelude ([below](#the-prelude)): it needs no import.
   - `AllocError` itself is built into the compiler, like `Ordering`:
     `throws(AllocError)` needs no import.
 - `std/math`, generic:
@@ -337,6 +338,50 @@ import yaml "github.com/someone/yaml"         // rename
 The full URL reduces typosquatting, because you see exactly where code comes
 from. It doesn't eliminate it (`github.com/gorila/mux` still looks plausible),
 which is why the points below matter.
+
+## The prelude
+
+**Status:** Implemented (allocation.md, Decision 11)
+
+A few names every package uses without an import:
+
+| Name | What it is |
+|---|---|
+| `Box` | `std/alloc`'s `Box[T]`: the same type as `alloc.Box` |
+| `AllocError`, `Ordering` | built into the compiler |
+| `Eq`, `Ordered`, `Copy`, `Clone`, `Integer`, `Unsigned`, `Signed` | the built-in traits |
+
+`List` and `String` join `Box` when they're in the standard library
+(allocation.md, M8c). The table of the names that come from a package is
+`PRELUDE` in `src/prelude.rs`: adding one is a line there.
+
+**Resolution.** A prelude name is the last place an unqualified name is
+looked up. A local variable or a type parameter of that name, an item of
+the package (in any of its files), or a built-in name comes first; and a
+file that imports a package under that name (`import Box "std/io"`)
+doesn't see the prelude's item either. Methods of `Box` are declared only
+in `std/alloc`, as for any type. The prelude doesn't add to a package's
+items: `io.Box` is an error, and `alloc.Box` is `std/alloc`'s own. In
+messages, a prelude type is shown by its prelude name: `Box[u32]`.
+
+**Pay only for what you use.** A program loads a prelude name's package
+only when it may use the name, so a program that doesn't is exactly what it
+was before (hello world is still 577 bytes), and `lode check --targets=all`
+still works for it: `std/alloc` imports `std/os`, which compiles only for
+Linux. Whether a package may use a name is decided when loading, before
+checking, from each file's tokens: the name is one of the file's
+identifiers, not right after a `.` (`alloc.Box`, `p.Box` are members), and
+neither the file imports a package under the name nor its package declares
+an item of that name outside `if comptime`. Anything else counts (a local
+named `Box`, a field `Box` in a struct literal, a use in an `if comptime`
+branch the target doesn't take), so the scan never misses a use, may load
+a package that isn't needed, and loads the same packages for every target.
+The package is loaded before the one that uses it, as if imported. Using
+`Box` in a program checked for a target `std/os` doesn't support gives
+`std/os`'s own error, `std/os: unsupported target`.
+
+The prelude's packages and what they import can't use its names without
+declaring them: that would be an import cycle, and the loader says so.
 
 ## Versions and supply chain
 

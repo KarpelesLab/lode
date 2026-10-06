@@ -125,3 +125,49 @@ fn usize_is_the_targets() {
         }
     }
 }
+
+/// A program that names no prelude item (docs/packages.md, The prelude)
+/// loads nothing for it, and checks for every target: here its own `Box`
+/// hides the prelude's.
+#[test]
+fn programs_without_prelude_names_check_for_every_target() {
+    let found = check_each(
+        "package main\n\nstruct Box {\n\tv: u32\n}\n\nfn open(b: Box) -> u32 {\n\treturn b.v\n}\n\n\
+         fn main() -> u32 {\n\treturn open(Box{v: 7})\n}\n",
+    );
+    for (target, messages) in lode::target::TARGETS.iter().zip(&found) {
+        assert!(messages.is_empty(), "{}: {messages:?}", target.name);
+    }
+}
+
+/// `Box` without an import loads `std/alloc`, and with it `std/os`: for
+/// the targets `std/os` doesn't support, that's the error, and the only
+/// one.
+#[test]
+fn the_prelude_box_needs_std_os() {
+    let found = check_each(
+        "package main\n\nfn boxed() uses alloc throws(AllocError) -> u32 {\n\
+         \tlet b = try Box.new(u32(7))\n\treturn b.value\n}\n\n\
+         fn main() uses alloc -> u32 {\n\treturn boxed() catch _ {\n\t\treturn 1\n\t}\n}\n",
+    );
+    for (target, messages) in lode::target::TARGETS.iter().zip(&found) {
+        if target.name.ends_with("-linux") {
+            assert!(messages.is_empty(), "{}: {messages:?}", target.name);
+        } else {
+            assert_eq!(messages, &["std/os: unsupported target"], "{}", target.name);
+        }
+    }
+}
+
+/// `lode check --targets` over a program file without prelude names, for
+/// the targets `std/os` doesn't support.
+#[test]
+fn a_program_without_imports_checks_for_small_targets() {
+    let (ok, _, err) = lode(&[
+        "check",
+        "--targets=wasm32,thumbv7m,avr",
+        "tests/programs/prelude_unused.lode",
+    ]);
+    assert!(ok, "{err}");
+    assert_eq!(err, "");
+}
