@@ -23,14 +23,25 @@
 //! parameter's local is assigned its value at the start of the body. The
 //! checker makes sure the instances are finitely many (`sema`'s check of
 //! generic recursion).
+//!
+//! Destruction (docs/allocation.md, Generics): where an instance destroys
+//! a value of a type that needs destruction (a `TStmt::Drop` of a local, a
+//! `TStmt::Destroy`, an assignment that replaces a value), the destruction
+//! of that type is reached too: its `deinit`'s instance, or else a function
+//! made here that destroys its parts (`main.Pair[main.Fd, u8].$destroy`):
+//! a struct's fields in reverse order, the payload of an enum's variant, an
+//! array's elements in order. For a type that needs none (an instance of
+//! generic code for plain data), the checker's moves, temporaries and
+//! destructions are removed, so the code is the same as without them.
 
 use std::collections::HashMap;
 
 use crate::sema::{
-    Func, FuncId, Handler, Local, Program, TExpr, TExprKind, TStmt, stmt_blocks_mut,
-    stmt_exprs_mut, subexprs_mut,
+    Convention, Func, FuncId, Handler, Local, Program, TArm, TExpr, TExprKind, TStmt,
+    stmt_blocks_mut, stmt_exprs_mut, subexprs_mut,
 };
-use crate::types::Ty;
+use crate::source::Span;
+use crate::types::{IntTy, Ty};
 
 /// The concrete functions of a program, reached from its root.
 #[derive(Debug)]
@@ -46,6 +57,10 @@ pub struct Instances {
     pub tables: Vec<bool>,
     /// Whether an instance calls `main` (`main` is recursive).
     pub root_called: bool,
+    /// The function that destroys a value of each type that needs
+    /// destruction and is destroyed somewhere: its `deinit`'s instance, or
+    /// one made here. It takes the value's address.
+    pub destroy: HashMap<Ty, FuncId>,
 }
 
 /// The instances `main` reaches. A program without `main` (a library:
@@ -61,6 +76,9 @@ pub fn instantiate(program: &Program) -> Instances {
         tables: vec![false; program.tables.len()],
         root: None,
         root_called: false,
+        destroy: HashMap::new(),
+        made: Vec::new(),
+        span: program.funcs.first().map(|f| f.span).unwrap_or_default(),
     };
     let main = match program.main {
         Some(main) => {
@@ -90,6 +108,11 @@ pub fn instantiate(program: &Program) -> Instances {
         origin[id] = orig;
         m.funcs[id] = Some(f);
     }
+    // The destructions made here come last.
+    origin.resize(m.funcs.len(), 0);
+    for &id in &m.made {
+        origin[id] = program.funcs.len();
+    }
     // The instances in the order of their functions in the program (and of
     // their making, for one function's), so the code's layout doesn't
     // depend on the order calls are found in.
@@ -115,6 +138,11 @@ pub fn instantiate(program: &Program) -> Instances {
         strings: m.strings,
         tables: m.tables,
         root_called: m.root_called,
+        destroy: m
+            .destroy
+            .into_iter()
+            .map(|(ty, id)| (ty, new_id[id]))
+            .collect(),
     }
 }
 
@@ -162,6 +190,13 @@ struct Mono<'p> {
     tables: Vec<bool>,
     root: Option<FuncId>,
     root_called: bool,
+    /// The destruction of each type, as in [`Instances::destroy`].
+    destroy: HashMap<Ty, FuncId>,
+    /// The destructions made here (see [`Mono::destroy_fn`]).
+    made: Vec<FuncId>,
+    /// The span of the function being made, for the destructions it
+    /// makes (their debug information).
+    span: Span,
 }
 
 impl Mono<'_> {
@@ -212,7 +247,7 @@ impl Mono<'_> {
         if !own.is_empty() {
             symbol = format!("{symbol}[{}]", names(own));
         }
-        let locals = f
+        let locals: Vec<Local> = f
             .locals
             .iter()
             .map(|l| Local {
@@ -220,6 +255,7 @@ impl Mono<'_> {
                 ty: l.ty.subst(&map),
                 mutable: l.mutable,
                 convention: l.convention,
+                drop_flag: l.drop_flag,
             })
             .collect();
         // Each value parameter's local starts with its value.
@@ -245,9 +281,8 @@ impl Mono<'_> {
             })
             .collect();
         body.extend(f.body.iter().cloned());
-        for s in &mut body {
-            self.stmt(s, &map);
-        }
+        self.span = f.span;
+        self.block(&mut body, &map, &locals);
         Func {
             name: f.name.clone(),
             symbol,
@@ -264,19 +299,83 @@ impl Mono<'_> {
         }
     }
 
-    fn stmt(&mut self, s: &mut TStmt, map: &impl Fn(Ty) -> Option<Ty>) {
-        for e in stmt_exprs_mut(s) {
-            self.expr(e, map);
-        }
-        for block in stmt_blocks_mut(s) {
-            for s in block {
-                self.stmt(s, map);
-            }
+    /// A statement list: what it destroys of types that need no
+    /// destruction is removed, the rest is made concrete.
+    fn block(&mut self, stmts: &mut Vec<TStmt>, map: &impl Fn(Ty) -> Option<Ty>, locals: &[Local]) {
+        stmts.retain(|s| match s {
+            TStmt::Drop { local, .. } => locals[*local].ty.needs_destroy(),
+            TStmt::Destroy(place) => place.ty.subst(map).needs_destroy(),
+            _ => true,
+        });
+        for s in stmts {
+            self.stmt(s, map, locals);
         }
     }
 
-    fn expr(&mut self, e: &mut TExpr, map: &impl Fn(Ty) -> Option<Ty>) {
+    fn stmt(&mut self, s: &mut TStmt, map: &impl Fn(Ty) -> Option<Ty>, locals: &[Local]) {
+        for e in stmt_exprs_mut(s) {
+            self.expr(e, map, locals);
+        }
+        // What the statement destroys.
+        let destroyed = match s {
+            TStmt::Drop { local, .. } | TStmt::Assign(local, _) => Some(locals[*local].ty),
+            TStmt::Destroy(place) | TStmt::Store(place, _) => Some(place.ty),
+            _ => None,
+        };
+        if let Some(ty) = destroyed
+            && ty.needs_destroy()
+        {
+            self.destroy_fn(ty);
+        }
+        for block in stmt_blocks_mut(s) {
+            self.block(block, map, locals);
+        }
+    }
+
+    /// The function that destroys a value of type `ty` (concrete, and
+    /// needing destruction): its `deinit`'s instance, or one made here
+    /// that destroys its parts.
+    fn destroy_fn(&mut self, ty: Ty) -> FuncId {
+        if let Some(&id) = self.destroy.get(&ty) {
+            return id;
+        }
+        if ty.has_deinit() {
+            let f = self.program.deinits[&ty.decl()];
+            let id = self.instance(f, ty.type_args().to_vec());
+            self.destroy.insert(ty, id);
+            return id;
+        }
+        let id = self.funcs.len();
+        self.funcs.push(None);
+        self.destroy.insert(ty, id);
+        self.made.push(id);
+        let mut f = destroy_parts(ty, format!("{}.$destroy", self.type_symbol(ty)), self.span);
+        let locals = f.locals.clone();
+        self.block(&mut f.body, &|_| None, &locals);
+        self.funcs[id] = Some(f);
+        id
+    }
+
+    fn expr(&mut self, e: &mut TExpr, map: &impl Fn(Ty) -> Option<Ty>, locals: &[Local]) {
         e.ty = e.ty.subst(map);
+        // A move or a temporary of a type that needs no destruction is its
+        // value.
+        while let TExprKind::Move(inner, _) | TExprKind::Temp(_, inner) = &mut e.kind
+            && !e.ty.needs_destroy()
+        {
+            let inner = std::mem::replace(
+                &mut **inner,
+                TExpr {
+                    kind: TExprKind::Bool(false),
+                    ty: Ty::Bool,
+                },
+            );
+            *e = inner;
+            e.ty = e.ty.subst(map);
+        }
+        if let TExprKind::Temp(local, _) = e.kind {
+            self.destroy_fn(locals[local].ty);
+        }
         // `a.lt(b)` of a type that implements `Ordered` with an `impl`.
         if let TExprKind::Compare(a, _) | TExprKind::Binary(_, a, _) = &e.kind
             && let Some(call) = self.program.dispatch.ordered_expr(e, a.ty.subst(map))
@@ -305,15 +404,11 @@ impl Mono<'_> {
             TExprKind::Catch {
                 handler: Handler::Block(body),
                 ..
-            } => {
-                for s in body {
-                    self.stmt(s, map);
-                }
-            }
+            } => self.block(body, map, locals),
             _ => {}
         }
         for sub in subexprs_mut(e) {
-            self.expr(sub, map);
+            self.expr(sub, map, locals);
         }
     }
 
@@ -348,5 +443,102 @@ impl Mono<'_> {
             return format!("?{}", self.type_symbol(inner));
         }
         ty.to_string()
+    }
+}
+
+/// A function that destroys the parts of a value of type `ty`, which has
+/// no `deinit` (see [`Mono::destroy_fn`]): it takes the value `inout`, and
+/// destroys each part that needs destruction.
+fn destroy_parts(ty: Ty, symbol: String, span: Span) -> Func {
+    let usize_ty = Ty::Int(IntTy {
+        signed: false,
+        bits: 64,
+        size: true,
+    });
+    let mut locals = vec![Local {
+        name: "self".to_owned(),
+        ty,
+        mutable: true,
+        convention: Some(Convention::Inout),
+        drop_flag: false,
+    }];
+    let this = TExpr {
+        kind: TExprKind::Local(0),
+        ty,
+    };
+    let destroy = |kind: TExprKind, ty: Ty| TStmt::Destroy(TExpr { kind, ty });
+    let body = if let Some((elem, n)) = ty.as_known_array() {
+        locals.push(Local {
+            name: "$i".to_owned(),
+            ty: usize_ty,
+            mutable: false,
+            convention: None,
+            drop_flag: false,
+        });
+        let int = |v: u64| TExpr {
+            kind: TExprKind::Int(i128::from(v)),
+            ty: usize_ty,
+        };
+        let index = TExpr {
+            kind: TExprKind::Local(1),
+            ty: usize_ty,
+        };
+        vec![TStmt::For {
+            var: 1,
+            start: int(0),
+            end: int(n),
+            body: vec![destroy(
+                TExprKind::Index(Box::new(this), Box::new(index)),
+                elem,
+            )],
+        }]
+    } else if let Some(def) = ty.as_struct() {
+        (0..def.fields.len())
+            .rev()
+            .filter(|&k| def.fields[k].ty.needs_destroy())
+            .map(|k| {
+                destroy(
+                    TExprKind::Field(Box::new(this.clone()), k as u32),
+                    def.fields[k].ty,
+                )
+            })
+            .collect()
+    } else {
+        let def = ty
+            .sum()
+            .expect("a struct, an enum, an optional, a result or an array");
+        let arms = def
+            .variants
+            .iter()
+            .enumerate()
+            .map(|(v, variant)| TArm {
+                variants: vec![v as u32],
+                body: (0..variant.fields.len())
+                    .rev()
+                    .filter(|&k| variant.fields[k].ty.needs_destroy())
+                    .map(|k| {
+                        destroy(
+                            TExprKind::Payload(Box::new(this.clone()), v as u32, k as u32),
+                            variant.fields[k].ty,
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        vec![TStmt::Match { value: this, arms }]
+    };
+    Func {
+        name: format!("{ty}.$destroy"),
+        symbol,
+        type_params: Vec::new(),
+        owner_params: 0,
+        value_params: Vec::new(),
+        params: vec![0],
+        ret: Ty::Unit,
+        throws: None,
+        locals,
+        body,
+        span,
+        template: false,
     }
 }

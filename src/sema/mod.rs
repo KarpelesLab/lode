@@ -64,6 +64,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         view_params: HashSet::new(),
         refined_types: Vec::new(),
         field_refines: HashMap::new(),
+        deinits: HashSet::new(),
         sources: packages
             .iter()
             .flat_map(|p| &p.files)
@@ -85,6 +86,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
             packages: packages.iter().map(|p| p.path.clone()).collect(),
             warnings: Vec::new(),
             dispatch: Dispatch::default(),
+            deinits: HashMap::new(),
         };
         return (program, ck.diags);
     }
@@ -147,6 +149,12 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
     ck.diags
         .retain(|d| seen.insert((d.span.file, d.span.start, d.span.end, d.message.clone())));
 
+    let deinits = ck
+        .methods
+        .iter()
+        .filter(|&((_, name), _)| name == DEINIT)
+        .map(|(&(ty, _), &id)| (ty, id))
+        .collect();
     let program = Program {
         funcs,
         strings: ck.strings,
@@ -155,6 +163,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         packages: packages.iter().map(|p| p.path.clone()).collect(),
         warnings: Vec::new(),
         dispatch: ck.dispatch,
+        deinits,
     };
     (program, ck.diags)
 }
@@ -345,6 +354,8 @@ struct Checker<'a> {
     /// The refinements of each struct's fields, by declaration, with the
     /// field's index.
     field_refines: HashMap<Ty, Vec<(usize, Rc<refine::Refine>)>>,
+    /// The `deinit` methods, which can't be called directly.
+    deinits: HashSet<FuncId>,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -433,6 +444,38 @@ struct FnCx {
     place_refines: HashMap<LocalId, (Rc<refine::Refine>, refine::Leaf)>,
     /// The refinement of the function's result.
     ret_refine: Option<Rc<refine::Refine>>,
+    /// The pattern bindings that read their value in place, whose type
+    /// isn't `Copy` (docs/allocation.md, Partial moves and patterns): each
+    /// with the place it reads, rooted at a local or at another binding.
+    /// Keeping one moves that local.
+    projections: HashMap<LocalId, TExpr>,
+    /// The temporaries of the statements being checked (see
+    /// [`Checker::temp`]), innermost statement's last.
+    temps: Vec<LocalId>,
+    /// The statements to add after the ones being checked, in their lists:
+    /// the `Drop` of a local they declare. Innermost statement's last.
+    after: Vec<TStmt>,
+    /// The variables `defer` bodies move, which must be assigned at every
+    /// exit they run at.
+    defer_moves: Vec<DeferMove>,
+    /// In a `defer` body: whether it's an `errdefer`, and the depth of the
+    /// scope of the block it's in.
+    defer_kind: Option<(bool, usize)>,
+    /// In a `deinit`: its `self`, which can't be moved.
+    deinit_self: Option<LocalId>,
+}
+
+/// A variable a `defer` body moves (see [`FnCx::defer_moves`]).
+#[derive(Clone, Copy, Debug)]
+struct DeferMove {
+    local: LocalId,
+    /// Whether the `defer` is an `errdefer`, which runs only at the exits
+    /// with an error.
+    on_error: bool,
+    /// The depth of the scope of the block the `defer` is in.
+    depth: usize,
+    /// Where the body moves it.
+    span: Span,
 }
 
 /// For a function returning a `str`: which locals hold only strings with
@@ -456,6 +499,9 @@ struct LoopEdges {
     /// The thresholds of the terms compared in the body (see
     /// [`note_thresholds`]).
     thresholds: Vec<(Term, i128)>,
+    /// The depth of the scope around the loop: a `break` or `continue`
+    /// leaves the deeper ones.
+    scope_depth: usize,
 }
 
 /// The state a trial check of a loop body rolls back.
@@ -507,6 +553,12 @@ impl FnCx {
             pack_params: Vec::new(),
             place_refines: HashMap::new(),
             ret_refine: None,
+            projections: HashMap::new(),
+            temps: Vec::new(),
+            after: Vec::new(),
+            defer_moves: Vec::new(),
+            defer_kind: None,
+            deinit_self: None,
         }
     }
 
@@ -539,6 +591,10 @@ const NEVER: &str = "never";
 
 /// The type implementing the trait, in a trait or an `impl`.
 const SELF: &str = "Self";
+
+/// The method that destroys a value: `fn T.deinit(sink self)`
+/// (docs/allocation.md, Declaring destruction).
+const DEINIT: &str = "deinit";
 
 /// `compile_error("message")`: an error where it's reached.
 const COMPILE_ERROR: &str = "compile_error";
@@ -1166,6 +1222,7 @@ fn matched_local(cx: &mut FnCx, value: expr::Checked, before: &mut Vec<TStmt>) -
         ty,
         mutable: false,
         convention: None,
+        drop_flag: false,
     });
     cx.scopes
         .last_mut()
@@ -1177,6 +1234,58 @@ fn matched_local(cx: &mut FnCx, value: expr::Checked, before: &mut Vec<TStmt>) -
         kind: TExprKind::Local(id),
         ty,
     }
+}
+
+/// The statements that destroy the parts of the value of `local`, of type
+/// `ty` (in a `deinit`, its `self`): a struct's fields in reverse order, or
+/// the payload of an enum's variant, those that aren't `Copy`.
+fn destroy_fields(local: LocalId, ty: Ty) -> Vec<TStmt> {
+    let this = TExpr {
+        kind: TExprKind::Local(local),
+        ty,
+    };
+    let destroy = |kind: TExprKind, ty: Ty| TStmt::Destroy(TExpr { kind, ty });
+    if let Some(def) = ty.as_struct() {
+        return (0..def.fields.len())
+            .rev()
+            .filter(|&k| !def.fields[k].ty.is_copy())
+            .map(|k| {
+                destroy(
+                    TExprKind::Field(Box::new(this.clone()), k as u32),
+                    def.fields[k].ty,
+                )
+            })
+            .collect();
+    }
+    let Some(def) = ty.as_enum() else {
+        return Vec::new();
+    };
+    if def
+        .variants
+        .iter()
+        .all(|v| v.fields.iter().all(|f| f.ty.is_copy()))
+    {
+        return Vec::new();
+    }
+    let arms = def
+        .variants
+        .iter()
+        .enumerate()
+        .map(|(v, variant)| TArm {
+            variants: vec![v as u32],
+            body: (0..variant.fields.len())
+                .rev()
+                .filter(|&k| !variant.fields[k].ty.is_copy())
+                .map(|k| {
+                    destroy(
+                        TExprKind::Payload(Box::new(this.clone()), v as u32, k as u32),
+                        variant.fields[k].ty,
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+    vec![TStmt::Match { value: this, arms }]
 }
 
 /// Whether a checked expression is the result of a call that throws.
@@ -1422,6 +1531,16 @@ impl<'a> Checker<'a> {
         // length in a type can name a constant declared further down, and a
         // field's type a struct declared further down. The bounds of the
         // generic types they name are checked once every field is known.
+        // The types that declare a `deinit` aren't `Copy`, which the bounds
+        // checked below and every signature depend on.
+        for &(f, pkg, _) in &fns {
+            if f.name.name == DEINIT
+                && let Some(TypeExpr::Named(t)) = &f.owner
+                && let Some(Item::Type(ty)) = self.pkgs[pkg].items.get(&t.name)
+            {
+                ty.set_deinit();
+            }
+        }
         self.pending_bounds = Some(Vec::new());
         for &(s, pkg, file, ty) in &structs {
             let fields = self.struct_fields(s, pkg, file, ty);
@@ -1461,6 +1580,11 @@ impl<'a> Checker<'a> {
                 }
             };
             self.sigs.push(sig);
+        }
+        for (id, &(f, _, _)) in fns.iter().enumerate() {
+            if f.name.name == DEINIT && f.owner.is_some() {
+                self.check_deinit(id, f);
+            }
         }
         self.check_impls();
         self.func_states = fns.iter().map(|_| FuncState::Unchecked).collect();
@@ -1771,6 +1895,75 @@ impl<'a> Checker<'a> {
         }
         self.methods.insert((ty, n.clone()), id);
         Some(ty)
+    }
+
+    /// Check the declaration of `fn T.deinit(sink self)`, function `id`:
+    /// `sink self` and nothing else, no result, no error, no parameters or
+    /// bounds of its own, not `unsafe` (docs/allocation.md, Declaring
+    /// destruction).
+    fn check_deinit(&mut self, id: FuncId, f: &ast::FnDecl) {
+        self.deinits.insert(id);
+        let sig = &self.sigs[id];
+        let owner = sig.name.rsplit_once('.').map_or("T", |(t, _)| t).to_owned();
+        let shape = sig.has_self
+            && sig.params.len() == 1
+            && sig.params[0].1 == Convention::Sink
+            && sig.ret == Ty::Unit;
+        let mut errors = Vec::new();
+        if !shape {
+            errors.push(
+                Diagnostic::error(
+                    f.name.span,
+                    "`deinit` takes `sink self` and nothing else, and returns nothing",
+                )
+                .with_help(format!("declare it `fn {owner}.deinit(sink self)`")),
+            );
+        }
+        if sig.throws.is_some() {
+            errors.push(
+                Diagnostic::error(f.name.span, "`deinit` can't throw")
+                    .with_help("destruction runs at the end of scopes, also in functions that don't throw")
+                    .with_help("a type whose cleanup can fail offers a method like `close(sink self) throws(E)`, and its `deinit` does the same cleanup and ignores the error"),
+            );
+        }
+        if sig.is_unsafe {
+            errors.push(
+                Diagnostic::error(
+                    f.name.span,
+                    "`deinit` can't be `unsafe`: destruction runs in safe code",
+                )
+                .with_help("use an `unsafe` block in its body"),
+            );
+        }
+        if sig.type_params.len() > sig.owner_params {
+            errors.push(Diagnostic::error(
+                f.name.span,
+                "`deinit` can't have generic parameters of its own",
+            ));
+        }
+        let decl = self
+            .methods
+            .iter()
+            .find(|&(_, &m)| m == id)
+            .map(|((t, _), _)| *t);
+        if let Some(decl) = decl {
+            let added = decl.decl_params().iter().zip(&sig.bounds).any(|(p, b)| {
+                b.iter()
+                    .any(|t| !self.declared_bounds.get(p).is_some_and(|d| d.contains(t)))
+            });
+            if added {
+                errors.push(
+                    Diagnostic::error(
+                        f.name.span,
+                        "`deinit` can't add bounds to the type's parameters",
+                    )
+                    .with_help(
+                        "every value of every instance is destroyed: declare it for all of them",
+                    ),
+                );
+            }
+        }
+        self.diags.extend(errors);
     }
 
     /// The fields of a struct declaration. A field whose type is in error
@@ -2758,6 +2951,16 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
+        if !ty.is_copy() {
+            self.diags.push(
+                Diagnostic::error(
+                    te.span(),
+                    format!("an error type must be `Copy`, and `{ty}` isn't"),
+                )
+                .with_help("an error is dropped by `catch v` and `catch _`: it can't hold a value that needs destruction"),
+            );
+            return None;
+        }
         Some(ty)
     }
 
@@ -2841,6 +3044,16 @@ impl<'a> Checker<'a> {
                         self.error(
                             t.span(),
                             format!("an array constant has at most {TABLE_MAX} elements"),
+                        );
+                        None
+                    }
+                    Some(ty) if !ty.is_copy() => {
+                        self.diags.push(
+                            Diagnostic::error(
+                                t.span(),
+                                format!("a constant's type must be `Copy`, and `{ty}` isn't"),
+                            )
+                            .with_help("a constant is copied where it's used: make the value with a function instead"),
                         );
                         None
                     }
@@ -3059,7 +3272,37 @@ impl<'a> Checker<'a> {
         }
         self.assume_vparams(&mut cx, id);
         self.assume_params(&mut cx, id);
-        let body = self.block(&mut cx, &f.body.stmts);
+        // A `sink` parameter owns its value: it's destroyed when the body
+        // ends, unless it's moved on. In a `deinit`, `self` isn't destroyed
+        // again (it can't be moved either): its fields are, when the body
+        // ends (docs/allocation.md, Declaring destruction).
+        let mut prologue = Vec::new();
+        for &p in &params {
+            let local = &cx.locals[p];
+            if local.convention != Some(Convention::Sink) || local.ty.is_copy() {
+                continue;
+            }
+            if self.deinits.contains(&id) && p == 0 {
+                cx.deinit_self = Some(p);
+                let fields = destroy_fields(p, local.ty);
+                if !fields.is_empty() {
+                    prologue.push(TStmt::Defer {
+                        body: fields,
+                        on_error: false,
+                    });
+                }
+                continue;
+            }
+            prologue.push(TStmt::Drop {
+                local: p,
+                init: true,
+            });
+        }
+        let mut body = self.block(&mut cx, &f.body.stmts);
+        if !prologue.is_empty() {
+            prologue.append(&mut body);
+            body = prologue;
+        }
         self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
         debug_assert!(cx.failed.is_empty() || crate::diag::has_errors(&self.diags));
@@ -3224,6 +3467,7 @@ impl<'a> Checker<'a> {
             ty,
             mutable,
             convention,
+            drop_flag: false,
         });
         cx.scopes
             .last_mut()
@@ -3248,6 +3492,7 @@ impl<'a> Checker<'a> {
         cx.scopes.push(HashMap::new());
         let mut out = Vec::new();
         for (k, s) in stmts.iter().enumerate() {
+            let (temps, after) = (cx.temps.len(), cx.after.len());
             let checked = match s {
                 Stmt::Defer { body, on_error, .. } => {
                     self.defer(cx, body, *on_error, &stmts[k + 1..])
@@ -3265,12 +3510,82 @@ impl<'a> Checker<'a> {
                 let local = self.declare(cx, &name.name, Ty::Unit, *mutable);
                 cx.failed.insert(local);
             }
-            if checked.is_some() {
-                out.push(TStmt::Loc(s.span()));
-            }
-            out.extend(checked);
+            // The statement's temporaries are destroyed when it ends, and
+            // what it declares owns its value from there.
+            let temps = cx.temps.split_off(temps);
+            let after = cx.after.split_off(after);
+            let Some(checked) = checked else {
+                continue;
+            };
+            out.extend(
+                temps
+                    .iter()
+                    .map(|&local| TStmt::Drop { local, init: false }),
+            );
+            out.push(TStmt::Loc(s.span()));
+            out.push(checked);
+            out.extend(after);
+            out.extend(temps.iter().rev().map(|&t| {
+                TStmt::Destroy(TExpr {
+                    kind: TExprKind::Local(t),
+                    ty: cx.locals[t].ty,
+                })
+            }));
         }
+        // The variables the block's `defer` bodies move are moved at its end.
+        let depth = cx.scopes.len();
+        for l in self.defer_moves_at(cx, depth - 1, false, None) {
+            cx.env.declare_uninit(l);
+            cx.moved.insert(l);
+        }
+        cx.defer_moves.retain(|m| m.depth < depth);
         cx.scopes.pop();
+        out
+    }
+
+    /// The variables the `defer` bodies that an exit runs move: those of
+    /// the blocks deeper than `depth` (the scopes the exit leaves), and of
+    /// their `errdefer`s too for an exit with an error. Each must be
+    /// assigned here, at the exit `at` (`None`: a block's end); after the
+    /// exit, it isn't.
+    fn defer_moves_at(
+        &mut self,
+        cx: &FnCx,
+        depth: usize,
+        error: bool,
+        at: Option<Span>,
+    ) -> Vec<LocalId> {
+        if cx.env.dead {
+            return Vec::new();
+        }
+        let moves: Vec<DeferMove> = cx
+            .defer_moves
+            .iter()
+            .filter(|m| m.depth > depth && (error || !m.on_error))
+            .copied()
+            .collect();
+        let mut out = Vec::new();
+        for m in moves {
+            if cx.env.is_uninit(m.local) && !out.contains(&m.local) {
+                let name = &cx.locals[m.local].name;
+                let what = if m.on_error { "errdefer" } else { "defer" };
+                let d = match at {
+                    Some(at) => Diagnostic::error(
+                        at,
+                        format!("`{name}` may be moved already at this exit, where a `{what}` that moves it runs"),
+                    )
+                    .with_note(m.span, format!("the `{what}` moves `{name}` here")),
+                    None => Diagnostic::error(
+                        m.span,
+                        format!("this `{what}` moves `{name}`, which may be moved already at the end of its block"),
+                    ),
+                };
+                self.diags.push(d.with_help(format!(
+                    "a `{what}` that moves a variable runs only where it's still assigned: don't move `{name}` after it"
+                )));
+            }
+            out.push(m.local);
+        }
         out
     }
 
@@ -3306,9 +3621,11 @@ impl<'a> Checker<'a> {
         }
         let loop_depth = std::mem::replace(&mut cx.loop_depth, 0);
         let floor = std::mem::replace(&mut cx.defer_floor, cx.locals.len());
+        let kind = cx.defer_kind.replace((on_error, cx.scopes.len()));
         cx.defer_depth += 1;
         let checked = self.block(cx, &body.stmts);
         cx.defer_depth -= 1;
+        cx.defer_kind = kind;
         cx.defer_floor = floor;
         cx.loop_depth = loop_depth;
         cx.env = saved;
@@ -3576,7 +3893,12 @@ impl<'a> Checker<'a> {
                     if let Some(r) = named {
                         cx.place_refines.insert(local, (r, refine::Leaf::Value));
                     }
-                    return None;
+                    if ty.is_copy() {
+                        return None;
+                    }
+                    // It owns what it's assigned, from here.
+                    cx.locals[local].drop_flag = true;
+                    return Some(TStmt::Drop { local, init: false });
                 };
                 if cx.scopes.last().expect("scope").contains_key(&name.name) {
                     self.error(
@@ -3611,7 +3933,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.consume(cx, &value.expr, init.span)?;
+                let value = self.kept(cx, value, init.span)?;
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
                 self.check_kept_view(cx, &value, init.span)?;
                 if let Some(r) = named {
@@ -3620,6 +3942,9 @@ impl<'a> Checker<'a> {
                 }
                 self.record_value(cx, local, &value);
                 self.assume_local_refine(cx, local);
+                if !value.ty().is_copy() {
+                    cx.after.push(TStmt::Drop { local, init: true });
+                }
                 Some(TStmt::Init(local, value.expr))
             }
             Stmt::Assign {
@@ -3683,12 +4008,20 @@ impl<'a> Checker<'a> {
                     }
                 };
                 let checked = checked.and_then(|c| self.coerce(cx, c, ty, value.span));
-                let checked = checked.filter(|c| self.consume(cx, &c.expr, value.span).is_some());
+                let checked = checked.and_then(|c| self.kept(cx, c, value.span));
                 let Some(checked) = checked else {
                     // As for a place above: the variable is still assigned.
                     cx.env.forget(local);
                     return None;
                 };
+                if !ty.is_copy() {
+                    // The old value is destroyed, if there's one: the drop
+                    // flag says, where there may be none.
+                    if cx.env.is_uninit(local) {
+                        cx.locals[local].drop_flag = true;
+                    }
+                    Self::invalidate_projections(cx, local);
+                }
                 self.check_kept_view(cx, &checked, value.span)?;
                 self.check_local_refine(cx, local, &checked, value.span);
                 self.record_value(cx, local, &checked);
@@ -3707,8 +4040,10 @@ impl<'a> Checker<'a> {
                 None
             }
             Stmt::Expr(e) => match &e.kind {
+                // A value that isn't `()` is destroyed right away.
                 ExprKind::Call(..) | ExprKind::Try(_) => {
-                    Some(TStmt::Expr(self.expr(cx, e, None)?.expr))
+                    let c = self.expr(cx, e, None)?;
+                    Some(TStmt::Expr(self.temp(cx, c).expr))
                 }
                 // The value is dropped, so the block may end normally.
                 ExprKind::Catch {
@@ -3736,7 +4071,10 @@ impl<'a> Checker<'a> {
             // Like a `return`, a `throw` that fails to check still ends
             // control flow; lowering never sees it.
             Stmt::Throw { value, span } => Some(match self.throw(cx, value, *span) {
-                Some(e) => TStmt::Throw(e),
+                Some(e) => {
+                    self.defer_moves_at(cx, 0, true, Some(*span));
+                    TStmt::Throw(e)
+                }
                 None => TStmt::Return(None),
             }),
             // Only reached for a `defer` outside a block's statements.
@@ -3767,7 +4105,7 @@ impl<'a> Checker<'a> {
                         .expr(cx, v, Some(ret))
                         .inspect(|checked| self.check_return_refine(cx, checked, v.span))
                         .and_then(|checked| self.coerce(cx, checked, ret, v.span))
-                        .filter(|c| self.consume(cx, &c.expr, v.span).is_some())
+                        .and_then(|c| self.kept(cx, c, v.span))
                         .map(|c| c.expr),
                 };
                 if let (Some(e), Ty::Str) = (&value, cx.ret) {
@@ -3780,6 +4118,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.check_set_params(cx, *span);
+                self.defer_moves_at(cx, 0, false, Some(*span));
                 Some(TStmt::Return(value))
             }
             Stmt::If(i) => Some(self.if_stmt(cx, i)),
@@ -3846,12 +4185,17 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
+                let depth = cx.loops.last().expect("in a loop").scope_depth;
+                let mut env = cx.env.clone();
+                for l in self.defer_moves_at(cx, depth, false, Some(*span)) {
+                    env.declare_uninit(l);
+                }
                 let edges = cx.loops.last_mut().expect("in a loop");
                 Some(if matches!(stmt, Stmt::Break(_)) {
-                    edges.exits.push(cx.env.clone());
+                    edges.exits.push(env);
                     TStmt::Break
                 } else {
-                    edges.next.push(cx.env.clone());
+                    edges.next.push(env);
                     TStmt::Continue
                 })
             }
@@ -3923,10 +4267,7 @@ impl<'a> Checker<'a> {
             return None;
         };
         let mut before = Vec::new();
-        if !matches!(checked.expr.kind, TExprKind::Local(_)) {
-            self.consume(cx, &checked.expr, value.span)?;
-        }
-        let matched = matched_local(cx, checked, &mut before);
+        let matched = self.scrutinee(cx, checked, value.span, &mut before)?;
         let entry = cx.env.clone();
         let mut covered = vec![false; def.variants.len()];
         let mut wildcard: Option<Span> = None;
@@ -4062,9 +4403,10 @@ impl<'a> Checker<'a> {
                         fty,
                         None,
                     );
-                    if self.consume(cx, &value.expr, b.span).is_none() {
-                        cx.failed.insert(local);
-                        continue;
+                    // A binding reads the payload in place: keeping it
+                    // moves the matched value.
+                    if !fty.is_copy() {
+                        cx.projections.insert(local, value.expr.clone());
                     }
                     self.record_value(cx, local, &value);
                     body.push(TStmt::Init(local, value.expr));
@@ -4364,6 +4706,44 @@ impl<'a> Checker<'a> {
 
     /// `if let name = opt { ... } else { ... }`: a `match` on the optional
     /// `opt`, with `name` bound to its value in the first block.
+    /// The local a `match` or an `if let` looks into, for the value
+    /// `checked` (docs/allocation.md, Partial moves and patterns): the
+    /// local itself; for another place of a type that isn't `Copy`, a
+    /// hidden local that reads it in place, so its bindings do too; or
+    /// else a hidden local the value is stored in, by a statement added to
+    /// `before`, which owns it (destroyed when the statement ends).
+    fn scrutinee(
+        &mut self,
+        cx: &mut FnCx,
+        checked: expr::Checked,
+        span: Span,
+        before: &mut Vec<TStmt>,
+    ) -> Option<TExpr> {
+        if let TExprKind::Local(_) = checked.expr.kind {
+            return Some(checked.expr);
+        }
+        let ty = checked.ty();
+        if !ty.is_copy() && generic::place_local(cx, &checked.expr).is_some() {
+            let place = checked.expr.clone();
+            let matched = matched_local(cx, checked, before);
+            if let TExprKind::Local(m) = matched.kind {
+                cx.projections.insert(m, place);
+            }
+            return Some(matched);
+        }
+        let checked = self.kept(cx, checked, span)?;
+        let matched = matched_local(cx, checked, before);
+        if let TExprKind::Local(m) = matched.kind
+            && !ty.is_copy()
+        {
+            before.push(TStmt::Drop {
+                local: m,
+                init: true,
+            });
+        }
+        Some(matched)
+    }
+
     fn if_let(&mut self, cx: &mut FnCx, i: &ast::IfStmt, name: &ast::Ident) -> TStmt {
         let checked = self.expr(cx, &i.cond, None);
         let inner = match &checked {
@@ -4386,12 +4766,8 @@ impl<'a> Checker<'a> {
         cx.scopes.push(HashMap::new());
         // What a refined result says about the value in it.
         let known = checked.as_ref().and_then(|c| c.payload.clone());
-        let checked = checked.filter(|c| {
-            matches!(c.expr.kind, TExprKind::Local(_))
-                || self.consume(cx, &c.expr, i.cond.span).is_some()
-        });
         let matched = match (checked, inner) {
-            (Some(c), Some(_)) => Some(matched_local(cx, c, &mut before)),
+            (Some(c), Some(_)) => self.scrutinee(cx, c, i.cond.span, &mut before),
             _ => None,
         };
         let entry = cx.env.clone();
@@ -4406,12 +4782,12 @@ impl<'a> Checker<'a> {
         }
         let mut then = Vec::new();
         if let (Some(m), Some(t)) = (&matched, inner) {
+            // The binding reads the value in place, as in a `match`.
             let value = payload(m, 1, 0, t);
-            if self.consume(cx, &value, name.span).is_some() {
-                then.push(TStmt::Init(local, value));
-            } else {
-                cx.failed.insert(local);
+            if !t.is_copy() {
+                cx.projections.insert(local, value.clone());
             }
+            then.push(TStmt::Init(local, value));
         }
         then.extend(self.block(cx, &i.then.stmts));
         cx.scopes.pop();
@@ -4486,12 +4862,24 @@ impl<'a> Checker<'a> {
             return None;
         }
         let mut before = Vec::new();
-        if !matches!(checked.expr.kind, TExprKind::Local(_)) {
-            self.consume(cx, &checked.expr, init.span)?;
-        }
+        let owned = !matches!(checked.expr.kind, TExprKind::Local(_));
+        let checked = if owned {
+            self.kept(cx, checked, init.span)?
+        } else {
+            checked
+        };
         // What a refined result says about the value in it.
         let known = checked.payload.clone();
         let matched = matched_local(cx, checked, &mut before);
+        if let TExprKind::Local(m) = matched.kind
+            && owned
+            && !matched.ty.is_copy()
+        {
+            before.push(TStmt::Drop {
+                local: m,
+                init: true,
+            });
+        }
         let entry = cx.env.clone();
         let else_body = self.block(cx, &otherwise.stmts);
         cx.env = entry;
@@ -4527,9 +4915,12 @@ impl<'a> Checker<'a> {
             value.range = k.0;
             value.known = k.1;
         }
-        self.consume(cx, &value.expr, name.span)?;
+        let value = self.kept(cx, value, name.span)?;
         let local = self.declare(cx, &name.name, inner, mutable);
         self.record_value(cx, local, &value);
+        if !inner.is_copy() {
+            cx.after.push(TStmt::Drop { local, init: true });
+        }
         before.push(TStmt::Match {
             value: matched,
             arms: vec![
@@ -4708,7 +5099,10 @@ impl<'a> Checker<'a> {
         check: &mut impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
     ) -> (T, LoopEdges) {
         cx.env = head;
-        cx.loops.push(LoopEdges::default());
+        cx.loops.push(LoopEdges {
+            scope_depth: cx.scopes.len(),
+            ..LoopEdges::default()
+        });
         cx.loop_depth += 1;
         let (out, reaches_end) = check(self, cx);
         cx.loop_depth -= 1;
@@ -4750,6 +5144,9 @@ impl<'a> Checker<'a> {
         cx.failed.retain(|&l| l < mark.locals);
         cx.ct_values.retain(|&l, _| l < mark.locals);
         cx.place_refines.retain(|&l, _| l < mark.locals);
+        cx.projections.retain(|&l, _| l < mark.locals);
+        cx.temps.retain(|&l| l < mark.locals);
+        cx.defer_moves.retain(|m| m.local < mark.locals);
         cx.strs = mark.strs.clone();
         cx.moved = mark.moved.clone();
         self.generic_calls.truncate(mark.generic_calls);
@@ -4832,10 +5229,19 @@ impl<'a> Checker<'a> {
                     (_, TExprKind::Table(_)) => (xs.clone(), seq.expr),
                     _ => {
                         self.check_looped_slice(cx, &seq.expr, &assigned, xs.span)?;
+                        // A sequence that isn't `Copy` moves into it, and is
+                        // destroyed after the loop.
+                        let seq = self.kept(cx, seq, xs.span)?;
                         let hidden = self.declare(cx, SEQ, seq.ty(), false);
                         self.record_value(cx, hidden, &seq);
                         let ty = seq.ty();
                         before.push(TStmt::Init(hidden, seq.expr));
+                        if !ty.is_copy() {
+                            before.push(TStmt::Drop {
+                                local: hidden,
+                                init: true,
+                            });
+                        }
                         let name = ast::Expr {
                             kind: ExprKind::Name(SEQ.to_owned()),
                             span: xs.span,
@@ -4944,10 +5350,13 @@ impl<'a> Checker<'a> {
                 } else {
                     ck.expr(cx, &element, Some(*elem))
                 };
-                let value = value.filter(|v| ck.consume(cx, &v.expr, var.span).is_some());
                 let x = ck.declare(cx, &var.name, *elem, false);
                 match value {
                     Some(value) => {
+                        // It reads the element in place: it can't be kept.
+                        if !elem.is_copy() {
+                            cx.projections.insert(x, value.expr.clone());
+                        }
                         ck.record_value(cx, x, &value);
                         stmts.push(TStmt::Init(x, value.expr));
                     }
@@ -5203,6 +5612,9 @@ impl<'a> Checker<'a> {
         let target_span = target.span;
         let place = self.expr(cx, &target, None)?;
         self.check_read_only(cx, &place.expr, target_span)?;
+        if !place.ty().is_copy() {
+            Self::invalidate_projections(cx, local);
+        }
         let ty = place.ty();
         let checked = match op {
             None => self.expr(cx, value, Some(ty))?,
@@ -5215,7 +5627,7 @@ impl<'a> Checker<'a> {
             }
         };
         let checked = self.coerce(cx, checked, ty, value.span)?;
-        self.consume(cx, &checked.expr, value.span)?;
+        let checked = self.kept(cx, checked, value.span)?;
         self.check_field_assign(cx, &place.expr, &checked, value.span);
         // A field reached through fields only is a term, or a struct of them:
         // forget what was known about them, then learn their new values.

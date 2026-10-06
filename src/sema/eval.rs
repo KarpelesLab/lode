@@ -488,6 +488,10 @@ impl Eval<'_, '_> {
                 return Err(Exit::Throw(v));
             }
             TStmt::Defer { .. } => unreachable!("handled by `block`"),
+            // Nothing is destroyed at compile time: a `deinit` releases what
+            // a program holds when it runs, and a value made while compiling
+            // holds nothing (docs/allocation.md, When destruction runs).
+            TStmt::Drop { .. } | TStmt::Destroy(_) => {}
         }
         Ok(())
     }
@@ -768,6 +772,9 @@ impl Eval<'_, '_> {
                 return Err(Exit::Throw(v));
             }
             TExprKind::Ref(_) => unreachable!("only a call's argument"),
+            // Values are abstract here: a move or a temporary is its value
+            // (see `TStmt::Drop` in `Eval::stmt`).
+            TExprKind::Move(inner, _) | TExprKind::Temp(_, inner) => self.expr(frame, inner)?,
             TExprKind::Never(inner) => {
                 self.expr(frame, inner)?;
                 return fail("a `never` function returned");

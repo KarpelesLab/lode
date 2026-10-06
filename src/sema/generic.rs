@@ -975,54 +975,125 @@ impl Checker<'_> {
         Some(out)
     }
 
+    /// [`Checker::consume`] of a checked value, which it returns (moved,
+    /// when it's read from a variable).
+    pub(super) fn kept(&mut self, cx: &mut FnCx, mut c: Checked, span: Span) -> Option<Checked> {
+        self.consume(cx, &mut c.expr, span)?;
+        Some(c)
+    }
+
     /// A value is kept (stored in a variable, a field, an element or an
     /// optional, returned, or passed `sink`): if its type isn't `Copy` and
-    /// it's read from a place, it's moved out of it. Only a `let` or `var`,
-    /// or a `sink` parameter, can be moved from, whole: the variable can't
-    /// be used again until it's assigned. Copying an element, a read-only
-    /// parameter or an `inout` one needs `Copy` (docs/generics.md, Copy and
-    /// moves). A value that isn't read from a place is a new value, whose
-    /// parts were kept when it was built.
-    pub(super) fn consume(&mut self, cx: &mut FnCx, e: &TExpr, span: Span) -> Option<()> {
+    /// it's read from a place, it's moved out of it (docs/allocation.md,
+    /// Moves). Only a `let` or `var`, or a `sink` parameter, can be moved
+    /// from, whole: the variable can't be used again until it's assigned,
+    /// and `e` becomes a [`TExprKind::Move`] of it. A field (or what a
+    /// pattern binds) moves the whole variable, which only works when what
+    /// it leaves is `Copy` and no `deinit` holds it together: there are no
+    /// partial moves. Copying an element, a read-only parameter or an
+    /// `inout` one is an error. A value that isn't read from a place is a
+    /// new value, whose parts were kept when it was built.
+    pub(super) fn consume(&mut self, cx: &mut FnCx, e: &mut TExpr, span: Span) -> Option<()> {
         if e.ty.is_copy() {
             return Some(());
         }
-        let Some((local, through_index)) = place_root(e) else {
+        let Some(path) = moved_path(cx, e) else {
             return Some(());
         };
-        let mut missing = Vec::new();
-        e.ty.params(&mut missing);
-        let param = missing.into_iter().find(|p| !p.is_copy()).unwrap_or(e.ty);
-        let text = place_text(cx, e).unwrap_or_else(|| cx.locals[local].name.clone());
+        let local = path.root;
+        let (param, fix) = not_copy(e.ty);
+        let text = place_text(cx, e).unwrap_or_else(|| "this value".to_owned());
         let name = cx.locals[local].name.clone();
-        let add_copy = format!("add the bound `Copy` to copy it: `[{param}: Copy]`");
-        if through_index {
-            self.diags.push(
-                Diagnostic::error(
-                    span,
-                    format!("this copies `{text}`, a `{}`, but `{param}` isn't `Copy`", e.ty),
-                )
-                .with_help(add_copy)
-                .with_help("an element can't be moved out of its array; read it in place instead (compare it, call a method on it, or pass it to a parameter that isn't `sink`)"),
-            );
+        if path.through_index {
+            let mut d = Diagnostic::error(
+                span,
+                format!(
+                    "this copies `{text}`, a `{}`, but `{param}` isn't `Copy`",
+                    e.ty
+                ),
+            )
+            .with_help(fix.clone());
+            if param.as_param().is_none() {
+                d = d.with_help(format!(
+                    "an element can't be moved out of its array: take it with `mem.replace(&{text}, v)` (`std/mem`), or read it in place"
+                ));
+            } else {
+                d = d.with_help("an element can't be moved out of its array; read it in place instead (compare it, call a method on it, or pass it to a parameter that isn't `sink`)");
+            }
+            self.diags.push(d);
             return None;
         }
         match cx.locals[local].convention {
             None | Some(Convention::Sink) => {
-                if cx.defer_depth > 0 && local < cx.defer_floor {
-                    self.diags.push(
+                // The values on the way: none may have a `deinit`, and what's left
+                // of each must be `Copy`.
+                for step in &path.steps {
+                    if step.holder.has_deinit() {
+                        self.diags.push(
                         Diagnostic::error(
                             span,
                             format!(
-                                "a `defer` block can't move `{name}`, which is declared outside it"
+                                "`{text}` can't be moved out of `{}`, a `{}`, which has a `deinit`",
+                                step.text, step.holder
                             ),
                         )
-                        .with_help(add_copy),
+                        .with_help(format!(
+                            "its `deinit` uses all of it: take the part with `mem.replace(&{text}, v)` (`std/mem`)"
+                        )),
+                    );
+                        return None;
+                    }
+                    if let Some(&other) = step.others.iter().find(|t| !t.is_copy()) {
+                        let (_, other_fix) = not_copy(other);
+                        self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!(
+                                "moving `{text}` out of `{name}` would leave the rest of `{}` behind, and `{other}` isn't `Copy`",
+                                step.text
+                            ),
+                        )
+                        .with_help(format!(
+                            "a part of a variable isn't moved alone: move `{name}` whole, or take the part with `mem.replace(&{text}, v)` (`std/mem`)"
+                        ))
+                        .with_help(other_fix),
+                    );
+                        return None;
+                    }
+                }
+                if cx.deinit_self == Some(local) {
+                    self.diags.push(
+                        Diagnostic::error(span, format!("`{text}` can't be moved out of `deinit`"))
+                            .with_help("`deinit` destroys the fields of `self` when it ends"),
                     );
                     return None;
                 }
+                if cx.defer_depth > 0 && local < cx.defer_floor {
+                    // Checked at the exits the `defer` runs at.
+                    let (on_error, depth) = cx.defer_kind.expect("in a `defer`");
+                    cx.defer_moves.push(super::DeferMove {
+                        local,
+                        on_error,
+                        depth,
+                        span,
+                    });
+                }
                 cx.env.declare_uninit(local);
                 cx.moved.insert(local);
+                cx.locals[local].drop_flag = true;
+                Self::invalidate_projections(cx, local);
+                let ty = e.ty;
+                let moved = std::mem::replace(
+                    e,
+                    TExpr {
+                        kind: TExprKind::Bool(false),
+                        ty: Ty::Bool,
+                    },
+                );
+                *e = TExpr {
+                    kind: TExprKind::Move(Box::new(moved), local),
+                    ty,
+                };
                 Some(())
             }
             Some(conv) => {
@@ -1049,11 +1120,28 @@ impl Checker<'_> {
                         span,
                         format!("this copies `{text}`, {what}, but `{param}` isn't `Copy`"),
                     )
-                    .with_help(add_copy)
+                    .with_help(fix)
                     .with_help(help),
                 );
                 None
             }
+        }
+    }
+
+    /// `local` was moved or changed: the pattern bindings that read part of
+    /// it in place, and aren't `Copy`, can't be used any more.
+    pub(super) fn invalidate_projections(cx: &mut FnCx, local: LocalId) {
+        let stale: Vec<LocalId> = cx
+            .projections
+            .iter()
+            .filter(|&(&b, place)| {
+                !cx.locals[b].ty.is_copy() && place_local(cx, place) == Some(local)
+            })
+            .map(|(&b, _)| b)
+            .collect();
+        for b in stale {
+            cx.env.declare_uninit(b);
+            cx.moved.insert(b);
         }
     }
 
@@ -1065,21 +1153,31 @@ impl Checker<'_> {
         }
         let name = &cx.locals[local].name;
         let ty = cx.locals[local].ty;
-        let mut missing = Vec::new();
-        ty.params(&mut missing);
-        let param = missing.into_iter().find(|p| !p.is_copy()).unwrap_or(ty);
-        self.diags.push(
-            Diagnostic::error(
-                span,
-                format!("`{name}` is used after it was moved (on some path to here)"),
-            )
-            .with_help(format!(
-                "a `{ty}` isn't copied, since `{param}` isn't `Copy`: keeping it moves it out of `{name}`"
-            ))
-            .with_help(format!(
-                "add the bound `[{param}: Copy]`, or use `{name}` before it's moved"
-            )),
+        let (param, _) = not_copy(ty);
+        let mut d = Diagnostic::error(
+            span,
+            format!("`{name}` is used after it was moved (on some path to here)"),
         );
+        if cx.projections.contains_key(&local) {
+            d = d.with_help(format!(
+                "`{name}` reads part of a variable in place, which was moved or changed since"
+            ));
+        } else if param.as_param().is_some() {
+            d = d
+                .with_help(format!(
+                    "a `{ty}` isn't copied, since `{param}` isn't `Copy`: keeping it moves it out of `{name}`"
+                ))
+                .with_help(format!(
+                    "add the bound `[{param}: Copy]`, or use `{name}` before it's moved"
+                ));
+        } else {
+            d = d
+                .with_help(format!(
+                    "a `{ty}` isn't `Copy`: keeping it (storing it, returning it, passing it `sink`) moves it out of `{name}`"
+                ))
+                .with_help(format!("use `{name}` before it's moved, or assign it again"));
+        }
+        self.diags.push(d);
         true
     }
 
@@ -1146,13 +1244,139 @@ impl Checker<'_> {
     }
 }
 
-/// The variable a place is part of, and whether an index is on the way: a
-/// local, a field, an element or a payload of one.
-fn place_root(e: &TExpr) -> Option<(LocalId, bool)> {
+/// Where a kept value is read from (see [`Checker::consume`]): the local it
+/// moves, whether an element is on the way, and the values it's part of.
+struct MovePath {
+    root: LocalId,
+    through_index: bool,
+    /// From the local outwards: each struct or variant's payload a part is
+    /// taken out of.
+    steps: Vec<MoveStep>,
+}
+
+/// A value a part is taken out of: its type, how it's written, and the
+/// types of its other parts (the other fields, or the variant's other
+/// payload fields).
+struct MoveStep {
+    holder: Ty,
+    text: String,
+    others: Vec<Ty>,
+}
+
+/// The place a kept value `e` is read from, through the pattern bindings
+/// that read their value in place; `None` for a new value.
+fn moved_path(cx: &FnCx, e: &TExpr) -> Option<MovePath> {
+    let shown = |base: &TExpr| place_text(cx, base).unwrap_or_else(|| "the temporary".to_owned());
     match &e.kind {
-        TExprKind::Local(l) => Some((*l, false)),
-        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) => place_root(base),
-        TExprKind::Index(base, _) => place_root(base).map(|(l, _)| (l, true)),
+        TExprKind::Local(l) => match cx.projections.get(l) {
+            Some(place) => moved_path(cx, place),
+            None => Some(MovePath {
+                root: *l,
+                through_index: false,
+                steps: Vec::new(),
+            }),
+        },
+        TExprKind::Temp(l, _) => Some(MovePath {
+            root: *l,
+            through_index: false,
+            steps: Vec::new(),
+        }),
+        TExprKind::Field(base, i) => {
+            let mut p = moved_path(cx, base)?;
+            let def = base.ty.as_struct()?;
+            let others = def
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| k != *i as usize)
+                .map(|(_, f)| f.ty)
+                .collect();
+            p.steps.push(MoveStep {
+                holder: base.ty,
+                text: shown(base),
+                others,
+            });
+            Some(p)
+        }
+        TExprKind::Payload(base, v, k) => {
+            let mut p = moved_path(cx, base)?;
+            let def = base.ty.sum()?;
+            let others = def.variants[*v as usize]
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != *k as usize)
+                .map(|(_, f)| f.ty)
+                .collect();
+            p.steps.push(MoveStep {
+                holder: base.ty,
+                text: shown(base),
+                others,
+            });
+            Some(p)
+        }
+        TExprKind::Index(base, _) => {
+            let mut p = moved_path(cx, base)?;
+            p.through_index = true;
+            Some(p)
+        }
+        _ => None,
+    }
+}
+
+/// The local a place is part of, through the pattern bindings that read
+/// their value in place.
+pub(super) fn place_local(cx: &FnCx, e: &TExpr) -> Option<LocalId> {
+    match &e.kind {
+        TExprKind::Local(l) => match cx.projections.get(l) {
+            Some(place) => place_local(cx, place),
+            None => Some(*l),
+        },
+        TExprKind::Temp(l, _) => Some(*l),
+        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) | TExprKind::Index(base, _) => {
+            place_local(cx, base)
+        }
+        _ => None,
+    }
+}
+
+/// Why a value of type `ty`, which isn't `Copy`, isn't: the type parameter
+/// without the bound it holds, or else the type itself; and the help to
+/// show.
+pub(super) fn not_copy(ty: Ty) -> (Ty, String) {
+    let mut params = Vec::new();
+    ty.params(&mut params);
+    if let Some(p) = params.into_iter().find(|p| !p.is_copy()) {
+        return (p, format!("add the bound `Copy` to copy it: `[{p}: Copy]`"));
+    }
+    match with_deinit(ty) {
+        Some(owner) if owner == ty => (
+            ty,
+            format!("`{ty}` has a `deinit`: its values are moved, never copied"),
+        ),
+        Some(owner) => (
+            ty,
+            format!(
+                "`{ty}` holds a `{owner}`, which has a `deinit`: its values are moved, never copied"
+            ),
+        ),
+        None => (
+            ty,
+            format!("`{ty}` isn't `Copy`: its values are moved, never copied"),
+        ),
+    }
+}
+
+/// The first type with a `deinit` that a value of type `ty` holds (itself
+/// included).
+fn with_deinit(ty: Ty) -> Option<Ty> {
+    if ty.has_deinit() {
+        return Some(ty);
+    }
+    match ty {
+        Ty::Array(_) => with_deinit(ty.as_array()?.0),
+        Ty::Optional(_) => with_deinit(ty.as_optional()?),
+        Ty::Struct(_) | Ty::Enum(_) => ty.members().into_iter().find_map(with_deinit),
         _ => None,
     }
 }

@@ -602,7 +602,7 @@ impl Checker<'_> {
             && coercible(c.ty(), inner)
         {
             let value = self.coerce(cx, c, inner, span)?;
-            self.consume(cx, &value.expr, span)?;
+            let value = self.kept(cx, value, span)?;
             return Some(Checked::new(
                 TExprKind::Variant(1, vec![value.expr]),
                 target,
@@ -966,7 +966,7 @@ impl Checker<'_> {
             };
             match c
                 .and_then(|c| self.coerce(cx, c, f.ty, arg.span))
-                .filter(|c| self.consume(cx, &c.expr, arg.span).is_some())
+                .and_then(|c| self.kept(cx, c, arg.span))
             {
                 Some(c) => values.push(c.expr),
                 None => ok = false,
@@ -1207,6 +1207,7 @@ impl Checker<'_> {
             }
             Some(_) => {}
         }
+        self.defer_moves_at(cx, 0, true, Some(span));
         let known = c.payload.clone();
         let mut out = Checked::new(TExprKind::Try(Box::new(c.expr)), value, None);
         if let Some(k) = known {
@@ -1243,7 +1244,7 @@ impl Checker<'_> {
             ast::CatchHandler::Value(v) => {
                 let d = self.expr(cx, v, Some(ty));
                 let d = self.coerce(cx, d?, ty, v.span)?;
-                self.consume(cx, &d.expr, v.span)?;
+                let d = self.kept(cx, d, v.span)?;
                 if let Some(k) = &mut known {
                     let r = k.0.or(type_range(ty)).map(|r| r.hull(d.int_range()));
                     **k = (r, Vec::new());
@@ -1427,7 +1428,7 @@ impl Checker<'_> {
             };
             match c
                 .and_then(|c| self.coerce(cx, c, fty, init.value.span))
-                .filter(|c| self.consume(cx, &c.expr, init.value.span).is_some())
+                .and_then(|c| self.kept(cx, c, init.value.span))
             {
                 Some(c) => {
                     if type_range(fty).is_some() {
@@ -1589,7 +1590,7 @@ impl Checker<'_> {
             };
             match c
                 .and_then(|c| self.coerce(cx, c, elem, e.span))
-                .filter(|c| self.consume(cx, &c.expr, e.span).is_some())
+                .and_then(|c| self.kept(cx, c, e.span))
             {
                 Some(c) => out.push(c.expr),
                 None => ok = false,
@@ -1755,6 +1756,7 @@ impl Checker<'_> {
         let usize_ty = self.usize_ty();
         let i = self.expr(cx, index, Some(usize_ty));
         let (b, i) = (b?, i?);
+        let b = self.temp(cx, b);
         let elem = match b.ty() {
             Ty::Array(_) | Ty::Slice(_) => b.ty().elem().expect("array or slice"),
             Ty::Str => {
@@ -2403,6 +2405,7 @@ impl Checker<'_> {
             return None;
         }
         let b = self.expr(cx, base, None)?;
+        let b = self.temp(cx, b);
         match (b.ty(), member.name.as_str()) {
             (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len_of(cx, &b)),
             (Ty::Array(_), "len") => Some(self.array_len(cx, b.expr)),
@@ -2865,6 +2868,8 @@ impl Checker<'_> {
         l: Checked,
         r: Checked,
     ) -> Checked {
+        // Both sides are read in place.
+        let (l, r) = (self.temp(cx, l), self.temp(cx, r));
         let numeric = type_range(l.ty()).is_some();
         if numeric {
             super::note_thresholds(cx, l.side(), r.side());
@@ -2893,7 +2898,7 @@ impl Checker<'_> {
             return None;
         };
         // The value is taken out of the optional.
-        self.consume(cx, &l.expr, lhs.span)?;
+        let l = self.kept(cx, l, lhs.span)?;
         // `opt ?? throw value` leaves the function when `opt` is `none`.
         // The right side runs only then: after it, what's known is what
         // holds whether it ran or not.
@@ -2909,7 +2914,7 @@ impl Checker<'_> {
             _ => {
                 let r = self.expr(cx, rhs, Some(inner))?;
                 let r = self.coerce(cx, r, inner, rhs.span)?;
-                self.consume(cx, &r.expr, rhs.span)?;
+                let r = self.kept(cx, r, rhs.span)?;
                 if let Some(k) = &mut known {
                     let range = k.0.or(type_range(inner)).map(|x| x.hull(r.int_range()));
                     **k = (range, Vec::new());
@@ -3599,6 +3604,13 @@ impl Checker<'_> {
                 return None;
             }
         };
+        if self.deinits.contains(&id) {
+            self.diags.push(
+                Diagnostic::error(callee.span, "`deinit` can't be called directly")
+                    .with_help("a value is destroyed when its variable's scope ends; `mem.destroy(x)` (`std/mem`) destroys it earlier"),
+            );
+            return None;
+        }
         // A call of a function with `comptime` parameters or a pack is a
         // call of its expansion for these arguments.
         let expanded;
@@ -3716,8 +3728,8 @@ impl Checker<'_> {
                         None => None,
                     }
                 }
-                Convention::Sink => self.consume(cx, &recv.expr, rspan).map(|()| recv.expr),
-                _ => Some(recv.expr),
+                Convention::Sink => self.kept(cx, recv, rspan).map(|c| c.expr),
+                _ => Some(self.temp(cx, recv).expr),
             };
             ok &= e.is_some();
             targs.push(e);
@@ -3914,6 +3926,24 @@ impl Checker<'_> {
         // a variable passed `set` is assigned (if the call succeeds).
         let mut sets = Vec::new();
         for (place, conv) in &changed {
+            if !place.ty.is_copy() {
+                if *conv == Convention::Set
+                    && !matches!(place.kind, TExprKind::Local(l) if cx.env.is_uninit(l))
+                {
+                    let text = place_text(cx, place).unwrap_or_else(|| "it".to_owned());
+                    self.diags.push(
+                        Diagnostic::error(
+                            span,
+                            format!("`{text}` holds a value, which `{name}` would replace without destroying it: a `set` argument of a type that isn't `Copy` must be unassigned"),
+                        )
+                        .with_help("pass a variable declared without a value, or moved out of; or pass it `inout`"),
+                    );
+                    ok = false;
+                }
+                if let Some(l) = super::generic::place_local(cx, place) {
+                    Self::invalidate_projections(cx, l);
+                }
+            }
             match place.kind {
                 TExprKind::Local(l) if *conv == Convention::Set => {
                     if cx.env.is_uninit(l) {
@@ -4065,9 +4095,11 @@ impl Checker<'_> {
             _ => {
                 let c = self.expr(cx, arg, Some(pty))?;
                 let c = self.coerce(cx, c, pty, arg.span)?;
-                if conv == Convention::Sink {
-                    self.consume(cx, &c.expr, arg.span)?;
-                }
+                let c = if conv == Convention::Sink {
+                    self.kept(cx, c, arg.span)?
+                } else {
+                    self.temp(cx, c)
+                };
                 let av = self.arg_of_checked(cx, &c);
                 Some((c.expr, av))
             }
@@ -4121,9 +4153,11 @@ impl Checker<'_> {
                 }
                 let pty = inf.apply(pty);
                 let c = self.coerce(cx, c, pty, arg.span)?;
-                if conv == Convention::Sink {
-                    self.consume(cx, &c.expr, arg.span)?;
-                }
+                let c = if conv == Convention::Sink {
+                    self.kept(cx, c, arg.span)?
+                } else {
+                    self.temp(cx, c)
+                };
                 let av = self.arg_of_checked(cx, &c);
                 Some((c.expr, av))
             }
@@ -4244,6 +4278,43 @@ impl Checker<'_> {
                 ),
         );
         None
+    }
+
+    /// A value read in place where it's used, and not kept (a call's
+    /// argument for a read-only parameter, a field read from it, a
+    /// statement's value): when it's a new value (not read from a place) of
+    /// a type that isn't `Copy`, it's a temporary, kept in a hidden local
+    /// that the statement destroys at its end (docs/allocation.md, When
+    /// destruction runs).
+    pub(super) fn temp(&mut self, cx: &mut FnCx, mut c: Checked) -> Checked {
+        let ty = c.ty();
+        if ty.is_copy() || super::generic::place_local(cx, &c.expr).is_some() {
+            return c;
+        }
+        if matches!(c.expr.kind, TExprKind::Move(..) | TExprKind::Never(_)) {
+            return c;
+        }
+        let local = cx.locals.len();
+        cx.locals.push(super::Local {
+            name: "$temp".to_owned(),
+            ty,
+            mutable: false,
+            convention: None,
+            drop_flag: true,
+        });
+        cx.temps.push(local);
+        let inner = std::mem::replace(
+            &mut c.expr,
+            TExpr {
+                kind: TExprKind::Bool(false),
+                ty: Ty::Bool,
+            },
+        );
+        c.expr = TExpr {
+            kind: TExprKind::Temp(local, Box::new(inner)),
+            ty,
+        };
+        c
     }
 
     /// Report a change of `place` (an assignment, `&`, an `inout self`

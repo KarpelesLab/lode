@@ -27,8 +27,10 @@ fn Pair[A: Copy, B: Copy].swap(self) -> Pair[B, A] {
 	return Pair{first: self.second, second: self.first}
 }
 
-/// Moves the parts out of `self`, so it needs no `Copy`.
-fn Pair[A, B].into_first(sink self) -> A {
+/// Moves the first part out of `self`, so `A` needs no `Copy`. The rest of
+/// `self` is left behind, so it must be `Copy`: nothing is moved out of a
+/// variable alone, part by part.
+fn Pair[A, B: Copy].into_first(sink self) -> A {
 	return self.first
 }
 

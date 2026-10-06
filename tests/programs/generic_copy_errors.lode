@@ -1,14 +1,11 @@
 // error: this copies `b`, a read-only parameter, but `T` isn't `Copy`
 // error: this copies `a`, a read-only parameter, but `T` isn't `Copy`
 // error: this copies `xs[0]`, a `T`, but `T` isn't `Copy`
-// error: this copies `xs[...]`, a `T`, but `T` isn't `Copy`
 // error: `a` is used after it was moved (on some path to here)
 // error: `a` is used after it was moved (on some path to here)
 // error: `x` is used after it was moved (on some path to here)
 // error: `[value; 2]` copies its value, but `T` isn't `Copy`
-// error: this copies `o`, a read-only parameter, but `T` isn't `Copy`
 // error: this copies `a`, a parameter the caller keeps, but `T` isn't `Copy`
-// error: a `defer` block can't move `a`, which is declared outside it
 // help: add the bound `Copy` to copy it: `[T: Copy]`
 // help: or take it as `sink a: T`, which moves the caller's value in
 // help: an element can't be moved out of its array
@@ -35,6 +32,8 @@ fn first[T](xs: []T) -> ?T {
 	return none
 }
 
+// Reading in place needs no `Copy`: `for` and pattern bindings read the
+// element or the payload where it is.
 fn each[T: Eq](xs: []T, v: T) -> bool {
 	for x in xs {
 		if x == v {
@@ -78,6 +77,8 @@ fn take[T](inout a: T) -> T {
 	return a
 }
 
+// A `defer` can move a variable declared outside it: it runs where the
+// block ends, and `a` is assigned there.
 fn deferred[T](sink a: T) {
 	defer {
 		let b = keep(a)

@@ -315,10 +315,11 @@ impl Ty {
     }
 
     /// Whether a value of this type can be copied implicitly (the built-in
-    /// trait `Copy`). Every type the compiler has is plain data, so every
-    /// type is, except a type parameter without the bound `Copy` and the
-    /// arrays, optionals, results, structs and enums that hold one. A view
-    /// is `Copy`: copying it doesn't copy what it views.
+    /// trait `Copy`). Plain data is; a struct or an enum with a `deinit`
+    /// isn't, nor a type parameter without the bound `Copy`, nor the
+    /// arrays, optionals, results, structs and enums that hold one of
+    /// those (docs/allocation.md, Which types own resources). A view is
+    /// `Copy`: copying it doesn't copy what it views.
     pub fn is_copy(self) -> bool {
         match self {
             Ty::Param(_) => {
@@ -331,7 +332,9 @@ impl Ty {
                 let (ok, err) = self.as_result().expect("a result");
                 ok.is_copy() && err.is_copy()
             }
-            Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|t| t.is_copy()),
+            Ty::Struct(_) | Ty::Enum(_) => {
+                !self.has_deinit() && self.members().iter().all(|t| t.is_copy())
+            }
             _ => true,
         }
     }
@@ -751,6 +754,7 @@ impl Ty {
                 args: Vec::new(),
                 tag: IntTy::new(false, 8),
                 explicit: false,
+                deinit: false,
                 variants: vec![
                     Variant {
                         name: "ok".to_owned(),
@@ -774,6 +778,7 @@ impl Ty {
             args: Vec::new(),
             tag: IntTy::new(false, 8),
             explicit: false,
+            deinit: false,
             variants: vec![
                 Variant {
                     name: "none".to_owned(),
@@ -805,6 +810,7 @@ impl Ty {
             params: params.clone(),
             tag: IntTy::new(false, 8),
             explicit: false,
+            deinit: false,
             variants: Vec::new(),
         }));
         drop(tables);
@@ -879,6 +885,7 @@ impl Ty {
             args: params.clone(),
             params: params.clone(),
             fields: Vec::new(),
+            deinit: false,
         }));
         drop(tables);
         let args = intern_args(&params);
@@ -901,6 +908,66 @@ impl Ty {
             ..StructDef::clone(entry)
         });
         tables.instances.clear();
+    }
+
+    /// Record that the struct or enum declares a `deinit` (for every
+    /// instance, if it's generic).
+    pub fn set_deinit(self) {
+        let mut tables = interner().lock().unwrap_or_else(|e| e.into_inner());
+        match self {
+            Ty::Struct(id) => {
+                let Compound::Struct { def, .. } = tables.entries[id.0 as usize] else {
+                    unreachable!("a struct id names another type")
+                };
+                let entry = &mut tables.structs[def as usize];
+                *entry = Arc::new(StructDef {
+                    deinit: true,
+                    ..StructDef::clone(entry)
+                });
+            }
+            Ty::Enum(id) => {
+                let Compound::Enum { def, .. } = tables.entries[id.0 as usize] else {
+                    unreachable!("an enum id names another type")
+                };
+                let entry = &mut tables.enums[def as usize];
+                *entry = Arc::new(EnumDef {
+                    deinit: true,
+                    ..EnumDef::clone(entry)
+                });
+            }
+            _ => unreachable!("only a struct or an enum has a `deinit`: {self}"),
+        }
+        tables.instances.clear();
+    }
+
+    /// Whether this is a struct or an enum that declares a `deinit`.
+    pub fn has_deinit(self) -> bool {
+        match self {
+            Ty::Struct(_) => self.as_struct().is_some_and(|d| d.deinit),
+            Ty::Enum(_) => self.as_enum().is_some_and(|d| d.deinit),
+            _ => false,
+        }
+    }
+
+    /// Whether destroying a value of this type does anything: it's a
+    /// struct or an enum with a `deinit`, or it holds one (in a field, a
+    /// payload, an element or an optional). For a type that mentions type
+    /// parameters, whether it does for every instance; generic code
+    /// destroys a value whose type isn't `Copy` (docs/allocation.md, When
+    /// destruction runs), and each instance knows.
+    pub fn needs_destroy(self) -> bool {
+        match self {
+            Ty::Array(_) => self.as_array().expect("an array").0.needs_destroy(),
+            Ty::Optional(_) => self.as_optional().expect("an optional").needs_destroy(),
+            Ty::Result(_) => {
+                let (ok, err) = self.as_result().expect("a result");
+                ok.needs_destroy() || err.needs_destroy()
+            }
+            Ty::Struct(_) | Ty::Enum(_) => {
+                self.has_deinit() || self.members().iter().any(|t| t.needs_destroy())
+            }
+            _ => false,
+        }
     }
 }
 
@@ -931,6 +998,9 @@ pub struct StructDef {
     /// declared form; empty if it isn't generic).
     pub args: Vec<Ty>,
     pub fields: Vec<Field>,
+    /// Whether it declares `fn T.deinit(sink self)` (docs/allocation.md,
+    /// Declaring destruction).
+    pub deinit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -988,6 +1058,9 @@ pub struct EnumDef {
     pub tag: IntTy,
     /// Whether the variants have declared integer values (a C-style enum).
     pub explicit: bool,
+    /// Whether it declares `fn T.deinit(sink self)`, as for
+    /// [`StructDef::deinit`].
+    pub deinit: bool,
     pub variants: Vec<Variant>,
 }
 

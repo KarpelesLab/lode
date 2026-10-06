@@ -32,6 +32,9 @@ pub struct Program {
     pub warnings: Vec<crate::diag::Diagnostic>,
     /// Which function a call of a trait's method runs, by `Self`.
     pub dispatch: Dispatch,
+    /// The `deinit` of each struct or enum that declares one (by its
+    /// declared form, [`Ty::decl`]).
+    pub deinits: HashMap<Ty, FuncId>,
 }
 
 /// The methods declared in traits, and those each `impl` gives: what a call
@@ -113,6 +116,12 @@ pub struct Local {
     pub mutable: bool,
     /// For a parameter, how it's passed (docs/memory.md).
     pub convention: Option<Convention>,
+    /// Whether it may be unassigned where it's destroyed or assigned: moved
+    /// out of on some path, declared without a value, a `set` parameter, or
+    /// a temporary. Lowering keeps a flag for it, when its type needs
+    /// destruction, that says whether it holds a value (docs/allocation.md,
+    /// Moves).
+    pub drop_flag: bool,
 }
 
 impl Local {
@@ -180,6 +189,22 @@ pub enum TStmt {
     /// checker puts one before each statement it checks. It does nothing;
     /// lowering uses it for debug information (`lode build -g`).
     Loc(Span),
+    /// From here to the end of the enclosing statement list, `local` owns
+    /// its value: it's destroyed at every exit of the list, like a `defer`
+    /// registered here, unless it's unassigned there (moved out, or never
+    /// assigned: its drop flag says). `init` says whether it's assigned
+    /// here (just before); without it, it starts unassigned. Its type isn't
+    /// `Copy`; for a type that needs no destruction it does nothing
+    /// (docs/allocation.md, When destruction runs).
+    Drop {
+        local: LocalId,
+        init: bool,
+    },
+    /// Destroy the value at a place now: a field of `self` in a `deinit`,
+    /// the parts of a value in a destruction made by `crate::mono`, or a
+    /// temporary at the end of its statement. A local with a drop flag is
+    /// destroyed only if it holds a value, and is unassigned after.
+    Destroy(TExpr),
 }
 
 /// One arm of a [`TStmt::Match`]: the variants it handles (by index) and
@@ -304,6 +329,17 @@ pub enum TExprKind {
     /// [`Ty::Never`]) where a value of another type is expected, as in
     /// `opt ?? fail()`. The call doesn't return, so there's never a value.
     Never(Box<TExpr>),
+    /// The value of a place rooted at `local` (the local itself, or a field
+    /// of it whose other fields need no destruction), moved out: the local
+    /// is unassigned after it (its drop flag cleared), so it isn't
+    /// destroyed (docs/allocation.md, Moves).
+    Move(Box<TExpr>, LocalId),
+    /// A value that isn't kept (a call's result passed to a read-only
+    /// parameter, a field read from it, a statement's value): it's stored
+    /// in the hidden local `local`, which the statement around it destroys
+    /// at its end, or at an exit before. Of its value's type, which isn't
+    /// `Copy`.
+    Temp(LocalId, Box<TExpr>),
     /// An operation whose proof obligation (overflow, an index in bounds,
     /// a lossless conversion...) wasn't proven, in code that only runs at
     /// compile time: a constant's value or an `if comptime` condition. The
@@ -399,11 +435,13 @@ pub fn stmt_exprs(s: &TStmt) -> Vec<&TExpr> {
         TStmt::Store(place, e) => vec![place, e],
         TStmt::Return(e) => e.iter().collect(),
         TStmt::For { start, end, .. } => vec![start, end],
+        TStmt::Destroy(place) => vec![place],
         TStmt::Loop(_)
         | TStmt::Break
         | TStmt::Continue
         | TStmt::Block(_)
         | TStmt::Defer { .. }
+        | TStmt::Drop { .. }
         | TStmt::Loc(_) => Vec::new(),
     }
 }
@@ -450,6 +488,8 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
         | TExprKind::Never(inner)
+        | TExprKind::Move(inner, _)
+        | TExprKind::Temp(_, inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
@@ -483,11 +523,13 @@ pub fn stmt_exprs_mut(s: &mut TStmt) -> Vec<&mut TExpr> {
         TStmt::Store(place, e) => vec![place, e],
         TStmt::Return(e) => e.iter_mut().collect(),
         TStmt::For { start, end, .. } => vec![start, end],
+        TStmt::Destroy(place) => vec![place],
         TStmt::Loop(_)
         | TStmt::Break
         | TStmt::Continue
         | TStmt::Block(_)
         | TStmt::Defer { .. }
+        | TStmt::Drop { .. }
         | TStmt::Loc(_) => Vec::new(),
     }
 }
@@ -511,6 +553,8 @@ pub fn stmt_blocks_mut(s: &mut TStmt) -> Vec<&mut Vec<TStmt>> {
         | TStmt::Throw(_)
         | TStmt::Break
         | TStmt::Continue
+        | TStmt::Drop { .. }
+        | TStmt::Destroy(_)
         | TStmt::Loc(_) => Vec::new(),
     }
 }
@@ -556,6 +600,8 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Throw(inner)
         | TExprKind::Ref(inner)
         | TExprKind::Never(inner)
+        | TExprKind::Move(inner, _)
+        | TExprKind::Temp(_, inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {

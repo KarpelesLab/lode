@@ -108,6 +108,18 @@
 //! order: at its end, and at every `return`, `throw`, failing `try`,
 //! `break` and `continue` that leaves it. `errdefer` bodies only at the
 //! exits that leave the function with an error.
+//!
+//! Destruction (docs/allocation.md, When destruction runs) goes with them:
+//! a `TStmt::Drop` registers its local where a `defer` would be, and each
+//! exit destroys it, by a call of the function [`crate::mono`] gives its
+//! type (its `deinit`, or one that destroys its parts) with the local's
+//! address. A local the checker gave a drop flag ([`Local::drop_flag`])
+//! has a `bool` slot saying whether it holds a value: a move clears it, an
+//! assignment sets it, and destruction tests it. mem2reg promotes it, and
+//! the optimizer folds it where the paths are known. An assignment to a
+//! place that holds a value destroys the old value after the new one is
+//! computed. A local whose type needs destruction is always in memory
+//! (never split or packed), since destruction takes its address.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -120,7 +132,7 @@ use latticefoundry::ir::{
 };
 use latticefoundry::support::StrInterner;
 
-use crate::mono;
+use crate::mono::{self, Instances};
 use crate::sema::{
     CmpOp, Convention, Func, Handler, Local, LocalId, Mode, Program, TBinOp, TExpr, TExprKind,
     TStmt, TUnOp,
@@ -137,6 +149,15 @@ struct SumIr {
     payloads: Vec<Option<TypeId>>,
     /// Each variant's tag value.
     values: Vec<i128>,
+}
+
+/// What leaving a statement list runs, registered as it's lowered.
+#[derive(Clone)]
+enum Defer {
+    /// A `defer` body, and whether it's an `errdefer`.
+    Body(Rc<[TStmt]>, bool),
+    /// The destruction of a local that owns its value (`TStmt::Drop`).
+    Drop(LocalId),
 }
 
 /// The width of a result's tag (a `u8`), below its payload in the packed
@@ -461,6 +482,9 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
         FnLower {
             b,
             t,
+            reach: &reach,
+            locals: &f.locals,
+            flags: Vec::new(),
             ids: &ids,
             strings: &string_globals,
             string_lens: &program.strings,
@@ -558,6 +582,13 @@ fn exit_status(b: &mut FunctionBuilder<'_>, t: Types, ret: Ty, v: Option<ValueId
 struct FnLower<'a> {
     b: FunctionBuilder<'a>,
     t: Types,
+    /// The program's instances: their parameters' conventions, and the
+    /// destruction of each type.
+    reach: &'a Instances,
+    /// The function's locals.
+    locals: &'a [Local],
+    /// The drop flag of each local that has one (see the module docs).
+    flags: Vec<Option<ValueId>>,
     /// The IR function of each reached function.
     ids: &'a [Option<IrFunc>],
     strings: &'a [GlobalId],
@@ -578,8 +609,8 @@ struct FnLower<'a> {
     /// [`iteration_locals`]).
     names: Vec<u32>,
     /// For each statement list being lowered, innermost last: the `defer`
-    /// bodies registered so far, with whether each is an `errdefer`.
-    defers: Vec<Vec<(Rc<[TStmt]>, bool)>>,
+    /// bodies and the destructions registered so far.
+    defers: Vec<Vec<Defer>>,
     /// Whether the current block already has its terminator.
     terminated: bool,
     /// For the entry function, `main`'s return type: its returns become
@@ -683,7 +714,7 @@ fn packed_locals(f: &Func) -> Vec<bool> {
     let mut packed: Vec<bool> = f
         .locals
         .iter()
-        .map(|l| l.convention.is_none() && returns_packed(l.ty))
+        .map(|l| l.convention.is_none() && returns_packed(l.ty) && !l.ty.needs_destroy())
         .collect();
     for &p in &f.params {
         packed[p] = false;
@@ -728,6 +759,8 @@ fn uses_in_stmts(stmts: &[TStmt], packed: &mut [bool]) {
             TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
                 uses_in_stmts(body, packed)
             }
+            TStmt::Drop { local, .. } => packed[*local] = false,
+            TStmt::Destroy(place) => uses_in_place(place, packed),
             TStmt::Match { value, arms } => {
                 if !matches!(value.kind, TExprKind::Local(_)) {
                     uses_in_expr(value, packed);
@@ -866,6 +899,7 @@ fn split_locals(f: &Func) -> Vec<bool> {
             !memory[l]
                 && local.convention.is_none()
                 && local.ty.as_struct().is_some()
+                && !local.ty.needs_destroy()
                 && leaf_tys(local.ty).is_some_and(|t| t.len() <= SPLIT_LIMIT)
         })
         .collect()
@@ -906,6 +940,8 @@ fn split_in_stmts(stmts: &[TStmt], memory: &mut [bool]) {
             TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
                 split_in_stmts(body, memory)
             }
+            TStmt::Drop { local, .. } => memory[*local] = true,
+            TStmt::Destroy(place) => split_place(place, memory),
             TStmt::Match { value, arms } => {
                 split_in_expr(value, memory);
                 for arm in arms {
@@ -1182,6 +1218,20 @@ impl FnLower<'_> {
             };
             self.slots.push(slot);
         }
+        // Drop flags, in the entry block. A `set` parameter starts
+        // unassigned; every other local's is set where it's declared.
+        for (l, local) in f.locals.iter().enumerate() {
+            let flag = (local.drop_flag && local.ty.needs_destroy()).then(|| {
+                let slot = self.b.alloca(self.t.bool);
+                if local.convention == Some(Convention::Set) {
+                    let no = self.b.const_bool(false);
+                    self.b.store(self.t.bool, slot, no, 1);
+                }
+                slot
+            });
+            debug_assert_eq!(self.flags.len(), l);
+            self.flags.push(flag);
+        }
         for (local, param) in params.into_iter().enumerate() {
             let info = &f.locals[local];
             match (param, self.slots[local]) {
@@ -1321,18 +1371,67 @@ impl FnLower<'_> {
     /// the `errdefer` bodies too.
     fn run_defers(&mut self, outer: usize, error: bool) {
         for scope in (outer..self.defers.len()).rev() {
-            let bodies = self.defers[scope].clone();
-            for (body, on_error) in bodies.iter().rev() {
-                if *on_error && !error {
-                    continue;
+            let entries = self.defers[scope].clone();
+            for entry in entries.iter().rev() {
+                match entry {
+                    Defer::Body(_, true) if !error => {}
+                    Defer::Body(body, _) => {
+                        // The body can't leave its own statements, so the
+                        // defers registered while lowering it are its own.
+                        let depth = self.defers.len();
+                        self.stmts(body);
+                        debug_assert_eq!(depth, self.defers.len());
+                    }
+                    Defer::Drop(local) => self.destroy_local(*local, false),
                 }
-                // The body can't leave its own statements, so the defers
-                // registered while lowering it are its own.
-                let depth = self.defers.len();
-                self.stmts(body);
-                debug_assert_eq!(depth, self.defers.len());
             }
         }
+    }
+
+    /// Set the drop flag of `local`, if it has one, to `value`.
+    fn set_flag(&mut self, local: LocalId, value: bool) {
+        if let Some(flag) = self.flags[local] {
+            let v = self.b.const_bool(value);
+            self.b.store(self.t.bool, flag, v, 1);
+        }
+    }
+
+    /// Destroy the value of `local` (if it holds one, when it has a drop
+    /// flag); with `clear`, it's unassigned after.
+    fn destroy_local(&mut self, local: LocalId, clear: bool) {
+        let ty = self.locals[local].ty;
+        let Slot::Mem(addr) = self.slots[local] else {
+            unreachable!("a local that needs destruction is in memory")
+        };
+        let Some(flag) = self.flags[local] else {
+            self.destroy(addr, ty);
+            return;
+        };
+        let held = self.b.load(self.t.bool, flag, 1);
+        let yes = self.b.create_block(&[]);
+        let done = self.b.create_block(&[]);
+        self.b.cond_br(held, yes, &[], done, &[]);
+        self.start_block(yes);
+        self.destroy(addr, ty);
+        if clear {
+            self.set_flag(local, false);
+        }
+        self.b.br(done, &[]);
+        self.start_block(done);
+    }
+
+    /// Destroy the value of type `ty` at `addr`: call its type's
+    /// destruction.
+    fn destroy(&mut self, addr: ValueId, ty: Ty) {
+        let f = self.reach.destroy[&ty];
+        let callee = self.b.func_ref(self.ids[f].expect("a reached function"));
+        self.b.call(callee, &[addr], self.t.void);
+    }
+
+    /// Destroy the value of `local`, of a type that needs destruction,
+    /// before it's assigned: always, or if it holds one (its drop flag).
+    fn destroy_old(&mut self, local: LocalId) {
+        self.destroy_local(local, false);
     }
 
     /// `return value`: write it (as `ok(value)` in a function that throws),
@@ -1591,6 +1690,16 @@ impl FnLower<'_> {
                     self.store(*local, v);
                 }
             },
+            TStmt::Assign(local, e) if self.locals[*local].ty.needs_destroy() => {
+                let Slot::Mem(dst) = self.slots[*local] else {
+                    unreachable!("a local that needs destruction is in memory")
+                };
+                // The new value first, then the old one is destroyed.
+                let src = self.place(e);
+                self.destroy_old(*local);
+                self.copy(dst, src, e.ty);
+                self.set_flag(*local, true);
+            }
             TStmt::Assign(local, e) => match self.slots[*local] {
                 Slot::Mem(dst) => self.assign_into(dst, e),
                 Slot::Split(k) => {
@@ -1606,6 +1715,12 @@ impl FnLower<'_> {
                     self.store(*local, v);
                 }
             },
+            TStmt::Store(place, e) if place.ty.needs_destroy() => {
+                let dst = self.address(place);
+                let src = self.place(e);
+                self.destroy(dst, place.ty);
+                self.copy(dst, src, e.ty);
+            }
             TStmt::Store(place, e) => {
                 if let Some((k, start)) = self.split_path(place) {
                     let vals = self.leaf_values(e);
@@ -1622,8 +1737,20 @@ impl FnLower<'_> {
             TStmt::Throw(e) => self.throw(e),
             TStmt::Defer { body, on_error } => {
                 let scope = self.defers.last_mut().expect("in a statement list");
-                scope.push((Rc::from(body.clone()), *on_error));
+                scope.push(Defer::Body(Rc::from(body.clone()), *on_error));
             }
+            TStmt::Drop { local, init } => {
+                self.set_flag(*local, *init);
+                let scope = self.defers.last_mut().expect("in a statement list");
+                scope.push(Defer::Drop(*local));
+            }
+            TStmt::Destroy(place) => match place.kind {
+                TExprKind::Local(l) => self.destroy_local(l, true),
+                _ => {
+                    let addr = self.place(place);
+                    self.destroy(addr, place.ty);
+                }
+            },
             TStmt::If(cond, then, otherwise) => {
                 let c = self.expr(cond).one();
                 let then_bb = self.b.create_block(&[]);
@@ -1782,6 +1909,22 @@ impl FnLower<'_> {
             // nothing writes to it.
             TExprKind::Table(id) => return Val::Mem(self.b.global_ref(self.tables[*id])),
             TExprKind::Local(local) => return self.load(*local),
+            TExprKind::Move(inner, local) => {
+                let v = self.expr(inner);
+                self.set_flag(*local, false);
+                return v;
+            }
+            // Kept in its hidden local, whose value from an earlier time
+            // round a loop is destroyed first.
+            TExprKind::Temp(local, inner) => {
+                let Slot::Mem(dst) = self.slots[*local] else {
+                    unreachable!("a temporary that needs destruction is in memory")
+                };
+                self.destroy_old(*local);
+                self.fill(dst, inner);
+                self.set_flag(*local, true);
+                return Val::Mem(dst);
+            }
             // A returned view is written to a pointer and length in memory.
             TExprKind::Call(f, args) if e.ty.is_view() => {
                 let ty = self.view_ir();
@@ -2058,6 +2201,7 @@ impl FnLower<'_> {
             self.t.of(ret)
         };
         let result = self.b.call(callee, &values, ret_ty);
+        self.set_args_assigned(f, args, ret, result, dst);
         if ret == Ty::Never {
             self.b.unreachable();
             let dead = self.b.create_block(&[]);
@@ -2070,6 +2214,49 @@ impl FnLower<'_> {
             (_, Some(p)) => Val::Mem(p),
             (Some(v), None) => Val::One(v),
             (None, None) => Val::Unit,
+        }
+    }
+
+    /// After a call of `f`, of result type `ret` (packed in `result`, or in
+    /// memory at `dst`): the locals with drop flags passed to its `set`
+    /// parameters hold a value, if the call succeeded.
+    fn set_args_assigned(
+        &mut self,
+        f: usize,
+        args: &[TExpr],
+        ret: Ty,
+        result: Option<ValueId>,
+        dst: Option<ValueId>,
+    ) {
+        let callee = &self.reach.funcs[f];
+        for (&p, a) in callee.params.iter().zip(args) {
+            if callee.locals[p].convention != Some(Convention::Set) {
+                continue;
+            }
+            let TExprKind::Ref(place) = &a.kind else {
+                continue;
+            };
+            let TExprKind::Local(l) = place.kind else {
+                continue;
+            };
+            let Some(flag) = self.flags[l] else {
+                continue;
+            };
+            let ok = if ret.as_result().is_none() {
+                self.b.const_bool(true)
+            } else {
+                // `ok` is variant 0, in the low bits.
+                let tag = match (result, dst) {
+                    (Some(p), _) if returns_packed(ret) => {
+                        self.unpack_scalar(p, 0, Ty::Int(IntTy::new(false, 8)))
+                    }
+                    (_, Some(d)) => self.load_tag(d, ret),
+                    _ => unreachable!("a result packed or in memory"),
+                };
+                let zero = self.b.const_i64(self.t.i8, 0);
+                self.b.icmp(IntPred::Eq, tag, zero)
+            };
+            self.b.store(self.t.bool, flag, ok, 1);
         }
     }
 
