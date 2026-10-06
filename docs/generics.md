@@ -127,7 +127,9 @@ error, in the checker. The formatter's rule "no space before an index's
 
 ### Value parameters
 
-**Status:** Implemented (M7b), without refinements, which don't exist yet
+**Status:** Implemented (M7b); refinements since 2026-10-06, on a
+function's value parameters and on struct fields
+([safety.md](safety.md#refinements-in-types))
 
 ```
 struct StackBuf[N: usize] {
@@ -144,7 +146,10 @@ fn first_n[N: usize](xs: []u8) -> ?[N]u8 { ... }
 - `[N]T` with a value parameter `N` has length `N`, so `for i in 0..a.len`
   proves `a[i]` once, for every `N`.
 - At an instantiation, the argument must be known at compile time, and its
-  refinement is checked there.
+  refinement is checked there: at a call, for a function's value
+  parameter, with the argument a number or the caller's own value
+  parameter (which its own refinement may bound). A struct's, an enum's
+  or an impl's value parameters can't have one yet.
 
 This replaces Zig's "`comptime` parameter checked at each use" for the cases
 where a type depends on a number. It keeps rule 1: the body is checked once
@@ -481,7 +486,7 @@ coercion rule of its own. It's a good candidate for right after M7.
 
 ## Checking generic bodies
 
-**Status:** Implemented (M7a), without refinements, which don't exist yet
+**Status:** Implemented (M7a); refinements since 2026-10-06
 
 ### Against the bounds
 
@@ -534,10 +539,14 @@ bits), is in [safety.md](safety.md#values-of-a-type-parameter).
 ### Refinements on generic code
 
 Refinements work unchanged on value parameters and on `T` terms with a
-numeric bound: `fn take[N: usize](xs: []u8, n: usize where n <= N)`. Their
-constants must fit in the bound's intersection, like literals. A refinement
-can't mention a trait method (no calls in the fact language,
+numeric bound: `fn take[N: usize](xs: []u8, n: usize where n <= N)`. A
+refinement can't mention a trait method (no calls in the fact language,
 [safety.md](safety.md#refinements-in-types)).
+
+As implemented, their constants needn't fit in the bound's intersection: a
+refinement's comparison is exact, over all integers, not an operation of
+type `T`, so `x: T where x < 1000` is fine for `T: Unsigned` (a `u8`
+argument always meets it).
 
 ### Error messages
 
@@ -885,8 +894,9 @@ proposal left room:
   `a[i]` is proven by `i < N` (or `i < a.len`) once, for every `N`.
   `[v; N]` builds one. `N` can be used as a value of its type (`x *| K`).
   It's also inferred from an argument's array length (`total(a)` with
-  `a: [3]u32`) or the expected type. No refinements yet: `[N: usize where
-  N > 0]`, and a field `len: usize where len <= N`, wait for them.
+  `a: [3]u32`) or the expected type. Refinements came later
+  (2026-10-06): `[N: usize where N > 0]` on a function's value parameter,
+  and a field `len: usize where len <= N`.
 - **Methods.** `fn Pair[A, B].swap(self)` names every parameter of the
   type, in order, under any names; a value parameter is written `N` (or
   `N: usize`). The type's bounds are implied. A method can add bounds,
@@ -929,9 +939,11 @@ proposal left room:
   ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
   (`io.print_int` built its digits in a `StackBuf[21]` at first, and went
   back to a plain array: 640 bytes less at `-O2`.) Every access in
-  them is proven. Without refinements, each method checks the invariant it
-  needs (`end <= N`). `StackBuf`'s fields are private and its storage
-  `@uninit`, so it doesn't fill its storage when it's made
+  them is proven. At first each method checked the invariant it needed
+  (`end <= N`); since 2026-10-06, the fields' refinements keep it
+  ([memory.md](memory.md#struct-invariants)). `StackBuf`'s fields are
+  private and its storage `@uninit`, so it doesn't fill its storage when
+  it's made
   ([memory.md](memory.md#uninitialized-buffers)).
   `ArrayVec` keeps its elements as `[N]?T`, so it needs no value to fill
   empty slots with, and `T: Copy` to make them `none`.

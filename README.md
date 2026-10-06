@@ -146,6 +146,14 @@ What works:
   `+% -% *% <<%` wrap and `+| -| *|` saturate. Every binary
   operator has an assignment form with the same rules: `x += 1`, `x +%= 1`,
   `flags |= bit`.
+- refinements, which carry facts across calls and into types, at no run-time
+  cost: `fn at(buf: []u8, i: usize where i < buf.len)` (the caller proves
+  it, the body knows it), `-> usize where result <= buf.len` (the body
+  proves it, the caller knows it), `fn last[N: usize where N > 0]`, struct
+  fields that every value keeps (`head: usize where head < CAP`, `start:
+  usize where start <= end`), and named refinements (`type Digit = u8
+  where self <= 9`), in the checker's fact language
+  ([docs/safety.md](docs/safety.md#refinements-in-types))
 
 ```
 fn clamp_to_u8(x: i32) -> u8 {

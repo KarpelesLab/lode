@@ -111,11 +111,21 @@ Slicing `a[i..j]` compiles only when the checker proves
 `0 <= i <= j <= a.len`, and `&a[i..j]` passes part of an array to an
 `inout` slice ([types.md](types.md#in-the-compiler-today)).
 
+**Refinements** (2026-10-06): facts in signatures and types, in the
+checker's fact language ([safety.md](safety.md#refinements-in-types)).
+Parameters (`i: usize where i < buf.len`, proven by callers, known in the
+body), results (`-> usize where result <= buf.len`, proven at each
+`return`, known by callers), a function's value parameters (`[N: usize
+where N > 0]`), struct fields, which every value of the struct keeps (a
+first form of invariants, [memory.md](memory.md#struct-invariants)), and
+named refinements (`type Digit = u8 where self <= 9`). In compile-time
+code, what isn't proven is checked as it runs. std uses them: `File.read`
+returns `n where result <= buf.len`, and `StackBuf`, `ArrayVec` and
+`print`'s buffer keep their bounds without checking them again (64 bytes
+less in every program that prints).
+
 ## Next
 
-- **Refinements in signatures** (in progress): `where` on parameters,
-  results, struct fields and named types
-  ([safety.md](safety.md#refinements-in-types)).
 - **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
   after refinements). The proposal is [allocation.md](allocation.md), in
   four steps: M8a, resource types, `deinit` and moves for every type, and
@@ -137,7 +147,9 @@ Slicing `a[i..j]` compiles only when the checker proves
   (a derived `Format`). Format specs (`{:x}`, widths) come with `Format`'s
   next step. `print` makes one `write` per call since 2026-10-06.
 
-Later, in no fixed order yet: globals with `Atomic`/`Mutex`, the rest of
-stack bounds (the bound in the binary, profiles that require one;
-`--stack-usage` already reports it), green threads, building for the other
-targets (`lode check` already checks for them), and self-hosting.
+Later, in no fixed order yet: refinements inside other types (`[N]Digit`,
+`?Digit`) and on a struct's value parameters, globals with
+`Atomic`/`Mutex`, the rest of stack bounds (the bound in the binary,
+profiles that require one; `--stack-usage` already reports it), green
+threads, building for the other targets (`lode check` already checks for
+them), and self-hosting.

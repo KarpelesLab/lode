@@ -281,12 +281,13 @@ fn search(xs: []i32, v: i32) -> bool {
 }
 ```
 
-Everything else gives no facts. In particular, facts don't cross function
-calls yet (that's what [refinements](#refinements-in-types) are for), array
-elements (and fields under them) have no facts, a copy of a struct doesn't
-keep its fields' facts, and a loop's head knows only facts of the kinds
-above that held before the loop (there's no counting: the checker can't
-prove that a loop dividing by 10 runs at most 20 times).
+Everything else gives no facts. In particular, facts cross function calls
+only through [refinements](#refinements-in-types), array elements (and
+fields under them) have no facts but their fields' refinements, a copy of
+a struct keeps only its fields' refinements, and a loop's head knows only
+facts of the kinds above that held before the loop (there's no counting:
+the checker can't prove that a loop dividing by 10 runs at most 20
+times).
 
 #### Values of a type parameter
 
@@ -479,7 +480,7 @@ left = left - usize(n)                   // proven by that relation
 
 ### Refinements in types
 
-**Status:** Decided (the syntax is still provisional)
+**Status:** Decided; implemented (2026-10-06, `src/sema/refine.rs`)
 
 Facts cross function boundaries through **lightweight refinements** attached
 to types. The caller must prove the refinement, and the callee assumes it:
@@ -508,6 +509,149 @@ Rules:
 
 Not included: full `requires`/`ensures` contracts with arbitrary predicates.
 A verification language is not "easy to read".
+
+#### In the compiler today
+
+Where a refinement can be written:
+
+| Form | Example | Names in it |
+| --- | --- | --- |
+| A parameter's | `i: usize where i < buf.len` | the parameter and those before it |
+| A result's | `-> usize where result <= buf.len` | `result` and every parameter |
+| A value parameter's | `fn last[N: usize where N > 0]` | the function's value parameters |
+| A struct field's | `head: usize where head < CAP` | the struct's fields, any of them |
+| A named refinement | `type Digit = u8 where self <= 9` | `self` |
+
+Each can also name constants (`CAP`, `pkg.MAX`) and the value parameters in
+scope (`N` of `[N: usize]`, also a generic struct's). A parameter is named
+by its value (an integer, or a `T` with a numeric bound), its `.len` (a
+slice, a `str`, or an array, whose length is a number or a value
+parameter), or an integer field (`p.x`, `p.a.b`, `self.count`). A name in
+scope hides a constant of the same name; `result` names the result even
+if a parameter has that name.
+
+**The language.** A refinement is comparisons (`<`, `<=`, `>`, `>=`, `==`,
+`!=`) joined with `&&`. Each side adds up integer constants (literals,
+characters, constants) and the values above, with `+`, `-`, a unary `-`,
+and `*` by a constant. With everything moved to one side, at most two
+values may remain, so each comparison is a range, a relation, a sum or a
+hole ([The fact language](#the-fact-language)). The arithmetic is exact,
+over all integers: `i + 1 <= n` can't overflow. Anything else is an error
+where the refinement is declared: a product of two values (`a * b < 100`),
+a call, an element (`xs[0]`), three values (`a + b < c`), or a parameter
+declared later. A comparison of constants only is checked there (false is
+an error).
+
+**Proving.** Where a refinement must hold (below), each value it names is
+mapped to what the checker knows there: an argument that's a form (a term
+plus a constant, or two terms, like `9 - d`) is its terms, and any other
+value is known by its range (and, for a call's value, by what its result
+refinement says, below). Then `x <= y` holds when the largest value of
+`x - y` the checker knows is at most 0, the others likewise (`x < y` is
+`x - y <= -1`, `==` is both ways). That largest value is, for the terms
+left after merging: with two terms, the tighter of their ranges and a
+relation or a sum about them (directly, or a relation through one other
+term); otherwise their ranges, each read narrowed by its relations as
+when a term is read. `x != y` holds when `x - y` can't be 0 by its range,
+or when it's one term (times 1 or -1) plus a constant and that term has a
+hole there or a range without it.
+
+**Assuming.** Where a refinement is known, each comparison gives the facts
+an `if` on it would give when true: a range, a relation or a sum, and for
+`!=`, a hole (or a range end moved past the value). A value that isn't a
+form is replaced by the end of its range that keeps the comparison true.
+
+**Calls.**
+- At a call, each parameter's refinement (but a `set` parameter's) must
+  hold for the arguments, as they are before the call: an error at the
+  argument otherwise. So must the value parameters' refinements, for the
+  generic arguments: a number, or the caller's own value parameter, which
+  its own refinement may bound.
+- After the call, the result's refinement says what the value is: a range,
+  and when `result` is in it once with the coefficient 1 or -1, a bound
+  relative to the arguments' terms. So `let n = try f.read(&buf)` with
+  `buf: [4096]u8` gives `n <= 4096`, and with a slice local `buf`,
+  `n <= buf.len`. An argument passed `inout` or `set` is read after the
+  call (its new value); an argument that isn't a term is known by its
+  range only.
+- For a `?T` result (`-> ?usize where result < CAP`), the refinement is
+  about the value in it, when there is one. `if let`, `let ... else`,
+  `??` (the range of either side), `try`, and `catch` (when the block
+  leaves; with a fallback value, the range of either) keep it. A `match`
+  on it doesn't.
+
+**Bodies.**
+- The parameters' refinements are facts when the body starts (except a
+  `set` parameter's), and each `return` must meet the result's. `return
+  none` meets any result refinement of a `?T`.
+- A parameter the body can assign (`inout`, `sink` or `set`, but not a
+  slice) keeps its refinement: every value assigned to it must meet it.
+  Its refinement can't name another parameter the body can assign, nor its
+  own fields, and no refinement can name a `set` parameter but its own. A
+  result's refinement can't name a `sink` parameter (the caller doesn't
+  have its value after the call).
+- A `let` or `var` declared with a named refinement (`var d: Digit`) keeps
+  it: every value assigned to it must meet it, and it's a fact after each.
+  `Digit(x)` converts to a named refinement, proven like `u8(x)` and then
+  the refinement.
+
+**Places passed `&`.** A place with a refinement (such a variable or
+parameter, or a field some refinement of its struct names) passed `inout`
+or `set` may come back changed: after the call, the parameter's refinement
+(if it has one) is assumed for the place, and the place's own refinement
+must follow from it. Otherwise it's an error at the argument.
+
+**Struct fields.** Every value of a struct keeps its fields' refinements,
+so a struct's refinements are a first form of invariant
+([memory.md](memory.md#struct-invariants)):
+- They're proven at each literal, with the values given; at each
+  assignment to a field (`p.f = v`, `p.f += 1`, `ps[i].f = v`), for every
+  refinement that names the field, with the new value and the other
+  fields' current values (terms for a place made of fields only, their
+  types' ranges otherwise); and for a field passed `&`, as above. A copy of
+  a struct needs nothing: its value already keeps them.
+- They're facts about the fields of a struct place made of fields only (a
+  local, a parameter, `p.inner`) wherever one of its fields is read, and
+  when it's passed to a call. A field read from another value (an element,
+  a call's result) is bounded by its own refinement, the other fields
+  known by their types' ranges.
+- A refined field is an integer. A refinement that relates two fields
+  (`start <= end`) is checked when either is assigned, so a struct whose
+  fields move together is changed in an order that keeps it at each step.
+
+**Named refinements.** `type Digit = u8 where self <= 9` refines an integer
+type. `Digit` is `u8` with the refinement: it's the whole type of a
+parameter, a result, a struct field, or a `let` or `var`, and where it is,
+its refinement applies as written there. Anywhere else (an array's
+elements, `?Digit`, a type argument, a payload field, a constant's type)
+it's an error for now: it would lose its refinement. A `type` declaration
+without `where` is an error too (distinct types are still
+[Proposed](types.md#distinct-types)).
+
+**Generic code.** A value parameter is a term, and a `T` with a numeric
+bound is one too ([Values of a type parameter](#values-of-a-type-parameter)),
+so `fn take[N: usize](xs: [N]u8, n: usize where n <= N)` proves `xs[i]`
+for `i < n`, once for every `N`, and `fn gap[T: Unsigned](lo: T, hi: T
+where lo <= hi)` proves `hi - lo`. A refinement's constants needn't fit in
+the bound's intersection: the comparison is exact. A trait's and an
+impl's methods, and functions with `comptime` parameters or a pack, can't
+have refinements yet; neither can a struct's, an enum's or an impl's value
+parameters.
+
+**Compile-time code.** In code that only runs at compile time (a
+constant's value), a refinement the checker doesn't prove at a call, a
+struct literal or a `Digit(x)` is checked as it runs, like any other
+obligation there ([Proof obligations](#proof-obligations)): one that fails
+is an error at the argument or the expression, "`i` of `at` doesn't meet
+its refinement `i < xs.len`".
+
+**Cost.** None at run time: refinements are facts for the checker, and
+they remove checks. In std, `File.read` and `File.read_full` return `n
+where result <= buf.len`, `StackBuf` keeps `start <= end <= N`, `ArrayVec`
+keeps `count <= N`, `slices.sort`'s helper takes `end where end <=
+xs.len`, and `print`'s buffer keeps `len <= 256`; the checks they made
+again are gone. Every program that prints is 64 bytes smaller at `-O2`,
+`std_containers.lode` 807; hello world is still 577 bytes.
 
 ## Stack bounds
 

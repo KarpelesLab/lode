@@ -122,7 +122,7 @@ fn main() {
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
 | Visibility | `pub` (default is package-private), on declarations and struct fields |
 | Method | `fn Point.length(self) -> f32`, called as `p.length()` (see below) |
-| Refinement | `i: usize where i < buf.len` ([safety.md](safety.md#refinements-in-types)) |
+| Refinement | `i: usize where i < buf.len`, `-> u8 where result <= 9`, `type Digit = u8 where self <= 9` (see below) |
 | Mutable global | `static n: Atomic[u64] = Atomic.new(0)` ([memory.md](memory.md#globals)) |
 | Compile-time | `comptime fmt: str`, `comptime let`, `comptime for`, `match comptime`, `if comptime cond { ... }`, `compile_error("...")`, `target.os` (see below) |
 | Pack | `fn print[..A: Format](comptime fmt: str, args: ..A)`, `args[i]`, `args.len`, `..args` (see below) |
@@ -225,6 +225,10 @@ fn main() -> i32 {
 - `@uninit name: [N]T` marks a private array that `unsafe` code may leave
   out of a literal ([memory.md](memory.md#uninitialized-buffers)). It
   can't be `pub`.
+- A field's refinement follows its type: `pub head: usize where head <
+  CAP` ([Refinements](#refinements)). So a field line is `@uninit` or
+  `pub` (either first, but not both), the name, `:`, the type, then
+  `where cond`; an `@uninit` field, an array, has no refinement.
 - `Name{field: value, ...}` is a literal. Every field is given exactly once,
   in any order. The values are evaluated in the order they're written. A
   literal can span lines, with a comma after each field, the last one too.
@@ -664,6 +668,47 @@ fn main() {
 - `x.method()` and `T.function()` call a trait's methods and associated
   functions; `Trait.method(x, ...)` calls one through its trait, with `self`
   as the first argument (`&x` for `inout self`).
+
+## Refinements
+
+**Status:** Implemented in the compiler (semantics in
+[safety.md](safety.md#refinements-in-types))
+
+```
+const CAP = 16
+
+type Index = usize where self < CAP
+
+struct Ring {
+	head: Index
+	len: usize where len <= CAP
+	data: [CAP]u32
+}
+
+fn at(buf: []u8, i: usize where i < buf.len) -> u8 {
+	return buf[i]
+}
+
+fn probe(r: Ring, k: u32) -> ?usize where result < CAP {
+	...
+}
+
+fn last[N: usize where N > 0](xs: [N]u8) -> u8 {
+	return xs[N - 1]
+}
+```
+
+- `where cond` follows the type of a parameter, of the result (after `->`,
+  before the body), of a struct field, and of a function's value parameter
+  (`[N: usize where N > 0]`). `type Name = T where cond` at package level
+  names a refinement; `pub type` exports it.
+- `cond` is comparisons joined with `&&`. In it, a parameter is named by
+  its name (with `.len` and fields: `buf.len`, `self.count`), the result
+  by `result`, a named refinement's value by `self`, and a struct's fields
+  by their names.
+- `Digit(x)` converts to a named refinement, like `u8(x)`.
+- `lode fmt` puts one space around `where`, as around a binary operator.
+  A long parameter list wraps like any other list.
 
 ## Compile-time code
 

@@ -270,6 +270,10 @@ let p = Point{x: 1, y: 2}
 - The proof checker knows the integer fields of struct locals
   ([safety.md](safety.md#the-fact-language)): after `if p.x < 10`, `p.x + 1`
   is proven.
+- An integer field can have a refinement, `head: usize where head < CAP`
+  or `start: usize where start <= end`, which every value of the struct
+  keeps: literals and field assignments prove it, and reading a field knows
+  it ([memory.md](memory.md#struct-invariants)).
 
 ### Enums (sum types)
 
@@ -408,6 +412,34 @@ alias Bytes = []u8       // just another name
 
 Distinct types are cheap and make "is this a byte count or an index?" visible
 in signatures.
+
+### Refined types
+
+**Status:** Implemented (2026-10-06)
+
+A `type` declaration with a `where` names a refinement of an integer type
+([safety.md](safety.md#refinements-in-types)):
+
+```
+type Digit = u8 where self <= 9
+
+fn add(a: Digit, b: Digit) -> u8 {
+	return a + b                     // proven: at most 18
+}
+```
+
+- A refined type isn't distinct: a `Digit` is a `u8` known to be at most
+  9. It's used wherever a `u8` is, and a `u8` becomes a `Digit` where the
+  checker proves the refinement: an argument, a `return`, a field's value,
+  `let d: Digit = c - '0'` after `if c >= '0' && c <= '9'`, or the
+  conversion `Digit(x)`. Nothing happens at run time.
+- It's the whole type of a parameter, a result, a struct field, or a `let`
+  or `var`, and its refinement applies there as if written with `where`. A
+  `var d: Digit` keeps it: every value assigned must meet it.
+- For now it can't be part of another type (`[4]Digit`, `?Digit`,
+  `Pair[Digit, u8]`), a payload field or a constant's type: it would lose
+  its refinement, so that's an error. A `type` without `where` is the
+  distinct type above, still Proposed: an error.
 
 ## Methods
 
@@ -614,8 +646,11 @@ fn max[T: Ordered](sink a: T, sink b: T) -> T {
   [generics.md](generics.md#m7b-in-the-compiler),
   [generics.md](generics.md#m7c-in-the-compiler) and
   [generics.md](generics.md#m7e-in-the-compiler).
-- Not yet: `dyn`, generic traits, refinements on value parameters
-  (`[N: usize where N > 0]`).
+- A function's value parameters can have a refinement, `fn last[N: usize
+  where N > 0]`, proven where it's called
+  ([safety.md](safety.md#refinements-in-types)).
+- Not yet: `dyn`, generic traits, refinements on a struct's, an enum's or
+  an impl's value parameters.
 
 ## `secret` types
 

@@ -407,6 +407,57 @@ smaller at `-O2` (and `-O0`), and one using `StackBuf`s 380 to 820 bytes
 smaller. Hello world, which has no buffer, is still 577 bytes and two
 system calls.
 
+Its written part, `bytes[start..end]`, is kept right by the refinements of
+its fields, `start <= end` and `end <= N` ([Struct
+invariants](#struct-invariants)); the `@uninit` storage has none. Every
+method that changes `start` or `end` proves them, and every method that
+reads them knows them, so none checks again.
+
+## Struct invariants
+
+**Status:** A first form is implemented (2026-10-06): the refinements of
+struct fields
+
+A type often keeps a fact about its fields: a ring buffer's `head < CAP`,
+a vector's `count <= N`, a window's `start <= end`. Without a way to say
+it, every function that relies on it had to check it again (`head % CAP`,
+`if count > N { return none }`), which costs code and hides real bugs
+behind fallbacks that can't run.
+
+A field's refinement says it ([safety.md](safety.md#refinements-in-types)):
+
+```
+struct Ring {
+	head: usize where head < CAP
+	len: usize where len <= CAP
+	data: [CAP]u32
+}
+```
+
+- Every value of the struct keeps its fields' refinements. A literal
+  proves them, and so does every assignment to a field, for each
+  refinement that names it (`r.head = (r.head + 1) % CAP` is proven; `r.len
+  += 1` needs `r.len < CAP` first). A field passed `&` must come back
+  meeting them, which only a parameter with a refinement that proves it
+  can promise.
+- Wherever a field is read, they're facts: about the fields of a variable
+  or a parameter (and the structs in it), relations included; for a value
+  read from elsewhere (an element, a call's result), the field's own
+  range.
+- A refinement can relate two fields (`start <= end`), name constants and
+  the struct's value parameters (`count <= N`). A refinement that relates
+  fields is checked at each assignment, so fields that move together are
+  changed in an order that keeps it at each step.
+
+With private fields, only the struct's package can assign them, so the
+proofs are all in that package; its users only read the facts. A field
+can be `pub`, `@uninit` (no refinement: it's an array) and refined, in
+that order: `pub head: usize where head < CAP`.
+
+Not yet: refinements over elements (`[N]Index` is an error for now), and
+invariants between a field and an array's contents (an empty slot means
+`count < CAP`).
+
 ## Destruction
 
 **Status:** Proposed. The M8 proposal works it out:

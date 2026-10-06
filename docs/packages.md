@@ -81,18 +81,20 @@ Go's vocabulary, which is proven:
     private field. It doesn't close the file (there's no way to open one
     yet). `stdin()`, `stdout()` and `stderr()` return the standard ones,
     and `File.from_fd(fd: i32)` any other.
-  - `File.read(self, inout buf: []u8) throws(os.Error) -> usize` reads into
+  - `File.read(self, inout buf: []u8) throws(os.Error) -> usize where
+    result <= buf.len` reads into
     `buf` once and returns the number of bytes read: 0 only at the end of
     the input (or for an empty `buf`), and possibly fewer than `buf.len`
     before it, as a pipe or a terminal gives what it has. An interrupted
     call (`EINTR`) is retried. `let n = try io.stdin().read(&buf)`.
-  - `File.read_full(self, inout buf: []u8) throws(os.Error) -> usize` reads
+  - `File.read_full(self, inout buf: []u8) throws(os.Error) -> usize where
+    result <= buf.len` reads
     until `buf` is full or the input ends, so it returns less than
     `buf.len` only at the end of the input. If it throws, the bytes read
     before the error are in `buf`, but their count is lost.
-  - There's no slicing yet (`buf[0..n]`), so a program can't pass the first
-    `n` bytes of a buffer it read to `write_bytes` without a pointer and
-    `unsafe` (tests/programs/stdin_cat.lode).
+  - Both results are refined ([safety.md](safety.md#refinements-in-types)):
+    after `let n = try io.stdin().read(&buf)`, `buf[..n]` is proven with no
+    check (tests/programs/stdin_cat.lode).
   - `File.write(self, s: str) throws(os.Error)` writes all of `s`, or
     throws the error that stopped it. It's the checked way to write:
     `try io.stdout().write(s)`.
@@ -184,9 +186,10 @@ Go's vocabulary, which is proven:
   - `var v = vec.ArrayVec[u16, 8].new()`, or `var v: vec.ArrayVec[u16, 8] =
     vec.ArrayVec.new()`.
 - Every access in `std/buf` and `std/vec` is proven. Their fields are
-  private, so only their own methods change them; without refinements,
-  each method still checks the bound it relies on (`end <= N`) for the
-  checker.
+  private, so only their own methods change them, and their refinements
+  keep the bounds the methods rely on (`StackBuf`: `start <= end`, `end <=
+  N`; `ArrayVec`: `count <= N`), so no method checks them again
+  ([memory.md](memory.md#struct-invariants)).
 - `std/encoding`, character encodings over bytes, beside the built-in
   `str` ([strings.md](strings.md)):
   - `Encoding`, a trait with an associated type `Rune` (`Copy + Eq`), an

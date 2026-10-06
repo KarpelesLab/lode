@@ -33,9 +33,9 @@ implemented yet.
 - Raw pointers exist only to integers (`*u8`), only `unsafe` code uses
   them, and a struct can't hold one. Struct fields are private to their
   package unless marked `pub` (decided and implemented 2026-10-06).
-- `uses` and `where` are reserved words, rejected by the parser.
-  Refinements (`where`) are being implemented now, including refinements
-  of struct fields that every value of the struct keeps.
+- `uses` is a reserved word, rejected by the parser. `where` writes a
+  refinement ([safety.md](safety.md#refinements-in-types)), including
+  refinements of struct fields that every value of the struct keeps.
 - `std/os` wraps `read`, `write`, `exit_group`. There's no `mmap`.
 - Views are never returned, except a `str` with static storage. A slice of
   a `var` array can't be kept in a local, only passed to a function
@@ -790,21 +790,24 @@ use." Proposed implementation, per function:
   local, which are already terms. With the sealed projection, `xs[i]`'s
   obligation is `i < xs.len`, discharged as for a slice: `for i in
   0..xs.len { xs[i] }` and `if i < xs.len { xs[i] }` need nothing new.
-- The field refinement `len <= cap` (refinements, now landing) is a fact
-  about every `List`, so `xs.cap - xs.len` is proven.
+- The field refinement `len <= cap` is a fact about every `List`, so
+  `xs.cap - xs.len` is proven.
 - After `xs.push(v)` (`inout self`), the checker forgets what it knew about
   `xs`, as for any `inout` place. To keep `xs.len >= 1` after it, a result
   refinement would have to name the `inout` parameter's value on return
-  (`-> () where self.len >= 1`). The fact language can say that, but not
-  "one more than before" (no `old`). **Open:** whether to allow refinements
+  (`-> () where self.len >= 1`). The fact language can say that (today a
+  result's refinement must name `result`, so a function returning nothing
+  can't have one), but not "one more than before" (no `old`). **Open:** whether to allow refinements
   on `inout` parameters' final values in M8; `reserve(n)` then `n` calls
   to `push_within` with a proof that none fails would need `old`, which
   the fact language doesn't have. M8 recommends without: `push_within`
   returns `?T`.
 - `insert` and `remove` take refined indexes (`where i < self.len`), which
   the caller proves, so they don't return optionals.
-- Refined element types work unchanged: a `List[Digit]` (`type Digit = u8
-  where self <= 9`) gives elements with the fact.
+- Refined element types (a `List[Digit]`, with `type Digit = u8 where
+  self <= 9`, whose elements have the fact) need named refinements as type
+  arguments, which aren't implemented: today `Digit` can't be part of
+  another type.
 - The checker learns nothing about heap contents beyond element types:
   elements have no facts, like array elements today.
 
