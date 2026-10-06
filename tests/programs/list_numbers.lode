@@ -1,0 +1,54 @@
+// stdin: 42\n7\n1000\n3\n
+// stdout: 3 7 42 1000\n
+package main
+
+import "std/io"
+import "std/slices"
+
+// The reference program of docs/allocation.md (Code size): a `List[u32]`
+// filled from standard input, one number per line, sorted and printed.
+// CI reports its size next to hello world's.
+
+fn read_numbers() uses alloc throws(AllocError) -> List[u32] {
+	var xs = List[u32].new()
+	var buf: [64]u8 = [0; 64]
+	var v: u32 = 0
+	var digits = false
+	loop {
+		let n = io.stdin().read(&buf) catch _ {
+			break
+		}
+		if n == 0 {
+			break
+		}
+		for b in buf[..n] {
+			if b >= '0' && b <= '9' {
+				v = v *% 10 +% u32(b - '0')
+				digits = true
+			} else if digits {
+				try xs.push(v)
+				v = 0
+				digits = false
+			}
+		}
+	}
+	if digits {
+		try xs.push(v)
+	}
+	return xs
+}
+
+fn main() uses alloc -> u8 {
+	var xs = read_numbers() catch _ {
+		return 1
+	}
+	slices.sort(&xs)
+	for i in 0..xs.len {
+		if i > 0 {
+			io.print(" ")
+		}
+		io.print("{}", xs[i])
+	}
+	io.print("\n")
+	return 0
+}

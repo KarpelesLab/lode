@@ -4,9 +4,8 @@
 // error: cannot prove that this slice's start is at most the length
 // error: cannot prove that this slice's start is not negative
 // error: a `str` can't be sliced: a slice could split a character
-// error: cannot keep a slice of `buf`, which is mutable
+// error: `s` is used after `buf` changed (on some path to here), and `s` views `buf`
 // error: cannot keep a slice of `xs`, an `inout` slice
-// error: returning a slice is not supported by the compiler yet
 // error: cannot pass `&xs[1..]`: `xs` is a read-only `[]u8`
 // error: cannot pass `&a[..2]`: `a` is immutable
 // error: `b[..2]` is passed `inout` or `set`, so `b[3]` can't be used in the same expression
@@ -75,7 +74,7 @@ fn str_slice(s: str) -> u32 {
 	return sum(s[0..1])
 }
 
-// A slice of a `var` array can't be kept: the array can change.
+// A slice of a `var` array can't be used after the array changes.
 fn keep_var() -> u32 {
 	var buf: [4]u8 = [0; 4]
 	let s = buf[..2]
@@ -90,11 +89,6 @@ fn keep_inout(inout xs: []u8) -> u32 {
 	}
 	let s = xs[1..]
 	return sum(s)
-}
-
-// A slice can't be returned.
-fn tail(xs: []u8) -> []u8 {
-	return xs
 }
 
 // A read-only slice's elements can't be changed through a slice of it.

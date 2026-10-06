@@ -255,6 +255,20 @@ if comptime target.os == .linux {
 		return syscall(SYS_MREMAP, addr, old, new, 0)
 	}
 
+	/// `MREMAP_MAYMOVE`: the mapping may move.
+	const MREMAP_MAYMOVE: usize = 1
+
+	/// Grow or shrink the mapping of `old` bytes at `addr` to `new` bytes,
+	/// in place or moved elsewhere (`MREMAP_MAYMOVE`), its contents kept
+	/// (the kernel moves the pages, not the bytes). Returns the new
+	/// address, or a negative error number.
+	///
+	/// The caller must ensure `addr` and `old` are a mapping's, which is
+	/// only used through the returned address after.
+	pub unsafe fn mremap_move(addr: *u8, old: usize, new: usize) -> isize {
+		return syscall(SYS_MREMAP, addr, old, new, MREMAP_MAYMOVE)
+	}
+
 	/// An allocator of whole pages (docs/allocation.md, The root
 	/// allocator): each allocation is a mapping of its own, rounded up to
 	/// pages, aligned to a page. `std/alloc` makes it an `Allocator`, and
@@ -314,6 +328,23 @@ if comptime target.os == .linux {
 			return false
 		}
 		return mremap(p, old, new) >= 0
+	}
+
+	/// Grow or shrink the mapping of `old` bytes at `p` to `new` bytes, in
+	/// place or moved, with its contents: its address after. Throws
+	/// `out_of_memory`, with the mapping unchanged, when the kernel can't.
+	///
+	/// The caller must ensure `p` and `old` are those of a mapping `map`
+	/// made, which is only used through the returned address after.
+	pub unsafe fn PageAllocator.move(self, p: *u8, old: usize, new: usize) throws(AllocError) -> *u8 {
+		if old == 0 || new == 0 || new > MAP_MAX {
+			throw .out_of_memory
+		}
+		let r = mremap_move(p, old, new)
+		if r < 0 {
+			throw .out_of_memory
+		}
+		return mem.from_addr[u8](usize(r))
 	}
 
 	/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of

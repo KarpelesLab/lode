@@ -1102,6 +1102,7 @@ impl Checker<'_> {
                 cx.moved.insert(local);
                 cx.locals[local].drop_flag = true;
                 Self::invalidate_projections(cx, local);
+                super::views::source_changed(cx, local, super::views::Change::Moved, span);
                 let ty = e.ty;
                 let moved = std::mem::replace(
                     e,
@@ -1348,8 +1349,9 @@ fn moved_path(cx: &FnCx, e: &TExpr) -> Option<MovePath> {
             p.through_index = true;
             Some(p)
         }
-        // A box's value is part of the box, whose `deinit` holds it.
-        TExprKind::Deref(base) => moved_path(cx, base),
+        // A box's value is part of the box, whose `deinit` holds it; a
+        // list's elements are part of the list.
+        TExprKind::Deref(base) | TExprKind::Elements(base) => moved_path(cx, base),
         _ => None,
     }
 }
@@ -1366,7 +1368,8 @@ pub(super) fn place_local(cx: &FnCx, e: &TExpr) -> Option<LocalId> {
         TExprKind::Field(base, _)
         | TExprKind::Payload(base, ..)
         | TExprKind::Index(base, _)
-        | TExprKind::Deref(base) => place_local(cx, base),
+        | TExprKind::Deref(base)
+        | TExprKind::Elements(base) => place_local(cx, base),
         _ => None,
     }
 }

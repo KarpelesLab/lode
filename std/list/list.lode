@@ -1,0 +1,220 @@
+/// Growable lists: `List[T]` (docs/allocation.md, `List[T]`), in the
+/// prelude as `List`.
+package list
+
+import "std/alloc"
+import "std/mem"
+
+/// A growable array of `T`s on the heap: `len` elements, in storage with
+/// room for `cap`, from the allocator it remembers. It owns its elements:
+/// it isn't `Copy`, it moves, and destroying it destroys them (first to
+/// last) and frees its storage, through the allocator it came from,
+/// wherever it ends up. It's `Clone` when `T` is.
+///
+/// `xs[i]`, `xs[i..j]`, `for x in xs`, passing `xs` where a slice is
+/// expected (`&xs` for an `inout` one) are those of a slice of its
+/// elements: indexes are proven against `xs.len`, a field that can be read
+/// everywhere and changed only here. A view of its elements (`xs[..]`,
+/// `xs.as_slice()`) borrows from the list: the list can't change while the
+/// view is used (docs/memory.md, Views).
+pub struct List[T] {
+	ptr: *T
+	pub let len: usize where len <= cap
+	pub let cap: usize
+	alloc: alloc.Handle
+}
+
+/// An empty list. It allocates nothing: the storage comes with the first
+/// element, from the allocator in context then.
+pub fn List[T].new() -> List[T] {
+	// Sound: with `cap` 0, the pointer is never read or written, and
+	// never freed.
+	unsafe {
+		return List{ptr: mem.from_addr[T](align_of[T]()), len: 0, cap: 0, alloc: alloc.root()}
+	}
+}
+
+/// An empty list with room for `n` elements.
+pub fn List[T].with_capacity(n: usize) uses alloc throws(AllocError) -> List[T] {
+	var xs = List[T].new()
+	try xs.reserve(n)
+	return xs
+}
+
+/// Make room for `n` more elements, so that adding them allocates no
+/// more.
+pub fn List[T].reserve(inout self, n: usize) uses alloc throws(AllocError) {
+	if n <= self.cap - self.len {
+		return
+	}
+	let need = self.len +| n
+	try self.grow(need)
+}
+
+/// Grow the storage to room for at least `need` elements, more than
+/// `cap`: at least twice as many, and at least 4. The storage grows through
+/// the list's allocator (`Allocator.grow`): in place when it can, or
+/// moved, the elements with it.
+fn List[T].grow(inout self, need: usize) uses alloc throws(AllocError) {
+	var cap = self.cap *| 2
+	if cap < need {
+		cap = need
+	}
+	if cap < 4 {
+		cap = 4
+	}
+	// `need` is more than `cap`, which is at least `len`; the checker
+	// doesn't know it of a saturated sum.
+	if cap < self.len {
+		throw .out_of_memory
+	}
+	let size = size_of[T]()
+	let align = align_of[T]()
+	// A size that overflows is more than any allocator gives.
+	let bytes = cap *| size
+	// Sound: the first `len` elements are written, and `cap` of them fit
+	// in the block of `self.cap * size` bytes the list's allocator gave.
+	unsafe {
+		if self.cap == 0 {
+			let h = alloc.current()
+			let p = try h.alloc(bytes, align)
+			self.alloc = h
+			self.ptr = p.cast[T]()
+		} else {
+			// In place, or moved: a value moves by its bytes.
+			let old = self.cap *| size
+			let p = try self.alloc.grow(self.ptr.cast[u8](), old, bytes, align)
+			self.ptr = p.cast[T]()
+		}
+	}
+	self.cap = cap
+}
+
+/// Add `v` at the end, growing the storage if it's full (`v` is destroyed
+/// if that fails).
+pub fn List[T].push(inout self, sink v: T) uses alloc throws(AllocError) {
+	if self.len >= self.cap {
+		let need = self.len +| 1
+		try self.grow(need)
+	}
+	// `grow` made room, but after a call that changes `self` the checker
+	// knows nothing of it.
+	if self.len >= self.cap {
+		throw .out_of_memory
+	}
+	// Sound: element `len` is in the storage, and isn't written.
+	unsafe {
+		(self.ptr + self.len).write(v)
+	}
+	self.len += 1
+}
+
+/// Add `v` at the end if there's room for it, without allocating: `none`,
+/// or `v` given back when the storage is full.
+pub fn List[T].push_within(inout self, sink v: T) -> ?T {
+	if self.len >= self.cap {
+		return v
+	}
+	// Sound, as in `push`.
+	unsafe {
+		(self.ptr + self.len).write(v)
+	}
+	self.len += 1
+	return none
+}
+
+/// Add copies of the elements of `xs` at the end.
+pub fn List[T: Copy].extend(inout self, xs: []T) uses alloc throws(AllocError) {
+	try self.reserve(xs.len)
+	for x in xs {
+		// `reserve` made room, as in `push`.
+		if self.len >= self.cap {
+			throw .out_of_memory
+		}
+		// Sound, as in `push`.
+		unsafe {
+			(self.ptr + self.len).write(x)
+		}
+		self.len += 1
+	}
+}
+
+/// Remove the last element and return it, or `none` if there's none.
+pub fn List[T].pop(inout self) -> ?T {
+	if self.len == 0 {
+		return none
+	}
+	let last = self.len - 1
+	self.len = last
+	// Sound: element `last` was written, and isn't part of the list any
+	// more: it's moved out once.
+	unsafe {
+		return (self.ptr + last).read()
+	}
+}
+
+/// A copy of element `i` (0 is the first), or `none` past the last.
+pub fn List[T: Copy].get(self, i: usize) -> ?T {
+	if i < self.len {
+		return self[i]
+	}
+	return none
+}
+
+/// The elements, as a slice: a view that borrows from the list, the same
+/// as `xs[..]`.
+pub fn List[T].as_slice(self) -> []T {
+	return self[..]
+}
+
+/// Keep the first `n` elements, and destroy the others, first to last.
+pub fn List[T].truncate(inout self, n: usize) {
+	if n >= self.len {
+		return
+	}
+	let old = self.len
+	self.len = n
+	// Sound: elements `n..old` were written, and aren't part of the list
+	// any more: each is destroyed once.
+	unsafe {
+		for i in n..old {
+			(self.ptr + i).destroy()
+		}
+	}
+}
+
+/// Destroy every element. The storage stays, for the elements added next.
+pub fn List[T].clear(inout self) {
+	self.truncate(0)
+}
+
+/// Destroy the elements, first to last, and free the storage through the
+/// allocator it came from.
+pub fn List[T].deinit(sink self) {
+	// Sound: the first `len` elements are written, and the storage is the
+	// block of `cap * size_of[T]()` bytes the allocator gave (none when
+	// `cap` is 0).
+	unsafe {
+		if needs_deinit[T]() {
+			for i in 0..self.len {
+				(self.ptr + i).destroy()
+			}
+		}
+		if self.cap > 0 {
+			self.alloc.free(self.ptr.cast[u8](), self.cap *| size_of[T](), align_of[T]())
+		}
+	}
+}
+
+/// A new list, of clones of the elements, in storage from the allocator in
+/// context.
+impl[T: Clone] Clone for List[T] {
+	fn clone(self) uses alloc throws(AllocError) -> List[T] {
+		var out = List[T].new()
+		try out.reserve(self.len)
+		for x in self {
+			try out.push(try x.clone())
+		}
+		return out
+	}
+}

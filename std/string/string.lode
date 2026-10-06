@@ -1,0 +1,161 @@
+/// Owned, growable text: `String` (docs/strings.md, docs/allocation.md,
+/// `String`), in the prelude as `String`.
+package string
+
+import "std/encoding"
+import "std/io"
+import "std/list"
+import "std/mem"
+import "std/os"
+
+/// An owned, growable string of UTF-8 text: strings.md's `String[utf8]`.
+/// Its bytes are a `List[u8]` that is always valid UTF-8: `s.bytes` can be
+/// read everywhere (`s.bytes.len` is the length in bytes, `s.bytes[i]` a
+/// byte), and changed only by this package, which adds only whole
+/// characters. It owns its bytes: it moves, and destroying it frees them.
+/// It's `Clone`, `io.Format` (it writes its text) and an `io.Writer`.
+pub struct String {
+	pub let bytes: list.List[u8]
+}
+
+/// An empty string. It allocates nothing.
+pub fn String.new() -> String {
+	return String{bytes: list.List[u8].new()}
+}
+
+/// A string holding a copy of `s`.
+pub fn String.from(s: str) uses alloc throws(AllocError) -> String {
+	var out = String.new()
+	try out.push_str(s)
+	return out
+}
+
+/// The length in bytes.
+pub fn String.len(self) -> usize {
+	return self.bytes.len
+}
+
+/// The text, as a `str`: a view that borrows from the string, which can't
+/// change while the view is used (docs/memory.md, Views).
+pub fn String.as_str(self) -> str {
+	let b = self.bytes.as_slice()
+	// Sound: the bytes are valid UTF-8 (every way to add to them adds
+	// whole characters), and they don't change while the view is used.
+	unsafe {
+		return mem.view_str(b.ptr, b.len)
+	}
+}
+
+/// Append `s`.
+pub fn String.push_str(inout self, s: str) uses alloc throws(AllocError) {
+	try self.bytes.extend(s.bytes())
+}
+
+/// Append the character `r`, a Unicode scalar value: `false`, and nothing
+/// appended, if `r` is past `0x10FFFF` or a surrogate (`0xD800..=0xDFFF`).
+pub fn String.push(inout self, r: u32) uses alloc throws(AllocError) -> bool {
+	if r > 0x10ffff || r >= 0xd800 && r <= 0xdfff {
+		return false
+	}
+	var out: [4]u8
+	let n = encoding.Utf8.encode(r, &out)
+	if n > out.len {
+		return false
+	}
+	try self.bytes.extend(out[..n])
+	return true
+}
+
+/// Keep the first `n` bytes: `false`, and no change, if `n` is past the
+/// end or not at the start of a character.
+pub fn String.truncate(inout self, n: usize) -> bool {
+	if n > self.bytes.len {
+		return false
+	}
+	// A byte `10xxxxxx` continues a character.
+	if n < self.bytes.len && self.bytes[n] & 0xc0 == 0x80 {
+		return false
+	}
+	self.bytes.truncate(n)
+	return true
+}
+
+/// Remove the text. The storage stays, for what's appended next.
+pub fn String.clear(inout self) {
+	self.bytes.clear()
+}
+
+/// Make room for `n` more bytes, so that appending them allocates no
+/// more.
+pub fn String.reserve(inout self, n: usize) uses alloc throws(AllocError) {
+	try self.bytes.reserve(n)
+}
+
+/// A new string, with a copy of the text.
+impl Clone for String {
+	fn clone(self) uses alloc throws(AllocError) -> String {
+		return String{bytes: try self.bytes.clone()}
+	}
+}
+
+/// A string is written as its text: `io.print("{}", s)`.
+impl io.Format for String {
+	fn format[W: io.Writer](self, inout w: W) throws(os.Error) {
+		try w.write_bytes(self.bytes)
+	}
+}
+
+/// The error number `EILSEQ`: bytes that aren't valid UTF-8.
+const EILSEQ: u16 = 84
+
+/// A string is an `io.Writer` that never allocates (a `Writer` can't: its
+/// methods don't declare `uses alloc`): bytes are appended when they fit
+/// in the room left, and `no_space` is thrown otherwise, with nothing
+/// appended. Bytes that aren't valid UTF-8 are refused (`other(EILSEQ)`).
+/// `reserve` makes room first; `write_fmt` below does both.
+impl io.Writer for String {
+	fn write_bytes(inout self, b: []u8) throws(os.Error) {
+		if !encoding.Utf8.validate(b) {
+			throw .other(EILSEQ)
+		}
+		if b.len > self.bytes.cap - self.bytes.len {
+			throw .no_space
+		}
+		for x in b {
+			self.bytes.push_within(x)
+		}
+	}
+}
+
+/// Counts the bytes written: the first pass of `write_fmt`.
+struct Counter {
+	n: usize
+}
+
+impl io.Writer for Counter {
+	fn write_bytes(inout self, b: []u8) throws(os.Error) {
+		self.n +|= b.len
+	}
+}
+
+/// Append the format string `fmt` to `s`, each `{}` replaced by the next
+/// argument, as `io.print` writes them: `string.write_fmt(&s, "{} items",
+/// n)`. The arguments are formatted twice: once to count the bytes, to
+/// make room for them, then into the string. (An argument whose `Format`
+/// writes more the second time is cut where the room ends.)
+pub fn write_fmt[..A: io.Format](inout s: String, comptime fmt: str, args: ..A) uses alloc throws(AllocError) {
+	var count = Counter{n: 0}
+	io.write_fmt(&count, fmt, ..args) catch _ {
+	}
+	try s.reserve(count.n)
+	io.write_fmt(&s, fmt, ..args) catch _ {
+	}
+}
+
+/// A new string: the format string `fmt` with its arguments, as
+/// `write_fmt` appends it.
+pub fn format[..A: io.Format](comptime fmt: str, args: ..A) uses alloc throws(AllocError) -> String {
+	var s = String.new()
+	try write_fmt(&s, fmt, ..args)
+	return s
+}

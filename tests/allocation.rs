@@ -2,8 +2,9 @@
 //! calls and stack. A program that doesn't allocate is the same program
 //! whether or not it imports `std/alloc` or declares `uses alloc`; the
 //! root allocator maps memory with `mmap` and gives large blocks back with
-//! `munmap` (checked under `strace`, skipped when it can't trace); and a
-//! chain of boxes is destroyed with a bounded stack.
+//! `munmap` (checked under `strace`, skipped when it can't trace); a
+//! chain of boxes is destroyed with a bounded stack; and a list grows with
+//! one `mremap` per doubling (M8c).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -147,6 +148,32 @@ fn the_heap_maps_chunks_and_large_blocks() {
     for opt in ["-O0", "-O2"] {
         let found = calls(&dir, "heap", source, opt);
         assert_eq!(found, ["mmap 65536", "mmap 10000", "munmap 10000"], "{opt}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_list_grows_by_remapping() {
+    if !strace_works() {
+        eprintln!("skipped: strace can't trace here");
+        return;
+    }
+    // Pushing a million bytes: the small sizes come from the heap's
+    // chunk, then the storage is a mapping of its own, which each growth
+    // past it remaps (moved by the kernel, not copied): one system call
+    // per doubling. Destroying the list unmaps it.
+    let source = "package main\n\n\
+        fn run() uses alloc throws(AllocError) {\n\
+        \tvar xs = List[u8].new()\n\
+        \tfor i in 0..1048576 {\n\t\ttry xs.push(u8(i & 0xff))\n\t}\n}\n\n\
+        fn main() uses alloc -> u8 {\n\trun() catch _ {\n\t\treturn 1\n\t}\n\treturn 0\n}\n";
+    let dir = scratch("list");
+    let mut expected = vec!["mmap 65536".to_owned(), "mmap 4096".to_owned()];
+    expected.extend((13..=20).map(|k| format!("mremap {}", 1u64 << k)));
+    expected.push("munmap 1048576".to_owned());
+    for opt in ["-O0", "-O2"] {
+        let found = calls(&dir, "list", source, opt);
+        assert_eq!(found, expected, "{opt}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

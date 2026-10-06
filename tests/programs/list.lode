@@ -1,0 +1,243 @@
+// stdout: ints: 1, 2, 3, len 3 cap 4, sum 6, get 2 none, pop 3 2 1 none\n
+// stdout: index: 10 20 30, sliced 18, sorted 1 2 3 4 5\n
+// stdout: structs: 1,2 3,4 x 101\n
+// stdout: views: first 7, then 7 8 9\n
+// stdout: growth: 100000 4999950000 cap 131072\n
+// stdout: clone: 1 2 3 | 1 2 3 99\n
+// stdout: resources: ~1 | ~3 ~2 ~3 | c1 c2 | ~c1 ~c2 ~1 ~2 | end ~4 ~5 \n
+// stdout: boxes: 30 300 | clear 0, then 1\n
+package main
+
+import "std/io"
+import "std/list"
+import "std/slices"
+
+// `List[T]` (std/list): growable, on the heap, with `xs[i]`, slicing and
+// `for` over its elements proven like a slice's (docs/allocation.md).
+
+fn sum(xs: []u32) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+fn show(o: ?u32) {
+	if let v = o {
+		io.print(" {}", v)
+	} else {
+		io.print(" none")
+	}
+}
+
+fn ints() uses alloc throws(AllocError) {
+	var xs = list.List[u32].new()
+	try xs.push(1)
+	try xs.push(2)
+	try xs.push(3)
+	io.print("ints:")
+	for i in 0..xs.len {
+		io.print(" {}", xs[i])
+		if i + 1 < xs.len {
+			io.print(",")
+		}
+	}
+	io.print(", len {} cap {}, sum {}, get", xs.len, xs.cap, sum(xs))
+	show(xs.get(1))
+	show(xs.get(5))
+	io.print(", pop")
+	show(xs.pop())
+	show(xs.pop())
+	show(xs.pop())
+	show(xs.pop())
+	io.print("\n")
+}
+
+fn index() uses alloc throws(AllocError) {
+	var xs = list.List[u32].new()
+	try xs.extend([1, 2, 3, 4, 5])
+	// Assigned through the projection, proven against `xs.len`.
+	if xs.len < 5 {
+		return
+	}
+	xs[0] = 10
+	xs[1] = 20
+	xs[2] = 30
+	io.print("index: {} {} {}", xs[0], xs[1], xs[2])
+	// Parts, and the whole list passed `inout` as a slice.
+	io.print(", sliced {}", sum(xs[3..]) +% sum(xs[..1]) -% 1)
+	xs[0] = 3
+	xs[1] = 1
+	xs[2] = 2
+	slices.sort(&xs)
+	io.print(", sorted")
+	for x in xs {
+		io.print(" {}", x)
+	}
+	io.print("\n")
+}
+
+struct Point {
+	x: u32
+	y: u32
+}
+
+fn structs() uses alloc throws(AllocError) {
+	var ps = list.List[Point].new()
+	try ps.push(Point{x: 1, y: 2})
+	try ps.push(Point{x: 3, y: 4})
+	io.print("structs:")
+	for p in ps {
+		io.print(" {},{}", p.x, p.y)
+	}
+	if ps.len > 1 {
+		ps[1].x +%= 98
+		io.print(" x {}\n", ps[1].x)
+	}
+}
+
+// A view of a list is used, then the list changes after its last use.
+fn views() uses alloc throws(AllocError) {
+	var xs = list.List[u32].new()
+	try xs.push(7)
+	let s = xs.as_slice()
+	if s.len > 0 {
+		io.print("views: first {}", s[0])
+	}
+	try xs.push(8)
+	try xs.push(9)
+	io.print(", then")
+	let t = xs[..]
+	for x in t {
+		io.print(" {}", x)
+	}
+	io.print("\n")
+}
+
+// Many reallocations: the storage moves, or grows in place.
+fn growth() uses alloc throws(AllocError) {
+	var xs = list.List[u64].new()
+	var i: u64 = 0
+	while i < 100000 {
+		try xs.push(i)
+		i += 1
+	}
+	var total: u64 = 0
+	for x in xs {
+		total = total +% x
+	}
+	io.print("growth: {} {} cap {}\n", xs.len, total, xs.cap)
+}
+
+fn clones() uses alloc throws(AllocError) {
+	var a = list.List[u32].new()
+	try a.extend([1, 2, 3])
+	var b = try a.clone()
+	try b.push(99)
+	io.print("clone:")
+	for x in a {
+		io.print(" {}", x)
+	}
+	io.print(" |")
+	for x in b {
+		io.print(" {}", x)
+	}
+	io.print("\n")
+}
+
+// A resource: its `deinit` prints.
+struct Res {
+	cloned: bool
+	n: u32
+}
+
+fn Res.deinit(sink self) {
+	if self.cloned {
+		io.print("~c{} ", self.n)
+	} else {
+		io.print("~{} ", self.n)
+	}
+}
+
+impl Clone for Res {
+	fn clone(self) -> Res {
+		io.print("c{} ", self.n)
+		return Res{cloned: true, n: self.n}
+	}
+}
+
+// A clone, destroyed when the function returns.
+fn clone_dropped(rs: list.List[Res]) uses alloc throws(AllocError) {
+	let copy = try rs.clone()
+	io.print("| ")
+}
+
+fn resources() uses alloc throws(AllocError) {
+	io.print("resources: ")
+	var rs = list.List[Res].new()
+	try rs.push(Res{cloned: false, n: 1})
+	// Popped and dropped.
+	if let r = rs.pop() {
+	}
+	io.print("| ")
+	try rs.push(Res{cloned: false, n: 2})
+	try rs.push(Res{cloned: false, n: 3})
+	// Assigning an element destroys the one it replaces, and clearing
+	// destroys the elements first to last.
+	if rs.len > 1 {
+		rs[1] = Res{cloned: false, n: 3}
+	}
+	rs.clear()
+	try rs.push(Res{cloned: false, n: 1})
+	try rs.push(Res{cloned: false, n: 2})
+	io.print("| ")
+	try clone_dropped(rs)
+	rs.clear()
+	io.print("| end ")
+	try rs.push(Res{cloned: false, n: 4})
+	try rs.push(Res{cloned: false, n: 5})
+}
+
+fn boxes() uses alloc throws(AllocError) {
+	var bs = list.List[Box[u32]].new()
+	try bs.push(try Box.new(10))
+	try bs.push(try Box.new(20))
+	var total: u32 = 0
+	for b in bs {
+		total +%= b.value
+	}
+	if bs.len > 1 {
+		bs[1].value = 280
+	}
+	io.print("boxes: {}", total)
+	total = 0
+	for b in bs {
+		total +%= b.value
+	}
+	io.print(" {}", total +% 10)
+	bs.clear()
+	io.print(" | clear {}", bs.len)
+	try bs.push(try Box.new(1))
+	io.print(", then {}\n", bs.len)
+}
+
+fn main() uses alloc {
+	ints() catch _ {
+	}
+	index() catch _ {
+	}
+	structs() catch _ {
+	}
+	views() catch _ {
+	}
+	growth() catch _ {
+	}
+	clones() catch _ {
+	}
+	resources() catch _ {
+	}
+	io.print("\n")
+	boxes() catch _ {
+	}
+}

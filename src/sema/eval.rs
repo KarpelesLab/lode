@@ -808,7 +808,8 @@ impl Eval<'_, '_> {
                 | Intrinsic::AllocHandle
                 | Intrinsic::HandleAlloc
                 | Intrinsic::HandleResize
-                | Intrinsic::HandleFree,
+                | Intrinsic::HandleFree
+                | Intrinsic::HandleGrow,
                 _,
             ) => {
                 return fail("it allocates: allocation when compiling is not supported yet");
@@ -819,9 +820,12 @@ impl Eval<'_, '_> {
                 | Intrinsic::PtrDestroy
                 | Intrinsic::PtrCast
                 | Intrinsic::PtrAddr
-                | Intrinsic::FromAddr,
+                | Intrinsic::FromAddr
+                | Intrinsic::View
+                | Intrinsic::StrView,
                 _,
             )
+            | TExprKind::Elements(_)
             | TExprKind::Deref(_) => {
                 return fail("raw pointers don't exist at compile time");
             }

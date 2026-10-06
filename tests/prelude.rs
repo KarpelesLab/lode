@@ -106,3 +106,29 @@ fn box_is_alloc_box() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("`Box[u32]`"), "{found:?}");
 }
+
+#[test]
+fn using_list_and_string_loads_their_packages() {
+    let list = loaded(
+        "package main\n\nfn f(xs: List[u32]) -> usize {\n\treturn xs.len\n}\n\nfn main() {\n}\n",
+    );
+    assert!(list.iter().any(|p| p == "std/list"), "{list:?}");
+    assert!(!list.iter().any(|p| p == "std/string"), "{list:?}");
+    let string = loaded(
+        "package main\n\nfn f(s: String) -> usize {\n\treturn s.len()\n}\n\nfn main() {\n}\n",
+    );
+    assert!(string.iter().any(|p| p == "std/string"), "{string:?}");
+    assert!(string.iter().any(|p| p == "std/list"), "{string:?}");
+    assert!(
+        !loaded(HELLO)
+            .iter()
+            .any(|p| p == "std/list" || p == "std/string")
+    );
+    // `List` is `list.List`, and a message shows `String` by its name.
+    let found = errors(
+        "package main\n\nimport \"std/list\"\n\nfn same(sink xs: List[u32]) -> list.List[u32] {\n\treturn xs\n}\n\n\
+         fn shown(sink s: String) -> u32 {\n\treturn s\n}\n\nfn main() {\n}\n",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("`String`"), "{found:?}");
+}

@@ -1,0 +1,141 @@
+// error: `s` is used after `a` changed (on some path to here), and `s` views `a`
+// error: `s` is used after `a` changed (on some path to here), and `s` views `a`
+// error: `s` is used after `r` was moved (on some path to here), and `s` views `r`
+// error: `u` is used after `r3` was moved (on some path to here), and `u` views `r3`
+// error: `s` is used after `a` changed (on some path to here), and `s` views `a`
+// error: `v` is used after `a` changed (on some path to here), and `v` views `a`
+// error: `a` is passed `inout` or `set`, so `s` can't be used in the same expression
+// error: `r` is moved in this expression, so `t`, which views it, can't be used in it
+// error: `s` can't keep a view of `b`, which ends before `s` does
+// error: a struct field can't be a view (`[]u8`)
+// help: a view can't see what it views change, move or end
+// help: `s` views `a`
+package main
+
+fn sum(xs: []u8) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% u32(x)
+	}
+	return total
+}
+
+fn fill(inout xs: []u8, v: u8) {
+	for i in 0..xs.len {
+		xs[i] = v
+	}
+}
+
+fn first(xs: []u8) -> []u8 {
+	if xs.len == 0 {
+		return xs
+	}
+	return xs[..1]
+}
+
+// A resource whose bytes can be viewed.
+struct Res {
+	data: [4]u8
+}
+
+fn Res.deinit(sink self) {
+}
+
+fn Res.bytes(self) -> []u8 {
+	return self.data
+}
+
+fn keep(sink r: Res, s: []u8) -> u32 {
+	return sum(s)
+}
+
+fn keep2(s: []u8, sink r: Res) -> u32 {
+	return sum(s)
+}
+
+fn copy_into(inout xs: []u8, ys: []u8) {
+	for i in 0..xs.len {
+		if i < ys.len {
+			xs[i] = ys[i]
+		}
+	}
+}
+
+// A view can't be used after what it views is assigned...
+fn assigned() -> u32 {
+	var a: [4]u8 = [1, 2, 3, 4]
+	let s = first(a)
+	a = [0; 4]
+	return sum(s)
+}
+
+// ... changed through `&`, on some path ...
+fn passed(c: bool) -> u32 {
+	var a: [4]u8 = [1, 2, 3, 4]
+	let s = first(a)
+	if c {
+		fill(&a, 0)
+	}
+	return sum(s)
+}
+
+// ... moved ...
+fn moved() -> u32 {
+	let r = Res{data: [1, 2, 3, 4]}
+	let s = r.bytes()
+	let r2 = r
+	return sum(s)
+}
+
+// ... or changed by an element's assignment.
+fn element() -> u32 {
+	var a: [4]u8 = [1, 2, 3, 4]
+	let s = a[1..]
+	a[0] = 9
+	return sum(s)
+}
+
+// In a loop, the change reaches the next iteration's use.
+fn looped() -> u32 {
+	var a: [4]u8 = [1, 2, 3, 4]
+	let v = first(a)
+	var total: u32 = 0
+	for i in 0..3 {
+		total = total +% sum(v)
+		a[i] = 0
+	}
+	return total
+}
+
+// A view can't be passed with what it views, changed or moved.
+fn exclusive() -> u32 {
+	var a: [4]u8 = [1, 2, 3, 4]
+	let s = first(a)
+	copy_into(&a, s)
+	let r = Res{data: [1, 2, 3, 4]}
+	let t = r.bytes()
+	let n = keep2(t, r)
+	let r3 = Res{data: [1, 2, 3, 4]}
+	let u = r3.bytes()
+	return keep(r3, u)
+}
+
+// A view can't outlive what it views.
+fn outlives(c: bool) -> u32 {
+	let a: [4]u8 = [1, 2, 3, 4]
+	var s = first(a)
+	if c {
+		let b: [4]u8 = [5, 6, 7, 8]
+		s = first(b)
+	}
+	return sum(s)
+}
+
+// Nor be stored in a struct.
+struct Holder {
+	s: []u8
+}
+
+fn main() -> u8 {
+	return 0
+}

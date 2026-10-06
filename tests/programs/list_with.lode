@@ -1,0 +1,104 @@
+// stdout: made 10, cap 16 | allocs 3 frees 2\n
+// stdout: grown 20, sum 210, cap 32 | allocs 4 frees 3\n
+// stdout: destroyed | allocs 4 frees 4\n
+// stdout: string: counted text, 12 | allocs 5 frees 4\n
+package main
+
+import "std/alloc"
+import "std/io"
+import "std/string"
+
+// A list remembers the allocator its storage came from: it grows and is
+// freed through it, wherever it ends up (docs/allocation.md, Who frees).
+
+// An allocator that counts what it allocates and frees, from the root's
+// memory. It can't resize in place, so a list's storage moves with the
+// trait's default `grow`: allocate, copy, free.
+struct Counting {
+	unused: u8
+}
+
+struct Counts {
+	allocs: u32
+	frees: u32
+}
+
+static COUNTS: Counts = Counts{allocs: 0, frees: 0}
+
+static COUNTING: Counting = Counting{unused: 0}
+
+unsafe impl alloc.Allocator for Counting {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		unsafe {
+			COUNTS.allocs +%= 1
+			return try alloc.ROOT.alloc(size, align)
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		COUNTS.frees +%= 1
+		alloc.ROOT.free(p, size, align)
+	}
+}
+
+fn show() {
+	unsafe {
+		io.print(" | allocs {} frees {}\n", COUNTS.allocs, COUNTS.frees)
+	}
+}
+
+fn counting() -> alloc.Handle {
+	unsafe {
+		return alloc.handle(COUNTING)
+	}
+}
+
+// Made in a `with` block, returned out of it.
+fn made() uses alloc throws(AllocError) -> List[u32] {
+	with alloc = counting() {
+		var xs = List[u32].new()
+		for i in 1..11 {
+			try xs.push(u32(i))
+		}
+		return xs
+	}
+}
+
+fn run() uses alloc throws(AllocError) {
+	var xs = try made()
+	io.print("made {}, cap {}", xs.len, xs.cap)
+	show()
+	// Grown outside the block: through the list's own allocator.
+	for i in 11..21 {
+		try xs.push(u32(i))
+	}
+	var sum: u32 = 0
+	for x in xs {
+		sum +%= x
+	}
+	io.print("grown {}, sum {}, cap {}", xs.len, sum, xs.cap)
+	show()
+	mem_destroy(xs)
+	io.print("destroyed")
+	show()
+	var s = String.new()
+	with alloc = counting() {
+		try s.push_str("counted text")
+	}
+	io.print("string: {}, {}", s, s.len())
+	show()
+}
+
+fn mem_destroy(sink xs: List[u32]) {
+}
+
+fn main() uses alloc -> u8 {
+	run() catch _ {
+		return 1
+	}
+	return 0
+}

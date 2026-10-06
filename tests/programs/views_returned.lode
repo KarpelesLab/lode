@@ -1,0 +1,106 @@
+// stdout: half 6, longer 4, row 5 6 7 8, field 3, method 7\n
+// stdout: after 10, row 99, pick b, static yes no, loop 24, kept 3 1\n
+package main
+
+import "std/io"
+
+// Functions return views of their parameters (docs/memory.md, Views):
+// the caller's view borrows from what it passed, and can't be used after
+// that changes.
+
+fn sum(xs: []u32) -> u32 {
+	var total: u32 = 0
+	for x in xs {
+		total = total +% x
+	}
+	return total
+}
+
+// Element `i` of `xs`, or 0.
+fn at(xs: []u32, i: usize) -> u32 {
+	if i < xs.len {
+		return xs[i]
+	}
+	return 0
+}
+
+fn first_half(xs: []u32) -> []u32 {
+	return xs[..xs.len / 2]
+}
+
+// A result that borrows from either parameter borrows from both.
+fn longer(a: []u32, b: []u32) -> []u32 {
+	if a.len >= b.len {
+		return a
+	}
+	return b
+}
+
+struct Grid {
+	rows: [3][4]u32
+	tag: u32
+}
+
+// A view of a field of a parameter.
+fn row(g: Grid, i: usize where i < 3) -> []u32 {
+	return g.rows[i]
+}
+
+fn Grid.row(self, i: usize where i < 3) -> []u32 {
+	return self.rows[i]
+}
+
+// A local that holds a parameter's view, or a literal.
+fn pick(a: str, b: str, second: bool) -> str {
+	var out = a
+	if second {
+		out = b
+	}
+	return out
+}
+
+// Static strings borrow from nothing.
+fn yes_no(b: bool) -> str {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+fn main() {
+	var a: [6]u32 = [1, 2, 3, 0, 0, 0]
+	let h = first_half(a)
+	io.print("half {}, ", sum(h))
+	// `h` isn't used below: `a` can change.
+	a[0] = 10
+	let b: [4]u32 = [1, 1, 1, 1]
+	let l = longer(a[..2], b)
+	io.print("longer {}, ", l.len)
+	var g = Grid{rows: [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]], tag: 3}
+	let r = row(g, 1)
+	if r.len < 4 {
+		return
+	}
+	io.print("row {} {} {} {}, ", r[0], r[1], r[2], r[3])
+	io.print("field {}, ", g.tag)
+	let m = g.row(1)
+	io.print("method {}\n", at(m, 2))
+	// After the last use of `r` and `m`.
+	g.rows[1][0] = 99
+	io.print("after {}, ", a[0])
+	io.print("row {}, ", at(row(g, 1), 0))
+	io.print("pick {}, ", pick("a", "b", true))
+	io.print("static {} {}, ", yes_no(true), yes_no(false))
+	// A view made in each iteration, and the array changed after it.
+	var total: u32 = 0
+	for i in 0..3 {
+		let v = g.row(i)
+		total = total +% at(v, 3)
+		g.tag = g.tag +% 1
+	}
+	io.print("loop {}, ", total)
+	// A view kept across reads of what it views.
+	let k = g.row(2)
+	let before = g.tag -% 5
+	io.print("kept {} {}\n", k.len -| 1, before)
+}

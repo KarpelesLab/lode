@@ -12,6 +12,7 @@ mod generic;
 mod refine;
 mod traits;
 pub mod tree;
+mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -67,6 +68,7 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         deinits: HashSet::new(),
         statics: Vec::new(),
         alloc: None,
+        list: None,
         prelude: HashMap::new(),
         sources: packages
             .iter()
@@ -411,6 +413,10 @@ struct Checker<'a> {
     statics: Vec<StaticInfo<'a>>,
     /// What the compiler knows of `std/alloc`, if it's loaded.
     alloc: Option<AllocInfo>,
+    /// `std/list`'s `List`, as declared, if it's loaded: `xs[i]`,
+    /// slicing, `for` and passing a list as a slice work on its elements
+    /// ([`TExprKind::Elements`]).
+    list: Option<Ty>,
     /// The items of the prelude whose packages are loaded, by name (see
     /// [`Checker::unqualified`]).
     prelude: HashMap<&'static str, Item>,
@@ -455,8 +461,13 @@ struct FnCx {
     /// For each loop around the current point, innermost last: where its
     /// body has left an iteration so far.
     loops: Vec<LoopEdges>,
-    /// Where the `str` locals' values come from, for `-> str`.
-    strs: StrOrigins,
+    /// What each view local borrows from: the variables whose storage it
+    /// may view (docs/memory.md, Views; see [`views`]). A view parameter
+    /// borrows from itself, and has no entry.
+    borrows: HashMap<LocalId, std::collections::BTreeSet<LocalId>>,
+    /// The view locals made unusable by a change of what they borrow from:
+    /// that variable, and where it changed, for the message.
+    stale: HashMap<LocalId, views::Stale>,
     /// The function being checked (`None` for a constant or a declaration).
     func: Option<FuncId>,
     /// The generic parameters of a generic function (or of the struct or
@@ -539,18 +550,6 @@ struct DeferMove {
     span: Span,
 }
 
-/// For a function returning a `str`: which locals hold only strings with
-/// static storage (see [`Checker::check_str_returns`]).
-#[derive(Clone, Default)]
-struct StrOrigins {
-    /// For each `str` local (not a parameter) given a value so far: the
-    /// locals its values were copied from, or `None` once it held a value
-    /// that may not be static.
-    deps: HashMap<LocalId, Option<Vec<LocalId>>>,
-    /// The locals returned, and where.
-    returned: Vec<(LocalId, Span)>,
-}
-
 /// The facts where a loop's body leaves an iteration: at each back-edge
 /// (a `continue`, or the end of the body) and at each `break`.
 #[derive(Default)]
@@ -570,7 +569,7 @@ struct Mark {
     diags: usize,
     locals: usize,
     consts: Vec<ConstState>,
-    strs: StrOrigins,
+    stale: HashMap<LocalId, views::Stale>,
     moved: HashSet<LocalId>,
     generic_calls: usize,
     checked: usize,
@@ -598,7 +597,8 @@ impl FnCx {
             set_params: Vec::new(),
             call_sets: Vec::new(),
             expr_depth: 0,
-            strs: StrOrigins::default(),
+            borrows: HashMap::new(),
+            stale: HashMap::new(),
             func: None,
             type_params: Vec::new(),
             value_locals: Vec::new(),
@@ -1674,6 +1674,11 @@ impl<'a> Checker<'a> {
         self.func_states = fns.iter().map(|_| FuncState::Unchecked).collect();
         self.fn_decls = fns;
         self.find_alloc();
+        if let Some(pkg) = self.pkgs.iter().position(|p| p.path == "std/list")
+            && let Some(&Item::Type(list)) = self.pkgs[pkg].items.get("List")
+        {
+            self.list = Some(list);
+        }
     }
 
     /// The items of `std/alloc` that the allocator context is made of, if
@@ -2059,12 +2064,15 @@ impl<'a> Checker<'a> {
             ("std/mem", None, "forget") => Some(Intrinsic::Forget),
             ("std/mem", None, "take") => Some(Intrinsic::Take),
             ("std/mem", None, "from_addr") => Some(Intrinsic::FromAddr),
+            ("std/mem", None, "view") => Some(Intrinsic::View),
+            ("std/mem", None, "view_str") => Some(Intrinsic::StrView),
             ("std/alloc", None, "current") => Some(Intrinsic::AllocCurrent),
             ("std/alloc", None, "root") => Some(Intrinsic::AllocRoot),
             ("std/alloc", None, "handle") => Some(Intrinsic::AllocHandle),
             ("std/alloc", Some("Handle"), "alloc") => Some(Intrinsic::HandleAlloc),
             ("std/alloc", Some("Handle"), "resize") => Some(Intrinsic::HandleResize),
             ("std/alloc", Some("Handle"), "free") => Some(Intrinsic::HandleFree),
+            ("std/alloc", Some("Handle"), "grow") => Some(Intrinsic::HandleGrow),
             (_, _, other) => {
                 self.error(
                     f.name.span,
@@ -3050,16 +3058,12 @@ impl<'a> Checker<'a> {
                 ret_named = r;
                 ty
             }) {
-                // A `str` with static storage can be returned (see
-                // `check_str_returns`).
-                Some(Ty::Str) if f.throws.is_some() => {
-                    self.error(t.span(), "a function that throws can't return a `str` yet");
-                    Ty::Str
-                }
-                Some(ty @ Ty::Slice(_)) => {
+                // A returned view borrows from the parameters (see
+                // `views`); in a result, it would be in memory.
+                Some(ty) if ty.is_view() && f.throws.is_some() => {
                     self.error(
                         t.span(),
-                        "returning a slice is not supported by the compiler yet",
+                        format!("a function that throws can't return a view (`{ty}`) yet"),
                     );
                     // The type is kept, so the body is still checked.
                     ty
@@ -3649,7 +3653,6 @@ impl<'a> Checker<'a> {
             prologue.append(&mut body);
             body = prologue;
         }
-        self.check_str_returns(&cx);
         // A failed local is only declared after its error was reported.
         debug_assert!(cx.failed.is_empty() || crate::diag::has_errors(&self.diags));
         if ret == Ty::Never && !terminates(&body) {
@@ -3710,57 +3713,6 @@ impl<'a> Checker<'a> {
             return;
         }
         self.error(span, format!("cannot find `{name}` in this scope"));
-    }
-
-    /// A function returning a `str` returns only strings with static
-    /// storage, which borrow from nothing: string literals, the results of
-    /// other functions returning a `str`, and locals that only ever hold
-    /// such strings. Until the compiler checks that a returned view borrows
-    /// from the parameters (docs/memory.md, Views), that's what keeps a
-    /// returned `str` valid. Report each returned local that may hold
-    /// another string.
-    fn check_str_returns(&mut self, cx: &FnCx) {
-        // The locals that may hold a string that isn't static: any that
-        // was given one, and any copied from such a local.
-        let deps = &cx.strs.deps;
-        let mut tainted: HashSet<LocalId> = deps
-            .iter()
-            .filter(|(_, d)| d.is_none())
-            .map(|(&l, _)| l)
-            .collect();
-        loop {
-            let more: Vec<LocalId> = deps
-                .iter()
-                .filter(|(l, d)| {
-                    !tainted.contains(l)
-                        && d.as_ref().is_some_and(|d| {
-                            d.iter()
-                                .any(|s| tainted.contains(s) || !deps.contains_key(s))
-                        })
-                })
-                .map(|(&l, _)| l)
-                .collect();
-            if more.is_empty() {
-                break;
-            }
-            tainted.extend(more);
-        }
-        let mut reported = HashSet::new();
-        for &(l, span) in &cx.strs.returned {
-            if (tainted.contains(&l) || !deps.contains_key(&l)) && reported.insert(span) {
-                self.report_str_return(span);
-            }
-        }
-    }
-
-    fn report_str_return(&mut self, span: Span) {
-        self.diags.push(
-            Diagnostic::error(
-                span,
-                "a function can only return a `str` that is a string literal (or another function's `str` result)",
-            )
-            .with_help("a returned `str` can't borrow from the parameters yet (docs/memory.md, Views)"),
-        );
     }
 
     /// The help for assigning to the immutable `local`, named `name`.
@@ -3881,9 +3833,14 @@ impl<'a> Checker<'a> {
         }
         // The variables the block's `defer` bodies move are moved at its end.
         let depth = cx.scopes.len();
+        let end = Span {
+            start: stmts.last().map_or(0, |s| s.span().end),
+            ..stmts.last().map_or(Span::default(), |s| s.span())
+        };
         for l in self.defer_moves_at(cx, depth - 1, false, None) {
             cx.env.declare_uninit(l);
             cx.moved.insert(l);
+            views::source_changed(cx, l, views::Change::Moved, end);
         }
         cx.defer_moves.retain(|m| m.depth < depth);
         cx.scopes.pop();
@@ -4022,14 +3979,7 @@ impl<'a> Checker<'a> {
 
     /// A local was given a new value: record what's known about it.
     fn record_value(&self, cx: &mut FnCx, local: LocalId, value: &expr::Checked) {
-        if cx.locals[local].ty == Ty::Str {
-            let origin = str_origin(cx, &value.expr);
-            let entry = cx.strs.deps.entry(local).or_insert(Some(Vec::new()));
-            match (entry.as_mut(), origin) {
-                (Some(deps), Some(more)) => deps.extend(more),
-                _ => *entry = None,
-            }
-        }
+        self.record_borrows(cx, local, &value.expr);
         match value.term {
             // `i = i + k`: what was known about `i` shifts by `k`.
             Some(src) if src.term == Term::Local(local) => {
@@ -4286,7 +4236,7 @@ impl<'a> Checker<'a> {
                 }
                 let value = self.kept(cx, value, init.span)?;
                 let local = self.declare(cx, &name.name, value.ty(), *mutable);
-                self.check_kept_view(cx, &value, init.span)?;
+                self.check_kept_view(cx, local, &value.expr, init.span)?;
                 if let Some(r) = named {
                     cx.place_refines.insert(local, (r, refine::Leaf::Value));
                     self.check_local_refine(cx, local, &value, init.span);
@@ -4379,7 +4329,8 @@ impl<'a> Checker<'a> {
                     }
                     Self::invalidate_projections(cx, local);
                 }
-                self.check_kept_view(cx, &checked, value.span)?;
+                views::source_changed(cx, local, views::Change::Changed, target.span);
+                self.check_kept_view(cx, local, &checked.expr, value.span)?;
                 self.check_local_refine(cx, local, &checked, value.span);
                 self.record_value(cx, local, &checked);
                 self.assume_local_refine(cx, local);
@@ -4476,14 +4427,10 @@ impl<'a> Checker<'a> {
                         .and_then(|c| self.kept(cx, c, v.span))
                         .map(|c| c.expr),
                 };
-                if let (Some(e), Ty::Str) = (&value, cx.ret) {
-                    match str_origin(cx, e) {
-                        Some(locals) => {
-                            let at = *span;
-                            cx.strs.returned.extend(locals.into_iter().map(|l| (l, at)));
-                        }
-                        None => self.report_str_return(*span),
-                    }
+                if let Some(e) = &value
+                    && e.ty.is_view()
+                {
+                    self.check_returned_view(cx, e, *span);
                 }
                 self.check_set_params(cx, *span);
                 self.defer_moves_at(cx, 0, false, Some(*span));
@@ -4557,6 +4504,14 @@ impl<'a> Checker<'a> {
                 let mut env = cx.env.clone();
                 for l in self.defer_moves_at(cx, depth, false, Some(*span)) {
                     env.declare_uninit(l);
+                    views::source_changed_in(
+                        &cx.borrows,
+                        &mut cx.stale,
+                        &mut env,
+                        l,
+                        views::Change::Moved,
+                        *span,
+                    );
                 }
                 let edges = cx.loops.last_mut().expect("in a loop");
                 Some(if matches!(stmt, Stmt::Break(_)) {
@@ -5407,6 +5362,20 @@ impl<'a> Checker<'a> {
     ) -> (T, Env, Vec<Env>) {
         let mark = self.mark(cx);
         let index_local = index.map(|ix| ix.local);
+        // What the view locals declared before the loop borrow from: a pass
+        // that adds to it is checked again, as the changes earlier in the
+        // body may affect the views on the next iteration (see `views`).
+        let outer_borrows = |cx: &FnCx| {
+            let mut b: Vec<(LocalId, usize)> = cx
+                .borrows
+                .iter()
+                .filter(|&(&l, _)| l < mark.locals)
+                .map(|(&l, r)| (l, r.len()))
+                .collect();
+            b.sort_unstable();
+            b
+        };
+        let mut borrows = outer_borrows(cx);
         let (mut out, mut head, mut edges) = self.loop_search(cx, body, index, &mut check);
         loop {
             let moved: Vec<LocalId> = edges
@@ -5416,13 +5385,22 @@ impl<'a> Checker<'a> {
                 .flat_map(Env::uninit_locals)
                 .filter(|&l| l < mark.locals && !head.dead && !head.is_uninit(l))
                 .collect();
-            if moved.is_empty() {
+            let now = outer_borrows(cx);
+            let grew = now != borrows;
+            borrows = now;
+            if moved.is_empty() && !grew {
                 return (out, head, edges.exits);
             }
             for &l in &moved {
                 head.declare_uninit(l);
             }
+            // A view made unusable at a back-edge says why in the next pass.
+            let stale: Vec<(LocalId, views::Stale)> = moved
+                .iter()
+                .filter_map(|l| cx.stale.get(l).map(|&s| (*l, s)))
+                .collect();
             self.rollback(cx, &mark);
+            cx.stale.extend(stale);
             cx.moved.extend(moved);
             (out, edges) = self.loop_pass(cx, head.clone(), index_local, &mut check);
         }
@@ -5559,7 +5537,7 @@ impl<'a> Checker<'a> {
             diags: self.diags.len(),
             locals: cx.locals.len(),
             consts: self.consts.iter().map(|c| c.state).collect(),
-            strs: cx.strs.clone(),
+            stale: cx.stale.clone(),
             moved: cx.moved.clone(),
             generic_calls: self.generic_calls.len(),
             checked: self.checked_order.len(),
@@ -5577,7 +5555,8 @@ impl<'a> Checker<'a> {
         cx.projections.retain(|&l, _| l < mark.locals);
         cx.temps.retain(|&l| l < mark.locals);
         cx.defer_moves.retain(|m| m.local < mark.locals);
-        cx.strs = mark.strs.clone();
+        cx.stale = mark.stale.clone();
+        cx.borrows.retain(|&l, _| l < mark.locals);
         cx.moved = mark.moved.clone();
         self.generic_calls.truncate(mark.generic_calls);
         for (c, &state) in self.consts.iter_mut().zip(&mark.consts) {
@@ -5635,6 +5614,12 @@ impl<'a> Checker<'a> {
             }
             ast::ForIter::Each(xs) => {
                 let seq = self.expr(cx, xs, None)?;
+                // A list's elements (docs/allocation.md, `List[T]`).
+                let seq = if self.is_list(seq.ty()) {
+                    self.elements(cx, seq)
+                } else {
+                    seq
+                };
                 let (elem, len) = match (seq.ty().as_array(), seq.ty().as_slice()) {
                     (Some((elem, n)), _) => (elem, Some(n)),
                     (_, Some(elem)) => (elem, None),
@@ -5887,70 +5872,6 @@ impl<'a> Checker<'a> {
         Some(())
     }
 
-    /// A slice stored in a local must not see its array change: the array
-    /// can't be changed while a view of it is in use (docs/memory.md, Views),
-    /// and until the compiler checks that, a slice local may only view a
-    /// `let` array (or part of one), or part of another view. A slice of a
-    /// `var` array or of a temporary can still be passed to a function.
-    fn check_kept_view(&mut self, cx: &FnCx, value: &expr::Checked, span: Span) -> Option<()> {
-        // A slice `v[i..j]` views what `v` views.
-        let mut viewed = &value.expr;
-        while let TExprKind::Slice(base, ..) = &viewed.kind {
-            viewed = base;
-        }
-        let sliced = !std::ptr::eq(viewed, &value.expr);
-        // A copy of an `inout` slice, or a slice of one, would see its
-        // elements change.
-        if let TExprKind::Local(l) = viewed.kind
-            && cx.locals[l].mutable_view()
-        {
-            let name = &cx.locals[l].name;
-            let what = if sliced { "a slice" } else { "a copy" };
-            self.diags.push(
-                Diagnostic::error(
-                    span,
-                    format!("cannot keep {what} of `{name}`, an `inout` slice"),
-                )
-                .with_help(format!(
-                    "its elements can change; use `{name}` itself, or pass it to the function that takes the slice"
-                )),
-            );
-            return None;
-        }
-        let TExprKind::ToSlice(array) = &viewed.kind else {
-            return Some(());
-        };
-        let mut root = &**array;
-        while let TExprKind::Index(base, _) | TExprKind::Field(base, _) = &root.kind {
-            root = base;
-        }
-        let diag = match root.kind {
-            // An array constant never changes.
-            TExprKind::Table(_) => return Some(()),
-            // Reassigning a `var` view doesn't change what it viewed.
-            TExprKind::Local(l)
-                if !cx.locals[l].mutable_view()
-                    && (!cx.locals[l].mutable || cx.locals[l].ty.is_view()) =>
-            {
-                return Some(());
-            }
-            TExprKind::Local(l) => {
-                let name = &cx.locals[l].name;
-                Diagnostic::error(
-                    span,
-                    format!("cannot keep a slice of `{name}`, which is mutable"),
-                )
-                .with_help(format!(
-                    "declare it with `let`, or pass `{name}` straight to the function that takes the slice"
-                ))
-            }
-            _ => Diagnostic::error(span, "cannot keep a slice of a temporary array")
-                .with_help("store the array with `let` first"),
-        };
-        self.diags.push(diag);
-        None
-    }
-
     /// `a[i] = v`, `p.x = v`, `a[i].x[j] op= v`: assign to an element or
     /// a field of a `var` array or struct.
     fn place_assign(
@@ -6021,7 +5942,12 @@ impl<'a> Checker<'a> {
         {
             Self::invalidate_projections(cx, local);
         }
-        self.place_store(cx, place, target, op, value, span, before)
+        let root = views::changed_root(cx, &place.expr);
+        let out = self.place_store(cx, place, target, op, value, span, before);
+        if let Some(root) = root {
+            views::source_changed(cx, root, views::Change::Changed, target_span);
+        }
+        out
     }
 
     /// Check that `target`, a place rooted at `local` (named `name`), can
@@ -6307,28 +6233,6 @@ pub fn table_leaf(ty: Ty) -> Option<Ty> {
         elem = inner;
     }
     matches!(elem, Ty::Int(_) | Ty::Bool).then_some(elem)
-}
-
-/// Where the `str` value `e` comes from, if its storage is static: the
-/// locals it's copied from (whose values must be static too), or `None` if
-/// it may borrow from a parameter. A string literal is static, and so is
-/// the result of a function returning a `str`, which returns only static
-/// strings.
-fn str_origin(cx: &FnCx, e: &TExpr) -> Option<Vec<LocalId>> {
-    match &e.kind {
-        // A call to a `never` function has no value at all.
-        TExprKind::Str(_) | TExprKind::Call(..) | TExprKind::Never(_) => Some(Vec::new()),
-        TExprKind::Local(l) if *l >= cx.params => Some(vec![*l]),
-        TExprKind::Try(call) => str_origin(cx, call),
-        TExprKind::Catch { call, handler, .. } => {
-            let mut out = str_origin(cx, call)?;
-            if let Handler::Value(v) = handler {
-                out.extend(str_origin(cx, v)?);
-            }
-            Some(out)
-        }
-        _ => None,
-    }
 }
 
 /// The smallest value of `all` that none of `ranges` holds, if any.

@@ -75,3 +75,20 @@ jobs:
             echo "::error::hello world made $calls system calls, expected 2"
             exit 1
           fi
+      - name: Build and run tests/programs/list_numbers.lode
+        # The reference program of docs/allocation.md (Code size): a
+        # `List[u32]` filled from standard input, sorted and printed.
+        run: |
+          cargo run --quiet -- build tests/programs/list_numbers.lode -O2 -o list_numbers
+          printf '42\n7\n1000\n3\n' | ./list_numbers > out
+          printf '3 7 42 1000\n' | cmp - out
+          size=$(stat -c %s list_numbers)
+          {
+            echo
+            echo '### `List[u32]` from standard input (`-O2`)'
+            echo
+            echo '| bytes |'
+            echo '| ---: |'
+            echo "| $size |"
+          } >> "$GITHUB_STEP_SUMMARY"
+

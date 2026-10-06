@@ -1,22 +1,21 @@
-// error: a function can only return a `str` that is a string literal
-// error: a function can only return a `str` that is a string literal
-// error: a function can only return a `str` that is a string literal
-// error: a function that throws can't return a `str` yet
-// error: returning a slice is not supported by the compiler yet
-// help: a returned `str` can't borrow from the parameters yet
+// error: this returns a view of `a`, a local variable, which ends when the function returns
+// error: this returns a view of `local`, a local variable, which ends when the function returns
+// error: this returns a view of a temporary value, which ends with its statement
+// error: this returns a view of `a`, a `sink` parameter, which the function destroys when it returns
+// error: a function that throws can't return a view (`str`) yet
+// help: a returned view borrows from the parameters (docs/memory.md, Views)
 package main
 
 enum E {
 	bad
 }
 
-// A parameter's string may borrow from the caller's storage: it can't be
-// returned until the compiler checks the view rules.
+// A returned view borrows from the parameters: a parameter's string can be
+// returned, and so can a local that holds one, or a string literal.
 fn same(s: str) -> str {
 	return s
 }
 
-// Nor a local that held one at any point.
 fn pick(s: str, b: bool) -> str {
 	var out = "default"
 	if b {
@@ -25,24 +24,38 @@ fn pick(s: str, b: bool) -> str {
 	return out
 }
 
-// Copies of such a local are tainted too.
-fn copied(s: str) -> str {
-	var a = "x"
-	let b = a
-	a = s
-	let c = b
-	if c.len > 0 {
-		return a
+// Not a view of a local array, which ends when the function returns.
+fn local_array() -> []u8 {
+	let a: [2]u8 = [1, 2]
+	return a
+}
+
+// Nor a local that viewed one at any point.
+fn tainted(xs: []u8, b: bool) -> []u8 {
+	let local: [2]u8 = [1, 2]
+	var out = xs
+	if b {
+		out = local
 	}
-	return "y"
+	return out
+}
+
+fn make() -> [2]u8 {
+	return [3, 4]
+}
+
+// Nor a view of a temporary.
+fn temporary() -> []u8 {
+	return make()[..]
+}
+
+// Nor of a `sink` parameter, which the function owns.
+fn sunk(sink a: [2]u8) -> []u8 {
+	return a
 }
 
 fn thrown() throws(E) -> str {
 	return "x"
-}
-
-fn slice(xs: []u8) -> []u8 {
-	return xs
 }
 
 fn main() -> u8 {

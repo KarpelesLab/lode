@@ -1,0 +1,140 @@
+// error: `s` is used after `xs` changed (on some path to here), and `s` views `xs`
+// error: this loop goes over a view of `xs`, which the loop's body changes
+// error: cannot prove that this index is less than the length
+// error: this copies `rs[0]`, a `Res`, but `Res` isn't `Copy`
+// error: cannot assign to an element of `ys`, which is immutable
+// error: `s` is used after `xs` was moved (on some path to here), and `s` views `xs`
+// error: `s` can't keep a view of a temporary value, which ends with its statement
+// error: this returns a view of `xs`, a local variable, which ends when the function returns
+// error: `len` of `List` is read-only outside package `std/list`
+// error: `xs.push` allocates (`uses alloc`)
+// error: `xs` is passed `inout` or `set`, so `s` can't be used in the same expression
+// error: `s` is used after `o` changed (on some path to here), and `s` views `o`
+// error: `s` is used after `xs` changed (on some path to here), and `s` views `xs`
+// error: a `defer` body can't use `s`, which views `xs`
+// help: a view can't see what it views change, move or end
+// help: check it first (`if i < xs.len`), or loop with `for`
+package main
+
+import "std/io"
+import "std/list"
+
+// The example of docs/allocation.md: a push may move the elements, so a
+// view of them can't be used after it.
+fn growth() uses alloc throws(AllocError) {
+	var xs = list.List[u32].new()
+	try xs.push(1)
+	let s = xs.as_slice()
+	try xs.push(2)
+	io.print("{}\n", s.len)
+}
+
+// A loop over a list can't change it.
+fn looped() uses alloc throws(AllocError) {
+	var xs = list.List[u32].new()
+	try xs.push(1)
+	for x in xs {
+		try xs.push(x)
+	}
+}
+
+// An index is proven against `xs.len`.
+fn unproven(xs: list.List[u32], i: usize) -> u32 {
+	return xs[i]
+}
+
+struct Res {
+	n: u32
+}
+
+fn Res.deinit(sink self) {
+}
+
+// An element isn't moved out of its list.
+fn moved_out(rs: list.List[Res]) -> u32 {
+	if rs.len == 0 {
+		return 0
+	}
+	let r = rs[0]
+	return 1
+}
+
+// A `let` list's elements can't change.
+fn immutable() uses alloc throws(AllocError) {
+	let ys = list.List[u32].new()
+	if ys.len > 0 {
+		ys[0] = 1
+	}
+}
+
+// A view can't be used after its list moved.
+fn after_move() -> usize {
+	let xs = list.List[u32].new()
+	let s = xs.as_slice()
+	let ys = xs
+	return s.len
+}
+
+fn make() -> list.List[u32] {
+	return list.List[u32].new()
+}
+
+// Nor kept from a temporary list.
+fn temporary() -> usize {
+	let s = make().as_slice()
+	return s.len
+}
+
+// Nor returned from a list that ends with the function.
+fn returned() -> []u32 {
+	let xs = list.List[u32].new()
+	return xs[..]
+}
+
+// `len` is read everywhere, set only in `std/list`.
+fn set_len(inout xs: list.List[u32]) {
+	xs.len = 0
+}
+
+// Growing needs the allocator in context.
+fn no_alloc(inout xs: list.List[u32]) {
+	xs.push(1) catch _ {
+	}
+}
+
+// A list can't be changed while a view of it is passed with it.
+fn extend_self(inout xs: list.List[u32]) uses alloc throws(AllocError) {
+	let s = xs.as_slice()
+	try xs.extend(s)
+}
+
+// A view of what a pattern binds views the matched variable.
+fn matched() uses alloc throws(AllocError) {
+	var o: ?List[u32] = List[u32].new()
+	if let l = o {
+		let s = l[..]
+		o = none
+		io.print("{}\n", s.len)
+	}
+}
+
+// A call that changes the list may have changed it when it fails too.
+fn caught() uses alloc throws(AllocError) {
+	var xs = List[u32].new()
+	let s = xs.as_slice()
+	xs.push(2) catch _ {
+		io.print("{}\n", s.len)
+	}
+}
+
+// A `defer` runs after the code that changes the list.
+fn deferred() uses alloc throws(AllocError) {
+	var xs = List[u32].new()
+	let s = xs.as_slice()
+	defer io.print("{}\n", s.len)
+	try xs.push(2)
+}
+
+fn main() -> u8 {
+	return 0
+}

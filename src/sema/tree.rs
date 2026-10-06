@@ -317,6 +317,11 @@ pub enum TExprKind {
     Field(Box<TExpr>, u32),
     /// An array viewed as a slice of all its elements.
     ToSlice(Box<TExpr>),
+    /// The elements of a `List` (`std/list`), a place or a value of one,
+    /// viewed as a slice: its `len` elements from its `ptr` (docs/allocation.md,
+    /// `List[T]`). `xs[i]`, `xs[i..j]`, `for x in xs` and `&xs` of a list
+    /// are those of this slice.
+    Elements(Box<TExpr>),
     /// `s.ptr` of a `str` or a slice (unsafe). For an array, `a.ptr` is this
     /// over a [`TExprKind::ToSlice`] of it.
     StrPtr(Box<TExpr>),
@@ -463,6 +468,14 @@ pub enum Intrinsic {
     HandleAlloc,
     HandleResize,
     HandleFree,
+    /// `h.grow(p, old, new, align)` on an `alloc.Handle`: the allocator's
+    /// `grow` (the trait's default, or its own).
+    HandleGrow,
+    /// `mem.view(p, n)`: the slice of the `n` elements at `p` (unsafe).
+    View,
+    /// `mem.view_str(p, n)`: the `str` of the `n` bytes at `p`, which must
+    /// be UTF-8 (unsafe).
+    StrView,
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -584,6 +597,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::ArrayLen(inner)
         | TExprKind::ArrayRepeat(inner)
         | TExprKind::ToSlice(inner)
+        | TExprKind::Elements(inner)
         | TExprKind::StrPtr(inner)
         | TExprKind::Bytes(inner)
         | TExprKind::Payload(inner, ..)
@@ -704,6 +718,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::ArrayLen(inner)
         | TExprKind::ArrayRepeat(inner)
         | TExprKind::ToSlice(inner)
+        | TExprKind::Elements(inner)
         | TExprKind::StrPtr(inner)
         | TExprKind::Bytes(inner)
         | TExprKind::Payload(inner, ..)

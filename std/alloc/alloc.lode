@@ -36,6 +36,42 @@ pub unsafe trait Allocator {
 	/// The caller must ensure `p` is a block of `size` bytes this allocator
 	/// gave, with `align`, which nothing uses any more.
 	unsafe fn free(self, p: *u8, size: usize, align: usize)
+
+	/// Grow the block of `old` bytes at `p` to `new` bytes, keeping its
+	/// first `old` bytes: the block after, at `p` or elsewhere (and `p`
+	/// isn't used any more); or `out_of_memory`, with the block unchanged.
+	/// By default, it resizes in place when it can, or else allocates a
+	/// new block, copies the bytes, and frees the old one. A growing list
+	/// calls it.
+	///
+	/// The caller must ensure `p` is a block of `old` bytes this allocator
+	/// gave, with `align`, and `new` is at least `old`.
+	unsafe fn grow(self, p: *u8, old: usize, new: usize, align: usize) throws(AllocError) -> *u8 {
+		if self.resize(p, old, new, align) {
+			return p
+		}
+		let q = try self.alloc(new, align)
+		copy(q, p, old)
+		self.free(p, old, align)
+		return q
+	}
+}
+
+/// Copy `n` bytes from `from` to `to`, which don't overlap.
+///
+/// The caller must ensure both are `n` bytes the program may read and
+/// write.
+unsafe fn copy(to: *u8, from: *u8, n: usize) {
+	// A word at a time, then the bytes left.
+	let words = n / 8
+	let w = to.cast[u64]()
+	let v = from.cast[u64]()
+	for i in 0..words {
+		(w + i).write((v + i).read())
+	}
+	for i in words * 8..n {
+		(to + i).write((from + i).read())
+	}
 }
 
 /// A handle of an allocator: which allocator it is, and where. It's what
@@ -90,6 +126,16 @@ pub fn Handle.alloc(self, size: usize, align: usize) uses alloc throws(AllocErro
 pub unsafe fn Handle.resize(self, p: *u8, old: usize, new: usize, align: usize) uses alloc -> bool {
 }
 
+/// Grow the block of `old` bytes at `p` to `new` bytes through the
+/// handle's allocator, keeping its first `old` bytes: the block after, at
+/// `p` or elsewhere (see `Allocator.grow`).
+///
+/// The caller must ensure `p` is a block of `old` bytes from this
+/// allocator, with `align`, and `new` is at least `old`.
+@intrinsic
+pub unsafe fn Handle.grow(self, p: *u8, old: usize, new: usize, align: usize) uses alloc throws(AllocError) -> *u8 {
+}
+
 /// Free the block of `size` bytes at `p` to the handle's allocator. Like
 /// destruction, it doesn't need `uses alloc`.
 ///
@@ -114,6 +160,10 @@ unsafe impl Allocator for os.PageAllocator {
 
 	unsafe fn free(self, p: *u8, size: usize, align: usize) {
 		self.unmap(p, size)
+	}
+
+	unsafe fn grow(self, p: *u8, old: usize, new: usize, align: usize) throws(AllocError) -> *u8 {
+		return try self.move(p, old, new)
 	}
 }
 
@@ -241,6 +291,22 @@ unsafe impl Allocator for Heap {
 		let k = class_of(n)
 		p.cast[usize]().write(ROOT.free[k])
 		ROOT.free[k] = p.addr()
+	}
+
+	// A large block is remapped, moved by the kernel if it must, without
+	// a copy; a small one keeps its class, or moves to a block of the new
+	// size.
+	unsafe fn grow(self, p: *u8, old: usize, new: usize, align: usize) throws(AllocError) -> *u8 {
+		if block_size(old, align) > SMALL_MAX && block_size(new, align) > SMALL_MAX {
+			return try PAGES.move(p, old, new)
+		}
+		if self.resize(p, old, new, align) {
+			return p
+		}
+		let q = try self.alloc(new, align)
+		copy(q, p, old)
+		self.free(p, old, align)
+		return q
 	}
 }
 

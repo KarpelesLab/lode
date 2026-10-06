@@ -55,3 +55,22 @@ pub fn destroy[T](sink x: T) {
 @intrinsic
 pub unsafe fn from_addr[T](addr: usize) -> *T {
 }
+
+/// The `n` values at `p`, as a slice: a view of memory, such as the
+/// elements a container keeps on the heap.
+///
+/// The compiler implements it. The caller must ensure the `n` values at
+/// `p` are written, and stay where they are, unchanged, for as long as the
+/// view is used. The view borrows from the parameters of the function that
+/// makes it (docs/memory.md, Views): a method of a container returns a
+/// view of its memory, and the caller can't change the container while it
+/// uses the view.
+@intrinsic
+pub unsafe fn view[T](p: *T, n: usize) -> []T {
+}
+
+/// The `n` bytes at `p`, as a `str`: `view` for text. The caller must
+/// also ensure they're valid UTF-8.
+@intrinsic
+pub unsafe fn view_str(p: *u8, n: usize) -> str {
+}

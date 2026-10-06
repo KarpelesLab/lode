@@ -101,17 +101,20 @@ impl Instances {
 }
 
 /// The methods of the `Allocator` trait, in the order of a handle's
-/// intrinsics (`HandleAlloc`, `HandleResize`, `HandleFree`).
-const ALLOC_METHODS: [&str; 3] = ["alloc", "resize", "free"];
+/// intrinsics (`HandleAlloc`, `HandleResize`, `HandleFree`, `HandleGrow`).
+const ALLOC_METHODS: [&str; 4] = ["alloc", "resize", "free", "grow"];
+
+/// How many methods [`ALLOC_METHODS`] has.
+const METHODS: usize = ALLOC_METHODS.len();
 
 /// The allocator context, while instances are made.
 struct AllocState {
     info: AllocInfo,
     /// The allocator types reached, the root's first, each with the
     /// instances of the methods the dispatch functions call, once made.
-    types: Vec<(Ty, [Option<FuncId>; 3])>,
+    types: Vec<(Ty, [Option<FuncId>; METHODS])>,
     /// The dispatch function of each method, once a call needs it.
-    dispatch: [Option<FuncId>; 3],
+    dispatch: [Option<FuncId>; METHODS],
 }
 
 /// The instances `main` reaches. A program without `main` (a library:
@@ -135,7 +138,7 @@ pub fn instantiate(program: &Program) -> Instances {
         alloc: program.alloc.map(|info| AllocState {
             info,
             types: Vec::new(),
-            dispatch: [None; 3],
+            dispatch: [None; METHODS],
         }),
     };
     let main = match program.main {
@@ -214,7 +217,7 @@ pub fn instantiate(program: &Program) -> Instances {
             .alloc
             .as_ref()
             .map(|a| {
-                (0..3)
+                (0..METHODS)
                     .filter_map(|k| {
                         let d = a.dispatch[k]?;
                         let root = a.types.first()?.1[k]?;
@@ -396,17 +399,30 @@ impl Mono<'_> {
     fn root_allocator(&mut self) -> Ty {
         let a = self.alloc.as_mut().expect("`std/alloc` is loaded");
         if a.types.is_empty() {
-            a.types.push((a.info.root_ty, [None; 3]));
+            a.types.push((a.info.root_ty, [None; METHODS]));
         }
         self.statics[a.info.root] = true;
         a.info.root_ty
     }
 
     /// The program-level function of method `m` (in [`ALLOC_METHODS`]) of
-    /// the `Allocator` implementation of `ty`.
-    fn allocator_method(&self, ty: Ty, m: usize) -> FuncId {
+    /// the `Allocator` implementation of `ty`, and its type arguments: the
+    /// impl's, or the trait's default (`grow`), whose one is `ty`.
+    fn allocator_method(&self, ty: Ty, m: usize) -> (FuncId, Vec<Ty>) {
         let info = self.alloc.as_ref().expect("`std/alloc` is loaded").info;
-        self.program.dispatch.impls[&(info.allocator, ty.decl())][ALLOC_METHODS[m]]
+        let name = ALLOC_METHODS[m];
+        if let Some(&f) = self.program.dispatch.impls[&(info.allocator, ty.decl())].get(name) {
+            return (f, ty.type_args().to_vec());
+        }
+        let default = self
+            .program
+            .dispatch
+            .trait_fns
+            .iter()
+            .find(|(_, (t, n))| *t == info.allocator && n == name)
+            .map(|(&f, _)| f)
+            .expect("the trait's default");
+        (default, vec![ty])
     }
 
     /// The next step of the allocator context, once the instances so far
@@ -423,15 +439,15 @@ impl Mono<'_> {
             .iter()
             .enumerate()
             .flat_map(|(k, &(ty, made))| {
-                (0..3)
+                (0..METHODS)
                     .filter(move |&m| a.dispatch[m].is_some() && made[m].is_none())
                     .map(move |m| (k, m, ty))
             })
             .collect();
         if !missing.is_empty() {
             for (k, m, ty) in missing {
-                let f = self.allocator_method(ty, m);
-                let id = self.instance(f, ty.type_args().to_vec());
+                let (f, args) = self.allocator_method(ty, m);
+                let id = self.instance(f, args);
                 self.alloc.as_mut().expect("checked").types[k].1[m] = Some(id);
             }
             return true;
@@ -491,6 +507,11 @@ impl Mono<'_> {
                 vec![bytes, usize_ty, usize_ty, usize_ty],
                 Ty::Bool,
             ),
+            3 => (
+                &["p", "old", "new", "align"],
+                vec![bytes, usize_ty, usize_ty, usize_ty],
+                bytes,
+            ),
             _ => (
                 &["p", "size", "align"],
                 vec![bytes, usize_ty, usize_ty],
@@ -514,9 +535,9 @@ impl Mono<'_> {
             kind: TExprKind::Field(Box::new(local(0)), k),
             ty: usize_ty,
         };
-        let throws = (m == 0).then(Ty::alloc_error);
+        let throws = (m == 0 || m == 3).then(Ty::alloc_error);
         let call_of = |k: usize, ty: Ty| -> Vec<TStmt> {
-            let f = self.allocator_method(ty, m);
+            let (f, type_args) = self.allocator_method(ty, m);
             let callee = &self.program.funcs[f];
             let this = if k == 0 {
                 TExpr {
@@ -536,7 +557,7 @@ impl Mono<'_> {
             let mut args = vec![this];
             args.extend((1..locals.len()).map(local));
             let call = TExpr {
-                kind: TExprKind::GenericCall(f, ty.type_args().to_vec(), args),
+                kind: TExprKind::GenericCall(f, type_args.clone(), args),
                 ty: match callee.throws {
                     Some(err) => Ty::result(ret, err),
                     None => ret,
@@ -840,7 +861,8 @@ impl Mono<'_> {
             | Intrinsic::AllocHandle
             | Intrinsic::HandleAlloc
             | Intrinsic::HandleResize
-            | Intrinsic::HandleFree),
+            | Intrinsic::HandleFree
+            | Intrinsic::HandleGrow),
             args,
         ) = &mut e.kind
         {
@@ -850,18 +872,19 @@ impl Mono<'_> {
                 Intrinsic::HandleAlloc => 0,
                 Intrinsic::HandleResize => 1,
                 Intrinsic::HandleFree => 2,
+                Intrinsic::HandleGrow => 3,
                 Intrinsic::AllocHandle => {
                     // Another allocator type, for the handles of `a`.
                     let ty = args[0].ty.subst(map);
                     let a = self.alloc.as_mut().expect("checked");
                     if !a.types.iter().any(|&(t, _)| t == ty) {
-                        a.types.push((ty, [None; 3]));
+                        a.types.push((ty, [None; METHODS]));
                     }
-                    3
+                    METHODS
                 }
-                _ => 3,
+                _ => METHODS,
             };
-            if m < 3 {
+            if m < METHODS {
                 let mut args = std::mem::take(args);
                 let via_root =
                     matches!(args[0].kind, TExprKind::Intrinsic(Intrinsic::AllocRoot, _));
@@ -869,18 +892,14 @@ impl Mono<'_> {
                     // `alloc.root().free(...)`: the root's method, directly.
                     let a = self.alloc.as_ref().expect("checked");
                     let (root, root_ty) = (a.info.root, a.info.root_ty);
-                    let g = self.allocator_method(root_ty, m);
+                    let (g, type_args) = self.allocator_method(root_ty, m);
                     let adapt =
                         e.ty.as_result().is_some() && self.program.funcs[g].throws.is_none();
                     args[0] = TExpr {
                         kind: TExprKind::Static(root),
                         ty: root_ty,
                     };
-                    self.instance_throwing(
-                        g,
-                        root_ty.type_args().to_vec(),
-                        adapt.then(Ty::alloc_error),
-                    )
+                    self.instance_throwing(g, type_args, adapt.then(Ty::alloc_error))
                 } else {
                     self.dispatch_fn(m)
                 };

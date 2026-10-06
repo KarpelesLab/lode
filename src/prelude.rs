@@ -40,11 +40,23 @@ pub struct Entry {
 
 /// The prelude. (`AllocError`, `Ordering` and the built-in traits are
 /// built into the compiler, so they need no package.)
-pub const PRELUDE: &[Entry] = &[Entry {
-    name: "Box",
-    package: "std/alloc",
-    item: "Box",
-}];
+pub const PRELUDE: &[Entry] = &[
+    Entry {
+        name: "Box",
+        package: "std/alloc",
+        item: "Box",
+    },
+    Entry {
+        name: "List",
+        package: "std/list",
+        item: "List",
+    },
+    Entry {
+        name: "String",
+        package: "std/string",
+        item: "String",
+    },
+];
 
 /// The prelude entry named `name`.
 pub fn entry(name: &str) -> Option<&'static Entry> {

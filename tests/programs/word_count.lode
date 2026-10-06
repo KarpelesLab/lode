@@ -1,0 +1,77 @@
+// stdin: the quick brown fox\njumps over the lazy dog\n
+// stdin: and then some more words to count here\n
+// stdout: lines 3, words 17, bytes 83, longest "quick"\n
+// stdout: 5 words of 3 letters, 6 of 4, 5 of 5\n
+package main
+
+import "std/io"
+
+// A word count over standard input: the input in a `List[u8]` that grows
+// as it's read, the words' lengths in a `List[usize]`, and the longest
+// word in a `String`.
+
+fn read_all() uses alloc throws(AllocError) -> List[u8] {
+	var data = List[u8].new()
+	var buf: [16]u8 = [0; 16]
+	loop {
+		let n = io.stdin().read(&buf) catch _ {
+			break
+		}
+		if n == 0 {
+			break
+		}
+		try data.extend(buf[..n])
+	}
+	return data
+}
+
+fn is_space(b: u8) -> bool {
+	return b == ' ' || b == '\n' || b == '\t'
+}
+
+fn run() uses alloc throws(AllocError) {
+	let data = try read_all()
+	var lengths = List[usize].new()
+	var lines: usize = 0
+	var start: usize = 0
+	var longest_at: usize = 0
+	var longest: usize = 0
+	for i in 0..data.len {
+		let b = data[i]
+		if b == '\n' {
+			lines += 1
+		}
+		if is_space(b) {
+			if i > start {
+				let n = i - start
+				try lengths.push(n)
+				if n > longest {
+					longest = n
+					longest_at = start
+				}
+			}
+			start = i + 1
+		}
+	}
+	var word = String.new()
+	for i in longest_at..longest_at +| longest {
+		if i < data.len {
+			let ok = try word.push(u32(data[i]))
+		}
+	}
+	io.print("lines {}, words {}, bytes {}, longest \"{}\"\n", lines, lengths.len, data.len, word)
+	var by_len: [8]usize = [0; 8]
+	for n in lengths {
+		if n < by_len.len {
+			by_len[n] +|= 1
+		}
+	}
+	io.print("{} words of 3 letters, {} of 4, {} of 5\n", by_len[3], by_len[4], by_len[5])
+}
+
+fn main() uses alloc -> u8 {
+	run() catch _ {
+		return 1
+	}
+	return 0
+}

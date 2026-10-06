@@ -1,0 +1,48 @@
+// stdout: hello, world! (13 bytes)\n
+// stdout: x = 42, ok = true, name = lode: 30\n
+// stdout: copy: hello, world! and hello\n
+// stdout: chars: aé€😀 10 true false\n
+// stdout: truncate: false true aé\n
+// stdout: writer: 7 items no space\n
+package main
+
+import "std/io"
+import "std/string"
+
+fn main() uses alloc {
+	run() catch _ {
+		io.print("out of memory\n")
+	}
+}
+
+fn run() uses alloc throws(AllocError) {
+	var s = try string.String.from("hello")
+	try s.push_str(", ")
+	try s.push_str("world!")
+	io.print("{} ({} bytes)\n", s, s.len())
+	let f = try string.format("x = {}, ok = {}, name = {}", u32(42), true, "lode")
+	io.print("{}: {}\n", f.as_str(), f.bytes.len)
+	var c = try s.clone()
+	let t = s.truncate(5)
+	io.print("copy: {} and {}\n", c, s)
+	var u = string.String.new()
+	let a = try u.push(0x61)
+	let b = try u.push(0xe9)
+	let e = try u.push(0x20ac)
+	let g = try u.push(0x1f600)
+	let bad = try u.push(0xd800)
+	io.print("chars: {} {} {} {}\n", u, u.len(), a && b && e && g, bad)
+	let mid = u.truncate(2)
+	let ok = u.truncate(3)
+	io.print("truncate: {} {} {}\n", mid, ok, u)
+	// A `Writer` appends within the room left.
+	var w = string.String.new()
+	try w.reserve(8)
+	io.write_fmt(&w, "{} items", u8(7)) catch _ {
+	}
+	io.write_fmt(&w, " and more") catch e {
+		if e == .no_space {
+			io.print("writer: {} no space\n", w)
+		}
+	}
+}

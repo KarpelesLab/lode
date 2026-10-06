@@ -277,6 +277,8 @@ fn place_path(e: &TExpr) -> Option<(LocalId, Vec<Step>)> {
         // A slice is some of the elements, at indexes not known here.
         TExprKind::Slice(base, ..) => (base, Step::Slice),
         TExprKind::ToSlice(inner) => return place_path(inner),
+        // A list's elements: some of the list's storage.
+        TExprKind::Elements(base) => (base, Step::Slice),
         _ => return None,
     };
     let (local, mut path) = place_path(base)?;
@@ -338,6 +340,16 @@ fn accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
     }
 }
 
+/// The variables `e` moves out of (see [`TExprKind::Move`]).
+fn moved_locals(e: &TExpr, out: &mut Vec<LocalId>) {
+    if let TExprKind::Move(_, l) = &e.kind {
+        out.push(*l);
+    }
+    for sub in subexprs(e) {
+        moved_locals(sub, out);
+    }
+}
+
 /// The accesses in the indexes of the place `e`.
 fn index_accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
     match &e.kind {
@@ -354,6 +366,7 @@ fn index_accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
         TExprKind::Field(base, _)
         | TExprKind::Payload(base, ..)
         | TExprKind::ToSlice(base)
+        | TExprKind::Elements(base)
         | TExprKind::Deref(base) => index_accesses(base, out),
         _ => {}
     }
@@ -395,7 +408,7 @@ pub(super) fn place_text(cx: &FnCx, e: &TExpr) -> Option<String> {
                 bound(end)
             )
         }
-        TExprKind::ToSlice(inner) => return place_text(cx, inner),
+        TExprKind::ToSlice(inner) | TExprKind::Elements(inner) => return place_text(cx, inner),
         // A box's value (its pointer is its first field).
         TExprKind::Deref(inner) => match &inner.kind {
             TExprKind::Field(base, 0) => format!("{}.value", place_text(cx, base)?),
@@ -632,6 +645,11 @@ impl Checker<'_> {
             let range = Some(c.int_range());
             return Some(c.converted(target, range));
         }
+        // A list where a slice of its element type is expected: a view of
+        // its elements.
+        if self.is_list(c.ty()) && target.as_slice() == c.ty().type_args().first().copied() {
+            return Some(self.elements(cx, c));
+        }
         // An array where a slice of its element type is expected: a view of
         // the whole array.
         if let (Some((from, _)), Some(to)) = (c.ty().as_array(), target.as_slice())
@@ -681,6 +699,42 @@ impl Checker<'_> {
     fn check_exclusive(&mut self, cx: &FnCx, e: &TExpr, span: Span) {
         let mut found = Vec::new();
         accesses(e, &mut found);
+        // A view local used in the expression uses what it borrows from
+        // (docs/memory.md, Views): a call that changes that, or moves it,
+        // can't also get the view.
+        let viewed: Vec<Access<'_>> = found
+            .iter()
+            .filter(|a| !a.write && cx.locals[a.local].ty.is_view())
+            .flat_map(|a| {
+                cx.borrows
+                    .get(&a.local)
+                    .into_iter()
+                    .flatten()
+                    .map(|&r| Access {
+                        local: r,
+                        path: Vec::new(),
+                        write: false,
+                        place: a.place,
+                    })
+            })
+            .collect();
+        let mut moved = Vec::new();
+        moved_locals(e, &mut moved);
+        for l in moved {
+            if let Some(v) = viewed.iter().find(|v| v.local == l) {
+                let name = &cx.locals[l].name;
+                let view = place_text(cx, v.place).unwrap_or_else(|| "a view".to_owned());
+                self.diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!("`{name}` is moved in this expression, so `{view}`, which views it, can't be used in it"),
+                    )
+                    .with_help("a view can't see what it views move or end"),
+                );
+                return;
+            }
+        }
+        found.extend(viewed);
         let text = |a: &Access<'_>| {
             place_text(cx, a.place).unwrap_or_else(|| cx.locals[a.local].name.clone())
         };
@@ -709,6 +763,9 @@ impl Checker<'_> {
             let mut d = Diagnostic::error(span, msg).with_help(
                 "a place passed `inout` or `set` (with `&`, or to a method that takes `inout self`) needs exclusive access: nothing else in the expression may use it",
             );
+            if place_path(other.place).is_some_and(|(root, _)| root != other.local) {
+                d = d.with_help(format!("`{ot}` views `{}`", cx.locals[other.local].name));
+            }
             let pairs = || w.path.iter().zip(&other.path);
             let unknown_index = pairs().any(|pair| {
                 matches!(pair, (Step::Index(a), Step::Index(b)) if a.is_none() || b.is_none())
@@ -1774,6 +1831,12 @@ impl Checker<'_> {
         let i = self.expr(cx, index, Some(usize_ty));
         let (b, i) = (b?, i?);
         let b = self.temp(cx, b);
+        // A list's elements (docs/allocation.md, `List[T]`).
+        let b = if self.is_list(b.ty()) {
+            self.elements(cx, b)
+        } else {
+            b
+        };
         let elem = match b.ty() {
             Ty::Array(_) | Ty::Slice(_) => b.ty().elem().expect("array or slice"),
             Ty::Str => {
@@ -1910,6 +1973,11 @@ impl Checker<'_> {
         let b = b?;
         let s = s.map_or(Some(None), |c| c.map(Some))?;
         let e = e.map_or(Some(None), |c| c.map(Some))?;
+        let b = if self.is_list(b.ty()) {
+            self.elements(cx, b)
+        } else {
+            b
+        };
         // The base as a view, and its length.
         let (view, len) = match b.ty() {
             Ty::Array(_) => {
@@ -2212,7 +2280,7 @@ impl Checker<'_> {
                 return self.materialize_ct(&v, cx.locals[local].ty, span);
             }
             if cx.env.is_uninit(local) {
-                if self.moved_error(cx, local, span) {
+                if self.stale_view_error(cx, local, span) || self.moved_error(cx, local, span) {
                     return None;
                 }
                 let help = if cx.set_params.contains(&local) {
@@ -2224,6 +2292,9 @@ impl Checker<'_> {
                     Diagnostic::error(span, format!("`{name}` is used before it's assigned"))
                         .with_help(help),
                 );
+                return None;
+            }
+            if !self.check_deferred_view(cx, local, span) {
                 return None;
             }
             let ty = cx.locals[local].ty;
@@ -3718,6 +3789,9 @@ impl Checker<'_> {
                     {
                         Self::invalidate_projections(cx, l);
                     }
+                    if let Some(l) = super::views::changed_root(cx, &place) {
+                        super::views::source_changed(cx, l, super::views::Change::Changed, span);
+                    }
                     let arg = TExpr {
                         ty,
                         kind: TExprKind::Ref(Box::new(place)),
@@ -4184,6 +4258,9 @@ impl Checker<'_> {
                     Self::invalidate_projections(cx, l);
                 }
             }
+            if let Some(l) = super::views::changed_root(cx, place) {
+                super::views::source_changed(cx, l, super::views::Change::Changed, span);
+            }
             match place.kind {
                 TExprKind::Local(l) if *conv == Convention::Set => {
                     if cx.env.is_uninit(l) {
@@ -4367,7 +4444,7 @@ impl Checker<'_> {
         match (&arg.kind, conv) {
             (ExprKind::Ref(inner), Convention::Inout | Convention::Set) => {
                 let place = self.ref_place(cx, inner, None, conv)?;
-                inf.unify(pty, place.ty, arg.span);
+                inf.unify(pty, self.as_slice_for(pty, place.ty), arg.span);
                 if !inf.known(pty) {
                     self.error(arg.span, format!("expected `{pty}`, found `{}`", place.ty));
                     return None;
@@ -4389,7 +4466,7 @@ impl Checker<'_> {
             }
             _ => {
                 let c = self.expr(cx, arg, None)?;
-                inf.unify(pty, c.ty(), arg.span);
+                inf.unify(pty, self.as_slice_for(pty, c.ty()), arg.span);
                 if !inf.known(pty) {
                     self.error(arg.span, format!("expected `{pty}`, found `{}`", c.ty()));
                     return None;
@@ -4405,6 +4482,16 @@ impl Checker<'_> {
                 Some((c.expr, av))
             }
         }
+    }
+
+    /// The type a value of type `actual` has where `pattern` is expected,
+    /// for inference: a list's elements' slice where a slice is expected,
+    /// as where it converts; `actual` otherwise.
+    fn as_slice_for(&self, pattern: Ty, actual: Ty) -> Ty {
+        if pattern.as_slice().is_some() && self.is_list(actual) {
+            return Ty::slice(actual.type_args()[0]);
+        }
+        actual
     }
 
     /// A method of a raw pointer `p` (`recv`, a `*to`): `p.read()` (the
@@ -4597,6 +4684,15 @@ impl Checker<'_> {
                 ty: pty,
             });
         }
+        // A list's elements, as an `inout` slice: they can change, not the
+        // list's length.
+        if self.is_list(place.ty) && pty.as_slice() == place.ty.type_args().first().copied() {
+            let list = self.mutable_place(cx, place, span, changer)?;
+            return Some(TExpr {
+                kind: TExprKind::Elements(Box::new(list)),
+                ty: pty,
+            });
+        }
         self.diags.push(
             Diagnostic::error(span, format!("expected `{pty}`, found `{}`", place.ty))
                 .with_help(
@@ -4676,6 +4772,7 @@ impl Checker<'_> {
                 TExprKind::Index(base, _)
                 | TExprKind::Slice(base, ..)
                 | TExprKind::ToSlice(base)
+                | TExprKind::Elements(base)
                 | TExprKind::Payload(base, ..) => e = base,
                 _ => return Some(()),
             }
@@ -4699,6 +4796,7 @@ impl Checker<'_> {
                 | TExprKind::Index(base, _)
                 | TExprKind::Slice(base, ..)
                 | TExprKind::ToSlice(base)
+                | TExprKind::Elements(base)
                 | TExprKind::Deref(base) => root = base,
                 TExprKind::Local(l) => break *l,
                 // A `static` (in `unsafe` code, checked where it's named).

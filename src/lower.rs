@@ -2420,6 +2420,49 @@ impl FnLower<'_> {
                 let p = self.expr(&args[0]).one();
                 self.b.cast(CastOp::PtrToInt, p, self.t.i64)
             }
+            // A view of memory: the pointer and the count, as they are.
+            TExprKind::Intrinsic(Intrinsic::View | Intrinsic::StrView, args) => {
+                let p = self.expr(&args[0]).one();
+                let n = self.offset(&args[1]);
+                return Val::View(p, n);
+            }
+            // A list's elements: its pointer and its length, read once from
+            // the list (`ptr` and `len` fields).
+            TExprKind::Elements(list) => {
+                let def = list.ty.as_struct().expect("a list is a struct");
+                let field = |name: &str| {
+                    def.fields
+                        .iter()
+                        .position(|f| f.name == name)
+                        .expect("a list has `ptr` and `len`") as u32
+                };
+                let (pk, lk) = (field("ptr"), field("len"));
+                let len_ty = def.fields[lk as usize].ty;
+                if self.split_path(list).is_some() {
+                    let read = |k: u32, ty: Ty| TExpr {
+                        kind: TExprKind::Field(list.clone(), k),
+                        ty,
+                    };
+                    let p = self.expr(&read(pk, def.fields[pk as usize].ty)).one();
+                    let n = self.offset(&read(lk, len_ty));
+                    return Val::View(p, n);
+                }
+                let at = self.place(list);
+                let pa = self.field_at(at, list.ty, pk);
+                let p = self.read(pa, def.fields[pk as usize].ty).one();
+                let la = self.field_at(at, list.ty, lk);
+                let n = self.read(la, len_ty).one();
+                let from = len_ty.as_int().expect("an integer length");
+                let n = self.resize(
+                    n,
+                    IntTy {
+                        signed: false,
+                        ..from
+                    },
+                    IntTy::new(false, 64),
+                );
+                return Val::View(p, n);
+            }
             TExprKind::Intrinsic(Intrinsic::FromAddr, args) => {
                 let a = self.expr(&args[0]).one();
                 self.b.cast(CastOp::IntToPtr, a, self.t.ptr)
@@ -2475,7 +2518,10 @@ impl FnLower<'_> {
                 return Val::Mem(h);
             }
             TExprKind::Intrinsic(
-                Intrinsic::HandleAlloc | Intrinsic::HandleResize | Intrinsic::HandleFree,
+                Intrinsic::HandleAlloc
+                | Intrinsic::HandleResize
+                | Intrinsic::HandleFree
+                | Intrinsic::HandleGrow,
                 _,
             ) => unreachable!("instances call the allocators"),
             // Kept in its hidden local, whose value from an earlier time
