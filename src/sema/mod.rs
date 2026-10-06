@@ -5062,6 +5062,13 @@ impl<'a> Checker<'a> {
     fn comptime_cond(&mut self, cx: &FnCx, e: &ast::Expr) -> Option<bool> {
         let mut locals = Vec::new();
         expr_names(e, &mut locals);
+        // A `comptime let` whose value failed (reported) fails silently.
+        if locals
+            .iter()
+            .any(|(n, _)| cx.lookup(n).is_some_and(|l| cx.failed.contains(&l)))
+        {
+            return None;
+        }
         if let Some((name, span)) = locals.into_iter().find(|(n, _)| {
             cx.lookup(n)
                 .is_some_and(|l| !Self::is_comptime_local(cx, l))
