@@ -1,0 +1,72 @@
+// error: this names `Nest[[2]T]`, which leads back to `Nest`: its instances would never end
+// error: this names `Deep[?T]`, which leads back to `Deep`: its instances would never end
+// error: this names `Pong[Pair[T, T]]`, which leads back to `Ping`: its instances would never end
+// error: this names `Chain[[2]T]`, which leads back to `Chain`: its instances would never end
+// error: this names `Grows[Pair[A, B], A]`, which leads back to `Grows`: its instances would never end
+// help: generic types that name each other in a cycle must pass their type parameters unchanged
+package main
+
+import "std/list"
+
+// Generic types whose members name bigger instances of themselves: making
+// an instance would make another without end (as calls between generic
+// functions can), so `lode check` rejects them.
+struct Pair[A, B] {
+	first: A
+	second: B
+}
+
+// Through `?` and `Box`.
+struct Nest[T] {
+	v: ?Box[Nest[[2]T]]
+}
+
+// Through an enum's payload and a `List`.
+enum Deep[T] {
+	leaf(value: T)
+	more(items: List[Deep[?T]])
+}
+
+// Through two types, each passing the other's parameter (one of them
+// grown).
+struct Ping[T] {
+	other: ?Box[Pong[Pair[T, T]]]
+}
+
+struct Pong[U] {
+	back: ?Box[Ping[U]]
+}
+
+// Through a pointer.
+struct Chain[T] {
+	next: *Chain[[2]T]
+}
+
+// Two parameters swapped are fine, but one grown is not.
+struct Swap[A, B] {
+	next: ?Box[Swap[B, A]]
+}
+
+struct Grows[A, B] {
+	next: ?Box[Grows[Pair[A, B], A]]
+}
+
+// Fine: the cycle passes the parameters unchanged, or the bigger instance
+// doesn't lead back (`Wrap` always names `Fixed[u8]`).
+struct List2[T] {
+	value: T
+	next: ?Box[List2[T]]
+}
+
+struct Fixed[T] {
+	value: T
+	other: ?Box[Wrap[[2]T]]
+}
+
+struct Wrap[U] {
+	value: U
+	back: ?Box[Fixed[u8]]
+}
+
+fn main() {
+}

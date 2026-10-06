@@ -1664,6 +1664,32 @@ impl<'a> Checker<'a> {
             .chain(enums.iter().map(|&(e, _, _, ty)| (&e.name, "enum", ty)))
             .collect();
         self.check_recursion(&nominal);
+        // The members of generic types, for the instances that never end.
+        let mut members = Vec::new();
+        for &(s, _, _, ty) in &structs {
+            if let Some(def) = ty.as_struct().filter(|_| !ty.decl_params().is_empty()) {
+                for f in &s.fields {
+                    if let Some((_, fty)) = def.field(&f.name.name) {
+                        members.push((ty, fty, f.ty.span()));
+                    }
+                }
+            }
+        }
+        for &(e, _, _, ty) in &enums {
+            if let Some(def) = ty.as_enum().filter(|_| !ty.decl_params().is_empty()) {
+                for v in &e.variants {
+                    let Some((_, var)) = def.variant(&v.name.name) else {
+                        continue;
+                    };
+                    for f in v.fields.iter().flatten() {
+                        if let Some(field) = var.fields.iter().find(|g| g.name == f.name.name) {
+                            members.push((ty, field.ty, f.ty.span()));
+                        }
+                    }
+                }
+            }
+        }
+        self.check_type_growth(&members);
         // The impls are registered before the bounds are checked: an impl
         // can make a type satisfy one.
         self.declare_impls();

@@ -1263,6 +1263,114 @@ impl Checker<'_> {
         }
         self.diags.extend(diags);
     }
+
+    /// Report the member types of generic structs and enums that would make
+    /// instances without end, as [`Checker::check_generic_recursion`] does
+    /// for functions: `struct S[T] { v: ?Box[S[[2]T]] }` makes `S[u8]` name
+    /// `S[[2]u8]`, which names `S[[2][2]u8]`, and so on. Each type argument
+    /// in a member's type (at any depth: through `?`, arrays, pointers, and
+    /// the arguments of other generic types, such as `Box` and `List`) that
+    /// mentions a parameter is an edge from that parameter to the parameter
+    /// it's passed as; it grows unless it's the parameter unchanged. A
+    /// growing edge on a cycle of edges would never end. `members` are the
+    /// declarations' members whose types are written in the program: the
+    /// declaration, the member's type and where it's written.
+    pub(super) fn check_type_growth(&mut self, members: &[(Ty, Ty, Span)]) {
+        /// A parameter of a generic declaration: its declared form, and the
+        /// parameter's position.
+        type Node = (Ty, usize);
+        /// The edges from the parameters of `decl` that `ty` (one of its
+        /// members' types) makes: (from, to, the instance passing the
+        /// argument, whether it grows).
+        fn edges(decl: Ty, ty: Ty, out: &mut Vec<(Node, Node, Ty, bool)>) {
+            let params = decl.decl_params();
+            match ty {
+                Ty::Struct(_) | Ty::Enum(_) => {
+                    let args = ty.type_args();
+                    for (k, &a) in args.iter().enumerate() {
+                        let mut mentions = Vec::new();
+                        a.params(&mut mentions);
+                        for p in mentions {
+                            if let Some(i) = params.iter().position(|&q| q == p) {
+                                out.push(((decl, i), (ty.decl(), k), ty, a != p));
+                            }
+                        }
+                        edges(decl, a, out);
+                    }
+                }
+                Ty::Array(_) => edges(decl, ty.as_array().expect("an array").0, out),
+                Ty::Slice(_) => edges(decl, ty.as_slice().expect("a slice"), out),
+                Ty::Ptr(_) => edges(decl, ty.as_ptr().expect("a pointer"), out),
+                Ty::Optional(_) => edges(decl, ty.as_optional().expect("an optional"), out),
+                Ty::Result(_) => {
+                    let (ok, err) = ty.as_result().expect("a result");
+                    edges(decl, ok, out);
+                    edges(decl, err, out);
+                }
+                _ => {}
+            }
+        }
+        // The edges from each declaration's parameters, through all of its
+        // members (including those of declarations not in `members`, such
+        // as the prelude's).
+        let mut cache: HashMap<Ty, Vec<(Node, Node, Ty, bool)>> = HashMap::new();
+        let mut from = |decl: Ty| -> Vec<(Node, Node, Ty, bool)> {
+            cache
+                .entry(decl)
+                .or_insert_with(|| {
+                    let mut out = Vec::new();
+                    let tys: Vec<Ty> = match (decl.as_struct(), decl.as_enum()) {
+                        (Some(s), _) => s.fields.iter().map(|f| f.ty).collect(),
+                        (_, Some(e)) => e
+                            .variants
+                            .iter()
+                            .flat_map(|v| v.fields.iter().map(|f| f.ty))
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    for t in tys {
+                        edges(decl, t, &mut out);
+                    }
+                    out
+                })
+                .clone()
+        };
+        let mut reaches = |start: Node, goal: Node| {
+            let mut seen = HashSet::new();
+            let mut work = vec![start];
+            while let Some(n) = work.pop() {
+                if n == goal {
+                    return true;
+                }
+                if seen.insert(n) {
+                    work.extend(from(n.0).into_iter().filter(|e| e.0 == n).map(|e| e.1));
+                }
+            }
+            false
+        };
+        let mut diags = Vec::new();
+        for &(decl, ty, span) in members {
+            let mut out = Vec::new();
+            edges(decl, ty, &mut out);
+            if let Some(&(_, _, inst, _)) =
+                out.iter().find(|&&(a, b, _, grows)| grows && reaches(b, a))
+            {
+                diags.push(
+                    Diagnostic::error(
+                        span,
+                        format!(
+                            "this names `{inst}`, which leads back to `{}`: its instances would never end",
+                            super::expr::nominal_name(decl)
+                        ),
+                    )
+                    .with_help(
+                        "generic types that name each other in a cycle must pass their type parameters unchanged",
+                    ),
+                );
+            }
+        }
+        self.diags.extend(diags);
+    }
 }
 
 /// Where a kept value is read from (see [`Checker::consume`]): the local it

@@ -935,6 +935,14 @@ proposal left room:
   when its instances would grow without end (`struct W[T] { w:
   ?W[Pair[T, T]] }`). What each declaration holds, by declaration and by
   parameter, is a fixed point over the declarations, so the check ends.
+  Held by reference too (through `Box`, `List`, a pointer), a member can't
+  name a bigger instance of a type that leads back to its own, as calls
+  can't: `struct S[T] { v: ?Box[S[[2]T]] }` is an error, "this names
+  `S[[2]T]`, which leads back to `S`: its instances would never end". Each
+  type argument in a member's type that mentions a parameter is an edge
+  from that parameter to the one it's passed as, growing unless it's the
+  parameter itself; a growing edge on a cycle is the error. So
+  `struct A[T] { b: ?Box[B[[2]T]] }` is fine when `B` only names `A[u8]`.
 - **Instances.** `src/mono.rs` makes one function per method and set of
   arguments `main` reaches. A symbol puts the type's arguments after its
   name, and the method's own after the method's: `std/buf.StackBuf[64].push`,
