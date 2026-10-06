@@ -650,8 +650,9 @@ cycle detection", as `const_value` already does for constants.
 ### Format strings
 
 **Status:** Implemented (M7e), with the differences in
-[M7e in the compiler](#m7e-in-the-compiler): no buffer, and the parts of
-the format found by index rather than in a list
+[M7e in the compiler](#m7e-in-the-compiler): one buffer type of 256 bytes
+for every format, and the parts of the format found by index rather than
+in a list
 
 `print("x = {}\n", x)` is the reason std needs comptime soon. It's built
 from three pieces.
@@ -1232,18 +1233,50 @@ proposal left room:
   implement `io.Format`, which `io.print` requires of `A`".
 - **`io.print`, `io.eprint`, `io.write_fmt`.**
   `print[..A: Format](comptime fmt: str, args: ..A)` writes each piece of
-  text with one `os.write_all` and each argument with its `Format` impl,
-  ignoring errors; `eprint` writes to standard error. `write_fmt[W:
+  text as it is and each argument with its `Format` impl, in one `write`
+  (below), ignoring errors; `eprint` writes to standard error. `write_fmt[W:
   Writer, ..A: Format](inout w: W, comptime fmt: str, args: ..A)
   throws(os.Error)` writes to any `Writer` (a `File`, a `StackBuf`) and
   passes errors on. `print_int` and `eprint_int` are gone (decision 8).
   `print("hello world\n")` is one `write` and no formatting code.
-- **No buffer** (a choice by measurement). The proposal's
-  `BufWriter[256]` makes one `write` per `print`. A 256-byte buffer in
-  `print` (zeroed, filled byte by byte, flushed) made programs that print
-  integers 1 to 3 KB larger at `-O2`, so each piece is its own `write`:
-  `print("x = {}\n", x)` is three. A buffered writer is for later, with
-  uninitialized buffers ([memory.md](memory.md#uninitialized-buffers)).
+- **One `write` per `print`** (decided 2026-10-06, accepting a size
+  cost). A format that's only text is one `os.write_all` of it, with no
+  buffer: hello world is unchanged (577 bytes, `write` and `exit`). Any
+  other format is put in a buffer and written at the end:
+  `print("x = {}\n", x)` is one `write` of `x = 7\n` (it was three, one
+  per piece, from 2026-10-05). The buffer is `io.PRINT_BUF_SIZE`, 256
+  bytes, on the stack of the expansion; a print longer than that is
+  written each time the buffer is full, and at the end, so it takes
+  `ceil(len / 256)` writes. `eprint` is the same on standard error. Errors
+  are still ignored; `write_fmt` is unchanged. The rule is checked under
+  `strace` by tests/print_writes.rs.
+  - **Why one buffer type.** The buffer is `std/io.Buffered`, not generic
+    in its size: the `Format` impls and `write_decimal` are instantiated
+    for each writer type, and its `put` is ~500 bytes of code. Measured
+    at `-O2` against the fixed 256 bytes: a buffer sized for each format
+    when compiling (its text, plus 20 bytes per argument, the widest
+    integer) made format_strings 19 KB larger and the dogfood programs
+    up to 5 KB larger (+92 KB over all runnable test programs); rounded
+    up to 32, 64, 128 or 256 bytes, +1.2 KB per size used (+22 KB). The
+    size of the buffer doesn't change the code, only the stack.
+  - **The shape that measured smallest.** `Buffered.new(fd)` (zeroing the
+    buffer, not inlined), then `put(text, last)` for each piece of text
+    and the `Format` impl for each argument, then a final `put` with
+    `last` that writes the buffer. `put` copies byte by byte, with one
+    `write_all` both for a full buffer and for the end. Copying the
+    first piece of text in `new` was ~350 bytes larger per program;
+    writing a piece larger than the buffer directly, rather than a
+    buffer at a time, ~150 bytes larger.
+    The buffer is still zeroed for each print, until uninitialized
+    buffers ([memory.md](memory.md#uninitialized-buffers)).
+  - **`f() catch _ {}` lowers to no branch.** Ignoring a result branched
+    on its tag to two blocks that both go on (the backend doesn't fold a
+    `cond_br` whose targets are the same block); now the call's result is
+    just dropped. That saved 14 KB over all runnable test programs, on
+    the `catch _ {}` after each argument of `print`.
+  - **An `if comptime` on a `comptime let` whose value failed** (an error
+    already reported, such as a bad format string) is skipped silently,
+    as `comptime for` already was, instead of a second error.
 - **An impl's method that doesn't throw, called through a trait's that
   does** (`print`'s writer ignores errors): `crate::mono` makes an
   instance of it that returns a result (`<throws>` in its symbol), and
@@ -1259,11 +1292,20 @@ proposal left room:
   function per format string and argument types, and the error each
   `Format` impl may throw is checked after it, even when the writer
   can't fail.
+- **Sizes with one `write` per `print`** (2026-10-06, `-O2`): hello world
+  577 bytes, 2 system calls; print_integers 4,401 bytes (3,918 before),
+  format_strings 15,133 (15,917), the dogfood programs 204 to 864 bytes
+  larger each (dogfood_parse_integers 3,438, dogfood_aggregates_stress
+  22,106). All 85 runnable test programs: 488,716 bytes, 7.5% more than
+  the 454,547 of a `write` per piece, and 1,219 `write` calls instead of 1,796 (format_strings 37
+  instead of 145, dogfood_integer_edges 83 instead of 152). Without the
+  `catch _ {}` change, the buffer alone costs 11%.
 - **Not yet:** format specs (`{:x}`, widths: `Format` gains a `spec`
   parameter), `comptime` parameters of other types (types as values),
   methods with `comptime` parameters or packs, packs for `select`
   ([concurrency.md](concurrency.md#select-without-syntax)), a buffered
-  writer, and `Format` derived by reflection.
+  `Writer` for files (`print` has its own buffer), and `Format` derived
+  by reflection.
 
 ### After M7
 
@@ -1273,8 +1315,9 @@ sharing for small targets; reflection.
 
 ## Decisions
 
-**Status:** Decided 2026-10-04 for questions 1–3 and 6 (by the user); the
-others keep the recommended answer unless the user changes them.
+**Status:** Decided 2026-10-04 for questions 1–3 and 6, and 2026-10-06
+for question 8 (by the user); the others keep the recommended answer
+unless the user changes them.
 
 1. **Traits are implemented in `impl Trait for T { ... }` blocks** holding
    the methods, callable as `p.cmp(q)` ([Implementations](#implementations)).
@@ -1305,8 +1348,11 @@ others keep the recommended answer unless the user changes them.
    for`, `match comptime` and `comptime` arguments.*
 8. **One `print`:** `io.print` becomes the formatted print with a
    compile-time format, and `print(s)` of a runtime string becomes
-   `print("{}", s)` ([Format strings](#format-strings)).
-   *Recommended, pending; implemented in M7e.*
+   `print("{}", s)` ([Format strings](#format-strings)). Each `print` is
+   one `write` (a print longer than its 256-byte buffer, one per 256
+   bytes), accepting the size cost for programs that format values.
+   *Decided; implemented in M7e, one `write` per `print` on 2026-10-06
+   ([M7e in the compiler](#m7e-in-the-compiler)).*
 9. **`dyn Trait` and allocation stay out of M7:** M7 ships with
    fixed-capacity containers, and `dyn` and the allocator context come
    right after ([`dyn Trait`](#dyn-trait),

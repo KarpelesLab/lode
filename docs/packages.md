@@ -58,8 +58,8 @@ Go's vocabulary, which is proven:
   - `exit(code: i32) -> never` ends the process at once with status `code`
     (its low 8 bits). It's the `exit_group` system call, so it ends every
     thread, not only the calling one. No `defer` or `errdefer` body runs, in
-    the function or its callers. Output isn't lost: there's no buffer, every
-    write is a system call. It returns
+    the function or its callers. Output isn't lost: nothing stays in a buffer
+    between calls (each `io.print` writes its output before it returns). It returns
     [`never`](types.md#never-in-the-compiler-today), so the code after a call
     can't be reached and needs no `return`. The checker doesn't know what a
     system call does, so an endless `loop {}` follows `exit_group` in its
@@ -114,9 +114,13 @@ Go's vocabulary, which is proven:
     `io.print("{}", s)`. The format is read when compiling: a `{}` without
     an argument, an argument without a `{}`, an unclosed `{`, a `}` alone
     and an argument whose type isn't `Format` are errors at the call
-    ([generics.md](generics.md#m7e-in-the-compiler)). Each piece of text is
-    one `write` system call, and so is each integer: there's no buffer.
-    `eprint` writes to standard error.
+    ([generics.md](generics.md#m7e-in-the-compiler)). Each `print` is one
+    `write` system call. A format that's only text is written as it is,
+    with no buffer: `io.print("hello world\n")` is that `write` and no
+    formatting code. Any other format is put together in a buffer of
+    `io.PRINT_BUF_SIZE` (256) bytes on the stack and written at the end; a
+    print longer than that is written 256 bytes at a time, each time the
+    buffer is full. `eprint` writes to standard error the same way.
   - `write_fmt[W: Writer, ..A: Format](inout w: W, comptime fmt: str, args:
     ..A) throws(os.Error)` writes a format string to any `Writer`, and
     throws the error that stopped it: `try io.write_fmt(&f, "{} items\n",

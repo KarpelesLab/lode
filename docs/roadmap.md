@@ -122,8 +122,8 @@ Slicing `a[i..j]` compiles only when the checker proves
   `dyn Trait`; the allocator context and heap containers; `Send`/`Sync`
   with the concurrency work; `Str[E]`; error-set unions with generic
   errors; code sharing for small targets; reflection (a derived
-  `Format`). Format specs (`{:x}`, widths) and a buffered writer for
-  `print` come with `Format`'s next step.
+  `Format`). Format specs (`{:x}`, widths) come with `Format`'s next
+  step. `print` makes one `write` per call since 2026-10-06.
 
 Later, in no fixed order yet: refinements in signatures, the allocator
 context and heap types, globals with `Atomic`/`Mutex`, the rest of stack

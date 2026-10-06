@@ -86,24 +86,29 @@ breaks. Mitigations:
 
 ## Format strings
 
-**Status:** Implemented (M7e), without a buffer
+**Status:** Implemented (M7e); one `write` per `print` since 2026-10-06
 ([generics.md](generics.md#m7e-in-the-compiler))
 
 `print` and similar take their format string as a comptime parameter. The
 format is parsed at compile time, argument types are checked against it, and
-the call expands into direct writes of the pieces:
+the call expands into code for exactly those pieces:
 
 ```
 io.print("hello world\n")
-// → one write(1, "hello world\n", 12) syscall. No formatting code is linked.
+// → one write(1, "hello world\n", 12) syscall. No buffer, and no formatting
+//   code is linked.
 
 io.print("x = {}\n", x)
-// → write "x = ", then x's `Format` impl (its digits in one write), then
-//   write "\n": three syscalls, as there's no buffer yet
+// → "x = ", then x's digits (its `Format` impl), then "\n", put in a
+//   256-byte buffer on the stack, and one write of "x = 7\n"
 
 io.print("x = {}\n")
 // error: this `{}` has no argument: 1 placeholder but 0 arguments
 ```
+
+Each `print` is one `write`, unless its output is longer than the buffer
+(`io.PRINT_BUF_SIZE`, 256 bytes): then it's written each time the buffer is
+full, and at the end.
 
 This is how the concept's "hello world is a single `write`" goal is met. It
 also removes the whole class of format-string bugs: a placeholder without

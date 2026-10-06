@@ -118,7 +118,8 @@ What works:
   array or slice), the `syscall` intrinsic
 - output: `io.print("x = {}\n", x)` with a format string checked when
   compiling, for integers, `bool`, `str` and types with an `impl
-  io.Format`, and `io.eprint` for standard error, which ignore errors;
+  io.Format`, and `io.eprint` for standard error, which ignore errors
+  and make one `write` per call (through a 256-byte buffer);
   `io.write_fmt(&w, fmt, ...)` to any `io.Writer`, and
   `io.stdout().write(s)` and `io.stdout().write_bytes(buf)` (raw bytes),
   which throw an `os.Error`

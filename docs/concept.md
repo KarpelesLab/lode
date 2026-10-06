@@ -105,6 +105,12 @@ functions inlining left without callers (here `io.print`, inlined into
 flags, keeping the loop in the syscall's registers, one segment) is the rest
 of the way to "a few hundred bytes".
 
+Every `io.print` is one `write` (2026-10-06): one with arguments,
+`io.print("x = {}\n", x)`, is put together in a 256-byte buffer on the
+stack and written once, so a line is one system call. That buffer costs a
+program that formats values 0.2 to 0.9 KB at `-O2` (the dogfood test
+programs); hello world, only text, has no buffer and is unchanged.
+
 ## Goals
 
 * Memory safety by design ([memory.md](memory.md))

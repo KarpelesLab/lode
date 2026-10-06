@@ -12,43 +12,88 @@ import "std/os"
 /// The format is read when compiling: a `{` without its `}`, a `}` alone,
 /// or a `{}` without an argument (or an argument without a `{}`) is an
 /// error at the call, and so is an argument whose type doesn't implement
-/// `Format`. Each piece of text is a `write`, and so is each argument:
-/// `io.print("hello world\n")` is one `write`, and no formatting code.
+/// `Format`.
+///
+/// Each `print` is one `write`. A format that's only text, such as
+/// `io.print("hello world\n")`, is written as it is, with no buffer and no
+/// formatting code. Otherwise the text and the arguments are put in a
+/// buffer of `PRINT_BUF_SIZE` (256) bytes on the stack, written at the end; a
+/// print longer than that is written 256 bytes at a time, each time the
+/// buffer is full.
 ///
 /// Output errors are ignored: `print` is for programs whose output isn't worth
 /// failing over (and a closed pipe already ends the process through SIGPIPE).
 /// To handle errors, use `io.write_fmt(&f, fmt, ...)` with `f` a `File`.
 pub fn print[..A: Format](comptime fmt: str, args: ..A) {
-	// The pieces are written here, not by calling `write_fmt`: an
-	// expansion of `print` is small and inlined where it's called, and
-	// another function per format string made programs larger.
-	var out = Out{fd: os.STDOUT}
-	comptime for k in 0..format_count(fmt, args.len) {
-		match comptime format_piece(fmt, k) {
+	// The body is here, and again in `eprint`, rather than in a function
+	// both call: an expansion of `print` that only writes text is small
+	// enough to be inlined where it's called, with nothing else left.
+	comptime let count = format_count(fmt, args.len)
+	if comptime count == 1 && args.len == 0 {
+		match comptime format_piece(fmt, 0) {
 			text(start, end) => {
 				comptime let s = fmt[start..end]
 				os.write_all(os.STDOUT, s.bytes())
 			}
-			arg(i) => args[i].format(&out) catch _ {
+			arg(i) => {
+			}
+		}
+	} else if comptime count > 0 {
+		var out = Buffered.new(os.STDOUT)
+		comptime for k in 0..count {
+			match comptime format_piece(fmt, k) {
+				text(start, end) => {
+					comptime let s = fmt[start..end]
+					out.put(s.bytes(), k + 1 == count)
+				}
+				arg(i) => {
+					args[i].format(&out) catch _ {
+					}
+					if comptime k + 1 == count {
+						out.flush()
+					}
+				}
 			}
 		}
 	}
 }
 
-/// `print` to standard error, ignoring errors like `print`.
+/// `print` to standard error, one `write` each, ignoring errors like
+/// `print`.
 pub fn eprint[..A: Format](comptime fmt: str, args: ..A) {
-	var out = Out{fd: os.STDERR}
-	comptime for k in 0..format_count(fmt, args.len) {
-		match comptime format_piece(fmt, k) {
+	comptime let count = format_count(fmt, args.len)
+	if comptime count == 1 && args.len == 0 {
+		match comptime format_piece(fmt, 0) {
 			text(start, end) => {
 				comptime let s = fmt[start..end]
 				os.write_all(os.STDERR, s.bytes())
 			}
-			arg(i) => args[i].format(&out) catch _ {
+			arg(i) => {
+			}
+		}
+	} else if comptime count > 0 {
+		var out = Buffered.new(os.STDERR)
+		comptime for k in 0..count {
+			match comptime format_piece(fmt, k) {
+				text(start, end) => {
+					comptime let s = fmt[start..end]
+					out.put(s.bytes(), k + 1 == count)
+				}
+				arg(i) => {
+					args[i].format(&out) catch _ {
+					}
+					if comptime k + 1 == count {
+						out.flush()
+					}
+				}
 			}
 		}
 	}
 }
+
+/// The size of the buffer of `print` and `eprint`: a print longer than this
+/// takes more than one `write`.
+pub const PRINT_BUF_SIZE: usize = 256
 
 /// Write the format string `fmt` to `w`, each `{}` replaced by the next
 /// argument, as `print` does, or throw the error that stopped it:
@@ -82,15 +127,58 @@ fn format_count(comptime fmt: str, comptime given: usize) -> usize {
 	return count
 }
 
-/// Standard output or error, for `print` and `eprint`: a `Writer` that
-/// ignores errors.
-struct Out {
+/// Standard output or error through a buffer, for `print` and `eprint`:
+/// a `Writer` that ignores errors. The bytes put so far are
+/// `bytes[..len]`.
+///
+/// It's one type, not one per buffer size: the `Format` impls and
+/// `write_decimal` are made for each type of writer they write to, and a
+/// buffer sized for each format string (its text, and 20 bytes for each
+/// argument) made programs up to 19 KB larger at `-O2`.
+struct Buffered {
 	fd: i32
+	bytes: [PRINT_BUF_SIZE]u8
+	len: usize
 }
 
-impl Writer for Out {
+/// An empty buffer for `fd`.
+fn Buffered.new(fd: i32) -> Buffered {
+	return Buffered{fd: fd, bytes: [0; PRINT_BUF_SIZE], len: 0}
+}
+
+/// Put `b` after the bytes buffered, writing the buffer each time it's
+/// full, and at the end if `last`.
+fn Buffered.put(inout self, b: []u8, last: bool) {
+	var at = self.len
+	if at > PRINT_BUF_SIZE {
+		at = 0
+	}
+	// One loop with one `write_all`, for both reasons to write: the
+	// smallest code found.
+	var i: usize = 0
+	loop {
+		if at >= PRINT_BUF_SIZE || i >= b.len && last {
+			os.write_all(self.fd, self.bytes[..at])
+			at = 0
+		}
+		if i >= b.len {
+			break
+		}
+		self.bytes[at] = b[i]
+		at += 1
+		i += 1
+	}
+	self.len = at
+}
+
+/// Write the bytes buffered.
+fn Buffered.flush(inout self) {
+	self.put("".bytes(), true)
+}
+
+impl Writer for Buffered {
 	fn write_bytes(inout self, b: []u8) {
-		os.write_all(self.fd, b)
+		self.put(b, false)
 	}
 }
 
