@@ -300,6 +300,7 @@ pub fn build(
         (compiled.object, compiled.stack)
     };
     emit_rodata(&mut object, &lowered.strings, &lowered.tables);
+    emit_data(&mut object, &lowered.data);
     let link_options = ImageOptions {
         entry: entry.clone(),
         debug: options.debug,
@@ -365,6 +366,46 @@ fn emit_rodata(
         ));
     }
     object.section_mut(section).bytes = bytes;
+}
+
+/// Define the symbols of the `static`s (`(symbol, bytes, alignment)`):
+/// those whose bytes are all zeros in a `.bss` section, which takes no
+/// space in the file, the others in a `.data` section.
+fn emit_data(object: &mut ObjectModule, data: &[(String, Vec<u8>, u64)]) {
+    for bss in [true, false] {
+        let items: Vec<&(String, Vec<u8>, u64)> = data
+            .iter()
+            .filter(|(_, bytes, _)| bytes.iter().all(|&b| b == 0) == bss)
+            .collect();
+        if items.is_empty() {
+            continue;
+        }
+        let align = items.iter().map(|d| d.2).max().unwrap_or(1).max(1);
+        let mut bytes = Vec::new();
+        let mut placed = Vec::new();
+        for (name, data, align) in &items {
+            bytes.resize(bytes.len().next_multiple_of((*align).max(1) as usize), 0);
+            placed.push((name.clone(), bytes.len() as u64, data.len() as u64));
+            bytes.extend_from_slice(data);
+        }
+        let section = if bss {
+            object.add_section(Section::bss(".bss", align, (bytes.len() as u64).max(1)))
+        } else {
+            let mut s = Section::new(".data", SectionKind::Data, align);
+            s.bytes = bytes;
+            object.add_section(s)
+        };
+        for (name, offset, size) in placed {
+            object.add_symbol(Symbol::defined(
+                name,
+                SymbolBinding::Local,
+                SymbolType::Object,
+                section,
+                offset,
+                size,
+            ));
+        }
+    }
 }
 
 fn verify_module(module: &Module, stage: &str) -> Result<(), Error> {

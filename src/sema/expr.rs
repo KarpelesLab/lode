@@ -272,6 +272,8 @@ fn place_path(e: &TExpr) -> Option<(LocalId, Vec<Step>)> {
             (base, Step::Index(at))
         }
         TExprKind::Payload(base, ..) => (base, Step::Payload),
+        // A box's value: one place for the box.
+        TExprKind::Deref(base) => (base, Step::Payload),
         // A slice is some of the elements, at indexes not known here.
         TExprKind::Slice(base, ..) => (base, Step::Slice),
         TExprKind::ToSlice(inner) => return place_path(inner),
@@ -349,9 +351,10 @@ fn index_accesses<'e>(e: &'e TExpr, out: &mut Vec<Access<'e>>) {
                 accesses(bound, out);
             }
         }
-        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) | TExprKind::ToSlice(base) => {
-            index_accesses(base, out)
-        }
+        TExprKind::Field(base, _)
+        | TExprKind::Payload(base, ..)
+        | TExprKind::ToSlice(base)
+        | TExprKind::Deref(base) => index_accesses(base, out),
         _ => {}
     }
 }
@@ -393,6 +396,11 @@ pub(super) fn place_text(cx: &FnCx, e: &TExpr) -> Option<String> {
             )
         }
         TExprKind::ToSlice(inner) => return place_text(cx, inner),
+        // A box's value (its pointer is its first field).
+        TExprKind::Deref(inner) => match &inner.kind {
+            TExprKind::Field(base, 0) => format!("{}.value", place_text(cx, base)?),
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -528,6 +536,11 @@ const SYSCALL: &str = "syscall";
 /// `needs_deinit[T]()`: whether destroying a `T` does anything
 /// (docs/allocation.md, Generics).
 const NEEDS_DEINIT: &str = "needs_deinit";
+
+/// `size_of[T]()` and `align_of[T]()`: the size and alignment of a `T` in
+/// memory, in bytes (docs/allocation.md, The unsafe toolkit).
+const SIZE_OF: &str = "size_of";
+const ALIGN_OF: &str = "align_of";
 
 /// The most arguments `syscall` takes after the number (the Linux ABI's six).
 const SYSCALL_MAX_ARGS: usize = 6;
@@ -870,6 +883,7 @@ impl Checker<'_> {
                 match self.pkgs[cx.pkg].items.get(name) {
                     Some(&Item::Type(ty)) => Some(Some(ty)),
                     None if name == "Ordering" => Some(Some(Ty::ordering())),
+                    None if name == "AllocError" => Some(Some(Ty::alloc_error())),
                     _ => None,
                 }
             }
@@ -2221,7 +2235,7 @@ impl Checker<'_> {
             return Some(c);
         }
         if let Some(&item) = self.pkgs[cx.pkg].items.get(name) {
-            return self.item_value(item, name, span);
+            return self.item_value(cx, item, name, span);
         }
         if name == super::TARGET && self.imported(cx, name).is_none() {
             let e = self.target_value();
@@ -2296,8 +2310,20 @@ impl Checker<'_> {
     }
 
     /// A package-level item used as a value.
-    fn item_value(&mut self, item: Item, name: &str, span: Span) -> Option<Checked> {
+    fn item_value(&mut self, cx: &FnCx, item: Item, name: &str, span: Span) -> Option<Checked> {
         match item {
+            Item::Static(k) => {
+                if cx.comptime {
+                    self.diags.push(
+                        Diagnostic::error(span, format!("`{name}` is a `static`: its value isn't known when compiling"))
+                            .with_help("a constant's value is computed when compiling, from constants and calls"),
+                    );
+                    return None;
+                }
+                self.require_unsafe(cx, span, &format!("using the `static` `{name}`"));
+                let ty = self.static_value(k)?;
+                Some(Checked::new(TExprKind::Static(k), ty, None))
+            }
             Item::Const(id) => match self.const_value(id)? {
                 ConstVal::Typed(ty, v) => {
                     Some(Checked::new(TExprKind::Int(v), ty, Some(Range::exact(v))))
@@ -2394,7 +2420,7 @@ impl Checker<'_> {
             && let Some(pkg) = self.imported(cx, pkg_name)
         {
             let item = self.package_item(cx, pkg, &member.name, member.span)?;
-            return self.item_value(item, &format!("{pkg_name}.{}", member.name), span);
+            return self.item_value(cx, item, &format!("{pkg_name}.{}", member.name), span);
         }
         // `target.os` and the like: known when compiling.
         if let ExprKind::Name(n) = &base.kind
@@ -2414,6 +2440,18 @@ impl Checker<'_> {
         match (b.ty(), member.name.as_str()) {
             (Ty::Str | Ty::Slice(_), "len") => Some(self.view_len_of(cx, &b)),
             (Ty::Array(_), "len") => Some(self.array_len(cx, b.expr)),
+            // `b.value`: the boxed value, a place (docs/allocation.md,
+            // `Box[T]`).
+            (ty, "value") if self.is_box(ty) => {
+                let def = ty.as_struct().expect("a struct");
+                let ptr_ty = def.fields[0].ty;
+                let to = ptr_ty.as_ptr().expect("a box's first field is its pointer");
+                let ptr = TExpr {
+                    kind: TExprKind::Field(Box::new(b.expr), 0),
+                    ty: ptr_ty,
+                };
+                Some(Checked::new(TExprKind::Deref(Box::new(ptr)), to, None))
+            }
             (ty, name)
                 if self.methods.contains_key(&(ty.decl(), name.to_owned()))
                     || (self
@@ -2430,7 +2468,17 @@ impl Checker<'_> {
             (Ty::Struct(_), name) => {
                 let def = b.ty().as_struct().expect("a struct");
                 let Some((i, fty)) = def.field(name) else {
-                    self.error(member.span, format!("`{}` has no field `{name}`", b.ty()));
+                    let mut d = Diagnostic::error(
+                        member.span,
+                        format!("`{}` has no field `{name}`", b.ty()),
+                    );
+                    if self.is_box(b.ty()) {
+                        d = d.with_help(format!(
+                            "the boxed value is `.value`: `{}.value.{name}`",
+                            callee_name(base)
+                        ));
+                    }
+                    self.diags.push(d);
                     return None;
                 };
                 if def.pkg != cx.pkg && !def.fields[i].is_pub {
@@ -2483,29 +2531,25 @@ impl Checker<'_> {
                 self.require_unsafe(cx, span, "taking a string's raw pointer");
                 Some(Checked::new(
                     TExprKind::StrPtr(Box::new(b.expr)),
-                    Ty::Ptr(IntTy::new(false, 8)),
+                    Ty::ptr(Ty::Int(IntTy::new(false, 8))),
                     None,
                 ))
             }
-            // The first element of an array or slice of integers. An array is
-            // viewed in place, as when it's passed where a slice is expected.
-            (ty @ (Ty::Array(_) | Ty::Slice(_)), "ptr")
-                if matches!(ty.elem(), Some(Ty::Int(_))) =>
-            {
-                let Some(Ty::Int(elem)) = ty.elem() else {
-                    unreachable!("an integer element")
-                };
+            // The first element of an array or slice. An array is viewed in
+            // place, as when it's passed where a slice is expected.
+            (ty @ (Ty::Array(_) | Ty::Slice(_)), "ptr") => {
+                let elem = ty.elem().expect("an array or a slice");
                 self.require_unsafe(cx, span, "taking an array's or slice's raw pointer");
                 let view = match ty {
                     Ty::Array(_) => TExpr {
                         kind: TExprKind::ToSlice(Box::new(b.expr)),
-                        ty: Ty::slice(Ty::Int(elem)),
+                        ty: Ty::slice(elem),
                     },
                     _ => b.expr,
                 };
                 Some(Checked::new(
                     TExprKind::StrPtr(Box::new(view)),
-                    Ty::Ptr(elem),
+                    Ty::ptr(elem),
                     None,
                 ))
             }
@@ -2514,6 +2558,68 @@ impl Checker<'_> {
                 None
             }
         }
+    }
+
+    /// Whether `ty` is an instance of `alloc.Box`.
+    pub(super) fn is_box(&self, ty: Ty) -> bool {
+        self.alloc.is_some_and(|a| ty.same_decl(a.boxed))
+    }
+
+    /// Report a call of `name`, which allocates (it declares `uses alloc`),
+    /// in code without the allocator context.
+    pub(super) fn alloc_needed(&mut self, cx: &FnCx, name: &str, span: Span) {
+        if cx.comptime {
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    format!(
+                        "`{name}` allocates (`uses alloc`), which code run when compiling can't do"
+                    ),
+                )
+                .with_help("a constant's value can't allocate"),
+            );
+            return;
+        }
+        let caller = match cx.func {
+            Some(f) => format!("`{}`", self.sigs[f].name),
+            None => "this function".to_owned(),
+        };
+        self.diags.push(
+            Diagnostic::error(
+                span,
+                format!("`{name}` allocates (`uses alloc`), so it's only called by a function that declares `uses alloc`"),
+            )
+            .with_help(format!(
+                "add `uses alloc` to {caller}, after its parameters, so its callers know it allocates"
+            )),
+        );
+    }
+
+    /// What cloning a value of type `ty` needs: whether it allocates and
+    /// whether it throws (`AllocError`). A `Copy` type's clone is the copy;
+    /// a type parameter's may do both, as the trait's `clone` does; an
+    /// `impl Clone` says; a derived clone does what its parts' do.
+    pub(super) fn clone_effects(&self, ty: Ty) -> (bool, bool) {
+        if ty.is_copy() {
+            return (false, false);
+        }
+        if ty.as_param().is_some() {
+            return (true, true);
+        }
+        if let Some(found) = self.impl_methods.get(&(ty.decl(), "clone".to_owned()))
+            && let Some(&(_, id)) = found.iter().find(|(t, _)| *t == Trait::Clone)
+        {
+            return (self.sigs[id].uses_alloc, self.sigs[id].throws.is_some());
+        }
+        let parts = match ty {
+            Ty::Array(_) => vec![ty.as_array().expect("an array").0],
+            Ty::Optional(_) => vec![ty.as_optional().expect("an optional")],
+            _ => ty.members(),
+        };
+        parts.into_iter().fold((false, false), |(a, t), p| {
+            let (pa, pt) = self.clone_effects(p);
+            (a || pa, t || pt)
+        })
     }
 
     pub(super) fn usize_ty(&self) -> Ty {
@@ -3360,25 +3466,50 @@ impl Checker<'_> {
         };
         if let Some((base, items)) = needs_deinit
             && let ExprKind::Name(n) = &base.kind
-            && n == NEEDS_DEINIT
+            && [NEEDS_DEINIT, SIZE_OF, ALIGN_OF].contains(&n.as_str())
             && cx.lookup(n).is_none()
             && !self.pkgs[cx.pkg].items.contains_key(n)
         {
             let [item] = &items[..] else {
-                self.error(callee.span, "`needs_deinit` takes one type argument");
+                self.error(callee.span, format!("`{n}` takes one type argument"));
                 return None;
             };
             if !args.is_empty() {
-                self.error(span, "`needs_deinit` takes no arguments");
+                self.error(span, format!("`{n}` takes no arguments"));
                 return None;
             }
             let ty = self.type_arg(cx, item)?;
-            let kind = if ty.is_generic() {
-                TExprKind::NeedsDeinit(ty)
+            if n == NEEDS_DEINIT {
+                let kind = if ty.is_generic() {
+                    TExprKind::NeedsDeinit(ty)
+                } else {
+                    TExprKind::Bool(ty.needs_destroy())
+                };
+                return Some(Checked::new(kind, Ty::Bool, None));
+            }
+            // The layout is LatticeFoundry's, known when lowering: not
+            // when compiling (docs/allocation.md, The unsafe toolkit).
+            if cx.comptime {
+                self.error(
+                    span,
+                    format!("`{n}` isn't known when compiling: the layout of types is decided when lowering"),
+                );
+                return None;
+            }
+            let align = n == ALIGN_OF;
+            let range = if align {
+                Range { lo: 1, hi: 16 }
             } else {
-                TExprKind::Bool(ty.needs_destroy())
+                Range {
+                    lo: 0,
+                    hi: self.len_max(),
+                }
             };
-            return Some(Checked::new(kind, Ty::Bool, None));
+            return Some(Checked::new(
+                TExprKind::Layout(ty, align),
+                self.usize_ty(),
+                Some(range),
+            ));
         }
         let (callee, explicit) = match &callee.kind {
             ExprKind::Index(base, item) if names_fn(self, cx, base) => (
@@ -3555,7 +3686,7 @@ impl Checker<'_> {
                         let shown = format!("{pkg_name}.{}", member.name);
                         return self.refined_conversion(cx, k, &shown, callee.span, args, span);
                     }
-                    Item::Const(_) | Item::Type(_) | Item::Trait(_) => {
+                    Item::Const(_) | Item::Type(_) | Item::Trait(_) | Item::Static(_) => {
                         self.error(
                             callee.span,
                             format!("`{pkg_name}.{}` is not a function", member.name),
@@ -3570,6 +3701,10 @@ impl Checker<'_> {
                 let ty = recv.ty();
                 if ty == Ty::Str && member.name == "bytes" {
                     return self.str_bytes(recv, args, span);
+                }
+                // The operations of a raw pointer.
+                if let Some(to) = ty.as_ptr() {
+                    return self.ptr_method(cx, recv, to, member, args, explicit.as_ref(), span);
                 }
                 // `opt.take()`: the value, leaving `none` (as `mem.take`).
                 if ty.as_optional().is_some() && member.name == "take" {
@@ -3616,16 +3751,38 @@ impl Checker<'_> {
                 {
                     return self.ordered_method(cx, recv, member, args, span);
                 }
-                // `x.clone()` of a type that's `Clone` without an `impl`.
+                // `x.clone()` of a type that's `Clone` without an `impl`:
+                // it allocates and throws when its parts' clones do.
                 if found.is_none() && member.name == "clone" && ty.satisfies(Trait::Clone) {
                     if !args.is_empty() {
                         self.error(span, "`clone` takes no arguments");
                         return None;
                     }
+                    let (allocates, throws) = self.clone_effects(ty);
+                    let name = format!("{}.clone()", callee_name(base));
+                    if allocates && !cx.uses_alloc {
+                        self.alloc_needed(cx, &name, span);
+                    }
+                    if throws && !handled {
+                        self.diags.push(
+                            Diagnostic::error(
+                                span,
+                                format!("cloning a `{ty}` can throw `AllocError`, and its error must be handled"),
+                            )
+                            .with_help(format!(
+                                "pass it on with `try {name}`, or handle it with `catch`"
+                            )),
+                        );
+                    }
                     let recv = self.temp(cx, recv);
+                    let rty = if throws && handled {
+                        Ty::result(ty, Ty::alloc_error())
+                    } else {
+                        ty
+                    };
                     return Some(Checked::new(
                         TExprKind::Clone(Box::new(recv.expr)),
-                        ty,
+                        rty,
                         None,
                     ));
                 }
@@ -3651,7 +3808,15 @@ impl Checker<'_> {
                             }
                             _ => format!("`{ty}` has no method `{}`", member.name),
                         };
-                        self.error(member.span, msg);
+                        let mut d = Diagnostic::error(member.span, msg);
+                        if self.is_box(ty) {
+                            d = d.with_help(format!(
+                                "the boxed value is `.value`: `{}.value.{}(...)`",
+                                callee_name(base),
+                                member.name
+                            ));
+                        }
+                        self.diags.push(d);
                         return None;
                     }
                 };
@@ -3718,6 +3883,11 @@ impl Checker<'_> {
                 callee.span,
                 &format!("calling the `unsafe fn` `{name}`"),
             );
+        }
+        // A function that allocates needs the allocator in context
+        // (docs/allocation.md, `uses alloc`).
+        if self.sigs[id].uses_alloc && !cx.uses_alloc {
+            self.alloc_needed(cx, &name, span);
         }
         let (params, sig_ret) = (self.sigs[id].params.clone(), self.sigs[id].ret);
         let throws = self.sigs[id].throws;
@@ -4239,6 +4409,89 @@ impl Checker<'_> {
         }
     }
 
+    /// A method of a raw pointer `p` (`recv`, a `*to`): `p.read()` (the
+    /// value, moved out), `p.write(v)` (`v` moved in, without destroying
+    /// what was there), `p.destroy()` (the value destroyed in place),
+    /// `p.cast[U]()` and `p.addr()`. All but `addr` are `unsafe`
+    /// (docs/allocation.md, The unsafe toolkit).
+    #[allow(clippy::too_many_arguments)]
+    fn ptr_method(
+        &mut self,
+        cx: &mut FnCx,
+        recv: Checked,
+        to: Ty,
+        member: &ast::Ident,
+        args: &[ast::Expr],
+        explicit: Option<&(Vec<ast::TypeArg>, Span)>,
+        span: Span,
+    ) -> Option<Checked> {
+        let name = member.name.as_str();
+        let (kind, arity) = match name {
+            "read" => (Intrinsic::PtrRead, 0),
+            "write" => (Intrinsic::PtrWrite, 1),
+            "destroy" => (Intrinsic::PtrDestroy, 0),
+            "cast" => (Intrinsic::PtrCast, 0),
+            "addr" => (Intrinsic::PtrAddr, 0),
+            _ => {
+                self.diags.push(
+                    Diagnostic::error(
+                        member.span,
+                        format!("`{}` has no method `{name}`", recv.ty()),
+                    )
+                    .with_help(
+                        "a raw pointer has `read`, `write`, `destroy`, `cast[U]` and `addr`",
+                    ),
+                );
+                return None;
+            }
+        };
+        if let Some((_, bspan)) = explicit
+            && kind != Intrinsic::PtrCast
+        {
+            self.error(*bspan, format!("`{name}` takes no type arguments"));
+            return None;
+        }
+        if args.len() != arity {
+            self.error(
+                span,
+                format!(
+                    "`{name}` takes {arity} argument(s), but {} were given",
+                    args.len()
+                ),
+            );
+            return None;
+        }
+        if kind != Intrinsic::PtrAddr {
+            self.require_unsafe(cx, span, &format!("`{name}` through a raw pointer"));
+        }
+        let p = recv.expr;
+        let (args, ty) = match kind {
+            Intrinsic::PtrRead => (vec![p], to),
+            Intrinsic::PtrWrite => {
+                let v = self.expr(cx, &args[0], Some(to))?;
+                let v = self.coerce(cx, v, to, args[0].span)?;
+                let v = self.kept(cx, v, args[0].span)?;
+                (vec![p, v.expr], Ty::Unit)
+            }
+            Intrinsic::PtrDestroy => (vec![p], Ty::Unit),
+            Intrinsic::PtrAddr => (vec![p], self.usize_ty()),
+            _ => {
+                let Some(([item], _)) = explicit.map(|(items, s)| (items.as_slice(), s)) else {
+                    self.diags.push(
+                        Diagnostic::error(span, "`cast` takes the type it casts to")
+                            .with_help("as in `p.cast[u32]()`"),
+                    );
+                    return None;
+                };
+                let u = self.type_arg(cx, item)?;
+                (vec![p], Ty::ptr(u))
+            }
+        };
+        let range = (kind == Intrinsic::PtrAddr)
+            .then(|| self.usize_ty().as_int().expect("an integer").range());
+        Some(Checked::new(TExprKind::Intrinsic(kind, args), ty, range))
+    }
+
     /// `s.bytes()`: the bytes of the `str` `s`, a `[]u8` view of the same
     /// storage. It's a projection of `s`, not a new value: like any view,
     /// it can be kept in a local and passed on, but not stored or returned.
@@ -4399,6 +4652,7 @@ impl Checker<'_> {
         let mut e = place;
         loop {
             match &e.kind {
+                TExprKind::Deref(base) => e = base,
                 TExprKind::Field(base, i) => {
                     if let Some(def) = base.ty.as_struct()
                         && def.pkg != cx.pkg
@@ -4446,8 +4700,11 @@ impl Checker<'_> {
                 TExprKind::Field(base, _)
                 | TExprKind::Index(base, _)
                 | TExprKind::Slice(base, ..)
-                | TExprKind::ToSlice(base) => root = base,
+                | TExprKind::ToSlice(base)
+                | TExprKind::Deref(base) => root = base,
                 TExprKind::Local(l) => break *l,
+                // A `static` (in `unsafe` code, checked where it's named).
+                TExprKind::Static(_) => return Some(place),
                 TExprKind::Table(id) => {
                     let name = &self.tables[*id].name;
                     let what = match changer {

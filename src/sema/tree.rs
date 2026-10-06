@@ -35,6 +35,41 @@ pub struct Program {
     /// The `deinit` of each struct or enum that declares one (by its
     /// declared form, [`Ty::decl`]).
     pub deinits: HashMap<Ty, FuncId>,
+    /// Every `static`, indexed by [`TExprKind::Static`].
+    pub statics: Vec<Static>,
+    /// What the compiler knows of `std/alloc`, if the program imports it.
+    pub alloc: Option<AllocInfo>,
+}
+
+/// A `static`: a global initialized when compiling (docs/memory.md,
+/// Globals).
+#[derive(Clone, Debug)]
+pub struct Static {
+    /// Its linker symbol: `<package path>.<name>`.
+    pub symbol: String,
+    pub ty: Ty,
+    /// Its initial value, a literal (as a constant's).
+    pub init: TExpr,
+}
+
+/// The items of `std/alloc` the compiler implements the allocator context
+/// with (docs/allocation.md, Lowering the context).
+#[derive(Clone, Copy, Debug)]
+pub struct AllocInfo {
+    /// The `Allocator` trait.
+    pub allocator: Trait,
+    /// `alloc.Handle`: which allocator, and where. Its fields are the
+    /// allocator's number among the program's allocator types and its
+    /// address; when the program installs no allocator but the root, it
+    /// has none (a handle is zero-sized).
+    pub handle: Ty,
+    /// The root allocator, a `static` (`alloc.ROOT`), and its type.
+    pub root: usize,
+    pub root_ty: Ty,
+    /// `alloc.Box[T]` as declared, and its `into_inner`, which the
+    /// destruction of a chain of boxes calls.
+    pub boxed: Ty,
+    pub into_inner: Option<FuncId>,
 }
 
 /// The methods declared in traits, and those each `impl` gives: what a call
@@ -93,6 +128,9 @@ pub struct Func {
     /// is never lowered: its calls are to its expansions, each a function
     /// of its own (docs/generics.md, Format strings).
     pub template: bool,
+    /// Whether it declares `uses alloc`: it gets the allocator in context
+    /// (docs/allocation.md, Lowering the context).
+    pub uses_alloc: bool,
 }
 
 impl Func {
@@ -205,6 +243,10 @@ pub enum TStmt {
     /// temporary at the end of its statement. A local with a drop flag is
     /// destroyed only if it holds a value, and is unassigned after.
     Destroy(TExpr),
+    /// `with alloc = h { ... }`: the statements run with the handle in
+    /// `local` (an `alloc.Handle`, assigned before) as the allocator in
+    /// context.
+    With(LocalId, Vec<TStmt>),
 }
 
 /// One arm of a [`TStmt::Match`]: the variants it handles (by index) and
@@ -349,8 +391,20 @@ pub enum TExprKind {
     NeedsDeinit(Ty),
     /// `x.clone()` of a value of a type that's `Clone` without an `impl`
     /// of its own: the value read in place, copied (a `Copy` type), or
-    /// cloned part by part. `crate::mono` makes it a copy or a call.
+    /// cloned part by part. `crate::mono` makes it a copy or a call. Of a
+    /// result type when cloning may fail (a type parameter's, or a part's
+    /// clone that allocates): `throws(AllocError) -> T`.
     Clone(Box<TExpr>),
+    /// A `static`, by index into [`Program::statics`]: a place in global
+    /// memory (only in `unsafe` code).
+    Static(usize),
+    /// The value a pointer points to, as a place: `b.value` of a
+    /// `Box[T]` (the pointer is its `ptr` field), and the allocators the
+    /// compiler calls through a handle.
+    Deref(Box<TExpr>),
+    /// `size_of[T]()` (`false`) or `align_of[T]()` (`true`): a `usize`
+    /// that the layout of each instance's `T` gives, when lowering.
+    Layout(Ty, bool),
     /// An operation whose proof obligation (overflow, an index in bounds,
     /// a lossless conversion...) wasn't proven, in code that only runs at
     /// compile time: a constant's value or an `if comptime` condition. The
@@ -385,6 +439,31 @@ pub enum Intrinsic {
     Forget,
     /// `mem.take(&opt)`: the optional's value, leaving `none`.
     Take,
+    /// `p.read()`: the value at the pointer, moved out (unsafe).
+    PtrRead,
+    /// `p.write(v)`: `v` moved to the pointer, without destroying what
+    /// was there (unsafe).
+    PtrWrite,
+    /// `p.destroy()`: destroy the value at the pointer, in place (unsafe).
+    PtrDestroy,
+    /// `p.cast[U]()`: the same address, as a `*U` (unsafe).
+    PtrCast,
+    /// `p.addr()`: the address, a `usize`.
+    PtrAddr,
+    /// `mem.from_addr[T](a)`: the address `a`, as a `*T` (unsafe).
+    FromAddr,
+    /// `alloc.current()`: the handle of the allocator in context.
+    AllocCurrent,
+    /// `alloc.root()`: the handle of the root allocator.
+    AllocRoot,
+    /// `alloc.handle(a)`: a handle of the allocator `a` (unsafe).
+    AllocHandle,
+    /// `h.alloc(size, align)`, `h.resize(p, old, new, align)` and
+    /// `h.free(p, size, align)` on an `alloc.Handle`: the method of the
+    /// allocator it names (`crate::mono` makes them calls).
+    HandleAlloc,
+    HandleResize,
+    HandleFree,
 }
 
 /// What a [`TExprKind::Catch`] does with an error.
@@ -462,6 +541,7 @@ pub fn stmt_exprs(s: &TStmt) -> Vec<&TExpr> {
         | TStmt::Break
         | TStmt::Continue
         | TStmt::Block(_)
+        | TStmt::With(..)
         | TStmt::Defer { .. }
         | TStmt::Drop { .. }
         | TStmt::Loc(_) => Vec::new(),
@@ -477,6 +557,8 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Str(_)
         | TExprKind::Table(_)
         | TExprKind::NeedsDeinit(_)
+        | TExprKind::Static(_)
+        | TExprKind::Layout(..)
         | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
         | TExprKind::GenericCall(_, _, items)
@@ -515,6 +597,7 @@ pub fn subexprs(e: &TExpr) -> Vec<&TExpr> {
         | TExprKind::Move(inner, _)
         | TExprKind::Temp(_, inner)
         | TExprKind::Clone(inner)
+        | TExprKind::Deref(inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
@@ -553,6 +636,7 @@ pub fn stmt_exprs_mut(s: &mut TStmt) -> Vec<&mut TExpr> {
         | TStmt::Break
         | TStmt::Continue
         | TStmt::Block(_)
+        | TStmt::With(..)
         | TStmt::Defer { .. }
         | TStmt::Drop { .. }
         | TStmt::Loc(_) => Vec::new(),
@@ -568,6 +652,7 @@ pub fn stmt_blocks_mut(s: &mut TStmt) -> Vec<&mut Vec<TStmt>> {
         | TStmt::For { body, .. }
         | TStmt::Loop(body)
         | TStmt::Block(body)
+        | TStmt::With(_, body)
         | TStmt::Defer { body, .. } => vec![body],
         TStmt::Match { arms, .. } => arms.iter_mut().map(|a| &mut a.body).collect(),
         TStmt::Init(..)
@@ -592,6 +677,8 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Str(_)
         | TExprKind::Table(_)
         | TExprKind::NeedsDeinit(_)
+        | TExprKind::Static(_)
+        | TExprKind::Layout(..)
         | TExprKind::Local(_) => Vec::new(),
         TExprKind::Call(_, items)
         | TExprKind::GenericCall(_, _, items)
@@ -630,6 +717,7 @@ pub fn subexprs_mut(e: &mut TExpr) -> Vec<&mut TExpr> {
         | TExprKind::Move(inner, _)
         | TExprKind::Temp(_, inner)
         | TExprKind::Clone(inner)
+        | TExprKind::Deref(inner)
         | TExprKind::Refined(inner, _)
         | TExprKind::Unproven(_, inner) => vec![inner],
         TExprKind::Catch { call, handler, .. } => match handler {
@@ -703,7 +791,7 @@ pub fn terminates(stmts: &[TStmt]) -> bool {
         TStmt::Return(_) | TStmt::Throw(_) => true,
         TStmt::If(_, then, otherwise) => terminates(then) && terminates(otherwise),
         TStmt::Loop(body) => !breaks(body),
-        TStmt::Block(body) => terminates(body),
+        TStmt::Block(body) | TStmt::With(_, body) => terminates(body),
         TStmt::Match { arms, .. } => arms.iter().all(|a| terminates(&a.body)),
         _ => false,
     })
@@ -718,7 +806,7 @@ pub fn diverges(stmts: &[TStmt]) -> bool {
         TStmt::Return(_) | TStmt::Throw(_) | TStmt::Break | TStmt::Continue => true,
         TStmt::If(_, then, otherwise) => diverges(then) && diverges(otherwise),
         TStmt::Loop(body) => !breaks(body),
-        TStmt::Block(body) => diverges(body),
+        TStmt::Block(body) | TStmt::With(_, body) => diverges(body),
         TStmt::Match { arms, .. } => arms.iter().all(|a| diverges(&a.body)),
         _ => false,
     })
@@ -732,7 +820,7 @@ pub fn breaks(stmts: &[TStmt]) -> bool {
         let nested = match s {
             TStmt::Break => true,
             TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
-            TStmt::Block(body) => breaks(body),
+            TStmt::Block(body) | TStmt::With(_, body) => breaks(body),
             TStmt::Match { arms, .. } => arms.iter().any(|a| breaks(&a.body)),
             _ => false,
         };

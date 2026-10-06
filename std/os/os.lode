@@ -16,6 +16,9 @@ if comptime target.os == .linux {
 		const SYS_READ = 0
 		const SYS_WRITE = 1
 		const SYS_CLOSE = 3
+		const SYS_MMAP = 9
+		const SYS_MUNMAP = 11
+		const SYS_MREMAP = 25
 		const SYS_OPENAT = 257
 		const SYS_EXIT_GROUP = 231
 	} else if comptime target.arch == .aarch64 {
@@ -24,6 +27,9 @@ if comptime target.os == .linux {
 		const SYS_OPENAT = 56
 		const SYS_CLOSE = 57
 		const SYS_EXIT_GROUP = 94
+		const SYS_MUNMAP = 215
+		const SYS_MREMAP = 216
+		const SYS_MMAP = 222
 	} else {
 		compile_error("std/os: Linux on this architecture is not supported yet")
 	}
@@ -206,6 +212,108 @@ if comptime target.os == .linux {
 		}
 		self.bytes[b.len] = 0
 		return 0
+	}
+
+	/// `PROT_READ | PROT_WRITE`: memory that can be read and written.
+	const PROT_READ_WRITE: usize = 3
+
+	/// `MAP_PRIVATE | MAP_ANONYMOUS`: memory of this process only, not of
+	/// a file, which starts as zeros.
+	const MAP_PRIVATE_ANONYMOUS: usize = 0x22
+
+	/// The size of a page, which mappings are made of: 4 KiB (the
+	/// smallest page of Linux on x86-64 and AArch64).
+	pub const PAGE_SIZE: usize = 4096
+
+	/// The largest mapping `PageAllocator` makes: 2^46 bytes (64 TiB).
+	pub const MAP_MAX: usize = 0x4000_0000_0000
+
+	/// Map `len` bytes of new memory (rounded up to pages by the kernel),
+	/// zero-filled, readable and writable, of this process only. Returns
+	/// its address, or a negative error number.
+	///
+	/// The caller must ensure `len` isn't 0.
+	pub unsafe fn mmap(len: usize) -> isize {
+		return syscall(SYS_MMAP, 0, len, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0)
+	}
+
+	/// Unmap the `len` bytes at `addr`. Returns 0, or a negative error
+	/// number.
+	///
+	/// The caller must ensure nothing uses that memory any more.
+	pub unsafe fn munmap(addr: *u8, len: usize) -> isize {
+		return syscall(SYS_MUNMAP, addr, len)
+	}
+
+	/// Grow or shrink the mapping of `old` bytes at `addr` to `new` bytes,
+	/// in place: it doesn't move (no `MREMAP_MAYMOVE`). Returns the
+	/// address, or a negative error number (`ENOMEM` when the memory after
+	/// it is taken).
+	///
+	/// The caller must ensure `addr` and `old` are a mapping's.
+	pub unsafe fn mremap(addr: *u8, old: usize, new: usize) -> isize {
+		return syscall(SYS_MREMAP, addr, old, new, 0)
+	}
+
+	/// An allocator of whole pages (docs/allocation.md, The root
+	/// allocator): each allocation is a mapping of its own, rounded up to
+	/// pages, aligned to a page. `std/alloc` makes it an `Allocator`, and
+	/// `alloc.Heap` takes its larger blocks and its chunks from it.
+	pub struct PageAllocator {
+		/// The size of a page, the alignment of every allocation.
+		pub let page: usize
+	}
+
+	/// The page allocator.
+	pub fn PageAllocator.new() -> PageAllocator {
+		return PageAllocator{page: PAGE_SIZE}
+	}
+
+	/// A new mapping of at least `size` bytes, aligned to a page; `size` 0
+	/// gets a page. Throws `out_of_memory` past `MAP_MAX` bytes, and when
+	/// the kernel has no memory to give.
+	pub fn PageAllocator.map(self, size: usize) throws(AllocError) -> *u8 {
+		if size > MAP_MAX {
+			throw .out_of_memory
+		}
+		var len = size
+		if len == 0 {
+			len = PAGE_SIZE
+		}
+		var r: isize
+		unsafe {
+			r = mmap(len)
+		}
+		if r < 0 {
+			throw .out_of_memory
+		}
+		unsafe {
+			return mem.from_addr[u8](usize(r))
+		}
+	}
+
+	/// Unmap the mapping of `size` bytes at `p`.
+	///
+	/// The caller must ensure `p` and `size` are those of a mapping `map`
+	/// made, which nothing uses any more.
+	pub unsafe fn PageAllocator.unmap(self, p: *u8, size: usize) {
+		var len = size
+		if len == 0 {
+			len = PAGE_SIZE
+		}
+		munmap(p, len)
+	}
+
+	/// Grow or shrink the mapping of `old` bytes at `p` to `new` bytes, in
+	/// place: whether it could.
+	///
+	/// The caller must ensure `p` and `old` are those of a mapping `map`
+	/// made.
+	pub unsafe fn PageAllocator.remap(self, p: *u8, old: usize, new: usize) -> bool {
+		if old == 0 || new == 0 || new > MAP_MAX {
+			return false
+		}
+		return mremap(p, old, new) >= 0
 	}
 
 	/// Read up to `len` bytes from `fd` into `data`, once. Returns the number of

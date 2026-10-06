@@ -85,6 +85,7 @@ keywords! {
     Var = "var",
     Where = "where",
     While = "while",
+    With = "with",
 }
 
 macro_rules! puncts {

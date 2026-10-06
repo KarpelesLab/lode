@@ -281,17 +281,26 @@ impl Parser {
                 self.bump();
                 self.fn_decl(is_pub, true, start).map(Item::Fn)
             }
+            Tok::Kw(Kw::Unsafe) if *self.peek_at(1) == Tok::Kw(Kw::Trait) => {
+                self.bump();
+                self.trait_decl(is_pub, true, start).map(Item::Trait)
+            }
             Tok::Kw(Kw::Const) => self.const_decl(is_pub, start).map(Item::Const),
+            Tok::Kw(Kw::Static) => self.static_decl(is_pub, start).map(Item::Static),
             Tok::Kw(Kw::Struct) => self.struct_decl(is_pub, start).map(Item::Struct),
             Tok::Kw(Kw::Enum) => self.enum_decl(is_pub, start).map(Item::Enum),
-            Tok::Kw(Kw::Trait) => self.trait_decl(is_pub, start).map(Item::Trait),
-            Tok::Kw(Kw::Impl) if is_pub => self.error(
+            Tok::Kw(Kw::Trait) => self.trait_decl(is_pub, false, start).map(Item::Trait),
+            Tok::Kw(Kw::Impl | Kw::Unsafe) if is_pub => self.error(
                 start,
                 "an `impl` is not marked `pub`: it's visible wherever its trait and type are",
             ),
-            Tok::Kw(Kw::Impl) => self.impl_decl(start).map(Item::Impl),
+            Tok::Kw(Kw::Impl) => self.impl_decl(false, start).map(Item::Impl),
+            Tok::Kw(Kw::Unsafe) if *self.peek_at(1) == Tok::Kw(Kw::Impl) => {
+                self.bump();
+                self.impl_decl(true, start).map(Item::Impl)
+            }
             Tok::Kw(Kw::Type) => self.type_decl(is_pub, start).map(Item::Type),
-            Tok::Kw(kw @ (Kw::Alias | Kw::Static | Kw::Unsafe)) => self.error(
+            Tok::Kw(kw @ (Kw::Alias | Kw::Unsafe)) => self.error(
                 self.span(),
                 format!(
                     "`{}` declarations are not supported by the compiler yet",
@@ -311,13 +320,17 @@ impl Parser {
             self.skip_newlines();
             let start = self.span();
             let is_pub = self.eat_kw(Kw::Pub);
+            let is_unsafe = self.at_kw(Kw::Unsafe) && *self.peek_at(1) == Tok::Kw(Kw::Fn);
+            if is_unsafe {
+                self.bump();
+            }
             if !self.at_kw(Kw::Fn) {
                 return self.error(
                     at.to(name.span),
                     "`@intrinsic` applies to a function declaration, on the next line",
                 );
             }
-            let mut f = self.fn_decl(is_pub, false, start)?;
+            let mut f = self.fn_decl(is_pub, is_unsafe, start)?;
             f.intrinsic = true;
             return Ok(Item::Fn(f));
         }
@@ -408,6 +421,25 @@ impl Parser {
         let value = self.expr()?;
         Ok(ConstDecl {
             budget: None,
+            is_pub,
+            name,
+            ty,
+            span: start.to(value.span),
+            value,
+        })
+    }
+
+    /// `static NAME: T = value`: a mutable global.
+    fn static_decl(&mut self, is_pub: bool, start: Span) -> PResult<StaticDecl> {
+        self.bump(); // static
+        let name = self.ident("a static's name")?;
+        if !self.eat_p(P::Colon) {
+            return self.expected("`:` and the static's type: `static NAME: T = value`");
+        }
+        let ty = self.type_expr()?;
+        self.expect_p(P::Eq)?;
+        let value = self.expr()?;
+        Ok(StaticDecl {
             is_pub,
             name,
             ty,
@@ -671,6 +703,25 @@ impl Parser {
                 break;
             }
         }
+        // `uses alloc`: the contexts the function uses, before `throws`.
+        let uses = if self.eat_kw(Kw::Uses) {
+            let name = self.ident("a context, as in `uses alloc`")?;
+            if name.name != "alloc" {
+                return self.error(
+                    name.span,
+                    format!(
+                        "`uses {}` is not supported by the compiler yet: the one context is `alloc`",
+                        name.name
+                    ),
+                );
+            }
+            if self.at_p(P::Comma) {
+                return self.error(self.span(), "`alloc` is the only context so far");
+            }
+            Some(name)
+        } else {
+            None
+        };
         let throws = if self.at_kw(Kw::Throws) {
             let start = self.bump().span;
             let ty = if self.eat_p(P::LParen) {
@@ -707,7 +758,7 @@ impl Parser {
         if self.at_kw(Kw::Uses) {
             return self.error(
                 self.span(),
-                "`uses` clauses are not supported by the compiler yet",
+                "`uses` comes after the parameters, before `throws` and the return type: `fn f() uses alloc throws(E) -> T`",
             );
         }
         if self.at_kw(Kw::Where) {
@@ -738,6 +789,7 @@ impl Parser {
                 name,
                 generics,
                 params,
+                uses,
                 throws,
                 ret,
                 ret_refine,
@@ -751,7 +803,7 @@ impl Parser {
 
     /// `trait Name: Super + Other { item ... }`: methods (with or without
     /// a body), `type Name: Bounds` and `const NAME: T`, one per line.
-    fn trait_decl(&mut self, is_pub: bool, start: Span) -> PResult<TraitDecl> {
+    fn trait_decl(&mut self, is_pub: bool, is_unsafe: bool, start: Span) -> PResult<TraitDecl> {
         self.bump(); // trait
         let name = self.ident("a trait name")?;
         if self.at_p(P::LBracket) {
@@ -768,8 +820,15 @@ impl Parser {
         self.expect_p(P::LBrace)?;
         let (items, end) = self.member_items("a trait", |p, istart| {
             Ok(match p.peek() {
-                Tok::Kw(Kw::Fn) => {
-                    let (decl, default) = p.fn_decl_in(false, false, istart, Member::Trait)?;
+                Tok::Kw(kw @ (Kw::Fn | Kw::Unsafe)) => {
+                    let is_unsafe = *kw == Kw::Unsafe;
+                    if is_unsafe {
+                        p.bump();
+                        if !p.at_kw(Kw::Fn) {
+                            return p.expected("`fn` after `unsafe`");
+                        }
+                    }
+                    let (decl, default) = p.fn_decl_in(false, is_unsafe, istart, Member::Trait)?;
                     TraitItem::Method {
                         decl: Box::new(decl),
                         default,
@@ -797,6 +856,7 @@ impl Parser {
         })?;
         Ok(TraitDecl {
             is_pub,
+            is_unsafe,
             name,
             supers,
             items,
@@ -806,7 +866,7 @@ impl Parser {
 
     /// `impl[A: Bound] Trait for Type[A] { item ... }`: methods, `type Name
     /// = T` and `const NAME: T = value`, one per line.
-    fn impl_decl(&mut self, start: Span) -> PResult<ImplDecl> {
+    fn impl_decl(&mut self, is_unsafe: bool, start: Span) -> PResult<ImplDecl> {
         self.bump(); // impl
         let generics = if self.at_p(P::LBracket) {
             self.generic_params()?
@@ -821,8 +881,15 @@ impl Parser {
         self.expect_p(P::LBrace)?;
         let (items, end) = self.member_items("an `impl`", |p, istart| {
             Ok(match p.peek() {
-                Tok::Kw(Kw::Fn) => {
-                    let (decl, _) = p.fn_decl_in(false, false, istart, Member::Impl)?;
+                Tok::Kw(kw @ (Kw::Fn | Kw::Unsafe)) => {
+                    let is_unsafe = *kw == Kw::Unsafe;
+                    if is_unsafe {
+                        p.bump();
+                        if !p.at_kw(Kw::Fn) {
+                            return p.expected("`fn` after `unsafe`");
+                        }
+                    }
+                    let (decl, _) = p.fn_decl_in(false, is_unsafe, istart, Member::Impl)?;
                     ImplItem::Method(decl)
                 }
                 Tok::Kw(Kw::Type) => {
@@ -837,6 +904,7 @@ impl Parser {
             })
         })?;
         Ok(ImplDecl {
+            is_unsafe,
             generics,
             trait_,
             ty,
@@ -1287,6 +1355,20 @@ impl Parser {
             Tok::Kw(Kw::Unsafe) => {
                 self.bump();
                 Ok(Stmt::Unsafe(self.block()?))
+            }
+            // `with alloc = value { ... }`
+            Tok::Kw(Kw::With) => {
+                self.bump();
+                let context = self.ident("a context, as in `with alloc = h`")?;
+                self.expect_p(P::Eq)?;
+                let value = self.header_expr()?;
+                let body = self.condition_block()?;
+                Ok(Stmt::With {
+                    context,
+                    value,
+                    span: start.to(body.span),
+                    body,
+                })
             }
             Tok::Kw(Kw::Break) => Ok(Stmt::Break(self.bump().span)),
             Tok::Kw(Kw::Continue) => Ok(Stmt::Continue(self.bump().span)),

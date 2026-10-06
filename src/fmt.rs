@@ -198,7 +198,8 @@ fn restructure(items: Vec<Item<'_>>) -> Result<Vec<Item<'_>>, String> {
                     | Kw::Impl
                     | Kw::Catch
                     | Kw::Defer
-                    | Kw::Errdefer,
+                    | Kw::Errdefer
+                    | Kw::With,
                 ) => headers.push(stack.len()),
                 Tok::P(P::RBrace | P::RParen | P::RBracket) => {
                     headers.retain(|&d| d < stack.len());

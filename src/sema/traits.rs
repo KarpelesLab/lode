@@ -358,6 +358,31 @@ impl<'a> Checker<'a> {
                 }
                 Trait::Ordered | Trait::Clone | Trait::User(_) => {}
             }
+            // An `unsafe trait` promises what the compiler can't check:
+            // implementing it says so (`unsafe impl`), and only then.
+            let unsafe_trait = self
+                .trait_index
+                .get(&tr)
+                .is_some_and(|&t| self.traits[t].decl.is_unsafe);
+            if unsafe_trait && !decl.is_unsafe {
+                self.diags.push(
+                    Diagnostic::error(
+                        decl.span_head(),
+                        format!("implementing `{tr}` is unsafe: write `unsafe impl`"),
+                    )
+                    .with_help(format!(
+                        "`{tr}` is an `unsafe trait`: its implementations keep promises the compiler can't check (see its documentation)"
+                    )),
+                );
+            } else if decl.is_unsafe && !unsafe_trait {
+                self.diags.push(
+                    Diagnostic::error(
+                        decl.span_head(),
+                        format!("`{tr}` isn't an `unsafe trait`: its `impl` isn't `unsafe`"),
+                    )
+                    .with_help("remove `unsafe`"),
+                );
+            }
             let Some((ty, params, bounds)) = self.impl_type(decl, pkg, file) else {
                 continue;
             };
@@ -861,17 +886,18 @@ impl<'a> Checker<'a> {
                 );
                 continue;
             }
+            // It may allocate and throw `AllocError`, as the trait's.
             let ok = sig.has_self
                 && sig.params.len() == 1
                 && sig.params[0].1 == Convention::Let
                 && sig.ret == ty
-                && sig.throws.is_none()
+                && sig.throws.is_none_or(|e| e == Ty::alloc_error())
                 && sig.type_params.len() == sig.owner_params;
             if !ok {
                 let span = sig.span;
                 self.diags.push(
                     Diagnostic::error(span, format!("`{ty}.clone` doesn't match `Clone.clone`"))
-                        .with_help("declare it `fn clone(self) -> Self`"),
+                        .with_help("declare it `fn clone(self) -> Self`, or `fn clone(self) uses alloc throws(AllocError) -> Self` if it allocates"),
                 );
                 continue;
             }
@@ -1063,6 +1089,9 @@ impl<'a> Checker<'a> {
         }
         if imp.is_unsafe && !want.is_unsafe {
             return Some("it's `unsafe`, and the trait's isn't".to_owned());
+        }
+        if imp.uses_alloc && !want.uses_alloc {
+            return Some("it allocates (`uses alloc`), and the trait's doesn't".to_owned());
         }
         None
     }

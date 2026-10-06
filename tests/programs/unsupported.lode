@@ -1,10 +1,10 @@
 // error: `alias` declarations are not supported by the compiler yet
-// error: `uses` clauses are not supported by the compiler yet
+// error: `uses task` is not supported by the compiler yet: the one context is `alloc`
 package main
 
 alias Meters = u32
 
-fn parse() uses alloc -> u32 {
+fn parse() uses task -> u32 {
 	return 0
 }
 

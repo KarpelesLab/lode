@@ -33,12 +33,28 @@
 //! array's elements in order. For a type that needs none (an instance of
 //! generic code for plain data), the checker's moves, temporaries and
 //! destructions are removed, so the code is the same as without them.
+//!
+//! The destruction of a chain of boxes, a struct with a field `next:
+//! ?Box[Self]` (docs/allocation.md, Destroying recursive structures), is a
+//! loop: it takes `next`, takes the node out of its box (freeing the box),
+//! destroys the node's other fields, and goes on with the node's `next`.
+//! Its stack doesn't grow with the chain.
+//!
+//! The allocator context (docs/allocation.md, Lowering the context): the
+//! program's allocator types are the root's (`alloc.ROOT`'s), first, and
+//! each type an `alloc.handle(a)` the program reaches makes a handle of.
+//! A call through a handle (`h.alloc(...)`, `h.resize(...)`, `h.free(...)`)
+//! is a call of a function made here (`std/alloc.Handle.$alloc`) that
+//! calls the method of the handle's allocator type: a test of the handle's
+//! number, one direct call per type (closed-world dispatch, no function
+//! pointers). With only the root, it calls the root's method, and handles
+//! hold nothing; a call through `alloc.root()` calls it directly.
 
 use std::collections::HashMap;
 
 use crate::sema::{
-    Convention, Func, FuncId, Handler, Local, Program, TArm, TExpr, TExprKind, TStmt,
-    stmt_blocks_mut, stmt_exprs_mut, subexprs_mut,
+    AllocInfo, CmpOp, Convention, Func, FuncId, Handler, Intrinsic, Local, Program, TArm, TBinOp,
+    TExpr, TExprKind, TStmt, stmt_blocks_mut, stmt_exprs_mut, subexprs_mut,
 };
 use crate::source::Span;
 use crate::types::{IntTy, Ty};
@@ -61,6 +77,36 @@ pub struct Instances {
     /// destruction and is destroyed somewhere: its `deinit`'s instance, or
     /// one made here. It takes the value's address.
     pub destroy: HashMap<Ty, FuncId>,
+    /// `statics[i]`: whether an instance uses `static` `i`.
+    pub statics: Vec<bool>,
+    /// The program's allocator types, the root's first (empty for a
+    /// program that never allocates). A handle's number is the index of
+    /// its allocator's type here; with only the root, handles are
+    /// zero-sized and `uses alloc` functions take no hidden parameter.
+    pub allocators: Vec<Ty>,
+}
+
+impl Instances {
+    /// Whether the allocator context is passed at run time: the program
+    /// has allocator types besides the root's (docs/allocation.md,
+    /// Lowering the context).
+    pub fn dynamic_alloc(&self) -> bool {
+        self.allocators.len() > 1
+    }
+}
+
+/// The methods of the `Allocator` trait, in the order of a handle's
+/// intrinsics (`HandleAlloc`, `HandleResize`, `HandleFree`).
+const ALLOC_METHODS: [&str; 3] = ["alloc", "resize", "free"];
+
+/// The allocator context, while instances are made.
+struct AllocState {
+    info: AllocInfo,
+    /// The allocator types reached, the root's first, each with the
+    /// instances of its methods once made.
+    types: Vec<(Ty, Option<[FuncId; 3]>)>,
+    /// The dispatch function of each method, once a call needs it.
+    dispatch: [Option<FuncId>; 3],
 }
 
 /// The instances `main` reaches. A program without `main` (a library:
@@ -80,6 +126,12 @@ pub fn instantiate(program: &Program) -> Instances {
         clones: HashMap::new(),
         made: Vec::new(),
         span: program.funcs.first().map(|f| f.span).unwrap_or_default(),
+        statics: vec![false; program.statics.len()],
+        alloc: program.alloc.map(|info| AllocState {
+            info,
+            types: Vec::new(),
+            dispatch: [None; 3],
+        }),
     };
     let main = match program.main {
         Some(main) => {
@@ -97,17 +149,25 @@ pub fn instantiate(program: &Program) -> Instances {
         }
     };
     let mut origin = vec![0; m.funcs.len()];
-    while let Some((orig, args, throws, id)) = m.work.pop() {
-        let mut f = m.make(orig, &args);
-        // A call through a trait whose method throws expects a result: the
-        // impl's method that doesn't throw is made to, never throwing.
-        if let Some(err) = throws {
-            f.throws = Some(err);
-            f.symbol.push_str("<throws>");
+    loop {
+        while let Some((orig, args, throws, id)) = m.work.pop() {
+            let mut f = m.make(orig, &args);
+            // A call through a trait whose method throws expects a result:
+            // the impl's method that doesn't throw is made to, never
+            // throwing.
+            if let Some(err) = throws {
+                f.throws = Some(err);
+                f.symbol.push_str("<throws>");
+            }
+            origin.resize(m.funcs.len(), 0);
+            origin[id] = orig;
+            m.funcs[id] = Some(f);
         }
-        origin.resize(m.funcs.len(), 0);
-        origin[id] = orig;
-        m.funcs[id] = Some(f);
+        // The allocators' methods, then the dispatch through handles,
+        // once every allocator type is known.
+        if !m.alloc_step() {
+            break;
+        }
     }
     // The destructions made here come last.
     origin.resize(m.funcs.len(), 0);
@@ -144,6 +204,11 @@ pub fn instantiate(program: &Program) -> Instances {
             .into_iter()
             .map(|(ty, id)| (ty, new_id[id]))
             .collect(),
+        statics: m.statics,
+        allocators: m
+            .alloc
+            .map(|a| a.types.iter().map(|&(t, _)| t).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -193,13 +258,18 @@ struct Mono<'p> {
     root_called: bool,
     /// The destruction of each type, as in [`Instances::destroy`].
     destroy: HashMap<Ty, FuncId>,
-    /// The clones made here, by type (see [`Mono::clone_fn`]).
-    clones: HashMap<Ty, FuncId>,
+    /// The clones made here, by type and whether they throw (see
+    /// [`Mono::clone_fn`]).
+    clones: HashMap<(Ty, bool), FuncId>,
     /// The destructions and clones made here (see [`Mono::destroy_fn`]).
     made: Vec<FuncId>,
     /// The span of the function being made, for the destructions it
     /// makes (their debug information).
     span: Span,
+    /// `statics[i]`: whether an instance uses `static` `i`.
+    statics: Vec<bool>,
+    /// The allocator context, if the program imports `std/alloc`.
+    alloc: Option<AllocState>,
 }
 
 impl Mono<'_> {
@@ -299,7 +369,216 @@ impl Mono<'_> {
             body,
             span: f.span,
             template: false,
+            uses_alloc: f.uses_alloc,
         }
+    }
+
+    /// The root allocator's type, reached by the program (once anything
+    /// allocates, or names an allocator).
+    fn root_allocator(&mut self) -> Ty {
+        let a = self.alloc.as_mut().expect("`std/alloc` is loaded");
+        if a.types.is_empty() {
+            a.types.push((a.info.root_ty, None));
+        }
+        self.statics[a.info.root] = true;
+        a.info.root_ty
+    }
+
+    /// The program-level function of method `m` (in [`ALLOC_METHODS`]) of
+    /// the `Allocator` implementation of `ty`.
+    fn allocator_method(&self, ty: Ty, m: usize) -> FuncId {
+        let info = self.alloc.as_ref().expect("`std/alloc` is loaded").info;
+        self.program.dispatch.impls[&(info.allocator, ty.decl())][ALLOC_METHODS[m]]
+    }
+
+    /// The next step of the allocator context, once the instances so far
+    /// are made: the methods of the allocator types reached, then the
+    /// dispatch functions. Whether it made anything.
+    fn alloc_step(&mut self) -> bool {
+        let Some(a) = &self.alloc else {
+            return false;
+        };
+        if let Some(k) = a.types.iter().position(|(_, m)| m.is_none()) {
+            let ty = a.types[k].0;
+            let methods = [0, 1, 2].map(|m| {
+                let f = self.allocator_method(ty, m);
+                self.instance(f, ty.type_args().to_vec())
+            });
+            self.alloc.as_mut().expect("checked").types[k].1 = Some(methods);
+            return true;
+        }
+        let pending: Vec<(usize, FuncId)> = a
+            .dispatch
+            .iter()
+            .enumerate()
+            .filter_map(|(m, id)| id.map(|id| (m, id)))
+            .filter(|&(_, id)| self.funcs[id].is_none())
+            .collect();
+        if pending.is_empty() {
+            return false;
+        }
+        for (m, id) in pending {
+            let mut f = self.dispatch_parts(m);
+            let locals = f.locals.clone();
+            self.block(&mut f.body, &|_| None, &locals);
+            self.funcs[id] = Some(f);
+        }
+        true
+    }
+
+    /// The function a call through a handle of method `m` calls (made
+    /// once every allocator type is known).
+    fn dispatch_fn(&mut self, m: usize) -> FuncId {
+        self.root_allocator();
+        let a = self.alloc.as_mut().expect("`std/alloc` is loaded");
+        if let Some(id) = a.dispatch[m] {
+            return id;
+        }
+        let id = self.funcs.len();
+        self.funcs.push(None);
+        self.made.push(id);
+        self.alloc.as_mut().expect("checked").dispatch[m] = Some(id);
+        id
+    }
+
+    /// The dispatch function of method `m` (see the module docs): it takes
+    /// the handle and the method's other parameters, and calls the method
+    /// of the allocator type the handle's number names, with the
+    /// allocator the handle's address points to (the root's, a `static`,
+    /// for number 0).
+    fn dispatch_parts(&self, m: usize) -> Func {
+        let a = self.alloc.as_ref().expect("`std/alloc` is loaded");
+        let info = a.info;
+        let usize_ty = Ty::Int(IntTy {
+            signed: false,
+            bits: 64,
+            size: true,
+        });
+        let bytes = Ty::ptr(Ty::Int(IntTy::new(false, 8)));
+        let (names, tys, ret): (&[&str], Vec<Ty>, Ty) = match m {
+            0 => (&["size", "align"], vec![usize_ty, usize_ty], bytes),
+            1 => (
+                &["p", "old", "new", "align"],
+                vec![bytes, usize_ty, usize_ty, usize_ty],
+                Ty::Bool,
+            ),
+            _ => (
+                &["p", "size", "align"],
+                vec![bytes, usize_ty, usize_ty],
+                Ty::Unit,
+            ),
+        };
+        let param = |name: &str, ty: Ty| Local {
+            name: name.to_owned(),
+            ty,
+            mutable: false,
+            convention: Some(Convention::Let),
+            drop_flag: false,
+        };
+        let mut locals = vec![param("self", info.handle)];
+        locals.extend(names.iter().zip(&tys).map(|(n, &t)| param(n, t)));
+        let local = |l: usize| TExpr {
+            kind: TExprKind::Local(l),
+            ty: locals[l].ty,
+        };
+        let handle_field = |k: u32| TExpr {
+            kind: TExprKind::Field(Box::new(local(0)), k),
+            ty: usize_ty,
+        };
+        let throws = (m == 0).then(Ty::alloc_error);
+        let call_of = |k: usize, ty: Ty| -> Vec<TStmt> {
+            let f = self.allocator_method(ty, m);
+            let callee = &self.program.funcs[f];
+            let this = if k == 0 {
+                TExpr {
+                    kind: TExprKind::Static(info.root),
+                    ty,
+                }
+            } else {
+                let addr = TExpr {
+                    kind: TExprKind::Intrinsic(Intrinsic::FromAddr, vec![handle_field(1)]),
+                    ty: Ty::ptr(ty),
+                };
+                TExpr {
+                    kind: TExprKind::Deref(Box::new(addr)),
+                    ty,
+                }
+            };
+            let mut args = vec![this];
+            args.extend((1..locals.len()).map(local));
+            let call = TExpr {
+                kind: TExprKind::GenericCall(f, ty.type_args().to_vec(), args),
+                ty: match callee.throws {
+                    Some(err) => Ty::result(ret, err),
+                    None => ret,
+                },
+            };
+            let value = if callee.throws.is_some() {
+                TExpr {
+                    kind: TExprKind::Try(Box::new(call)),
+                    ty: ret,
+                }
+            } else {
+                call
+            };
+            if ret == Ty::Unit {
+                vec![TStmt::Expr(value), TStmt::Return(None)]
+            } else {
+                vec![TStmt::Return(Some(value))]
+            }
+        };
+        // Number 0 (the root's) last, without a test.
+        let mut body = call_of(0, a.types[0].0);
+        for (k, &(ty, _)) in a.types.iter().enumerate().skip(1) {
+            let is = TExpr {
+                kind: TExprKind::Binary(
+                    TBinOp::Cmp(CmpOp::Eq),
+                    Box::new(handle_field(0)),
+                    Box::new(TExpr {
+                        kind: TExprKind::Int(k as i128),
+                        ty: usize_ty,
+                    }),
+                ),
+                ty: Ty::Bool,
+            };
+            body = vec![TStmt::If(is, call_of(k, ty), body)];
+        }
+        Func {
+            name: format!("Handle.${}", ALLOC_METHODS[m]),
+            symbol: format!("std/alloc.Handle.${}", ALLOC_METHODS[m]),
+            type_params: Vec::new(),
+            owner_params: 0,
+            value_params: Vec::new(),
+            params: (0..locals.len()).collect(),
+            ret,
+            throws,
+            locals,
+            body,
+            span: self.span,
+            template: false,
+            uses_alloc: false,
+        }
+    }
+
+    /// Whether cloning a value of the concrete type `ty` allocates, and
+    /// whether it throws (as the checker's `clone_effects`).
+    fn clone_effects(&self, ty: Ty) -> (bool, bool) {
+        if ty.is_copy() {
+            return (false, false);
+        }
+        if let Some(f) = self.program.dispatch.clone_impl(ty) {
+            let f = &self.program.funcs[f];
+            return (f.uses_alloc, f.throws.is_some());
+        }
+        let parts = match ty {
+            Ty::Array(_) => vec![ty.as_array().expect("an array").0],
+            Ty::Optional(_) => vec![ty.as_optional().expect("an optional")],
+            _ => ty.members(),
+        };
+        parts.into_iter().fold((false, false), |(a, t), p| {
+            let (pa, pt) = self.clone_effects(p);
+            (a || pa, t || pt)
+        })
     }
 
     /// A statement list: what it destroys of types that need no
@@ -352,25 +631,67 @@ impl Mono<'_> {
         self.funcs.push(None);
         self.destroy.insert(ty, id);
         self.made.push(id);
-        let mut f = destroy_parts(ty, format!("{}.$destroy", self.type_symbol(ty)), self.span);
+        let chain = self.chain_link(ty);
+        let mut f = destroy_parts(
+            ty,
+            format!("{}.$destroy", self.type_symbol(ty)),
+            self.span,
+            chain,
+        );
         let locals = f.locals.clone();
         self.block(&mut f.body, &|_| None, &locals);
         self.funcs[id] = Some(f);
         id
     }
 
+    /// For a struct with one field `?Box[Self]` (a link of a chain), the
+    /// field's index and `Box.into_inner`, which its destruction loops
+    /// with (see the module docs).
+    fn chain_link(&self, ty: Ty) -> Option<(usize, FuncId)> {
+        let info = self.program.alloc?;
+        let into_inner = info.into_inner?;
+        let def = ty.as_struct()?;
+        let links: Vec<usize> = (0..def.fields.len())
+            .filter(|&k| {
+                def.fields[k]
+                    .ty
+                    .as_optional()
+                    .is_some_and(|b| b.same_decl(info.boxed) && b.type_args().first() == Some(&ty))
+            })
+            .collect();
+        match links[..] {
+            [k] => Some((k, into_inner)),
+            _ => None,
+        }
+    }
+
     /// The function that clones a value of type `ty`, a struct, an enum,
     /// an optional or an array without a `deinit` or an `impl Clone` of its
-    /// own, whose parts are `Clone`: made here, it clones each part.
-    fn clone_fn(&mut self, ty: Ty) -> FuncId {
-        if let Some(&id) = self.clones.get(&ty) {
+    /// own, whose parts are `Clone`: made here, it clones each part. It
+    /// allocates and throws when a part's clone does, and throws when the
+    /// call expects a result (`throws`).
+    fn clone_fn(&mut self, ty: Ty, throws: bool) -> FuncId {
+        if let Some(&id) = self.clones.get(&(ty, throws)) {
             return id;
         }
         let id = self.funcs.len();
         self.funcs.push(None);
-        self.clones.insert(ty, id);
+        self.clones.insert((ty, throws), id);
         self.made.push(id);
-        let mut f = clone_parts(ty, format!("{}.$clone", self.type_symbol(ty)), self.span);
+        let (allocates, parts_throw) = self.clone_effects(ty);
+        debug_assert!(throws || !parts_throw, "a clone that throws gives a result");
+        let mut f = clone_parts(
+            ty,
+            format!(
+                "{}.$clone{}",
+                self.type_symbol(ty),
+                if throws { "<throws>" } else { "" }
+            ),
+            self.span,
+            &|t| self.clone_effects(t).1,
+        );
+        f.uses_alloc = allocates;
+        f.throws = throws.then(Ty::alloc_error);
         let locals = f.locals.clone();
         self.block(&mut f.body, &|_| None, &locals);
         self.funcs[id] = Some(f);
@@ -399,6 +720,12 @@ impl Mono<'_> {
         }
         if let TExprKind::NeedsDeinit(t) = e.kind {
             e.kind = TExprKind::Bool(t.subst(map).needs_destroy());
+        }
+        if let TExprKind::Layout(t, _) = &mut e.kind {
+            *t = t.subst(map);
+        }
+        if let TExprKind::Static(k) = e.kind {
+            self.statics[k] = true;
         }
         // `a.lt(b)` of a type that implements `Ordered` with an `impl`.
         if let TExprKind::Compare(a, _) | TExprKind::Binary(_, a, _) = &e.kind
@@ -431,7 +758,9 @@ impl Mono<'_> {
             } => self.block(body, map, locals),
             _ => {}
         }
-        // `x.clone()`: the copy, or a call of the type's `clone`.
+        // `x.clone()`: the copy, or a call of the type's `clone`. Where it
+        // may fail, its value is a result: the copy is `ok`, and a clone
+        // that doesn't throw is made to.
         if let TExprKind::Clone(inner) = &mut e.kind {
             let inner = std::mem::replace(
                 &mut **inner,
@@ -440,20 +769,95 @@ impl Mono<'_> {
                     ty: Ty::Bool,
                 },
             );
-            let ty = e.ty;
+            let rty = e.ty;
+            let (ty, wants) = match rty.as_result() {
+                Some((ok, _)) => (ok, true),
+                None => (rty, false),
+            };
             if ty.is_copy() {
-                *e = inner;
+                *e = if wants {
+                    TExpr {
+                        kind: TExprKind::Variant(0, vec![inner]),
+                        ty: rty,
+                    }
+                } else {
+                    inner
+                };
                 self.expr(e, map, locals);
                 return;
             }
             let f = match self.program.dispatch.clone_impl(ty) {
-                Some(f) => self.instance(f, ty.type_args().to_vec()),
-                None => self.clone_fn(ty),
+                Some(f) => {
+                    let adapt = wants && self.program.funcs[f].throws.is_none();
+                    self.instance_throwing(f, ty.type_args().to_vec(), adapt.then(Ty::alloc_error))
+                }
+                None => self.clone_fn(ty, wants),
             };
             *e = TExpr {
                 kind: TExprKind::Call(f, vec![inner]),
-                ty,
+                ty: rty,
             };
+        }
+        // `p.destroy()` destroys what the pointer points to.
+        if let TExprKind::Intrinsic(Intrinsic::PtrDestroy, args) = &e.kind
+            && let Some(to) = args[0].ty.subst(map).as_ptr()
+            && to.needs_destroy()
+        {
+            self.destroy_fn(to);
+        }
+        // The allocator context.
+        if let TExprKind::Intrinsic(
+            k @ (Intrinsic::AllocCurrent
+            | Intrinsic::AllocRoot
+            | Intrinsic::AllocHandle
+            | Intrinsic::HandleAlloc
+            | Intrinsic::HandleResize
+            | Intrinsic::HandleFree),
+            args,
+        ) = &mut e.kind
+        {
+            let k = *k;
+            self.root_allocator();
+            let m = match k {
+                Intrinsic::HandleAlloc => 0,
+                Intrinsic::HandleResize => 1,
+                Intrinsic::HandleFree => 2,
+                Intrinsic::AllocHandle => {
+                    // Another allocator type, for the handles of `a`.
+                    let ty = args[0].ty.subst(map);
+                    let a = self.alloc.as_mut().expect("checked");
+                    if !a.types.iter().any(|&(t, _)| t == ty) {
+                        a.types.push((ty, None));
+                    }
+                    3
+                }
+                _ => 3,
+            };
+            if m < 3 {
+                let mut args = std::mem::take(args);
+                let via_root =
+                    matches!(args[0].kind, TExprKind::Intrinsic(Intrinsic::AllocRoot, _));
+                let f = if via_root {
+                    // `alloc.root().free(...)`: the root's method, directly.
+                    let a = self.alloc.as_ref().expect("checked");
+                    let (root, root_ty) = (a.info.root, a.info.root_ty);
+                    let g = self.allocator_method(root_ty, m);
+                    let adapt =
+                        e.ty.as_result().is_some() && self.program.funcs[g].throws.is_none();
+                    args[0] = TExpr {
+                        kind: TExprKind::Static(root),
+                        ty: root_ty,
+                    };
+                    self.instance_throwing(
+                        g,
+                        root_ty.type_args().to_vec(),
+                        adapt.then(Ty::alloc_error),
+                    )
+                } else {
+                    self.dispatch_fn(m)
+                };
+                e.kind = TExprKind::Call(f, args);
+            }
         }
         for sub in subexprs_mut(e) {
             self.expr(sub, map, locals);
@@ -496,8 +900,10 @@ impl Mono<'_> {
 
 /// A function that destroys the parts of a value of type `ty`, which has
 /// no `deinit` (see [`Mono::destroy_fn`]): it takes the value `inout`, and
-/// destroys each part that needs destruction.
-fn destroy_parts(ty: Ty, symbol: String, span: Span) -> Func {
+/// destroys each part that needs destruction. With `chain`, the struct's
+/// field of that index is a link `?Box[Self]`, destroyed by a loop with
+/// `Box.into_inner` (the function given), not by destroying it.
+fn destroy_parts(ty: Ty, symbol: String, span: Span, chain: Option<(usize, FuncId)>) -> Func {
     let usize_ty = Ty::Int(IntTy {
         signed: false,
         bits: 64,
@@ -541,16 +947,24 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span) -> Func {
             )],
         }]
     } else if let Some(def) = ty.as_struct() {
-        (0..def.fields.len())
-            .rev()
-            .filter(|&k| def.fields[k].ty.needs_destroy())
-            .map(|k| {
-                destroy(
-                    TExprKind::Field(Box::new(this.clone()), k as u32),
-                    def.fields[k].ty,
-                )
-            })
-            .collect()
+        // The fields of `of`, last first, but the link of a chain.
+        let fields = |of: &TExpr| -> Vec<TStmt> {
+            (0..def.fields.len())
+                .rev()
+                .filter(|&k| def.fields[k].ty.needs_destroy() && Some(k) != chain.map(|c| c.0))
+                .map(|k| {
+                    destroy(
+                        TExprKind::Field(Box::new(of.clone()), k as u32),
+                        def.fields[k].ty,
+                    )
+                })
+                .collect()
+        };
+        let mut body = fields(&this);
+        if let Some((k, into_inner)) = chain {
+            body.extend(chain_loop(&mut locals, ty, k, into_inner, &this, &fields));
+        }
+        body
     } else {
         let def = ty
             .sum()
@@ -588,13 +1002,97 @@ fn destroy_parts(ty: Ty, symbol: String, span: Span) -> Func {
         body,
         span,
         template: false,
+        uses_alloc: false,
     }
+}
+
+/// The loop that destroys the chain of boxes from field `k` of `this` (a
+/// struct of type `ty`, whose other fields `fields` destroys), with two
+/// more locals: the link taken out (`$link`, a `?Box[ty]`) and the node
+/// taken out of its box (`$node`). Neither is destroyed as a whole: the
+/// box is freed by `into_inner`, and the node's fields are destroyed but
+/// its link, which goes on to `$link`.
+fn chain_loop(
+    locals: &mut Vec<Local>,
+    ty: Ty,
+    k: usize,
+    into_inner: FuncId,
+    this: &TExpr,
+    fields: &dyn Fn(&TExpr) -> Vec<TStmt>,
+) -> Vec<TStmt> {
+    let def = ty.as_struct().expect("a struct");
+    let link_ty = def.fields[k].ty;
+    let box_ty = link_ty.as_optional().expect("an optional box");
+    let hidden = |name: &str, ty: Ty| Local {
+        name: name.to_owned(),
+        ty,
+        mutable: true,
+        convention: None,
+        drop_flag: false,
+    };
+    let (link, node) = (locals.len(), locals.len() + 1);
+    locals.push(hidden("$link", link_ty));
+    locals.push(hidden("$node", ty));
+    let local = |l: usize, ty: Ty| TExpr {
+        kind: TExprKind::Local(l),
+        ty,
+    };
+    // `$link = take(&of.next)`: written over, never destroyed.
+    let take = |of: &TExpr| {
+        let place = TExpr {
+            kind: TExprKind::Field(Box::new(of.clone()), k as u32),
+            ty: link_ty,
+        };
+        TStmt::Init(
+            link,
+            TExpr {
+                kind: TExprKind::Intrinsic(
+                    Intrinsic::Take,
+                    vec![TExpr {
+                        kind: TExprKind::Ref(Box::new(place)),
+                        ty: link_ty,
+                    }],
+                ),
+                ty: link_ty,
+            },
+        )
+    };
+    let boxed = TExpr {
+        kind: TExprKind::Payload(Box::new(local(link, link_ty)), 1, 0),
+        ty: box_ty,
+    };
+    let mut next = vec![TStmt::Init(
+        node,
+        TExpr {
+            kind: TExprKind::GenericCall(into_inner, vec![ty], vec![boxed]),
+            ty,
+        },
+    )];
+    next.extend(fields(&local(node, ty)));
+    next.push(take(&local(node, ty)));
+    vec![
+        take(this),
+        TStmt::Loop(vec![TStmt::Match {
+            value: local(link, link_ty),
+            arms: vec![
+                TArm {
+                    variants: vec![0],
+                    body: vec![TStmt::Break],
+                },
+                TArm {
+                    variants: vec![1],
+                    body: next,
+                },
+            ],
+        }]),
+    ]
 }
 
 /// A function that clones a value of type `ty` part by part (see
 /// [`Mono::clone_fn`]): it takes the value read-only, and returns a struct
-/// literal, a variant or an array literal of its parts' clones.
-fn clone_parts(ty: Ty, symbol: String, span: Span) -> Func {
+/// literal, a variant or an array literal of its parts' clones. A part
+/// whose clone throws (`throws` says) is passed on with `try`.
+fn clone_parts(ty: Ty, symbol: String, span: Span, throws: &dyn Fn(Ty) -> bool) -> Func {
     let locals = vec![Local {
         name: "self".to_owned(),
         ty,
@@ -606,9 +1104,22 @@ fn clone_parts(ty: Ty, symbol: String, span: Span) -> Func {
         kind: TExprKind::Local(0),
         ty,
     };
-    let clone = |kind: TExprKind, ty: Ty| TExpr {
-        kind: TExprKind::Clone(Box::new(TExpr { kind, ty })),
-        ty,
+    let clone = |kind: TExprKind, ty: Ty| {
+        let part = TExpr { kind, ty };
+        if !throws(ty) {
+            return TExpr {
+                kind: TExprKind::Clone(Box::new(part)),
+                ty,
+            };
+        }
+        let result = TExpr {
+            kind: TExprKind::Clone(Box::new(part)),
+            ty: Ty::result(ty, Ty::alloc_error()),
+        };
+        TExpr {
+            kind: TExprKind::Try(Box::new(result)),
+            ty,
+        }
     };
     let value = |kind: TExprKind| TStmt::Return(Some(TExpr { kind, ty }));
     let body = if let Some((elem, n)) = ty.as_known_array() {
@@ -684,5 +1195,6 @@ fn clone_parts(ty: Ty, symbol: String, span: Span) -> Func {
         body,
         span,
         template: false,
+        uses_alloc: false,
     }
 }

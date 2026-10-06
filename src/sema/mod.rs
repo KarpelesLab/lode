@@ -65,6 +65,8 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         refined_types: Vec::new(),
         field_refines: HashMap::new(),
         deinits: HashSet::new(),
+        statics: Vec::new(),
+        alloc: None,
         sources: packages
             .iter()
             .flat_map(|p| &p.files)
@@ -87,6 +89,8 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
             warnings: Vec::new(),
             dispatch: Dispatch::default(),
             deinits: HashMap::new(),
+            statics: Vec::new(),
+            alloc: None,
         };
         return (program, ck.diags);
     }
@@ -95,6 +99,9 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
     // functions a constant's value calls are checked on the way.
     for id in 0..ck.consts.len() {
         ck.const_value(id);
+    }
+    for k in 0..ck.statics.len() {
+        ck.static_value(k);
     }
     // Expansions are added as they're made (and checked then, unless a
     // trial check of a loop's body rolled that back).
@@ -155,6 +162,25 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         .filter(|&((_, name), _)| name == DEINIT)
         .map(|(&(ty, _), &id)| (ty, id))
         .collect();
+    let statics = ck
+        .statics
+        .iter()
+        .map(|st| match &st.state {
+            StaticState::Done(ty, init) => Static {
+                symbol: format!("{}.{}", ck.pkgs[st.pkg].path, st.decl.name.name),
+                ty: *ty,
+                init: init.clone(),
+            },
+            _ => Static {
+                symbol: String::new(),
+                ty: Ty::Unit,
+                init: TExpr {
+                    kind: TExprKind::Bool(false),
+                    ty: Ty::Bool,
+                },
+            },
+        })
+        .collect();
     let program = Program {
         funcs,
         strings: ck.strings,
@@ -164,6 +190,8 @@ pub fn check(packages: &[Package], target: &Target) -> (Program, Vec<Diagnostic>
         warnings: Vec::new(),
         dispatch: ck.dispatch,
         deinits,
+        statics,
+        alloc: ck.alloc,
     };
     (program, ck.diags)
 }
@@ -179,6 +207,24 @@ enum Item {
     /// A named refinement (`type Digit = u8 where self <= 9`), by index
     /// into [`Checker::refined_types`].
     Refined(usize),
+    /// A `static`, by index into [`Checker::statics`].
+    Static(usize),
+}
+
+/// A `static`'s declaration, and its type and value once checked.
+struct StaticInfo<'a> {
+    decl: &'a ast::StaticDecl,
+    pkg: usize,
+    file: FileId,
+    state: StaticState,
+}
+
+#[derive(Clone)]
+enum StaticState {
+    Unchecked,
+    Checking,
+    Done(Ty, TExpr),
+    Failed,
 }
 
 /// A named refinement's declaration, and its type and refinement once
@@ -204,6 +250,8 @@ struct PkgInfo {
 struct Sig {
     is_pub: bool,
     is_unsafe: bool,
+    /// Whether it declares `uses alloc` (docs/allocation.md, `uses alloc`).
+    uses_alloc: bool,
     /// The package that declares it.
     pkg: usize,
     /// The name calls are shown with: `f`, or `Point.scale` for a method
@@ -358,6 +406,10 @@ struct Checker<'a> {
     field_refines: HashMap<Ty, Vec<(usize, Rc<refine::Refine>)>>,
     /// The `deinit` methods, which can't be called directly.
     deinits: HashSet<FuncId>,
+    /// The `static`s.
+    statics: Vec<StaticInfo<'a>>,
+    /// What the compiler knows of `std/alloc`, if it's loaded.
+    alloc: Option<AllocInfo>,
 }
 
 /// Per-function (or per-constant) checking state.
@@ -465,6 +517,9 @@ struct FnCx {
     defer_kind: Option<(bool, usize)>,
     /// In a `deinit`: its `self`, which can't be moved.
     deinit_self: Option<LocalId>,
+    /// Whether the function declares `uses alloc`: it may call functions
+    /// that allocate, and use `with alloc`.
+    uses_alloc: bool,
 }
 
 /// A variable a `defer` body moves (see [`FnCx::defer_moves`]).
@@ -561,6 +616,7 @@ impl FnCx {
             defer_moves: Vec::new(),
             defer_kind: None,
             deinit_self: None,
+            uses_alloc: false,
         }
     }
 
@@ -699,7 +755,10 @@ fn own_exprs(s: &Stmt) -> Vec<&ast::Expr> {
         Stmt::Let { init, .. } => init.iter().collect(),
         Stmt::ComptimeLet { init, .. } => vec![init],
         Stmt::Assign { target, value, .. } => vec![target, value],
-        Stmt::Expr(e) | Stmt::Throw { value: e, .. } | Stmt::Match { value: e, .. } => vec![e],
+        Stmt::Expr(e)
+        | Stmt::Throw { value: e, .. }
+        | Stmt::Match { value: e, .. }
+        | Stmt::With { value: e, .. } => vec![e],
         Stmt::Return { value, .. } => value.iter().collect(),
         Stmt::If(i) => vec![&i.cond],
         Stmt::While { cond, .. } => vec![cond],
@@ -802,6 +861,7 @@ fn child_blocks(s: &Stmt) -> Vec<&ast::Block> {
         | Stmt::Loop { body, .. }
         | Stmt::For { body, .. }
         | Stmt::Unsafe(body)
+        | Stmt::With { body, .. }
         | Stmt::Defer { body, .. } => blocks.push(body),
         _ => {}
     }
@@ -1200,13 +1260,14 @@ fn storable(ty: Ty) -> Result<(), Option<()>> {
     match ty {
         Ty::Int(_)
         | Ty::Bool
+        | Ty::Ptr(_)
         | Ty::Array(_)
         | Ty::Struct(_)
         | Ty::Enum(_)
         | Ty::Optional(_)
         | Ty::Param(_) => Ok(()),
         Ty::Str | Ty::Slice(_) => Err(Some(())),
-        Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) | Ty::Value(_) => Err(None),
+        Ty::Unit | Ty::Never | Ty::Result(_) | Ty::Value(_) => Err(None),
     }
 }
 
@@ -1510,6 +1571,15 @@ impl<'a> Checker<'a> {
                             self.check_type_name(&t.name);
                             (&t.name, Item::Refined(self.refined_types.len() - 1))
                         }
+                        ast::Item::Static(st) => {
+                            self.statics.push(StaticInfo {
+                                decl: st,
+                                pkg,
+                                file: file.id,
+                                state: StaticState::Unchecked,
+                            });
+                            (&st.name, Item::Static(self.statics.len() - 1))
+                        }
                         ast::Item::If(_) | ast::Item::CompileError(_) => {
                             unreachable!("replaced by `active_items`")
                         }
@@ -1591,6 +1661,49 @@ impl<'a> Checker<'a> {
         self.check_impls();
         self.func_states = fns.iter().map(|_| FuncState::Unchecked).collect();
         self.fn_decls = fns;
+        self.find_alloc();
+    }
+
+    /// The items of `std/alloc` that the allocator context is made of, if
+    /// it's loaded (see [`AllocInfo`]).
+    fn find_alloc(&mut self) {
+        let Some(pkg) = self.pkgs.iter().position(|p| p.path == "std/alloc") else {
+            return;
+        };
+        let items = &self.pkgs[pkg].items;
+        let (
+            Some(&Item::Trait(allocator)),
+            Some(&Item::Type(handle)),
+            Some(&Item::Static(root)),
+            Some(&Item::Type(boxed)),
+        ) = (
+            items.get("Allocator"),
+            items.get("Handle"),
+            items.get("ROOT"),
+            items.get("Box"),
+        )
+        else {
+            return;
+        };
+        let into_inner = self
+            .methods
+            .get(&(boxed.decl(), "into_inner".to_owned()))
+            .copied();
+        let root_ty = match &self.statics[root].decl.ty {
+            TypeExpr::Named(id) => match items.get(&id.name) {
+                Some(&Item::Type(t)) => t,
+                _ => return,
+            },
+            _ => return,
+        };
+        self.alloc = Some(AllocInfo {
+            allocator,
+            handle,
+            root,
+            root_ty,
+            boxed,
+            into_inner,
+        });
     }
 
     /// The items of a file that are compiled for the target: those outside
@@ -1905,18 +2018,31 @@ impl<'a> Checker<'a> {
         if !f.intrinsic {
             return None;
         }
-        if !self.pkgs[cx.pkg].path.starts_with("std/") || f.owner.is_some() {
+        let path = self.pkgs[cx.pkg].path.as_str();
+        let owner = match &f.owner {
+            None => None,
+            Some(TypeExpr::Named(t)) => Some(t.name.as_str()),
+            Some(_) => Some(""),
+        };
+        if !path.starts_with("std/") || (owner.is_some() && path != "std/alloc") {
             self.error(
                 f.name.span,
                 "`@intrinsic` is only for the functions of the standard library that the compiler implements",
             );
             return None;
         }
-        match f.name.name.as_str() {
-            "swap" => Some(Intrinsic::Swap),
-            "forget" => Some(Intrinsic::Forget),
-            "take" => Some(Intrinsic::Take),
-            other => {
+        match (path, owner, f.name.name.as_str()) {
+            ("std/mem", None, "swap") => Some(Intrinsic::Swap),
+            ("std/mem", None, "forget") => Some(Intrinsic::Forget),
+            ("std/mem", None, "take") => Some(Intrinsic::Take),
+            ("std/mem", None, "from_addr") => Some(Intrinsic::FromAddr),
+            ("std/alloc", None, "current") => Some(Intrinsic::AllocCurrent),
+            ("std/alloc", None, "root") => Some(Intrinsic::AllocRoot),
+            ("std/alloc", None, "handle") => Some(Intrinsic::AllocHandle),
+            ("std/alloc", Some("Handle"), "alloc") => Some(Intrinsic::HandleAlloc),
+            ("std/alloc", Some("Handle"), "resize") => Some(Intrinsic::HandleResize),
+            ("std/alloc", Some("Handle"), "free") => Some(Intrinsic::HandleFree),
+            (_, _, other) => {
                 self.error(
                     f.name.span,
                     format!("the compiler has no intrinsic `{other}`"),
@@ -1962,6 +2088,12 @@ impl<'a> Checker<'a> {
                     "`deinit` can't be `unsafe`: destruction runs in safe code",
                 )
                 .with_help("use an `unsafe` block in its body"),
+            );
+        }
+        if sig.uses_alloc {
+            errors.push(
+                Diagnostic::error(f.name.span, "`deinit` can't allocate (`uses alloc`)")
+                    .with_help("destruction runs at the end of scopes, also in functions without `uses alloc`; a container frees through the allocator it remembers"),
             );
         }
         if sig.type_params.len() > sig.owner_params {
@@ -2470,7 +2602,21 @@ impl<'a> Checker<'a> {
                 }
             }
             TypeExpr::Ptr(inner, span) => match self.resolve_type(cx, inner)? {
-                Ty::Int(it) => Some(Ty::Ptr(it)),
+                to @ (Ty::Int(_)
+                | Ty::Bool
+                | Ty::Ptr(_)
+                | Ty::Array(_)
+                | Ty::Struct(_)
+                | Ty::Enum(_)
+                | Ty::Optional(_)
+                | Ty::Param(_)) => Some(Ty::ptr(to)),
+                other @ (Ty::Str | Ty::Slice(_)) => {
+                    self.diags.push(
+                        Diagnostic::error(*span, format!("a pointer can't point to a view (`{other}`)"))
+                            .with_help("views are never stored, so they can't outlive what they view (docs/memory.md, Views)"),
+                    );
+                    None
+                }
                 other => {
                     self.error(
                         *span,
@@ -2575,6 +2721,7 @@ impl<'a> Checker<'a> {
                         None
                     }
                     None if id.name == "Ordering" => Some(Ty::ordering()),
+                    None if id.name == "AllocError" => Some(Ty::alloc_error()),
                     // In a trait, its associated types: `Rune` is
                     // `Self.Rune`.
                     None if cx.self_ty.is_some_and(|s| {
@@ -2617,6 +2764,7 @@ impl<'a> Checker<'a> {
         match elem {
             Ty::Int(_)
             | Ty::Bool
+            | Ty::Ptr(_)
             | Ty::Array(_)
             | Ty::Struct(_)
             | Ty::Enum(_)
@@ -2923,6 +3071,7 @@ impl<'a> Checker<'a> {
         Sig {
             is_pub: f.is_pub,
             is_unsafe: f.is_unsafe,
+            uses_alloc: f.uses.is_some(),
             pkg: cx.pkg,
             template: (is_template && cx.expanding.is_none())
                 .then_some(comptime::Template { kinds }),
@@ -3011,6 +3160,7 @@ impl<'a> Checker<'a> {
             },
             Item::Trait(t) => self.traits[self.trait_index[&t]].decl.is_pub,
             Item::Refined(k) => self.refined_types[k].decl.is_pub,
+            Item::Static(k) => self.statics[k].decl.is_pub,
         };
         if pkg != cx.pkg && !is_pub {
             let path = self.pkgs[pkg].path.clone();
@@ -3103,6 +3253,82 @@ impl<'a> Checker<'a> {
         };
         self.consts[id].state = value.map_or(ConstState::Failed, ConstState::Done);
         value
+    }
+
+    /// The type of `static` `k`, with its initial value checked and
+    /// computed (once): a `Copy` type a constant can have, and a value
+    /// computed when compiling, as a constant's.
+    fn static_value(&mut self, k: usize) -> Option<Ty> {
+        match &self.statics[k].state {
+            StaticState::Done(ty, _) => return Some(*ty),
+            StaticState::Failed => return None,
+            StaticState::Checking => {
+                let decl = self.statics[k].decl;
+                self.error(
+                    decl.name.span,
+                    format!("the value of `{}` depends on itself", decl.name.name),
+                );
+                self.statics[k].state = StaticState::Failed;
+                return None;
+            }
+            StaticState::Unchecked => {}
+        }
+        self.statics[k].state = StaticState::Checking;
+        let (decl, pkg, file) = (
+            self.statics[k].decl,
+            self.statics[k].pkg,
+            self.statics[k].file,
+        );
+        let mut cx = FnCx::new(pkg, file, Ty::Unit, false);
+        let state = match self.resolve_type(&mut cx, &decl.ty) {
+            Some(ty) if !ty.is_copy() => {
+                self.diags.push(
+                    Diagnostic::error(
+                        decl.ty.span(),
+                        format!("a static's type must be `Copy`, and `{ty}` isn't"),
+                    )
+                    .with_help("nothing destroys a static: it can't own a resource"),
+                );
+                StaticState::Failed
+            }
+            Some(ty) if !const_type(ty) => {
+                self.diags.push(
+                    Diagnostic::error(
+                        decl.ty.span(),
+                        format!("statics of type `{ty}` are not supported by the compiler yet"),
+                    )
+                    .with_help("a static holds integers and `bool`s, or arrays, structs, enums and optionals of them"),
+                );
+                StaticState::Failed
+            }
+            Some(ty) => match self.static_init(&mut cx, decl, ty) {
+                Some(init) => StaticState::Done(ty, init),
+                None => StaticState::Failed,
+            },
+            None => StaticState::Failed,
+        };
+        let ty = match &state {
+            StaticState::Done(ty, _) => Some(*ty),
+            _ => None,
+        };
+        self.statics[k].state = state;
+        ty
+    }
+
+    /// The initial value of the static `decl`, of type `ty`: computed when
+    /// compiling, as a constant's, and given as a literal.
+    fn static_init(&mut self, cx: &mut FnCx, decl: &ast::StaticDecl, ty: Ty) -> Option<TExpr> {
+        cx.comptime = true;
+        let c = self.expr(cx, &decl.value, Some(ty))?;
+        let c = self.coerce(cx, c, ty, decl.value.span)?;
+        let what = format!("`{}`", decl.name.name);
+        let subject = eval::Subject {
+            what: &what,
+            span: decl.value.span,
+            budget_span: None,
+        };
+        let v = self.evaluate(&c.expr, cx.locals.len(), eval::DEFAULT_STEPS, &subject)?;
+        Some(eval::materialize(&v, ty))
     }
 
     /// The value of the typed constant `decl`, of type `ty`, computed at
@@ -3220,6 +3446,7 @@ impl<'a> Checker<'a> {
         let mut cx = FnCx::new(pkg, file, ret, is_unsafe);
         cx.throws = throws;
         cx.func = Some(id);
+        cx.uses_alloc = self.sigs[id].uses_alloc;
         cx.type_params = self.sigs[id].type_params.clone();
         cx.self_ty = self.sigs[id].self_ty;
         // A trait's required method has no body: an impl's replaces it in
@@ -3241,6 +3468,7 @@ impl<'a> Checker<'a> {
                 body: Vec::new(),
                 span: f.span,
                 template,
+                uses_alloc: self.sigs[id].uses_alloc,
             };
         }
         let mut params = Vec::new();
@@ -3329,6 +3557,26 @@ impl<'a> Checker<'a> {
                 init: true,
             });
         }
+        // A `set` parameter the body assigns is the caller's when the
+        // function returns; when it leaves with an error instead, what it
+        // was assigned is destroyed here: the caller's variable isn't
+        // assigned then (docs/allocation.md, When destruction runs).
+        if throws.is_some() {
+            for &p in &params {
+                let ty = cx.locals[p].ty;
+                if cx.locals[p].convention != Some(Convention::Set) || ty.is_copy() {
+                    continue;
+                }
+                cx.locals[p].drop_flag = true;
+                prologue.push(TStmt::Defer {
+                    body: vec![TStmt::Destroy(TExpr {
+                        kind: TExprKind::Local(p),
+                        ty,
+                    })],
+                    on_error: true,
+                });
+            }
+        }
         let mut body = self.block(&mut cx, &f.body.stmts);
         if !prologue.is_empty() {
             prologue.append(&mut body);
@@ -3377,6 +3625,7 @@ impl<'a> Checker<'a> {
             body,
             span: f.span,
             template: false,
+            uses_alloc: self.sigs[id].uses_alloc,
         }
     }
 
@@ -4009,6 +4258,12 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 };
+                // A `static`, assigned like a place.
+                if cx.lookup(name).is_none()
+                    && let Some(Item::Static(_)) = self.pkgs[cx.pkg].items.get(name)
+                {
+                    return self.place_assign(cx, target, *op, value, *span);
+                }
                 let Some(local) = cx.lookup(name) else {
                     self.unknown_target(cx, name, target.span);
                     return None;
@@ -4251,6 +4506,12 @@ impl<'a> Checker<'a> {
                 cx.unsafe_depth -= 1;
                 Some(TStmt::Block(body))
             }
+            Stmt::With {
+                context,
+                value,
+                body,
+                span,
+            } => self.with_stmt(cx, context, value, body, *span),
             Stmt::Match {
                 comptime: true,
                 value,
@@ -4266,6 +4527,62 @@ impl<'a> Checker<'a> {
                 out
             }
         }
+    }
+
+    /// `with alloc = value { ... }`: the block runs with `value`, an
+    /// `alloc.Handle`, as the allocator in context (docs/allocation.md,
+    /// `with alloc = x`). Only a function that declares `uses alloc` has a
+    /// context to replace, so one without it allocates through no call.
+    fn with_stmt(
+        &mut self,
+        cx: &mut FnCx,
+        context: &ast::Ident,
+        value: &ast::Expr,
+        body: &ast::Block,
+        span: Span,
+    ) -> Option<TStmt> {
+        if context.name != "alloc" {
+            self.diags.push(
+                Diagnostic::error(
+                    context.span,
+                    format!("there's no context `{}`", context.name),
+                )
+                .with_help("`with alloc = h { ... }` replaces the allocator in context"),
+            );
+            return None;
+        }
+        if !cx.uses_alloc {
+            let what = match cx.func {
+                Some(f) => format!("`{}`", self.sigs[f].name),
+                None => "this function".to_owned(),
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    span,
+                    "`with alloc` is only allowed in a function that declares `uses alloc`",
+                )
+                .with_help(format!(
+                    "add `uses alloc` to {what}, after its parameters: then no function without it allocates, through any call it makes (docs/allocation.md)"
+                )),
+            );
+            return None;
+        }
+        let Some(info) = self.alloc else {
+            self.diags.push(
+                Diagnostic::error(value.span, "`with alloc` takes an `alloc.Handle`")
+                    .with_help("add `import \"std/alloc\"`"),
+            );
+            return None;
+        };
+        let h = self.expr(cx, value, Some(info.handle))?;
+        let h = self.coerce(cx, h, info.handle, value.span)?;
+        let local = self.declare(cx, "$with", info.handle, false);
+        cx.env.assign(local, None);
+        let stmts = self.block(cx, &body.stmts);
+        Some(TStmt::Block(vec![
+            TStmt::Init(local, h.expr),
+            TStmt::With(local, stmts),
+        ]))
     }
 
     /// The facts after statements that branch: `envs` are the facts at the
@@ -5585,40 +5902,14 @@ impl<'a> Checker<'a> {
             );
             return None;
         };
-        let Some(local) = cx.lookup(name) else {
+        // A `static` of the package, or a local.
+        let local = cx.lookup(name);
+        if local.is_none() && !matches!(self.pkgs[cx.pkg].items.get(name), Some(Item::Static(_))) {
             self.unknown_target(cx, name, root.span);
             return None;
-        };
-        if cx.failed.contains(&local) {
-            return None;
         }
-        self.check_defer_assign(cx, local, name, target.span)?;
-        let root_ty = cx.locals[local].ty;
-        if root_ty.is_view() && !cx.locals[local].mutable_view() {
-            self.diags.push(
-                Diagnostic::error(
-                    target.span,
-                    format!("cannot assign through `{name}`, which is a read-only `{root_ty}`"),
-                )
-                .with_help(
-                    "only the elements of an `inout` slice parameter can be assigned (`inout xs: []u8`)",
-                ),
-            );
-            return None;
-        }
-        if root_ty.in_memory() && !cx.locals[local].mutable {
-            let part = match target.kind {
-                ExprKind::Field(..) => "a field",
-                _ => "an element",
-            };
-            self.diags.push(
-                Diagnostic::error(
-                    target.span,
-                    format!("cannot assign to {part} of `{name}`, which is immutable"),
-                )
-                .with_help(Self::immutable_help(cx, local, name)),
-            );
-            return None;
+        if let Some(local) = local {
+            self.check_local_target(cx, local, name, target)?;
         }
 
         // For `op=`, the target is read and then written: an index that
@@ -5658,9 +5949,70 @@ impl<'a> Checker<'a> {
         let target_span = target.span;
         let place = self.expr(cx, &target, None)?;
         self.check_read_only(cx, &place.expr, target_span)?;
-        if !place.ty().is_copy() {
+        if !place.ty().is_copy()
+            && let Some(local) = local
+        {
             Self::invalidate_projections(cx, local);
         }
+        self.place_store(cx, place, target, op, value, span, before)
+    }
+
+    /// Check that `target`, a place rooted at `local` (named `name`), can
+    /// be assigned: a `var`, or a parameter the function may change.
+    fn check_local_target(
+        &mut self,
+        cx: &FnCx,
+        local: LocalId,
+        name: &str,
+        target: &ast::Expr,
+    ) -> Option<()> {
+        if cx.failed.contains(&local) {
+            return None;
+        }
+        self.check_defer_assign(cx, local, name, target.span)?;
+        let root_ty = cx.locals[local].ty;
+        if root_ty.is_view() && !cx.locals[local].mutable_view() {
+            self.diags.push(
+                Diagnostic::error(
+                    target.span,
+                    format!("cannot assign through `{name}`, which is a read-only `{root_ty}`"),
+                )
+                .with_help(
+                    "only the elements of an `inout` slice parameter can be assigned (`inout xs: []u8`)",
+                ),
+            );
+            return None;
+        }
+        if root_ty.in_memory() && !cx.locals[local].mutable {
+            let part = match target.kind {
+                ExprKind::Field(..) => "a field",
+                _ => "an element",
+            };
+            self.diags.push(
+                Diagnostic::error(
+                    target.span,
+                    format!("cannot assign to {part} of `{name}`, which is immutable"),
+                )
+                .with_help(Self::immutable_help(cx, local, name)),
+            );
+            return None;
+        }
+        Some(())
+    }
+
+    /// The store of `value` (or of `target op value`) into `place`, the
+    /// checked `target`, after the statements `before`.
+    #[allow(clippy::too_many_arguments)]
+    fn place_store(
+        &mut self,
+        cx: &mut FnCx,
+        place: expr::Checked,
+        target: ast::Expr,
+        op: Option<ast::BinOp>,
+        value: &ast::Expr,
+        span: Span,
+        mut before: Vec<TStmt>,
+    ) -> Option<TStmt> {
         let ty = place.ty();
         let checked = match op {
             None => self.expr(cx, value, Some(ty))?,

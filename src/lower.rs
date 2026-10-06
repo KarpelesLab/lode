@@ -120,6 +120,24 @@
 //! place that holds a value destroys the old value after the new one is
 //! computed. A local whose type needs destruction is always in memory
 //! (never split or packed), since destruction takes its address.
+//!
+//! While an array, a struct, a variant or a call's arguments are built,
+//! the parts already built that need destruction are registered too, until
+//! the value is complete: a `try` (or another early exit) in a later part
+//! destroys them, so a value built into an aggregate that never completes
+//! is destroyed once (docs/allocation.md, M8b in the compiler).
+//!
+//! A `static` is a global in `.bss` (or `.data`, when its value isn't all
+//! zeros), which the object defines ([`Lowered::data`]).
+//!
+//! The allocator context (docs/allocation.md, Lowering the context): when
+//! the program has allocator types besides the root's
+//! ([`Instances::dynamic_alloc`]), a function that `uses alloc` takes one
+//! more parameter, last: the address of the handle in context (an
+//! `alloc.Handle`: its allocator's number and address). `main` makes the
+//! root's, and `with alloc = h` passes `h`'s. Otherwise there's no such
+//! parameter, and `alloc.Handle` has no fields: it's zero-sized, in boxes
+//! too.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -128,7 +146,7 @@ use latticefoundry::Module;
 use latticefoundry::ir::builder::FunctionBuilder;
 use latticefoundry::ir::{
     BinOp as IrOp, BlockId, CastOp, Const, Flags, FuncAttrs, FuncId as IrFunc, Global, GlobalId,
-    IntPred, Linkage, TypeId, ValueId, Visibility,
+    IntPred, Linkage, TypeContext, TypeId, ValueId, Visibility,
 };
 use latticefoundry::support::StrInterner;
 
@@ -158,6 +176,9 @@ enum Defer {
     Body(Rc<[TStmt]>, bool),
     /// The destruction of a local that owns its value (`TStmt::Drop`).
     Drop(LocalId),
+    /// The destruction of a part of an aggregate being built, at this
+    /// address, of this type, until the aggregate is complete.
+    Place(ValueId, Ty),
 }
 
 /// The width of a result's tag (a `u8`), below its payload in the packed
@@ -217,6 +238,10 @@ pub struct Lowered {
     /// line numbers stand for a file and a line, as LatticeFoundry's
     /// debug information only has one source file. Empty otherwise.
     pub lines: Vec<(FileId, u32)>,
+    /// The writable data the object must define for each `static` the
+    /// program uses: `(symbol, bytes, alignment)`, in `.bss` when the
+    /// bytes are all zeros.
+    pub data: Vec<(String, Vec<u8>, u64)>,
 }
 
 /// The IR line numbers given so far, for debug information (see
@@ -279,8 +304,9 @@ impl Types {
     }
 
     /// A function's IR parameter and return types. A result in memory is
-    /// written through a pointer passed first (see the module docs).
-    fn signature(&self, f: &Func) -> (Vec<TypeId>, TypeId) {
+    /// written through a pointer passed first (see the module docs); with
+    /// `ctx`, the address of the handle in context comes last.
+    fn signature(&self, f: &Func, ctx: bool) -> (Vec<TypeId>, TypeId) {
         let mut params = Vec::new();
         let result = f.result_ty();
         let ret = if returns_packed(result) {
@@ -296,6 +322,9 @@ impl Types {
                 .iter()
                 .flat_map(|&p| self.param_parts(&f.locals[p])),
         );
+        if ctx {
+            params.push(self.ptr);
+        }
         (params, ret)
     }
 
@@ -413,6 +442,13 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
     let reach = mono::instantiate(program);
     // `main` is the entry itself unless Lode code calls it.
     let direct_entry = reach.main.filter(|_| !reach.root_called);
+    let dynamic = reach.dynamic_alloc();
+    // With only the root allocator, a handle holds nothing.
+    if let Some(info) = program.alloc
+        && !dynamic
+    {
+        info.handle.set_fields(Vec::new());
+    }
 
     let mut strings = Vec::new();
     let mut string_globals = Vec::new();
@@ -458,14 +494,40 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
         }
     }
 
+    // The `static`s used: globals the object defines, with their initial
+    // values' bytes.
+    let mut data = Vec::new();
+    let mut static_globals = Vec::new();
+    for (i, st) in program.statics.iter().enumerate() {
+        if !reach.statics[i] {
+            static_globals.push(None);
+            continue;
+        }
+        let ty = ir_type(module.types_mut(), t, st.ty);
+        let layout = module.types().layout(ty);
+        let mut bytes = vec![0u8; layout.size as usize];
+        static_bytes(module.types_mut(), t, &st.init, &mut bytes, 0);
+        let init = module.intern_const(Const::Poison(ty));
+        static_globals.push(Some(module.add_global(Global {
+            name: syms.intern(&st.symbol),
+            ty,
+            init: Some(init),
+        })));
+        data.push((st.symbol.clone(), bytes, layout.align));
+    }
+    let root_static = program
+        .alloc
+        .filter(|_| !reach.allocators.is_empty())
+        .and_then(|info| static_globals[info.root]);
+
     let internal = FuncAttrs::new(Linkage::Internal, Visibility::Default);
     let ids: Vec<Option<IrFunc>> = reach
         .funcs
         .iter()
         .enumerate()
         .map(|(i, f)| {
-            let (params, ret) = t.signature(f);
             let is_entry = direct_entry == Some(i);
+            let (params, ret) = t.signature(f, dynamic && f.uses_alloc && !is_entry);
             let ret = if is_entry { t.i64 } else { ret };
             let sig = module.types_mut().func(params, ret, false);
             let id = module.declare_function(syms.intern(&f.symbol), sig);
@@ -489,6 +551,11 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
             strings: &string_globals,
             string_lens: &program.strings,
             tables: &table_globals,
+            statics: &static_globals,
+            root_static,
+            handle: program.alloc.map(|a| a.handle),
+            ctx: Vec::new(),
+            dynamic,
             slots: Vec::new(),
             splits: Vec::new(),
             addrs: HashMap::new(),
@@ -529,7 +596,17 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
             }
             b.create_entry_block();
             let callee = b.func_ref(ids[main].expect("main is reached"));
-            let result = b.call(callee, &[], t.of(ret));
+            // `main` that `uses alloc` gets the root allocator.
+            let mut args = Vec::new();
+            if dynamic && reach.funcs[main].uses_alloc {
+                let handle = program.alloc.expect("a program that allocates").handle;
+                let ty = ir_type(b.types_mut(), t, handle);
+                let h = b.alloca(ty);
+                let root = b.global_ref(root_static.expect("the root allocator is used"));
+                write_root_handle(&mut b, t, ty, h, root);
+                args.push(h);
+            }
+            let result = b.call(callee, &args, t.of(ret));
             let status = exit_status(&mut b, t, ret, result);
             b.ret(Some(status));
             Some(ENTRY_WRAPPER.to_owned())
@@ -547,7 +624,156 @@ fn lower_with(program: &Program, name: &str, files: Option<&SourceMap>) -> Lower
         warnings: program.warnings.clone(),
         funcs,
         lines: lines.table,
+        data,
     }
+}
+
+/// Write the root allocator's handle at `h` (of the IR type `ty`): number
+/// 0, and the address of the root, `root`.
+fn write_root_handle(b: &mut FunctionBuilder<'_>, t: Types, ty: TypeId, h: ValueId, root: ValueId) {
+    let zero = b.const_i64(t.i64, 0);
+    b.store(t.i64, h, zero, 8);
+    let addr = b.cast(CastOp::PtrToInt, root, t.i64);
+    let (offset, _) = b.types().field_offset(ty, 1);
+    let off = b.const_i64(t.i64, offset as i64);
+    let at = b.ptr_add(h, off, true);
+    b.store(t.i64, at, addr, 8);
+}
+
+/// The IR type of a value of type `ty` stored in memory: a scalar, or an
+/// array, a struct, an enum or an optional of them (see the module docs).
+fn ir_type(types: &mut TypeContext, t: Types, ty: Ty) -> TypeId {
+    if let Some((elem, n)) = ty.as_known_array() {
+        let elem = ir_type(types, t, elem);
+        return types.array(elem, n);
+    }
+    if ty.sum().is_some() {
+        return sum_layout(types, t, ty).ty;
+    }
+    match ty.as_struct() {
+        Some(def) => {
+            let fields = def.fields.iter().map(|f| ir_type(types, t, f.ty)).collect();
+            types.struct_(fields)
+        }
+        None => t.of(ty),
+    }
+}
+
+/// The IR layout of an enum, an optional or a result (see the module
+/// docs).
+fn sum_layout(types: &mut TypeContext, t: Types, ty: Ty) -> SumIr {
+    let def = ty.sum().expect("an enum or an optional");
+    let tag = t.int(def.tag);
+    let payloads: Vec<Option<TypeId>> = def
+        .variants
+        .iter()
+        .map(|v| {
+            if v.fields.is_empty() {
+                return None;
+            }
+            let fields = v.fields.iter().map(|f| ir_type(types, t, f.ty)).collect();
+            Some(types.struct_(fields))
+        })
+        .collect();
+    let (mut size, mut align) = (0, 1);
+    for &p in payloads.iter().flatten() {
+        let layout = types.layout(p);
+        size = size.max(layout.size);
+        align = align.max(layout.align);
+    }
+    let ir = if size == 0 {
+        types.struct_(vec![tag])
+    } else {
+        let word = types.int(align as u32 * 8);
+        let area = types.array(word, size.div_ceil(align));
+        types.struct_(vec![tag, area])
+    };
+    SumIr {
+        ty: ir,
+        tag: def.tag,
+        payloads,
+        values: def.variants.iter().map(|v| v.value).collect(),
+    }
+}
+
+/// Write the bytes of the literal `e` (a `static`'s value: integers,
+/// `bool`s, and arrays, structs and variants of them) at `at` in `out`,
+/// laid out as its IR type.
+fn static_bytes(types: &mut TypeContext, t: Types, e: &TExpr, out: &mut [u8], at: u64) {
+    let mut put = |v: i128, size: u64| {
+        let bytes = v.to_le_bytes();
+        out[at as usize..(at + size) as usize].copy_from_slice(&bytes[..size as usize]);
+    };
+    match &e.kind {
+        TExprKind::Int(v) => {
+            let size = types.layout(t.of(e.ty)).size;
+            put(*v, size);
+        }
+        TExprKind::Bool(b) => put(i128::from(*b), 1),
+        TExprKind::ArrayLit(items) => {
+            let (elem, _) = e.ty.as_known_array().expect("an array");
+            let ir = ir_type(types, t, elem);
+            let stride = types.stride(ir);
+            for (k, item) in items.iter().enumerate() {
+                static_bytes(types, t, item, out, at + stride * k as u64);
+            }
+        }
+        TExprKind::ArrayRepeat(item) => {
+            let (elem, n) = e.ty.as_known_array().expect("an array");
+            let ir = ir_type(types, t, elem);
+            let stride = types.stride(ir);
+            for k in 0..n {
+                static_bytes(types, t, item, out, at + stride * k);
+            }
+        }
+        TExprKind::StructLit(fields) => {
+            let ir = ir_type(types, t, e.ty);
+            for (i, v) in fields {
+                let (offset, _) = types.field_offset(ir, *i);
+                static_bytes(types, t, v, out, at + offset);
+            }
+        }
+        TExprKind::Variant(k, values) => {
+            let sum = sum_layout(types, t, e.ty);
+            let tag_size = types.layout(t.int(sum.tag)).size;
+            let tag = const_bits(sum.values[*k as usize], sum.tag);
+            put(i128::from(tag), tag_size);
+            if let Some(payload) = sum.payloads[*k as usize] {
+                let (area, _) = types.field_offset(sum.ty, 1);
+                for (j, v) in values.iter().enumerate() {
+                    let (offset, _) = types.field_offset(payload, j as u32);
+                    static_bytes(types, t, v, out, at + area + offset);
+                }
+            }
+        }
+        other => unreachable!("a static's value is a literal, found {other:?}"),
+    }
+}
+
+/// Whether evaluating `e` may leave the statement it's in before it's
+/// done: a `try`, a `throw` (after `??`), or the block of a `catch`.
+fn may_leave(e: &TExpr) -> bool {
+    match &e.kind {
+        TExprKind::Try(_) | TExprKind::Throw(_) => true,
+        TExprKind::Catch {
+            handler: Handler::Block(body),
+            ..
+        } if !body.is_empty() => true,
+        _ => crate::sema::subexprs(e).into_iter().any(may_leave),
+    }
+}
+
+/// For each of `parts`, whether a part after it may leave early (see
+/// [`may_leave`]).
+fn later_leaves<'e>(parts: impl DoubleEndedIterator<Item = &'e TExpr>) -> Vec<bool> {
+    let mut out: Vec<bool> = Vec::new();
+    let mut any = false;
+    for p in parts.rev() {
+        out.push(any);
+        any |= may_leave(p);
+    }
+    out.reverse();
+    out
 }
 
 /// The IR type of an array of scalars (or of arrays of them), built at
@@ -595,6 +821,18 @@ struct FnLower<'a> {
     string_lens: &'a [Vec<u8>],
     /// The global of each array constant.
     tables: &'a [GlobalId],
+    /// The global of each `static` the program uses.
+    statics: &'a [Option<GlobalId>],
+    /// The root allocator's global, if the program allocates.
+    root_static: Option<GlobalId>,
+    /// `alloc.Handle`, if the program imports `std/alloc`.
+    handle: Option<Ty>,
+    /// The addresses of the handles in context, innermost last (with a
+    /// dynamic allocator context).
+    ctx: Vec<ValueId>,
+    /// Whether the allocator context is passed at run time
+    /// ([`Instances::dynamic_alloc`]).
+    dynamic: bool,
     slots: Vec<Slot>,
     /// The slots of each split local ([`Slot::Split`]): one per scalar,
     /// in the order of [`leaf_tys`], with its type.
@@ -759,6 +997,10 @@ fn uses_in_stmts(stmts: &[TStmt], packed: &mut [bool]) {
             TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
                 uses_in_stmts(body, packed)
             }
+            TStmt::With(local, body) => {
+                packed[*local] = false;
+                uses_in_stmts(body, packed);
+            }
             TStmt::Drop { local, .. } => packed[*local] = false,
             TStmt::Destroy(place) => uses_in_place(place, packed),
             TStmt::Match { value, arms } => {
@@ -833,7 +1075,8 @@ fn written_locals(f: &Func) -> Vec<bool> {
                 | TExprKind::Index(base, _)
                 | TExprKind::Payload(base, ..)
                 | TExprKind::Slice(base, ..)
-                | TExprKind::ToSlice(base) => e = base,
+                | TExprKind::ToSlice(base)
+                | TExprKind::Deref(base) => e = base,
                 _ => return None,
             }
         }
@@ -878,6 +1121,7 @@ fn written_locals(f: &Func) -> Vec<bool> {
                 | TStmt::For { body, .. }
                 | TStmt::Loop(body)
                 | TStmt::Block(body)
+                | TStmt::With(_, body)
                 | TStmt::Defer { body, .. } => in_stmts(body, out),
                 TStmt::Match { arms, .. } => {
                     for arm in arms {
@@ -1011,6 +1255,11 @@ fn split_in_stmts(stmts: &[TStmt], memory: &mut [bool]) {
             TStmt::Loop(body) | TStmt::Block(body) | TStmt::Defer { body, .. } => {
                 split_in_stmts(body, memory)
             }
+            // The handle in context is passed by address.
+            TStmt::With(local, body) => {
+                memory[*local] = true;
+                split_in_stmts(body, memory);
+            }
             TStmt::Drop { local, .. } => memory[*local] = true,
             TStmt::Destroy(place) => split_place(place, memory),
             TStmt::Match { value, arms } => {
@@ -1133,7 +1382,7 @@ fn count_names(stmts: &[TStmt], names: &mut [u32], declared: &mut Vec<LocalId>) 
                 names[*l] += 1;
                 declared.push(*l);
             }
-            TStmt::Assign(l, _) => names[*l] += 1,
+            TStmt::Assign(l, _) | TStmt::With(l, _) => names[*l] += 1,
             _ => {}
         }
         for e in crate::sema::stmt_exprs(s) {
@@ -1148,6 +1397,7 @@ fn count_names(stmts: &[TStmt], names: &mut [u32], declared: &mut Vec<LocalId>) 
             | TStmt::For { body, .. }
             | TStmt::Loop(body)
             | TStmt::Block(body)
+            | TStmt::With(_, body)
             | TStmt::Defer { body, .. } => count_names(body, names, declared),
             TStmt::Match { arms, .. } => {
                 for arm in arms {
@@ -1217,6 +1467,21 @@ impl FnLower<'_> {
         if !self.packed && (self.result_ty.in_memory() || self.result_ty.is_view()) {
             self.result = Some(self.b.param(entry, 0));
             next = 1;
+        }
+        // The handle in context: a parameter, last, or for the entry, the
+        // root allocator's.
+        if self.dynamic && f.uses_alloc {
+            let ctx = if self.exit_status.is_some() {
+                self.root_handle()
+            } else {
+                let parts: usize = f
+                    .params
+                    .iter()
+                    .map(|&p| self.t.param_parts(&f.locals[p]).len())
+                    .sum();
+                self.b.param(entry, next + parts as u32)
+            };
+            self.ctx.push(ctx);
         }
         let mut params: Vec<Option<Val>> = vec![None; f.locals.len()];
         for &p in &f.params {
@@ -1459,6 +1724,7 @@ impl FnLower<'_> {
                         debug_assert_eq!(depth, self.defers.len());
                     }
                     Defer::Drop(local) => self.destroy_local(*local, false),
+                    Defer::Place(addr, ty) => self.destroy(*addr, *ty),
                 }
             }
         }
@@ -1489,6 +1755,19 @@ impl FnLower<'_> {
         let vy = self.b.load(ir_ty, y, align_of(ty));
         self.b.store(ir_ty, x, vy, align_of(ty));
         self.b.store(ir_ty, y, vx, align_of(ty));
+    }
+
+    /// A new handle of the root allocator (number 0, at `alloc.ROOT`), in
+    /// a temporary.
+    fn root_handle(&mut self) -> ValueId {
+        let handle = self.handle.expect("a program that allocates");
+        let ty = self.ir_ty(handle);
+        let h = self.b.alloca(ty);
+        let root = self
+            .b
+            .global_ref(self.root_static.expect("the root allocator is used"));
+        write_root_handle(&mut self.b, self.t, ty, h, root);
+        h
     }
 
     /// Set the drop flag of `local`, if it has one, to `value`.
@@ -1534,6 +1813,37 @@ impl FnLower<'_> {
     /// `return value`: write it (as `ok(value)` in a function that throws),
     /// or pack it, run every `defer`, and return.
     fn return_value(&mut self, value: Option<&TExpr>) {
+        // A value that needs destruction and may leave while it's built
+        // is built aside first: the exit it may take writes the result's
+        // storage, and destroys the parts built so far.
+        if let Some(e) = value
+            && !self.packed
+            && e.ty.needs_destroy()
+            && matches!(
+                e.kind,
+                TExprKind::StructLit(_) | TExprKind::ArrayLit(_) | TExprKind::Variant(..)
+            )
+            && may_leave(e)
+        {
+            let ir_ty = self.ir_ty(e.ty);
+            let tmp = self.b.alloca(ir_ty);
+            self.fill(tmp, e);
+            let dst = self.result.expect("a result in memory");
+            let dst = if self.throws {
+                self.payload_at(dst, self.result_ty, 0, 0)
+            } else {
+                dst
+            };
+            self.copy(dst, tmp, e.ty);
+            if self.throws {
+                let base = self.result.expect("a result in memory");
+                self.store_tag(base, self.result_ty, 0);
+            }
+            self.run_defers(0, false);
+            self.ret(None);
+            self.terminated = true;
+            return;
+        }
         let v = if self.packed {
             Some(if self.throws {
                 let bits = value.map(|e| self.pack(e));
@@ -1934,6 +2244,19 @@ impl FnLower<'_> {
                 self.terminated = true;
             }
             TStmt::Block(body) => self.stmts(body),
+            // The block's calls get `local`'s handle as the context.
+            TStmt::With(local, body) => {
+                if self.dynamic {
+                    let Slot::Mem(addr) = self.slots[*local] else {
+                        unreachable!("a handle in context is in memory")
+                    };
+                    self.ctx.push(addr);
+                    self.stmts(body);
+                    self.ctx.pop();
+                } else {
+                    self.stmts(body);
+                }
+            }
             // Handled by `stmts`.
             TStmt::Loc(_) => {}
             TStmt::Match { value, arms } => {
@@ -2028,6 +2351,101 @@ impl FnLower<'_> {
             }
             TExprKind::Clone(_) => unreachable!("instances clone by copies and calls"),
             TExprKind::NeedsDeinit(_) => unreachable!("instances know their types"),
+            TExprKind::Static(k) => {
+                let g = self.statics[*k].expect("a static the program uses");
+                let addr = self.b.global_ref(g);
+                return self.read(addr, e.ty);
+            }
+            TExprKind::Deref(p) => {
+                let addr = self.expr(p).one();
+                return self.read(addr, e.ty);
+            }
+            TExprKind::Layout(ty, align) => {
+                let ir_ty = self.ir_ty(*ty);
+                let layout = self.b.types().layout(ir_ty);
+                let v = if *align { layout.align } else { layout.size };
+                self.b.const_i64(self.t.i64, v as i64)
+            }
+            TExprKind::Intrinsic(Intrinsic::PtrRead, args) => {
+                let addr = self.expr(&args[0]).one();
+                if e.ty.in_memory() {
+                    let ir_ty = self.ir_ty(e.ty);
+                    let tmp = self.b.alloca(ir_ty);
+                    self.copy(tmp, addr, e.ty);
+                    return Val::Mem(tmp);
+                }
+                return self.read(addr, e.ty);
+            }
+            TExprKind::Intrinsic(Intrinsic::PtrWrite, args) => {
+                let addr = self.expr(&args[0]).one();
+                self.fill_or_write(addr, &args[1]);
+                return Val::Unit;
+            }
+            TExprKind::Intrinsic(Intrinsic::PtrDestroy, args) => {
+                let addr = self.expr(&args[0]).one();
+                let to = args[0].ty.as_ptr().expect("a pointer");
+                if to.needs_destroy() {
+                    self.destroy(addr, to);
+                }
+                return Val::Unit;
+            }
+            TExprKind::Intrinsic(Intrinsic::PtrCast, args) => return self.expr(&args[0]),
+            TExprKind::Intrinsic(Intrinsic::PtrAddr, args) => {
+                let p = self.expr(&args[0]).one();
+                self.b.cast(CastOp::PtrToInt, p, self.t.i64)
+            }
+            TExprKind::Intrinsic(Intrinsic::FromAddr, args) => {
+                let a = self.expr(&args[0]).one();
+                self.b.cast(CastOp::IntToPtr, a, self.t.ptr)
+            }
+            // The handle in context, read in place.
+            TExprKind::Intrinsic(Intrinsic::AllocCurrent, _) => {
+                if self.dynamic {
+                    return Val::Mem(*self.ctx.last().expect("a function that `uses alloc`"));
+                }
+                let ir_ty = self.ir_ty(e.ty);
+                return Val::Mem(self.b.alloca(ir_ty));
+            }
+            TExprKind::Intrinsic(Intrinsic::AllocRoot, _) => {
+                if self.dynamic {
+                    return Val::Mem(self.root_handle());
+                }
+                let ir_ty = self.ir_ty(e.ty);
+                return Val::Mem(self.b.alloca(ir_ty));
+            }
+            // A handle of the allocator `a`: its type's number and its
+            // address.
+            TExprKind::Intrinsic(Intrinsic::AllocHandle, args) => {
+                let a = &args[0];
+                let addr = match self.expr(a) {
+                    Val::Mem(p) => p,
+                    Val::One(v) => {
+                        let ir_ty = self.t.of(a.ty);
+                        let tmp = self.b.alloca(ir_ty);
+                        self.b.store(ir_ty, tmp, v, align_of(a.ty));
+                        tmp
+                    }
+                    other => unreachable!("an allocator is a value, found {other:?}"),
+                };
+                let number = self
+                    .reach
+                    .allocators
+                    .iter()
+                    .position(|&t| t == a.ty)
+                    .expect("an allocator type of the program");
+                let ir_ty = self.ir_ty(e.ty);
+                let h = self.b.alloca(ir_ty);
+                let n = self.b.const_i64(self.t.i64, number as i64);
+                self.b.store(self.t.i64, h, n, 8);
+                let addr = self.b.cast(CastOp::PtrToInt, addr, self.t.i64);
+                let at = self.field_at(h, e.ty, 1);
+                self.b.store(self.t.i64, at, addr, 8);
+                return Val::Mem(h);
+            }
+            TExprKind::Intrinsic(
+                Intrinsic::HandleAlloc | Intrinsic::HandleResize | Intrinsic::HandleFree,
+                _,
+            ) => unreachable!("instances call the allocators"),
             // Kept in its hidden local, whose value from an earlier time
             // round a loop is destroyed first.
             TExprKind::Temp(local, inner) => {
@@ -2178,10 +2596,9 @@ impl FnLower<'_> {
             TExprKind::PtrAdd(p, n) => {
                 let base = self.expr(p).one();
                 let count = self.expr(n).one();
-                let Ty::Ptr(elem) = p.ty else {
-                    unreachable!("pointer arithmetic on {}", p.ty)
-                };
-                let size = i64::from(elem.bits / 8);
+                let elem = p.ty.as_ptr().expect("pointer arithmetic on a pointer");
+                let elem = self.ir_ty(elem);
+                let size = self.b.types().stride(elem) as i64;
                 let offset = if size == 1 {
                     count
                 } else {
@@ -2302,9 +2719,34 @@ impl FnLower<'_> {
     fn call(&mut self, f: usize, args: &[TExpr], ret: Ty, dst: Option<ValueId>) -> Val {
         let packed = returns_packed(ret);
         let mut values: Vec<ValueId> = dst.filter(|_| !packed).into_iter().collect();
-        for a in args {
-            let v = self.expr(a).parts();
-            values.extend(v);
+        // An argument moved in (`sink`) belongs to the call: until it's
+        // made, an argument after it that leaves early destroys it.
+        let later = later_leaves(args.iter());
+        let callee_fn = &self.reach.funcs[f];
+        let owned: Vec<bool> = callee_fn
+            .params
+            .iter()
+            .map(|&p| callee_fn.locals[p].convention == Some(Convention::Sink))
+            .collect();
+        let pending = self.defers.last().map_or(0, Vec::len);
+        for (k, a) in args.iter().enumerate() {
+            let v = self.expr(a);
+            if let Val::Mem(addr) = v
+                && later[k]
+                && owned.get(k).copied().unwrap_or(false)
+                && a.ty.needs_destroy()
+                && let Some(scope) = self.defers.last_mut()
+            {
+                scope.push(Defer::Place(addr, a.ty));
+            }
+            values.extend(v.parts());
+        }
+        if let Some(scope) = self.defers.last_mut() {
+            scope.truncate(pending);
+        }
+        // The handle in context, for a function that `uses alloc`.
+        if self.dynamic && self.reach.funcs[f].uses_alloc {
+            values.push(*self.ctx.last().expect("a caller that `uses alloc`"));
         }
         let callee = self.b.func_ref(self.ids[f].expect("a reached function"));
         let ret_ty = if packed {
@@ -2396,56 +2838,12 @@ impl FnLower<'_> {
     /// The IR type of a value stored in memory: a scalar, or an array or a
     /// struct of them.
     fn ir_ty(&mut self, ty: Ty) -> TypeId {
-        if let Some((elem, n)) = ty.as_known_array() {
-            let elem = self.ir_ty(elem);
-            return self.b.types_mut().array(elem, n);
-        }
-        if ty.sum().is_some() {
-            return self.sum_ir(ty).ty;
-        }
-        match ty.as_struct() {
-            Some(def) => {
-                let fields = def.fields.iter().map(|f| self.ir_ty(f.ty)).collect();
-                self.b.types_mut().struct_(fields)
-            }
-            None => self.t.of(ty),
-        }
+        ir_type(self.b.types_mut(), self.t, ty)
     }
 
     /// The IR layout of an enum or an optional (see the module docs).
     fn sum_ir(&mut self, ty: Ty) -> SumIr {
-        let def = ty.sum().expect("an enum or an optional");
-        let tag = self.t.int(def.tag);
-        let payloads: Vec<Option<TypeId>> = def
-            .variants
-            .iter()
-            .map(|v| {
-                if v.fields.is_empty() {
-                    return None;
-                }
-                let fields = v.fields.iter().map(|f| self.ir_ty(f.ty)).collect();
-                Some(self.b.types_mut().struct_(fields))
-            })
-            .collect();
-        let (mut size, mut align) = (0, 1);
-        for &p in payloads.iter().flatten() {
-            let layout = self.b.types().layout(p);
-            size = size.max(layout.size);
-            align = align.max(layout.align);
-        }
-        let ir = if size == 0 {
-            self.b.types_mut().struct_(vec![tag])
-        } else {
-            let word = self.b.types_mut().int(align as u32 * 8);
-            let area = self.b.types_mut().array(word, size.div_ceil(align));
-            self.b.types_mut().struct_(vec![tag, area])
-        };
-        SumIr {
-            ty: ir,
-            tag: def.tag,
-            payloads,
-            values: def.variants.iter().map(|v| v.value).collect(),
-        }
+        sum_layout(self.b.types_mut(), self.t, ty)
     }
 
     /// The tag of the enum or optional of type `ty` at `base`.
@@ -3126,6 +3524,14 @@ impl FnLower<'_> {
     /// The address of the element or field an [`TExprKind::Index`] or a
     /// [`TExprKind::Field`] names.
     fn address(&mut self, e: &TExpr) -> ValueId {
+        match &e.kind {
+            TExprKind::Static(k) => {
+                let g = self.statics[*k].expect("a static the program uses");
+                return self.b.global_ref(g);
+            }
+            TExprKind::Deref(p) => return self.expr(p).one(),
+            _ => {}
+        }
         if let TExprKind::Field(base, i) = &e.kind {
             let p = self.place(base);
             return self.field_at(p, base.ty, *i);
@@ -3320,27 +3726,43 @@ impl FnLower<'_> {
         match &e.kind {
             TExprKind::ArrayLit(elems) => {
                 let (elem, _) = e.ty.as_known_array().expect("an array");
+                let later = later_leaves(elems.iter());
+                let pending = self.defers.last().map_or(0, Vec::len);
                 for (k, el) in elems.iter().enumerate() {
-                    let k = self.b.const_i64(self.t.i64, k as i64);
-                    let d = self.elem_at(dst, elem, k);
+                    let at = self.b.const_i64(self.t.i64, k as i64);
+                    let d = self.elem_at(dst, elem, at);
                     self.fill_or_write(d, el);
+                    self.built(d, el, later[k]);
                 }
+                self.complete(pending);
             }
             TExprKind::StructLit(fields) => {
-                for (i, value) in fields {
+                let later = later_leaves(fields.iter().map(|(_, v)| v));
+                let pending = self.defers.last().map_or(0, Vec::len);
+                for (k, (i, value)) in fields.iter().enumerate() {
                     let d = self.field_at(dst, e.ty, *i);
                     self.fill_or_write(d, value);
+                    self.built(d, value, later[k]);
                 }
+                self.complete(pending);
             }
             TExprKind::Call(f, args) => {
                 self.call(*f, args, e.ty, Some(dst));
             }
             TExprKind::Variant(v, values) => {
                 self.store_tag(dst, e.ty, *v);
+                let later = later_leaves(values.iter());
+                let pending = self.defers.last().map_or(0, Vec::len);
                 for (k, value) in values.iter().enumerate() {
                     let d = self.payload_at(dst, e.ty, *v, k as u32);
                     self.fill_or_write(d, value);
+                    self.built(d, value, later[k]);
                 }
+                self.complete(pending);
+            }
+            TExprKind::Intrinsic(Intrinsic::PtrRead, args) => {
+                let src = self.expr(&args[0]).one();
+                self.copy(dst, src, e.ty);
             }
             TExprKind::EnumFrom(x) => self.enum_from(dst, e.ty, x),
             TExprKind::Compare(a, b) => self.compare(dst, e.ty, a, b),
@@ -3366,6 +3788,26 @@ impl FnLower<'_> {
                 let src = self.place(e);
                 self.copy(dst, src, e.ty);
             }
+        }
+    }
+
+    /// A part `e` of an aggregate was built at `addr`: when a later part
+    /// may leave early (`later`) and `e` needs destruction, it's destroyed
+    /// at such an exit, until the aggregate is complete.
+    fn built(&mut self, addr: ValueId, e: &TExpr, later: bool) {
+        if later
+            && e.ty.needs_destroy()
+            && let Some(scope) = self.defers.last_mut()
+        {
+            scope.push(Defer::Place(addr, e.ty));
+        }
+    }
+
+    /// An aggregate is complete: its parts, registered since `pending`
+    /// (the length of the innermost scope's list then), are its own.
+    fn complete(&mut self, pending: usize) {
+        if let Some(scope) = self.defers.last_mut() {
+            scope.truncate(pending);
         }
     }
 

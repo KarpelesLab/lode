@@ -672,6 +672,7 @@ impl Checker<'_> {
         match ty {
             Ty::Int(_)
             | Ty::Bool
+            | Ty::Ptr(_)
             | Ty::Array(_)
             | Ty::Struct(_)
             | Ty::Enum(_)
@@ -686,7 +687,7 @@ impl Checker<'_> {
                 );
                 None
             }
-            Ty::Ptr(_) | Ty::Unit | Ty::Never | Ty::Result(_) => {
+            Ty::Unit | Ty::Never | Ty::Result(_) => {
                 self.error(
                     span,
                     format!("`{ty}` as a type argument is not supported by the compiler yet"),
@@ -1347,6 +1348,8 @@ fn moved_path(cx: &FnCx, e: &TExpr) -> Option<MovePath> {
             p.through_index = true;
             Some(p)
         }
+        // A box's value is part of the box, whose `deinit` holds it.
+        TExprKind::Deref(base) => moved_path(cx, base),
         _ => None,
     }
 }
@@ -1360,9 +1363,10 @@ pub(super) fn place_local(cx: &FnCx, e: &TExpr) -> Option<LocalId> {
             None => Some(*l),
         },
         TExprKind::Temp(l, _) => Some(*l),
-        TExprKind::Field(base, _) | TExprKind::Payload(base, ..) | TExprKind::Index(base, _) => {
-            place_local(cx, base)
-        }
+        TExprKind::Field(base, _)
+        | TExprKind::Payload(base, ..)
+        | TExprKind::Index(base, _)
+        | TExprKind::Deref(base) => place_local(cx, base),
         _ => None,
     }
 }
@@ -1387,10 +1391,30 @@ pub(super) fn not_copy(ty: Ty) -> (Ty, String) {
                 "`{ty}` holds a `{owner}`, which has a `deinit`: its values are moved, never copied"
             ),
         ),
-        None => (
-            ty,
-            format!("`{ty}` isn't `Copy`: its values are moved, never copied"),
-        ),
+        None => match with_raw_ptr(ty) {
+            Some(owner) => (
+                ty,
+                format!(
+                    "`{owner}` holds a raw pointer, which copying would share: its values are moved, never copied"
+                ),
+            ),
+            None => (
+                ty,
+                format!("`{ty}` isn't `Copy`: its values are moved, never copied"),
+            ),
+        },
+    }
+}
+
+/// The first struct or enum with a raw pointer field that a value of type
+/// `ty` holds (itself included).
+fn with_raw_ptr(ty: Ty) -> Option<Ty> {
+    match ty {
+        Ty::Struct(_) | Ty::Enum(_) if ty.has_raw_ptr_field() => Some(ty),
+        Ty::Array(_) => with_raw_ptr(ty.as_array()?.0),
+        Ty::Optional(_) => with_raw_ptr(ty.as_optional()?),
+        Ty::Struct(_) | Ty::Enum(_) => ty.members().into_iter().find_map(with_raw_ptr),
+        _ => None,
     }
 }
 

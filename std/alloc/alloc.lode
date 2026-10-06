@@ -1,0 +1,291 @@
+/// Allocation: the allocator context, the root allocator and `Box`
+/// (docs/allocation.md).
+///
+/// A function that allocates declares `uses alloc`: it gets the allocator
+/// in context, `current()`, which `with alloc = h { ... }` replaces for a
+/// block. Everything that allocates throws `AllocError` (built in, like
+/// `Ordering`) when there's no memory. A value that owns memory remembers
+/// the allocator it came from, and frees through it wherever it ends up.
+package alloc
+
+import "std/mem"
+import "std/os"
+
+/// An allocator: what `with alloc = h` installs, and what a handle names.
+///
+/// Implementing it is `unsafe`: an implementation promises that `alloc`
+/// gives memory that's fresh (no other allocation overlaps it), at least
+/// `size` bytes, aligned to `align` (a power of two), and that `free` and
+/// `resize` are only given what it gave. Its methods take `self`
+/// read-only, since many values reach one allocator at once: an
+/// allocator's state changes through `unsafe` code inside it.
+pub unsafe trait Allocator {
+	/// `size` bytes, aligned to `align`, not initialized; or
+	/// `out_of_memory`.
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8
+
+	/// Grow or shrink the block of `old` bytes at `p` to `new` bytes, in
+	/// place: whether it could (otherwise, nothing changed).
+	///
+	/// The caller must ensure `p` is a block of `old` bytes this allocator
+	/// gave, with `align`.
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool
+
+	/// Free the block of `size` bytes at `p`.
+	///
+	/// The caller must ensure `p` is a block of `size` bytes this allocator
+	/// gave, with `align`, which nothing uses any more.
+	unsafe fn free(self, p: *u8, size: usize, align: usize)
+}
+
+/// A handle of an allocator: which allocator it is, and where. It's what
+/// `with alloc = h` takes and `current()` gives, and what a value that
+/// owns memory keeps, to free it.
+///
+/// The compiler lays it out: when the program uses no allocator but the
+/// root, a handle holds nothing at all (it's zero-sized), and a call
+/// through it is a call of the root's method. Otherwise it's the number of
+/// its allocator's type among the program's allocator types, and the
+/// allocator's address (docs/allocation.md, Lowering the context).
+pub struct Handle {
+	kind: usize
+	addr: usize
+}
+
+/// The handle of the allocator in context: the root allocator, or the one
+/// a `with alloc = h` around the call installs.
+@intrinsic
+pub fn current() uses alloc -> Handle {
+}
+
+/// The handle of the root allocator, `Heap`'s `ROOT`, which never ends.
+@intrinsic
+pub fn root() -> Handle {
+}
+
+/// A handle of the allocator `a`, a struct or an enum, which `with alloc =
+/// h` can install.
+///
+/// The caller must ensure `a` outlives every allocation made through the
+/// handle (a `static` does), and doesn't move meanwhile: the handle holds
+/// its address. (Allocators that end, counted so that this is safe, come
+/// later: docs/allocation.md, Allocators that end.)
+@intrinsic
+pub unsafe fn handle[A: Allocator](a: A) -> Handle {
+}
+
+/// `size` bytes, aligned to `align`, from the handle's allocator.
+@intrinsic
+pub fn Handle.alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+}
+
+/// Grow or shrink the block of `old` bytes at `p`, in place: whether the
+/// handle's allocator could.
+///
+/// The caller must ensure `p` is a block of `old` bytes from this
+/// allocator, with `align`.
+@intrinsic
+pub unsafe fn Handle.resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+}
+
+/// Free the block of `size` bytes at `p` to the handle's allocator.
+///
+/// The caller must ensure `p` is a block of `size` bytes from this
+/// allocator, with `align`, which nothing uses any more.
+@intrinsic
+pub unsafe fn Handle.free(self, p: *u8, size: usize, align: usize) {
+}
+
+/// The pages of `std/os`: each allocation is a mapping of its own.
+unsafe impl Allocator for os.PageAllocator {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		if align > self.page {
+			throw .out_of_memory
+		}
+		return try self.map(size)
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		return self.remap(p, old, new)
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		self.unmap(p, size)
+	}
+}
+
+/// The size classes of `Heap`: blocks of 16 to 2048 bytes, powers of two.
+const SIZES: [8]usize = [16, 32, 64, 128, 256, 512, 1024, 2048]
+
+/// The largest block of a size class.
+const SMALL_MAX: usize = 2048
+
+/// The size of the chunks `Heap` carves its blocks from.
+const CHUNK: usize = 65536
+
+/// The pages larger blocks and chunks come from.
+const PAGES: os.PageAllocator = os.PageAllocator.new()
+
+/// The general allocator, and the root (docs/allocation.md, The root
+/// allocator): a block of at most 2048 bytes is of the smallest size class
+/// that holds it, and comes from the class's list of freed blocks, or else
+/// from the chunk of 64 KiB being carved (a new one when it's used up);
+/// a larger block is a mapping of its own (`os.PageAllocator`). A freed
+/// small block goes to its class's list, to be used again; chunks are
+/// never unmapped. Not thread-safe: there are no threads yet.
+///
+/// There's one: `ROOT`, a `static` that maps its first chunk on its first
+/// allocation (nothing runs before `main`). Its methods change `ROOT` in
+/// place.
+pub struct Heap {
+	/// The address of the first freed block of each class, 0 for none;
+	/// each free block holds the address of the next.
+	free: [8]usize
+	/// Where the next block is carved from in the current chunk, and its
+	/// end (both 0 before the first chunk).
+	next: usize
+	end: usize
+}
+
+/// The root allocator.
+static ROOT: Heap = Heap{free: [0; 8], next: 0, end: 0}
+
+/// The size class of a block of `n` bytes.
+fn class_of(n: usize where n <= SMALL_MAX) -> usize where result < 8 {
+	if n <= 16 {
+		return 0
+	}
+	if n <= 32 {
+		return 1
+	}
+	if n <= 64 {
+		return 2
+	}
+	if n <= 128 {
+		return 3
+	}
+	if n <= 256 {
+		return 4
+	}
+	if n <= 512 {
+		return 5
+	}
+	if n <= 1024 {
+		return 6
+	}
+	return 7
+}
+
+/// The bytes a block of `size` bytes aligned to `align` takes: the larger.
+fn block_size(size: usize, align: usize) -> usize {
+	if align > size {
+		return align
+	}
+	return size
+}
+
+unsafe impl Allocator for Heap {
+	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+		let n = block_size(size, align)
+		if n > SMALL_MAX {
+			if align > os.PAGE_SIZE {
+				throw .out_of_memory
+			}
+			return try PAGES.map(size)
+		}
+		let k = class_of(n)
+		let s = SIZES[k]
+		unsafe {
+			// A freed block of the class.
+			let head = ROOT.free[k]
+			if head != 0 {
+				let p = mem.from_addr[u8](head)
+				ROOT.free[k] = p.cast[usize]().read()
+				return p
+			}
+			// Carved from the chunk, aligned to the class's size (which
+			// is at least `align`); from a new chunk if it doesn't fit.
+			var at = (ROOT.next +% (s - 1)) & ~(s - 1)
+			if ROOT.next == 0 || at >= ROOT.end || ROOT.end -% at < s {
+				let chunk = try PAGES.map(CHUNK)
+				at = chunk.addr()
+				ROOT.end = at +% CHUNK
+			}
+			ROOT.next = at +% s
+			return mem.from_addr[u8](at)
+		}
+	}
+
+	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+		let a = block_size(old, align)
+		let b = block_size(new, align)
+		if a > SMALL_MAX && b > SMALL_MAX {
+			return PAGES.remap(p, old, new)
+		}
+		if a <= SMALL_MAX && b <= SMALL_MAX {
+			return class_of(a) == class_of(b)
+		}
+		return false
+	}
+
+	unsafe fn free(self, p: *u8, size: usize, align: usize) {
+		let n = block_size(size, align)
+		if n > SMALL_MAX {
+			PAGES.unmap(p, size)
+			return
+		}
+		let k = class_of(n)
+		p.cast[usize]().write(ROOT.free[k])
+		ROOT.free[k] = p.addr()
+	}
+}
+
+/// One `T` on the heap, owned (docs/allocation.md, `Box[T]`): `b.value` is
+/// the boxed value, a place, which `b`'s variable decides whether it can
+/// change (`var b`) or not. It isn't `Copy`: it moves, and its `deinit`
+/// destroys the value and frees it, through the allocator it came from.
+/// `Box[T]` is `Clone` when `T` is.
+///
+/// A chain of boxes, a struct whose field `next: ?Box[Self]` links to the
+/// next one, is destroyed by a loop: its stack doesn't grow with the
+/// chain.
+pub struct Box[T] {
+	ptr: *T
+	alloc: Handle
+}
+
+/// A box holding `v`, from the allocator in context.
+pub fn Box[T].new(sink v: T) uses alloc throws(AllocError) -> Box[T] {
+	let h = current()
+	unsafe {
+		let raw = try h.alloc(size_of[T](), align_of[T]())
+		let p = raw.cast[T]()
+		p.write(v)
+		return Box{ptr: p, alloc: h}
+	}
+}
+
+/// The boxed value, moved out; the box is freed.
+pub fn Box[T].into_inner(sink self) -> T {
+	unsafe {
+		let v = self.ptr.read()
+		self.alloc.free(self.ptr.cast[u8](), size_of[T](), align_of[T]())
+		mem.forget(self)
+		return v
+	}
+}
+
+/// Destroy the boxed value, and free it.
+pub fn Box[T].deinit(sink self) {
+	unsafe {
+		self.ptr.destroy()
+		self.alloc.free(self.ptr.cast[u8](), size_of[T](), align_of[T]())
+	}
+}
+
+/// A new box, holding a clone of the value.
+impl[T: Clone] Clone for Box[T] {
+	fn clone(self) uses alloc throws(AllocError) -> Box[T] {
+		return try Box.new(try self.value.clone())
+	}
+}

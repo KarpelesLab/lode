@@ -473,7 +473,7 @@ impl Eval<'_, '_> {
             TStmt::Loc(_) => {}
             TStmt::Break => return Err(Exit::Break),
             TStmt::Continue => return Err(Exit::Continue),
-            TStmt::Block(body) => self.block(frame, body)?,
+            TStmt::Block(body) | TStmt::With(_, body) => self.block(frame, body)?,
             TStmt::Match { value, arms } => {
                 let v = self.expr(frame, value)?;
                 let (k, _) = v.variant();
@@ -802,10 +802,46 @@ impl Eval<'_, '_> {
                 self.expr(frame, &args[0])?;
                 Value::Unit
             }
+            TExprKind::Intrinsic(
+                Intrinsic::AllocCurrent
+                | Intrinsic::AllocRoot
+                | Intrinsic::AllocHandle
+                | Intrinsic::HandleAlloc
+                | Intrinsic::HandleResize
+                | Intrinsic::HandleFree,
+                _,
+            ) => {
+                return fail("it allocates: allocation when compiling is not supported yet");
+            }
+            TExprKind::Intrinsic(
+                Intrinsic::PtrRead
+                | Intrinsic::PtrWrite
+                | Intrinsic::PtrDestroy
+                | Intrinsic::PtrCast
+                | Intrinsic::PtrAddr
+                | Intrinsic::FromAddr,
+                _,
+            )
+            | TExprKind::Deref(_) => {
+                return fail("raw pointers don't exist at compile time");
+            }
+            TExprKind::Static(_) => {
+                return fail("a `static` isn't known when compiling");
+            }
+            TExprKind::Layout(..) => {
+                return fail("the layout of types isn't known when compiling");
+            }
             TExprKind::NeedsDeinit(t) => Value::Bool(frame.ty(*t).needs_destroy()),
+            // A clone that may fail gives a result.
             TExprKind::Clone(inner) => {
                 let v = self.expr(frame, inner)?;
-                self.clone_value(frame.ty(inner.ty), v)?
+                let cloned = self.clone_value(frame.ty(inner.ty), v);
+                match (frame.ty(e.ty).as_result(), cloned) {
+                    (None, v) => v?,
+                    (Some(_), Ok(v)) => Value::variant_of(0, vec![v]),
+                    (Some(_), Err(Exit::Throw(err))) => Value::variant_of(1, vec![err]),
+                    (Some(_), Err(x)) => return Err(x),
+                }
             }
             TExprKind::Never(inner) => {
                 self.expr(frame, inner)?;
@@ -1062,7 +1098,15 @@ impl Eval<'_, '_> {
         }
         if let Some(f) = self.ck.dispatch.clone_impl(ty) {
             let types = ty.type_args().to_vec();
-            return self.call_values(f, types, vec![(v, ty)]);
+            let out = self.call_values(f, types, vec![(v, ty)])?;
+            // An `impl` whose `clone` throws gives a result.
+            if self.ck.sigs[f].throws.is_none() {
+                return Ok(out);
+            }
+            return match out.variant() {
+                (0, fields) => Ok(fields[0].clone()),
+                (_, fields) => Err(Exit::Throw(fields[0].clone())),
+            };
         }
         let clone_all = |ev: &mut Self, vs: &[Value], tys: &[Ty]| -> R<Vec<Value>> {
             vs.iter()
@@ -1166,6 +1210,8 @@ impl Eval<'_, '_> {
                 p
             }
             TExprKind::Unproven(_, inner) => self.place(frame, inner)?,
+            TExprKind::Static(_) => return fail("a `static` isn't known when compiling"),
+            TExprKind::Deref(_) => return fail("raw pointers don't exist at compile time"),
             other => unreachable!("not a place: {other:?}"),
         })
     }

@@ -46,3 +46,12 @@ pub fn take[T](inout place: ?T) -> ?T {
 /// moved in, and destroyed when this function returns.
 pub fn destroy[T](sink x: T) {
 }
+
+/// The address `addr`, as a pointer to a `T`: the reverse of `p.addr()`.
+///
+/// The compiler implements it. The caller must ensure the address is one
+/// the program may use as a `*T` (an allocator's, or `p.addr()` of such a
+/// pointer).
+@intrinsic
+pub unsafe fn from_addr[T](addr: usize) -> *T {
+}

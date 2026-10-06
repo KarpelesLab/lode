@@ -71,8 +71,10 @@ pub enum Ty {
     /// library's `Str[E]` will replace it once there are generics
     /// (docs/strings.md); `str` stays the name for `Str[utf8]`.
     Str,
-    /// A raw pointer `*T` to an integer type. Only usable in `unsafe` code.
-    Ptr(IntTy),
+    /// A raw pointer `*T`: a [`Compound::Ptr`] in the interner. Holding,
+    /// copying and comparing one is safe; using it (reading or writing
+    /// what it points to, moving it) is only for `unsafe` code.
+    Ptr(CompoundId),
     /// A fixed-size array `[N]T`: a [`Compound::Array`] in the interner.
     Array(CompoundId),
     /// A slice `[]T`, a read-only view like `str`: a [`Compound::Slice`] in
@@ -314,6 +316,26 @@ impl Ty {
         })
     }
 
+    /// The built-in enum `AllocError`, what allocating throws: its one
+    /// variant is `out_of_memory` (docs/allocation.md, The `Allocator`
+    /// trait). Like `Ordering`, it's usable without an import.
+    pub fn alloc_error() -> Ty {
+        static ALLOC_ERROR: OnceLock<Ty> = OnceLock::new();
+        *ALLOC_ERROR.get_or_init(|| {
+            let ty = Ty::new_enum("AllocError".to_owned(), usize::MAX, true, Vec::new());
+            ty.set_variants(
+                IntTy::new(false, 8),
+                false,
+                vec![Variant {
+                    name: "out_of_memory".to_owned(),
+                    fields: Vec::new(),
+                    value: 0,
+                }],
+            );
+            ty
+        })
+    }
+
     /// Whether a value of this type can be copied implicitly (the built-in
     /// trait `Copy`). Plain data is; a struct or an enum with a `deinit`
     /// isn't, nor a type parameter without the bound `Copy`, nor the
@@ -333,9 +355,48 @@ impl Ty {
                 ok.is_copy() && err.is_copy()
             }
             Ty::Struct(_) | Ty::Enum(_) => {
-                !self.has_deinit() && self.members().iter().all(|t| t.is_copy())
+                !self.has_deinit()
+                    && self
+                        .members()
+                        .iter()
+                        .all(|t| t.is_copy() && !t.holds_raw_ptr())
             }
             _ => true,
+        }
+    }
+
+    /// Whether this is a raw pointer, or an array or an optional of one: a
+    /// struct or an enum that holds one isn't `Copy`, `Eq` or derived
+    /// `Clone` (copying the pointer would share what it points to;
+    /// docs/allocation.md, Which types own resources).
+    pub fn holds_raw_ptr(self) -> bool {
+        match self {
+            Ty::Ptr(_) => true,
+            Ty::Array(_) => self.as_array().expect("an array").0.holds_raw_ptr(),
+            Ty::Optional(_) => self.as_optional().expect("an optional").holds_raw_ptr(),
+            _ => false,
+        }
+    }
+
+    /// Whether a struct's fields, or an enum's payload fields, hold a raw
+    /// pointer directly (see [`Ty::holds_raw_ptr`]).
+    pub fn has_raw_ptr_field(self) -> bool {
+        self.members().iter().any(|t| t.holds_raw_ptr())
+    }
+
+    /// The pointer type `*to`.
+    pub fn ptr(to: Ty) -> Ty {
+        Ty::Ptr(intern(Compound::Ptr { to }))
+    }
+
+    /// The type a pointer type points to.
+    pub fn as_ptr(self) -> Option<Ty> {
+        match self {
+            Ty::Ptr(id) => match compound(id) {
+                Compound::Ptr { to } => Some(to),
+                _ => unreachable!("a pointer id names another type"),
+            },
+            _ => None,
         }
     }
 
@@ -376,6 +437,8 @@ impl Ty {
                 // An `@uninit` field may hold bytes never written, which
                 // `==` must not read.
                 Ty::Struct(_) if self.uninit_field().is_some() => false,
+                // `==` would compare the pointers, not what they point to.
+                Ty::Struct(_) | Ty::Enum(_) if self.has_raw_ptr_field() => false,
                 Ty::Struct(_) | Ty::Enum(_) => self.members().iter().all(|m| m.satisfies(t)),
                 _ => false,
             },
@@ -387,7 +450,9 @@ impl Ty {
                         Ty::Array(_) => self.as_array().expect("an array").0.satisfies(t),
                         Ty::Optional(_) => self.as_optional().expect("an optional").satisfies(t),
                         Ty::Struct(_) | Ty::Enum(_) => {
-                            !self.has_deinit() && self.members().iter().all(|m| m.satisfies(t))
+                            !self.has_deinit()
+                                && !self.has_raw_ptr_field()
+                                && self.members().iter().all(|m| m.satisfies(t))
                         }
                         _ => false,
                     }
@@ -439,6 +504,7 @@ impl Ty {
                 }
             }
             Ty::Slice(_) => self.as_slice().expect("a slice").params(out),
+            Ty::Ptr(_) => self.as_ptr().expect("a pointer").params(out),
             Ty::Optional(_) => self.as_optional().expect("an optional").params(out),
             Ty::Result(_) => {
                 let (ok, err) = self.as_result().expect("a result");
@@ -497,6 +563,7 @@ impl Ty {
                 Ty::array_of(elem.subst(with), len)
             }
             Ty::Slice(_) => Ty::slice(self.as_slice().expect("a slice").subst(with)),
+            Ty::Ptr(_) => Ty::ptr(self.as_ptr().expect("a pointer").subst(with)),
             Ty::Optional(_) => Ty::optional(self.as_optional().expect("an optional").subst(with)),
             Ty::Result(_) => {
                 let (ok, err) = self.as_result().expect("a result");
@@ -1454,6 +1521,10 @@ pub enum Compound {
     Slice {
         elem: Ty,
     },
+    /// `*to`, a raw pointer.
+    Ptr {
+        to: Ty,
+    },
     /// A struct, by the index of its declaration and its type arguments:
     /// two declarations are two types, even with the same fields, and so
     /// are two instances of a generic struct with different arguments.
@@ -1615,9 +1686,9 @@ impl fmt::Display for Ty {
             Ty::Unit => f.write_str("()"),
             Ty::Never => f.write_str("never"),
             Ty::Str => f.write_str("str"),
-            Ty::Ptr(t) => write!(f, "*{t}"),
             Ty::Param(id) => f.write_str(&param_def(*id).name),
-            Ty::Array(id)
+            Ty::Ptr(id)
+            | Ty::Array(id)
             | Ty::Slice(id)
             | Ty::Struct(id)
             | Ty::Enum(id)
@@ -1626,6 +1697,7 @@ impl fmt::Display for Ty {
             | Ty::Value(id) => match compound(*id) {
                 Compound::Array { elem, len } => write!(f, "[{len}]{elem}"),
                 Compound::Slice { elem } => write!(f, "[]{elem}"),
+                Compound::Ptr { to } => write!(f, "*{to}"),
                 Compound::Struct { def, args } => {
                     f.write_str(&struct_def(def).name)?;
                     write_args(f, &arg_list(args))

@@ -34,19 +34,20 @@ struct Pair {
 	tag: u32
 }
 
-// Generic code clones a `T: Clone`: a copy for plain data.
-fn twice[T: Clone](x: T) -> [2]T {
-	return [x.clone(), x.clone()]
+// Generic code clones a `T: Clone`, which may allocate and fail (a copy
+// for plain data).
+fn twice[T: Clone](x: T) uses alloc throws(AllocError) -> [2]T {
+	return [try x.clone(), try x.clone()]
 }
 
-fn clones() {
+fn clones() uses alloc throws(AllocError) {
 	let n = noisy(1)
 	let c = n.clone()
 	let p = Pair{a: noisy(2), b: noisy(3), tag: 4}
 	let q = p.clone()
 	io.print(" | {} {} {}", q.a.id, q.b.id, q.tag)
-	let ns = twice(noisy(5))
-	let xs = twice(u8(6))
+	let ns = try twice(noisy(5))
+	let xs = try twice(u8(6))
 	io.print(" | {} {} {}", ns[0].id, ns[1].id, xs[1])
 }
 
@@ -84,9 +85,9 @@ fn needs[T]() -> bool {
 	return needs_deinit[T]()
 }
 
-fn main() {
+fn main() uses alloc {
 	io.print("clone:")
-	clones()
+	clones() catch _ {}
 	io.print("\nmem:")
 	mems()
 	io.print("\nneeds: {} {} {} {}\n", needs[Noisy](), needs[Pair](), needs[u32](), needs_deinit[[2]?Noisy]())

@@ -46,6 +46,20 @@ pub enum Item {
     Type(TypeDecl),
     /// `impl Trait for Type { ... }`
     Impl(ImplDecl),
+    /// `static NAME: T = value`: a mutable global, used only in `unsafe`
+    /// code (docs/memory.md, Globals).
+    Static(StaticDecl),
+}
+
+/// `static NAME: T = value` at package level: a global initialized when
+/// compiling, which `unsafe` code reads and changes.
+#[derive(Debug)]
+pub struct StaticDecl {
+    pub is_pub: bool,
+    pub name: Ident,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    pub span: Span,
 }
 
 /// A trait named in a bound or an `impl`: `Ordered`, or `io.Writer` for a
@@ -77,6 +91,9 @@ impl Bound {
 #[derive(Debug)]
 pub struct TraitDecl {
     pub is_pub: bool,
+    /// `unsafe trait`: implementing it promises what its documentation
+    /// says, which the compiler can't check (`unsafe impl`).
+    pub is_unsafe: bool,
     pub name: Ident,
     pub supers: Vec<Bound>,
     pub items: Vec<TraitItem>,
@@ -99,6 +116,8 @@ pub enum TraitItem {
 /// `impl[A: Bound] Trait for Type[A] { item ... }`.
 #[derive(Debug)]
 pub struct ImplDecl {
+    /// `unsafe impl`, for an `unsafe trait`.
+    pub is_unsafe: bool,
     /// The generic parameters: one per parameter of a generic type.
     pub generics: Vec<GenericParam>,
     pub trait_: Bound,
@@ -223,6 +242,10 @@ pub struct FnDecl {
     /// The parameters. A method's first is `self`, whose type is the
     /// owner's.
     pub params: Vec<Param>,
+    /// `uses alloc` after the parameters: the span of the context's name.
+    /// The function may allocate, and gets the allocator in context
+    /// (docs/allocation.md, `uses alloc`).
+    pub uses: Option<Ident>,
     /// `throws(E)`, or `throws` alone (an inferred error set).
     pub throws: Option<Throws>,
     pub ret: Option<TypeExpr>,
@@ -420,6 +443,14 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `with alloc = value { ... }`: the block runs with `value`, an
+    /// `alloc.Handle`, as the allocator in context.
+    With {
+        context: Ident,
+        value: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `defer { ... }` (or `defer` and one statement): run the block when
     /// leaving the enclosing block. With `on_error` (`errdefer`), only when
     /// leaving the function with an error.
@@ -445,6 +476,7 @@ impl Stmt {
             | Stmt::Continue(span)
             | Stmt::Match { span, .. }
             | Stmt::Throw { span, .. }
+            | Stmt::With { span, .. }
             | Stmt::Defer { span, .. } => *span,
             Stmt::Expr(e) => e.span,
             Stmt::If(i) => i.span,
