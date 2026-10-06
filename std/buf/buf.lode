@@ -21,8 +21,8 @@ pub enum Error {
 /// `==` would compare the bytes never written too.
 pub struct StackBuf[N: usize] {
 	@uninit bytes: [N]u8
-	start: usize
-	end: usize
+	start: usize where start <= end && start <= N
+	end: usize where end <= N
 }
 
 /// An empty buffer that `push` fills from the front of its storage.
@@ -45,9 +45,6 @@ pub fn StackBuf[N].new_end() -> StackBuf[N] {
 
 /// The number of bytes written.
 pub fn StackBuf[N].len(self) -> usize {
-	if self.start > self.end {
-		return 0
-	}
 	return self.end - self.start
 }
 
@@ -64,12 +61,10 @@ pub fn StackBuf[N].push(inout self, b: u8) throws(Error) {
 /// Write `b` before the bytes written so far, or throw `full` when the
 /// storage's front is reached.
 pub fn StackBuf[N].push_front(inout self, b: u8) throws(Error) {
-	// `start - 1`, wrapping to the largest `usize` when `start` is 0: one
-	// check covers both a full front and a `start` past the storage.
-	let at = self.start -% 1
-	if at >= N {
+	if self.start == 0 {
 		throw .full
 	}
+	let at = self.start - 1
 	self.bytes[at] = b
 	self.start = at
 }
@@ -79,7 +74,7 @@ pub fn StackBuf[N].get(self, i: usize) -> ?u8 {
 	// `start + i`, or the largest `usize` if it's larger, which is past
 	// the end.
 	let at = self.start +| i
-	if at >= self.end || at >= N {
+	if at >= self.end {
 		return none
 	}
 	return self.bytes[at]
@@ -89,8 +84,6 @@ pub fn StackBuf[N].get(self, i: usize) -> ?u8 {
 /// does: returns 0, or the negative error number of the first failure.
 /// (`io.File.write_buf` calls it: only this package sees the bytes.)
 pub fn StackBuf[N].write_to(self, fd: i32) -> isize {
-	if self.start > self.end || self.end > N {
-		return 0
-	}
+	// The fields' refinements keep `start <= end <= N`.
 	return os.write_all(fd, self.bytes[self.start..self.end])
 }

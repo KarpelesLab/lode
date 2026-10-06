@@ -25,7 +25,7 @@ struct Entry {
 }
 
 struct Map {
-	count: usize
+	count: usize where count <= CAP
 	slots: [CAP]?Entry
 }
 
@@ -42,7 +42,7 @@ fn map_new() -> Map {
 }
 
 // Linear probing. Returns the slot holding `k`, or the first empty one.
-fn probe(m: Map, k: u32) -> ?usize {
+fn probe(m: Map, k: u32) -> ?usize where result < CAP {
 	var i = usize(hash(k) % CAP)
 	for step in 0..CAP {
 		match m.slots[i] {
@@ -62,9 +62,6 @@ fn get(m: Map, k: u32) -> ?u32 {
 	let i = probe(m, k) else {
 		return none
 	}
-	if i >= CAP { // WORKAROUND: probe's result is always < CAP, but no refinement on returns
-		return none
-	}
 	if let e = m.slots[i] {
 		return e.value
 	}
@@ -75,12 +72,10 @@ fn put(m: Map, k: u32, v: u32) -> ?Map {
 	let i = probe(m, k) else {
 		return none
 	}
-	if i >= CAP {
-		return none
-	}
 	var out = m
 	if out.slots[i] == none {
-		if out.count >= CAP { // WORKAROUND: struct invariant count <= CAP unknown
+		// WORKAROUND: an empty slot means `count < CAP`, which no fact can say
+		if out.count >= CAP {
 			return none
 		}
 		out.count = out.count + 1

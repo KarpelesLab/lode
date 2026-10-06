@@ -141,7 +141,7 @@ fn format_count(comptime fmt: str, comptime given: usize) -> usize {
 struct Buffered {
 	fd: i32
 	@uninit bytes: [PRINT_BUF_SIZE]u8
-	len: usize
+	len: usize where len <= PRINT_BUF_SIZE
 }
 
 /// An empty buffer for `fd`.
@@ -156,9 +156,6 @@ fn Buffered.new(fd: i32) -> Buffered {
 /// full, and at the end if `last`.
 fn Buffered.put(inout self, b: []u8, last: bool) {
 	var at = self.len
-	if at > PRINT_BUF_SIZE {
-		at = 0
-	}
 	// One loop with one `write_all`, for both reasons to write: the
 	// smallest code found.
 	var i: usize = 0
@@ -281,7 +278,7 @@ impl[N: usize] Writer for buf.StackBuf[N] {
 /// 0 only at the end of the input (or if `buf` is empty), and may be fewer
 /// than `buf.len` even before the end (a pipe or a terminal gives what it
 /// has). Throws the error that stopped it. An interrupted call is retried.
-pub fn File.read(self, inout buf: []u8) throws(os.Error) -> usize {
+pub fn File.read(self, inout buf: []u8) throws(os.Error) -> usize where result <= buf.len {
 	loop {
 		var n: isize
 		unsafe {
@@ -305,11 +302,13 @@ pub fn File.read(self, inout buf: []u8) throws(os.Error) -> usize {
 /// number of bytes read, which is less than `buf.len` only at the end of the
 /// input. Throws the error that stopped it; the bytes read before it are in
 /// `buf`, but their count is lost.
-pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize {
+pub fn File.read_full(self, inout buf: []u8) throws(os.Error) -> usize where result <= buf.len {
 	var got: usize = 0
 	loop {
+		// `got` is never more than `buf.len`, but the checker doesn't keep
+		// that through the loop: `buf.len` is the same value here.
 		if got >= buf.len {
-			return got
+			return buf.len
 		}
 		let n = try self.read(&buf[got..])
 		if n == 0 {

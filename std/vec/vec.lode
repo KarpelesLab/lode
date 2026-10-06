@@ -16,7 +16,7 @@ pub enum Error {
 /// (docs/generics.md, `Copy` and moves).
 pub struct ArrayVec[T: Copy, N: usize] {
 	slots: [N]?T
-	count: usize
+	count: usize where count <= N
 }
 
 /// An empty vector.
@@ -40,11 +40,10 @@ pub fn ArrayVec[T, N].push(inout self, v: T) throws(Error) {
 
 /// Remove the last element and return it, or `none` if there's none.
 pub fn ArrayVec[T, N].pop(inout self) -> ?T {
-	let n = self.count
-	if n == 0 || n > N {
+	if self.count == 0 {
 		return none
 	}
-	let last = n - 1
+	let last = self.count - 1
 	let v = self.slots[last]
 	self.slots[last] = none
 	self.count = last
@@ -53,7 +52,7 @@ pub fn ArrayVec[T, N].pop(inout self) -> ?T {
 
 /// Element `i` (0 is the first), or `none` past the last.
 pub fn ArrayVec[T, N].get(self, i: usize) -> ?T {
-	if i >= self.count || i >= N {
+	if i >= self.count {
 		return none
 	}
 	return self.slots[i]
@@ -62,7 +61,7 @@ pub fn ArrayVec[T, N].get(self, i: usize) -> ?T {
 /// Replace element `i` with `v`; `false` (and no change) if there's no
 /// element `i`.
 pub fn ArrayVec[T, N].put(inout self, i: usize, v: T) -> bool {
-	if i >= self.count || i >= N {
+	if i >= self.count {
 		return false
 	}
 	self.slots[i] = v

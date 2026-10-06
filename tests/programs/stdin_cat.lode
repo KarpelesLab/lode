@@ -16,11 +16,6 @@ fn main() -> u8 {
 		if n == 0 {
 			return 0
 		}
-		// `read` never returns more than `buf.len`, but the checker doesn't
-		// know what a call returns yet.
-		if n > buf.len {
-			return 3
-		}
 		io.stdout().write_bytes(buf[..n]) catch _ {
 			return 2
 		}

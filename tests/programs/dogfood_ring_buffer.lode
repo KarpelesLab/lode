@@ -9,8 +9,8 @@ import "std/io"
 const CAP = 8
 
 struct Ring {
-	head: usize
-	len: usize
+	head: usize where head < CAP
+	len: usize where len <= CAP
 	data: [CAP]u32
 }
 
@@ -28,8 +28,7 @@ fn push(r: Ring, v: u32) -> ?Ring {
 		return none
 	}
 	var out = r
-	// WORKAROUND: re-reduce head; struct invariant head < CAP isn't known
-	let tail = (r.head % CAP + r.len) % CAP
+	let tail = (r.head + r.len) % CAP
 	out.data[tail] = v
 	out.len = r.len + 1
 	return out
@@ -45,9 +44,8 @@ fn pop(r: Ring) -> ?Popped {
 		return none
 	}
 	var out = r
-	let h = r.head % CAP // WORKAROUND, as above
-	let v = r.data[h]
-	out.head = (h + 1) % CAP
+	let v = r.data[r.head]
+	out.head = (r.head + 1) % CAP
 	out.len = r.len - 1
 	return Popped{ring: out, value: v}
 }

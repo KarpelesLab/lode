@@ -28,10 +28,7 @@ pub fn sort[T: Ordered + Copy](inout xs: []T) {
 
 /// Move `xs[root]` down the heap made of `xs[..end]` until it's at least
 /// as large as its children.
-fn sift_down[T: Ordered + Copy](inout xs: []T, start: usize, end: usize) {
-	if end > xs.len {
-		return
-	}
+fn sift_down[T: Ordered + Copy](inout xs: []T, start: usize, end: usize where end <= xs.len) {
 	var root = start
 	loop {
 		if root >= end {

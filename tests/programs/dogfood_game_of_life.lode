@@ -23,7 +23,7 @@ struct Grid {
 	cells: [H][W]bool
 }
 
-fn neighbors(g: Grid, r: usize, c: usize) -> u8 {
+fn neighbors(g: Grid, r: usize where r < H, c: usize where c < W) -> u8 {
 	var n: u8 = 0
 	for dr in 0..3 {
 		for dc in 0..3 {
@@ -31,9 +31,8 @@ fn neighbors(g: Grid, r: usize, c: usize) -> u8 {
 				continue
 			}
 			// wrap around the edges (torus)
-			// WORKAROUND: no refinement on r/c, so reduce them first
-			let rr = (r % H + H + dr - 1) % H
-			let cc = (c % W + W + dc - 1) % W
+			let rr = (r + H + dr - 1) % H
+			let cc = (c + W + dc - 1) % W
 			if g.cells[rr][cc] {
 				n +%= 1 // WORKAROUND: the checker doesn't count iterations
 			}
