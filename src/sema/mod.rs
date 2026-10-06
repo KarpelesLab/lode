@@ -908,6 +908,19 @@ fn whole_assigned_names(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
+/// The height of the loops in a loop's condition `cond` (a `while`
+/// loop's) and its body.
+fn loop_height_with(cond: Option<&ast::Expr>, body: &[Stmt]) -> u32 {
+    let mut blocks = Vec::new();
+    if let Some(cond) = cond {
+        catch_blocks(cond, &mut blocks);
+    }
+    blocks
+        .iter()
+        .map(|b| loop_height(&b.stmts))
+        .fold(loop_height(body), u32::max)
+}
+
 /// The height of the loops in `stmts`: 0 without loops, otherwise one more
 /// than the height of the loops in the body of the highest one (loops at
 /// any depth in blocks count, as do loops in `catch` blocks).
@@ -942,13 +955,24 @@ fn loop_height(stmts: &[Stmt]) -> u32 {
 /// loops, whatever the nesting.
 const SEARCH_HEIGHT: u32 = 4;
 
-/// The locals assigned anywhere in `body`, as seen from before it (for the
-/// facts at a loop's head).
-fn assigned_locals(cx: &FnCx, body: &[Stmt]) -> HashSet<LocalId> {
+/// The locals assigned anywhere in a loop, as seen from before it (for the
+/// facts at its head): in `body`, and in `cond`, a `while` loop's
+/// condition, which is evaluated on each iteration (by what it passes with
+/// `&`, a method's receiver, and in the blocks of its `catch`es).
+fn assigned_locals(cx: &FnCx, cond: Option<&ast::Expr>, body: &[Stmt]) -> HashSet<LocalId> {
     let mut names = HashSet::new();
     assigned_names(body, &mut names);
     let mut whole = HashSet::new();
     whole_assigned_names(body, &mut whole);
+    if let Some(cond) = cond {
+        changed_names(cond, &mut names);
+        let mut blocks = Vec::new();
+        catch_blocks(cond, &mut blocks);
+        for b in blocks {
+            assigned_names(&b.stmts, &mut names);
+            whole_assigned_names(&b.stmts, &mut whole);
+        }
+    }
     // An `inout` slice is never assigned itself, only its elements, which
     // have no facts: its length stays. Another view keeps its length unless
     // it's assigned whole.
@@ -4437,24 +4461,32 @@ impl<'a> Checker<'a> {
                 Some(TStmt::Return(value))
             }
             Stmt::If(i) => Some(self.if_stmt(cx, i)),
-            Stmt::While { cond, body, .. } => {
-                let ((cond, facts, body), head, exits) =
-                    self.loop_body(cx, &body.stmts, None, |ck, cx| {
-                        let (cond, facts) = ck.condition(cx, cond);
+            Stmt::While {
+                cond: cond_ast,
+                body,
+                ..
+            } => {
+                // The condition is checked in the loop: a `break` or a
+                // `continue` in one of its `catch` blocks leaves this loop,
+                // or goes back to its head.
+                let ((cond, facts, after_cond, body), _, exits) =
+                    self.loop_body(cx, Some(cond_ast), &body.stmts, None, |ck, cx| {
+                        let (cond, facts) = ck.condition(cx, cond_ast);
+                        let after_cond = cx.env.clone();
                         cx.env.apply(&facts.when_true);
                         let body = ck.block(cx, &body.stmts);
                         let reaches_end = !diverges(&body);
-                        ((cond, facts, body), reaches_end)
+                        ((cond, facts, after_cond, body), reaches_end)
                     });
-                // The loop ends at its head when the condition is false, or
-                // at a `break`.
-                let mut done = head;
+                // The loop ends after its condition when it's false (with
+                // what evaluating it changed), or at a `break`.
+                let mut done = after_cond;
                 done.apply(&facts.when_false);
                 cx.env = exits.into_iter().fold(done, Env::join);
                 Some(TStmt::While(cond.unwrap_or_else(placeholder_bool), body))
             }
             Stmt::Loop { body, .. } => {
-                let (body, _, exits) = self.loop_body(cx, &body.stmts, None, |ck, cx| {
+                let (body, _, exits) = self.loop_body(cx, None, &body.stmts, None, |ck, cx| {
                     let body = ck.block(cx, &body.stmts);
                     let reaches_end = !diverges(&body);
                     (body, reaches_end)
@@ -5356,6 +5388,7 @@ impl<'a> Checker<'a> {
     fn loop_body<T>(
         &mut self,
         cx: &mut FnCx,
+        cond: Option<&ast::Expr>,
         body: &[Stmt],
         index: Option<&ForIndex>,
         mut check: impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
@@ -5376,7 +5409,7 @@ impl<'a> Checker<'a> {
             b
         };
         let mut borrows = outer_borrows(cx);
-        let (mut out, mut head, mut edges) = self.loop_search(cx, body, index, &mut check);
+        let (mut out, mut head, mut edges) = self.loop_search(cx, cond, body, index, &mut check);
         loop {
             let moved: Vec<LocalId> = edges
                 .next
@@ -5411,12 +5444,13 @@ impl<'a> Checker<'a> {
     fn loop_search<T>(
         &mut self,
         cx: &mut FnCx,
+        cond: Option<&ast::Expr>,
         body: &[Stmt],
         index: Option<&ForIndex>,
         check: &mut impl FnMut(&mut Self, &mut FnCx) -> (T, bool),
     ) -> (T, Env, LoopEdges) {
         use facts::Loosen::{Cover, Drop};
-        let mut assigned = assigned_locals(cx, body);
+        let mut assigned = assigned_locals(cx, cond, body);
         if let Some(ix) = index {
             assigned.insert(ix.local);
         }
@@ -5438,7 +5472,7 @@ impl<'a> Checker<'a> {
             }
             base
         };
-        if 1 + loop_height(body) > SEARCH_HEIGHT {
+        if 1 + loop_height_with(cond, body) > SEARCH_HEIGHT {
             let base = forget_all(entry);
             let (out, edges) = self.loop_pass(cx, base.clone(), index, check);
             return (out, base, edges);
@@ -5701,7 +5735,8 @@ impl<'a> Checker<'a> {
                 || !assigned.contains(&local.name)
                 || (local.ty.is_view() && !whole.contains(&local.name))
         };
-        let (stmts, head, exits) = self.loop_body(cx, &body.stmts, Some(&for_index), |ck, cx| {
+        let ix = Some(&for_index);
+        let (stmts, head, exits) = self.loop_body(cx, None, &body.stmts, ix, |ck, cx| {
             // What the body knows about the loop variable.
             let (lo, hi) = (start.int_range().lo, end.int_range().hi - 1);
             // An empty range: the body never runs, and any range will do.

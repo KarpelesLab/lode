@@ -123,6 +123,9 @@ and `errdefer` cover the rest.
     When the call's value is used (`let n = f() catch e { ... }`), the
     block must leave (`return`, `throw`, `break` or `continue`): a block
     has no value. As a statement on its own, the block may end normally.
+    In a `while` condition, `break` and `continue` belong to that loop
+    (`continue` evaluates the condition again); in a `for` loop's bounds,
+    evaluated once before it, to the loop around it.
   - `f() catch v` uses `v` when the call fails. `v` is only evaluated
     then, as with `??`.
   - `f() catch _ { ... }` doesn't bind the error. `f() catch _ {}` ignores

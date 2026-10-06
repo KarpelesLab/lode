@@ -1,0 +1,78 @@
+// stdout: 1 2 skip 5 | 0 01 | 7 | 3\n
+package main
+
+import "std/io"
+
+// `break` and `continue` in a `catch` block of a `while` condition leave
+// the loop or go back to its condition; in a `for` loop's bounds, they
+// belong to the loop around it.
+enum Fail {
+	bad
+}
+
+fn check(n: u32) throws(Fail) -> bool {
+	if n == 3 {
+		throw .bad
+	}
+	return n < 5
+}
+
+fn above(n: u32) throws(Fail) -> u32 {
+	if n > 1 {
+		throw .bad
+	}
+	return n + 1
+}
+
+// The loop only leaves through the `break` in its condition: the code
+// after the inner loop is reached, and so is the `return`.
+fn first_failure() -> u32 {
+	var n: u32 = 0
+	loop {
+		while check(n) catch _ {
+			break
+		} {
+			n = n +% 1
+		}
+		return n +% 4
+	}
+}
+
+fn main() {
+	let a: [5]u32 = [0, 1, 2, 3, 4]
+	var n: u32 = 0
+	var i: usize = 0
+	while check(n) catch _ {
+		io.print("skip ")
+		n = n +% 1
+		i = i +% 1
+		continue
+	} {
+		if i < a.len {
+			n = n +% 1
+			i = i + 1
+			if n != 3 {
+				io.print("{} ", a[i - 1] +% 1)
+			}
+		}
+	}
+	io.print("| ")
+	var outer: u32 = 0
+	while outer < 4 {
+		for k in 0..above(outer) catch _ {
+			break
+		} {
+			io.print("{}", k)
+		}
+		io.print(" ")
+		outer = outer + 1
+	}
+	io.print("| {} | ", first_failure())
+	var m: u32 = 0
+	while check(m) catch _ {
+		break
+	} {
+		m = m +% 1
+	}
+	io.print("{}\n", m)
+}

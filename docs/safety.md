@@ -159,7 +159,7 @@ All are decidable and cheap, and the rules for how they flow are fixed:
 | `a ?? b` | After, what holds whether `b` ran or not: the facts before `b` joined with those after it |
 | A comparison `x < y` (and `<=`, `>`, `>=`, `==`) | Each side narrows by the other's range; between two terms (plus constants), a relation: `i + 1 < xs.len` gives `i - xs.len <= -2`. More generally, when both sides are forms and `x - y` has at most two terms, `x - y <= c` gives a relation or a sum for two terms, and a range for one (`10 - d >= 3` gives `d <= 7`); a side can also be a quotient (see [Sums](#sums)). `x != k` (and `x == k` being false), with `k` a single value: when `k` is at an end of `x`'s range, the range narrows past it; when it's inside, a hole at `k`. A range that narrows to a hole's value moves past it too. |
 | The head of a loop | The facts before the loop, with those about the variables the loop assigns kept as far as every iteration keeps them: see [Facts through loops](#facts-through-loops) |
-| `while cond` | The body knows `cond` is true. After the loop, what the head and `cond` being false give, joined (as after an `if`) with the facts at each `break` |
+| `while cond` | `cond` is checked from the head on each iteration, as part of the loop: a `break` or `continue` in one of its `catch` blocks leaves this loop or goes back to its head (one in a `for` loop's bounds, which are evaluated once before it, belongs to the loop around it). The body knows `cond` is true. After the loop, what the facts after `cond` and it being false give, joined (as after an `if`) with the facts at each `break` |
 | `loop` | After the loop, the facts at its `break`s, joined. Without a `break`, the code after it can't be reached. |
 | `for i in a..b` | In the body, `i` lies in `a.lo..=b.hi - 1`, and when `a` or `b` is a term (plus a constant) the body doesn't assign, `a <= i` and `i < b` as relations. So `for i in 0..xs.len` proves `xs[i]`. After the loop, the head facts, with `i` past the end: in `b.lo..=b.hi` (`..=max(a.hi, b.hi)` unless `a.hi <= b.lo` or a relation gives `a <= b`), and when `b` is a term the body doesn't assign, `b <= i`, and `i <= b` in the same case; joined with the facts at each `break`. (`i` itself can't be used after the loop, but relations go through it.) |
 | `for x in xs` | The same as `for` over `0..xs.len` with a hidden index, which proves the hidden `xs[index]` that gives `x` |
@@ -343,7 +343,8 @@ for every `N`. A relation through the term works as for any other:
 
 At the head of a loop, the facts before it, `E`, still hold about everything
 the loop doesn't assign. The variables it assigns (`A`: every variable
-assigned anywhere in the body, including in nested loops; for `a[i] = v` and
+assigned anywhere in the body, including in nested loops, and in a `while`
+loop's condition, which runs on every iteration; for `a[i] = v` and
 `p.x = v`, `a` and `p`; a variable passed with `&`, and the receiver of every
 method call, since the method may take `inout self`; but not an `inout`
 slice, of which only the elements change, nor another view that isn't
@@ -353,7 +354,8 @@ for them the head
 keeps only facts that every iteration keeps. Those are found by checking the
 body from a few candidate heads, in a fixed order, and taking the first that
 **holds**: each of its facts about `A` holds again at every **back-edge** (a
-`continue`, and the end of the body when it can be reached). At a back-edge,
+`continue`, also one in a `catch` block of a `while` condition, and the end
+of the body when it can be reached). At a back-edge,
 a range end holds if the back-edge's range for the term (or its type's range,
 if none is known) is within it, and a relation `a - b <= c` holds if the
 back-edge gives `a - b <= c'` with `c' <= c` (directly or through one other

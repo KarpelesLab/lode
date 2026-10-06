@@ -827,8 +827,9 @@ pub fn diverges(stmts: &[TStmt]) -> bool {
 }
 
 /// Whether `stmts` contain a `break` that leaves the enclosing loop
-/// (including one in the block of a `catch`, and in the condition or the
-/// bounds of a nested loop, which are evaluated outside of it).
+/// (including one in the block of a `catch`, and in the bounds of a nested
+/// `for` loop, which are evaluated outside of it; not one in a nested
+/// `while` loop's condition, which leaves that loop).
 pub fn breaks(stmts: &[TStmt]) -> bool {
     stmts.iter().any(|s| {
         let nested = match s {
@@ -836,6 +837,7 @@ pub fn breaks(stmts: &[TStmt]) -> bool {
             TStmt::If(_, then, otherwise) => breaks(then) || breaks(otherwise),
             TStmt::Block(body) | TStmt::With(_, body) => breaks(body),
             TStmt::Match { arms, .. } => arms.iter().any(|a| breaks(&a.body)),
+            TStmt::While(..) => return false,
             _ => false,
         };
         nested || stmt_blocks(s).into_iter().any(breaks)

@@ -1,0 +1,115 @@
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+// error: cannot prove that this index is less than the length
+package main
+
+import "std/io"
+
+// A `while` condition is evaluated on each iteration: what it assigns (in
+// its `catch` blocks, or with `&`) changes the facts at the loop's head and
+// after the loop, and a `continue` in it is a back-edge like one in the
+// body.
+enum Fail {
+	bad
+}
+
+fn may(n: u32) throws(Fail) -> bool {
+	if n == 0 {
+		throw .bad
+	}
+	return n < 3
+}
+
+fn count(n: u32) throws(Fail) -> u32 {
+	if n == 0 {
+		throw .bad
+	}
+	return n
+}
+
+fn next(inout i: usize) -> bool {
+	i = i +% 5
+	return i < 20
+}
+
+// `continue` in the condition's `catch` block goes back to the head with
+// `i` out of range.
+fn continue_in_condition() {
+	let a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	var n: u32 = 0
+	while may(n) catch _ {
+		i = 1000000
+		n = 1
+		continue
+	} {
+		io.print("{}\n", a[i])
+		n = n +% 1
+	}
+}
+
+// The condition changes `i` through `&`: after the loop, `i` isn't 0.
+fn changed_by_condition() {
+	let a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	while next(&i) {
+	}
+	io.print("{}\n", a[i])
+}
+
+// The same, read in the body.
+fn changed_by_condition_in_body() {
+	let a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	while next(&i) {
+		io.print("{}\n", a[i])
+	}
+}
+
+// A `break` in a nested loop's condition leaves that loop only; the outer
+// loop goes on with `i` out of range.
+fn nested_condition() {
+	let a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	var n: u32 = 0
+	loop {
+		io.print("{}\n", a[i])
+		while may(n) catch _ {
+			i = 1000000
+			break
+		} {
+			n = n +% 1
+		}
+		n = n +% 1
+		if n > 10 {
+			break
+		}
+	}
+}
+
+// A `continue` in a `for` loop's bounds goes back to the loop around it.
+fn continue_in_for_bounds() {
+	let a: [4]u32 = [1, 2, 3, 4]
+	var i: usize = 0
+	var n: u32 = 0
+	while n < 10 {
+		io.print("{}\n", a[i])
+		n = n +% 1
+		for k in 0..count(n) catch _ {
+			i = 9
+			continue
+		} {
+			io.print("{}\n", k)
+		}
+	}
+}
+
+fn main() {
+	continue_in_condition()
+	changed_by_condition()
+	changed_by_condition_in_body()
+	nested_condition()
+	continue_in_for_bounds()
+}

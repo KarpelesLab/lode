@@ -2205,7 +2205,13 @@ impl FnLower<'_> {
                 let exit = self.b.create_block(&[]);
                 self.b.br(header, &[]);
                 self.start_block(header);
+                // The condition is in the loop: a `break` or a `continue` in
+                // one of its `catch` blocks leaves it or goes back to the
+                // header.
+                let kills: Rc<[LocalId]> = iteration_locals(body, &self.names).into();
+                self.loops.push((header, exit, self.defers.len(), kills));
                 let c = self.expr(cond).one();
+                self.loops.pop();
                 self.b.cond_br(c, body_bb, &[], exit, &[]);
                 self.loop_body(body_bb, header, exit, body);
                 self.start_block(exit);

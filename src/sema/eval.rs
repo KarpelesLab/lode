@@ -432,8 +432,16 @@ impl Eval<'_, '_> {
                 }
             }
             TStmt::While(c, body) => loop {
-                if !self.expr(frame, c)?.bool() {
-                    break;
+                // A `break` or `continue` in a `catch` block of the
+                // condition leaves this loop or goes back to its head.
+                match self.expr(frame, c) {
+                    Ok(v) if v.bool() => {}
+                    Ok(_) | Err(Exit::Break) => break,
+                    Err(Exit::Continue) => {
+                        self.step()?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
                 match self.block(frame, body) {
                     Ok(()) | Err(Exit::Continue) => {}
