@@ -58,7 +58,7 @@ pub struct Handle {
 pub fn current() uses alloc -> Handle {
 }
 
-/// The handle of the root allocator, `Heap`'s `ROOT`, which never ends.
+/// The handle of the root allocator, `ROOT`, which never ends.
 @intrinsic
 pub fn root() -> Handle {
 }
@@ -75,8 +75,10 @@ pub unsafe fn handle[A: Allocator](a: A) -> Handle {
 }
 
 /// `size` bytes, aligned to `align`, from the handle's allocator.
+/// Allocating, through the context or a handle, is for a function that
+/// declares `uses alloc`.
 @intrinsic
-pub fn Handle.alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
+pub fn Handle.alloc(self, size: usize, align: usize) uses alloc throws(AllocError) -> *u8 {
 }
 
 /// Grow or shrink the block of `old` bytes at `p`, in place: whether the
@@ -85,10 +87,11 @@ pub fn Handle.alloc(self, size: usize, align: usize) throws(AllocError) -> *u8 {
 /// The caller must ensure `p` is a block of `old` bytes from this
 /// allocator, with `align`.
 @intrinsic
-pub unsafe fn Handle.resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
+pub unsafe fn Handle.resize(self, p: *u8, old: usize, new: usize, align: usize) uses alloc -> bool {
 }
 
-/// Free the block of `size` bytes at `p` to the handle's allocator.
+/// Free the block of `size` bytes at `p` to the handle's allocator. Like
+/// destruction, it doesn't need `uses alloc`.
 ///
 /// The caller must ensure `p` is a block of `size` bytes from this
 /// allocator, with `align`, which nothing uses any more.
@@ -136,7 +139,8 @@ const PAGES: os.PageAllocator = os.PageAllocator.new()
 ///
 /// There's one: `ROOT`, a `static` that maps its first chunk on its first
 /// allocation (nothing runs before `main`). Its methods change `ROOT` in
-/// place.
+/// place. An allocator built on it calls its methods directly, as in
+/// `alloc.ROOT.alloc(size, align)` (in `unsafe` code, as for any static).
 pub struct Heap {
 	/// The address of the first freed block of each class, 0 for none;
 	/// each free block holds the address of the next.
@@ -148,7 +152,7 @@ pub struct Heap {
 }
 
 /// The root allocator.
-static ROOT: Heap = Heap{free: [0; 8], next: 0, end: 0}
+pub static ROOT: Heap = Heap{free: [0; 8], next: 0, end: 0}
 
 /// The size class of a block of `n` bytes.
 fn class_of(n: usize where n <= SMALL_MAX) -> usize where result < 8 {

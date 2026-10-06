@@ -21,7 +21,7 @@ fn yes(b: bool) -> str {
 	return "no"
 }
 
-fn reuse() throws(AllocError) {
+fn reuse() uses alloc throws(AllocError) {
 	let h = alloc.root()
 	let p = try h.alloc(24, 8)
 	unsafe {
@@ -48,7 +48,7 @@ fn reuse() throws(AllocError) {
 }
 
 // A block is aligned to its class's size, at least the alignment asked.
-fn aligned() throws(AllocError) {
+fn aligned() uses alloc throws(AllocError) {
 	let h = alloc.root()
 	let a = try h.alloc(1, 16)
 	let b = try h.alloc(3, 64)
@@ -65,7 +65,7 @@ const N: usize = 5000
 
 // Many blocks: freed in order, they come back in reverse (each class's
 // list is last in, first out).
-fn many() throws(AllocError) {
+fn many() uses alloc throws(AllocError) {
 	let h = alloc.root()
 	var first: [N]usize = [0; N]
 	for i in 0..N {

@@ -9,8 +9,9 @@ import "std/alloc"
 import "std/io"
 
 // An allocator that counts what it allocates and frees, and fails after
-// `limit` allocations: it takes its memory from the root allocator. It's
-// a `static`, so it outlives everything it allocates.
+// `limit` allocations: it takes its memory from the root allocator,
+// calling its methods. It's a `static`, so it outlives everything it
+// allocates.
 struct Counting {
 	limit: u32
 	slot: usize
@@ -38,7 +39,9 @@ unsafe impl alloc.Allocator for Counting {
 			}
 			COUNTS.allocs[self.slot] +%= 1
 		}
-		return try alloc.root().alloc(size, align)
+		unsafe {
+			return try alloc.ROOT.alloc(size, align)
+		}
 	}
 
 	unsafe fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool {
@@ -49,7 +52,7 @@ unsafe impl alloc.Allocator for Counting {
 		if self.slot < 2 {
 			COUNTS.frees[self.slot] +%= 1
 		}
-		alloc.root().free(p, size, align)
+		alloc.ROOT.free(p, size, align)
 	}
 }
 
