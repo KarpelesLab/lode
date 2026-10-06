@@ -1,0 +1,10 @@
+// stdout: 21
+package main
+
+import "std/io"
+
+// A format without text: the only string the program uses is the empty
+// one `Buffered.flush` writes, so the read-only data holds no bytes.
+fn main() {
+	io.print("{}{}", u8(2), u8(1))
+}

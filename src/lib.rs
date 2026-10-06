@@ -366,6 +366,12 @@ fn emit_rodata(
             data.len() as u64,
         ));
     }
+    // The linker doesn't place an empty section, and then can't resolve
+    // the symbols in it: with only empty strings or tables (`""` in
+    // `Buffered.flush`), the section gets a byte, as `.bss` does below.
+    if bytes.is_empty() {
+        bytes.push(0);
+    }
     object.section_mut(section).bytes = bytes;
 }
 
