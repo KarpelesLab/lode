@@ -275,7 +275,7 @@ yet (its result would hold a view in memory).
 
 ## Copies
 
-**Status:** Proposed
+**Status:** Proposed (M8: [allocation.md](allocation.md#moves))
 
 - Small plain types (integers, fixed arrays of them, structs of them) are
   implicitly copied.
@@ -380,7 +380,8 @@ fields can be private, `new` can leave them unwritten through such an
 
 ## Destruction
 
-**Status:** Proposed
+**Status:** Proposed. The M8 proposal works it out:
+[allocation.md](allocation.md#1-resource-types-and-destruction).
 
 Values are destroyed at the end of their scope in reverse order. A type can
 define `fn deinit(sink self)`. Destruction is deterministic and visible in the
@@ -393,7 +394,9 @@ fits the model well.
 
 ## Allocation
 
-**Status:** Proposed
+**Status:** Proposed. The M8 proposal works it out, with the lowering of the
+context and the safety of arenas:
+[allocation.md](allocation.md#2-the-allocator-context).
 
 - There is no global `malloc` that code can call behind the user's back.
   Anything that allocates takes an allocator.
@@ -427,7 +430,9 @@ Allocation returns `AllocError`. Because that is noisy for applications, a
 
 **Open:** can the same library be compiled under both policies without writing
 it twice? (Probably yes, if `AllocError` is part of an inferred error set, see
-[errors.md](errors.md).)
+[errors.md](errors.md).) [allocation.md](allocation.md#out-of-memory)
+proposes yes: under `oom = abort`, `AllocError` is an empty enum, which
+needs only explicit unions (`throws(A | B)`), not inference.
 
 ## Globals
 

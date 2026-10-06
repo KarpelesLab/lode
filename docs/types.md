@@ -195,7 +195,9 @@ let p = Point{x: 1, y: 2}
   views are never stored in structs ([memory.md](memory.md#views)).
 - **Open:** field visibility. Today a struct's fields are visible wherever
   the struct is, and `pub` applies to the whole struct. Private fields (for
-  types that keep an invariant) are likely to come with methods.
+  types that keep an invariant) are likely to come with methods. M8
+  proposes private by default, with `pub` and `pub let` (read-only
+  outside the package) ([allocation.md](allocation.md#field-visibility)).
 
 #### In the compiler today
 

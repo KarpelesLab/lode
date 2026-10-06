@@ -113,20 +113,30 @@ Slicing `a[i..j]` compiles only when the checker proves
 
 ## Next
 
+- **Refinements in signatures** (in progress): `where` on parameters,
+  results, struct fields and named types
+  ([safety.md](safety.md#refinements-in-types)).
+- **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
+  after refinements). The proposal is [allocation.md](allocation.md), in
+  four steps: M8a, resource types, `deinit` and moves for every type, and
+  field visibility; M8b, `uses alloc`, `with`, the root allocator and
+  `Box[T]`; M8c, views returned from functions (rule 2 of
+  [memory.md](memory.md#views)), `List[T]` and `String`; M8d, error-set
+  unions, the `oom` policy and arenas. Its open questions are in
+  [allocation.md](allocation.md#7-questions-for-the-user).
 - **Checker: filling buffers.** A buffer must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read. The
   options are in [memory.md](memory.md#uninitialized-buffers): option 3's
   type, `StackBuf[N]`, exists, and stops filling once fields can be
-  private.
-- **After M7**, in the order of [generics.md](generics.md#after-m7):
-  `dyn Trait`; the allocator context and heap containers; `Send`/`Sync`
-  with the concurrency work; `Str[E]`; error-set unions with generic
-  errors; code sharing for small targets; reflection (a derived
-  `Format`). Format specs (`{:x}`, widths) come with `Format`'s next
-  step. `print` makes one `write` per call since 2026-10-06.
+  private (M8a).
+- **After M7**, in the order of [generics.md](generics.md#after-m7), with
+  the allocator context moved first as M8: `dyn Trait`; `Send`/`Sync` with
+  the concurrency work; `Str[E]`; error-set unions with generic errors
+  (M8d brings explicit unions); code sharing for small targets; reflection
+  (a derived `Format`). Format specs (`{:x}`, widths) come with `Format`'s
+  next step. `print` makes one `write` per call since 2026-10-06.
 
-Later, in no fixed order yet: refinements in signatures, the allocator
-context and heap types, globals with `Atomic`/`Mutex`, the rest of stack
-bounds (the bound in the binary, profiles that require one; `--stack-usage`
-already reports it), green threads, building for the other targets
-(`lode check` already checks for them), and self-hosting.
+Later, in no fixed order yet: globals with `Atomic`/`Mutex`, the rest of
+stack bounds (the bound in the binary, profiles that require one;
+`--stack-usage` already reports it), green threads, building for the other
+targets (`lode check` already checks for them), and self-hosting.

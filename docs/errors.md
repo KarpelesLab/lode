@@ -71,7 +71,8 @@ match parse_u32(s) {                       // full control
 ## Error sets
 
 **Status:** Proposed. The compiler has only named error types, with no
-conversion (below).
+conversion (below). M8 proposes explicit unions, `throws(A | B)`, before
+inference ([allocation.md](allocation.md#out-of-memory)).
 
 - `throws(E)` names a concrete error type.
 - `throws` alone means "**inferred**": the compiler computes the union of every
