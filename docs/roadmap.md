@@ -169,21 +169,32 @@ for a large list). `std/string`'s `String`, UTF-8, with `as_str`,
 `io.Format`, an `io.Writer` and `string.format`. Both are in the prelude.
 Programs that don't use them are byte for byte the same.
 
+**M8d: Error-set unions, the `oom` policy and counted allocators**
+(2026-10-07, [allocation.md](allocation.md#m8d-in-the-compiler)).
+`throws(A | B)`: a union of error types, whose value is one member's;
+`try` converts a member or a smaller union into it, and `match` names
+each member by its type ([errors.md](errors.md#in-the-compiler-today)).
+`@oom(abort)` in the main package: allocation failure ends the process
+(status 134), a function that throws only `AllocError` doesn't throw, and
+`try` drops `AllocError` from a union, so the same library compiles
+under both policies. `alloc.Counted[A]` and `alloc.Arena` count their
+live allocations: their memory lives until the owner and every
+allocation have ended, so a value made in `with alloc = arena { }` can
+leave it; the block borrows the arena, which can't change while the block
+allocates. `alloc.FixedBuf` only in `unsafe` code. `string.print_to` and
+`string.read_all` throw `os.Error | AllocError`. Every program from before
+M8d is byte for byte the same; this completes M8.
+
 ## Next
 
-- **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
-  after refinements). The proposal is [allocation.md](allocation.md), in
-  four steps: M8a, resource types, `deinit` and moves for every type, and
-  field visibility (done); M8b, `uses alloc`, `with`, the root allocator
-  and `Box[T]` (done); M8c, views returned from functions (rule 2 of
-  [memory.md](memory.md#views)), `List[T]`, `String` and `mem.view`
-  (done); M8d, error-set unions, the `oom` policy, arenas and counted
-  allocators (which make `alloc.handle` safe). The prelude is done: `Box`,
-  `List` and `String` without an import, loaded only by the programs that
-  name them ([packages.md](packages.md#the-prelude)). Left from M8c:
+- **Left from M8** ([allocation.md](allocation.md#m8d-in-the-compiler)):
   `impl Eq` for types with pointer fields (`==` on `List` and `String`),
   `List.insert` and `remove`, the projection for `ArrayVec` and
-  `StackBuf`. Its open questions are in
+  `StackBuf`, `@root_allocator` (a fixed buffer over a `static` array as
+  the root, for firmware), union members that depend on a type parameter,
+  and `io.Writer` for `String` with a union error. Then `Map[K, V]`, and
+  the region check that would let a fixed buffer on the stack be a `with`
+  allocator in safe code. The open questions are in
   [allocation.md](allocation.md#7-decisions).
 - **Checker: filling buffers.** A plain array must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read.
@@ -194,7 +205,8 @@ Programs that don't use them are byte for byte the same.
 - **After M7**, in the order of [generics.md](generics.md#after-m7), with
   the allocator context moved first as M8: `dyn Trait`; `Send`/`Sync` with
   the concurrency work; `Str[E]`; error-set unions with generic errors
-  (M8d brings explicit unions); code sharing for small targets; reflection
+  and inferred sets (M8d brought explicit unions); code sharing for small
+  targets; reflection
   (a derived `Format`). Format specs (`{:x}`, widths) come with `Format`'s
   next step. `print` makes one `write` per call since 2026-10-06.
 

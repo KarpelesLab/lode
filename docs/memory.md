@@ -611,7 +611,7 @@ fits the model well.
 
 ## Allocation
 
-**Status:** Implemented (M8b), but the `oom` policy and arenas (M8d). The
+**Status:** Implemented (M8b; the `oom` policy and arenas in M8d). The
 M8 proposal works it out, with the lowering of the context and the safety
 of arenas: [allocation.md](allocation.md#2-the-allocator-context).
 
@@ -622,8 +622,9 @@ of arenas: [allocation.md](allocation.md#2-the-allocator-context).
   inherit their own, and it can be overridden for a scope:
 
 ```
-fn build(names: []str) uses alloc throws(AllocError) -> List[str] { ... }
+fn build(names: []str) uses alloc throws(AllocError) -> List[String] { ... }
 
+var arena = try alloc.Arena.new()
 with alloc = arena {
 	let l = try build(names)     // allocates in the arena
 }
@@ -637,7 +638,7 @@ with alloc = arena {
 
 ### In the compiler today
 
-**Status:** Implemented (M8b)
+**Status:** Implemented (M8b to M8d)
 
 - `fn f() uses alloc throws(AllocError) -> T` declares that `f`
   allocates; a function without `uses alloc` can't call it, nor allocate
@@ -648,6 +649,16 @@ with alloc = arena {
   with the allocator of the handle `h` (`alloc.Handle`) in context:
   `alloc.root()`, or `alloc.handle(a)` of any allocator `a` (`unsafe`: `a`
   must outlive what it allocates, as a `static` does).
+- `with alloc = arena { ... }` allocates from a counted allocator
+  (`alloc.Arena`, `alloc.Counted[A]`, M8d), a variable the block borrows:
+  allocating after it changed or moved, on some path in the block, is an
+  error. Its memory lives until it and everything allocated from it have
+  ended: a value made in the block can leave it, and the arena's
+  function. Its handle as a value is `unsafe`, and so is
+  `alloc.current()`: a handle kept without an allocation could outlive the
+  arena ([allocation.md](allocation.md#m8d-in-the-compiler)).
+- A fixed buffer over memory the caller gives (`alloc.FixedBuf`) is used
+  through `unsafe` code only: over a stack array, it ends with its frame.
 - `main` declares `uses alloc` to get the root allocator, `alloc.ROOT`,
   a general allocator written in Lode (`alloc.Heap`: size classes, free
   lists, 64 KiB chunks and large blocks mapped with `mmap`).
@@ -660,9 +671,12 @@ with alloc = arena {
   handle tests which allocator it names
   ([allocation.md](allocation.md#m8b-in-the-compiler)).
 - Allocating throws `AllocError` (`out_of_memory`), built in like
-  `Ordering`. The `oom` policy below isn't there yet (M8d).
+  `Ordering`, unless the main package says `@oom(abort)` (below).
 
 ### Out of memory
+
+**Status:** Decided (the recommended answer of allocation.md);
+implemented (M8d)
 
 Allocation returns `AllocError`. Because that is noisy for applications, a
 **program-level policy** can turn it into a defined abort:
@@ -672,11 +686,16 @@ Allocation returns `AllocError`. Because that is noisy for applications, a
 - `oom = abort` (opt-in for applications): allocating functions are no longer
   `throws(AllocError)` from the caller's point of view.
 
-**Open:** can the same library be compiled under both policies without writing
-it twice? (Probably yes, if `AllocError` is part of an inferred error set, see
-[errors.md](errors.md).) [allocation.md](allocation.md#out-of-memory)
-proposes yes: under `oom = abort`, `AllocError` is an empty enum, which
-needs only explicit unions (`throws(A | B)`), not inference.
+The same library compiles under both policies, without inference: the
+policy is `@oom(abort)` (or `@oom(error)`) in the main package, and under
+`abort`, `AllocError` never happens. Allocation failure ends the process
+with status 134 (`out of memory` on standard error); a function that
+throws only `AllocError` doesn't throw, so `try` on it compiles to
+nothing; `try` drops `AllocError` from a union (`throws(A | B)`,
+[errors.md](errors.md#in-the-compiler-today)). Library code is written
+once, with `try`, as for `error`; an application under `abort` may leave
+out `try` on calls whose only error is `AllocError`
+([allocation.md](allocation.md#out-of-memory)).
 
 ## Globals
 

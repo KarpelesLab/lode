@@ -1,4 +1,4 @@
-# Allocation and heap types (M8 proposal)
+# Allocation and heap types (M8)
 
 This is the design proposal for milestone M8 ([roadmap.md](roadmap.md)):
 types that own resources, the allocator context, and the first heap types.
@@ -17,7 +17,10 @@ what the compiler does in [M8a in the compiler](#m8a-in-the-compiler).
 M8b is implemented (2026-10-06): the allocator context, the root
 allocator and `Box`, in [M8b in the compiler](#m8b-in-the-compiler).
 M8c is implemented (2026-10-06): views returned from functions, `List`
-and `String`, in [M8c in the compiler](#m8c-in-the-compiler).
+and `String`, in [M8c in the compiler](#m8c-in-the-compiler). M8d is
+implemented (2026-10-07): error-set unions, the `oom` policy and counted
+allocators, in [M8d in the compiler](#m8d-in-the-compiler). That
+completes M8.
 
 ## Starting point
 
@@ -367,7 +370,8 @@ fn read_lines(f: File) uses alloc throws(LineError | AllocError) -> List[String]
 ### `with alloc = x`
 
 **Status:** Implemented (M8b); handles of the root, of a `static`
-allocator, or (`unsafe`) of any allocator until counted ones (M8d)
+allocator, or (`unsafe`) of any allocator; a counted allocator given as
+it is, `with alloc = arena` (M8d)
 
 ```
 fn summarize(path: str) uses alloc throws(Error | AllocError) -> Summary {
@@ -452,7 +456,8 @@ and the stored allocator is zero-sized ([Lowering](#lowering-the-context)).
 
 ### Allocators that end: arenas and fixed buffers
 
-**Status:** Decided (question 5): counted allocators, in M8d
+**Status:** Decided (question 5): counted allocators; implemented (M8d),
+with the choices of [M8d in the compiler](#m8d-in-the-compiler)
 
 Option 1 above stores a pointer to the allocator in every container. If
 the allocator is destroyed first (an arena local whose function returns, a
@@ -566,7 +571,8 @@ The cost when a program does use `with`: one register per call to a
 
 ### Out of memory
 
-**Status:** Proposed (memory.md); details proposed here
+**Status:** Implemented (M8d), as proposed here, with the choices of
+[M8d in the compiler](#m8d-in-the-compiler)
 
 memory.md proposes a program-level policy: `oom = error` (the default)
 propagates `AllocError`; `oom = abort` makes allocating functions not throw
@@ -841,9 +847,8 @@ cap` a fact, no refinements of `inout` results, and `push_within` returns
 
 ## 5. Code size: pay only for what you use
 
-**Status:** Implemented for M8a to M8c (the counted allocators are M8d);
-the reference program is `tests/programs/list_numbers.lode`, 12,330 bytes
-at `-O2`
+**Status:** Implemented (M8a to M8d); the reference program is
+`tests/programs/list_numbers.lode`, 12,330 bytes at `-O2`
 
 - **No `uses alloc` reachable from `main`**: no allocator, no hidden
   parameter, no `mmap`. Hello world is unchanged: 577 bytes, `write` and
@@ -1068,12 +1073,11 @@ What M8b does, and the choices made where the proposal left room:
   `defer`, destruction and every exit work as in any block, and the
   context is the outer one again after it. A `defer` body runs in the
   context it's written in, also at an exit from inside a `with` block.
-- **Handles** (`std/alloc`). `alloc.current()` (`uses alloc`) is the
-  context's; `alloc.root()` the root allocator's; and `unsafe
+- **Handles** (`std/alloc`). `alloc.current()` (`uses alloc`, and
+  `unsafe` since M8d) is the context's; `alloc.root()` the root allocator's; and `unsafe
   alloc.handle(a)` one of the allocator `a`, a struct or an enum: its
   caller promises that `a` outlives what it allocates and doesn't move,
-  which a `static` does. Counted allocators, which make handles safe to
-  keep, are M8d. `h.alloc(size, align)` and `h.resize(...)` declare `uses
+  which a `static` does. Counted allocators came with M8d. `h.alloc(size, align)` and `h.resize(...)` declare `uses
   alloc` too, so a function without it allocates through no handle
   either; `h.free(...)` doesn't, as destruction needs no context.
 - **`Allocator`** is an `unsafe trait` (`unsafe impl` implements one, and
@@ -1319,6 +1323,9 @@ What M8c does, and the choices made where the proposal left room:
 
 ### M8d: error-set unions, the `oom` policy and arenas
 
+**Status:** Implemented (2026-10-07): see
+[M8d in the compiler](#m8d-in-the-compiler)
+
 - `throws(A | B)`, conversion on `try`, matching by member type; empty
   members dropped.
 - `@oom(abort)`: `AllocError` empty, the root allocator aborting, `try` on
@@ -1332,6 +1339,118 @@ What M8c does, and the choices made where the proposal left room:
   from it is alive (freed by the last `free`, checked by counting `munmap`);
   `with` inside `with`.
 
+
+### M8d in the compiler
+
+**Status:** Implemented (2026-10-07)
+
+What M8d does, and the choices made where the proposal left room:
+
+- **Error-set unions.** `throws(A | B)` (two or more error types, each
+  named once) is a union: an enum the compiler makes, with one variant
+  per member, named as the member is shown (`ParseError`, `os.Error`),
+  whose one payload field is the member's value. The variants are sorted
+  by name, so `A | B` and `B | A` are the same type. A member can't be a
+  type that depends on a type parameter yet. The rest is in
+  [errors.md](errors.md#in-the-compiler-today): `try` converts a member,
+  or a smaller union, into the caller's union (and nothing else); a
+  member's value converts to the union where the union is expected
+  (`throw ParseError.empty`); `.name` takes the variant of the one member
+  that has it; `match` names a member by its type (`ParseError(p) =>`,
+  `os.Error(e) =>`). The conversion is a `catch` that rethrows, which the
+  checker writes: a union's tag, then the member's, so lowering and packed
+  results are unchanged.
+- **Unions are flat.** The proposal left open whether a union's value
+  holds the member (`.alloc(e)`) or every member's variants side by
+  side. It holds the member: two members can have variants of the same
+  name (`os.Error.io` and a user's `io`), the conversion of a member is
+  one tag, and code that handles one member passes its value on as it
+  is. Matching a variant through a union is a `match` in a `match`.
+- **`@oom(abort)`**, alone on a line in the main package, sets the
+  policy; `@oom(error)` is the default, and setting it twice is an
+  error, as is `@oom` in another package. With `abort`, `AllocError`
+  never happens, but the checker sees the same types under both
+  policies, so the same source checks the same way: `AllocError` keeps
+  its variant, and making one (`throw .out_of_memory`) calls
+  `alloc.out_of_memory()`, which writes `out of memory` to standard error
+  and ends the process with status 134 (`os.abort()`). `crate::mono`
+  applies the policy: a function that throws only `AllocError` doesn't
+  throw; `try` and `catch` on a call of one are the call; where a result
+  is still expected (a `match` on the call), it's always `ok`. So the
+  "empty enum" of the proposal is an enum whose value is never made.
+- **What `abort` allows.** A call that throws only `AllocError` may be
+  left without `try` (`xs.push(5)`), and `try` drops `AllocError` from a
+  union: `try` on a `throws(ParseError | AllocError)` call passes on
+  `ParseError` from a `throws(ParseError)` function. A `try`, `catch` or
+  `match` on a call that can't fail any more is allowed, without a
+  warning. The union keeps its `AllocError` member (its value is never
+  made), so a `match` on it has the same arms under both policies.
+- **Counted allocators** (`std/alloc`). A **control block** holds an
+  allocator `A` and what releasing it needs; it's on the memory of the
+  allocator in context when it's made, in one block with a **count**
+  before it: the live allocations, plus one for the owner. `alloc` adds
+  one, `free` takes one; the last to end (the owner's `deinit`, or the
+  last `free`) destroys `A` and frees the block. A handle of a counted
+  allocator names its control block, an allocator type of the program
+  like any other (`alloc.handle_at(p)`). `alloc.Counted[A]` is the owner
+  of any allocator counted so; `alloc.Arena` is a counted bump
+  allocator (chunks of 4 KiB, doubling to 1 MiB, from its parent; it
+  gives back only its last block, `reset()` reuses its memory once
+  nothing from it is alive). An arena made in an arena is one of its
+  allocations. Each allocation through a counted handle costs an
+  increment, each free a decrement and a test.
+- **`with alloc = arena`.** The proposal's safe `arena.handle()` would
+  be a `Copy` value that can outlive the arena: kept in a variable after
+  the arena is destroyed, it would allocate from freed memory. So a
+  handle of a counted allocator isn't a value safe code gets:
+  `Arena.handle()` and `Counted.handle()` are `unsafe`, and so is
+  `alloc.current()`. Safe code gives the counted allocator itself, a
+  variable: `with alloc = arena { ... }`. The block borrows it, as a
+  view borrows what it views ([memory.md](memory.md#views-in-the-compiler-today)):
+  a call that allocates (`uses alloc`) after the arena changed or moved,
+  on some path in the block, is an error that points at the change; so
+  is a call that allocates while it changes or takes the arena (`f(&arena)`,
+  `f(arena)`). A `defer` body in the block can't allocate from it (it
+  runs at the block's exits, after the arena may have changed). Changing
+  the arena after the block's last allocation is fine. What the block
+  allocated keeps the arena's memory alive wherever it goes: returned,
+  stored through `inout`, kept by a `defer`.
+- **Containers keep a counted allocator alive** by their allocation:
+  `List`, `String` and `Box` hold their allocator's handle with the
+  memory they got from it, until they free it. A handle is only taken
+  from the context inside `std` (`alloc.current()`, now `unsafe`) by a
+  container that allocates through it at once.
+- **Fixed buffers.** `alloc.FixedBuf` carves blocks from memory the
+  caller gives (`unsafe fn FixedBuf.new(p, n) -> ?FixedBuf`, its state
+  in the first 32 bytes). It's not counted: over a stack array it ends
+  with its frame. `with alloc = f` is an error; `unsafe` code makes its
+  handle, `alloc.handle(f)`, and promises that nothing it allocates
+  outlives the buffer. Over a `static` array it never ends.
+  `@root_allocator` (a fixed buffer as the root) isn't there yet.
+- **Allocators built on others.** An allocator's methods don't declare
+  `uses alloc`, so they take memory from their parent with `unsafe
+  h.raw_alloc(size, align)`, which is `h.alloc` without the context.
+- **std.** `alloc.Counted`, `Arena`, `FixedBuf`, `handle_at`,
+  `Handle.raw_alloc`, `out_of_memory`; `string.print_to(f, fmt, args...)`
+  (formats into a `String`, then one write) and `string.read_all(f, &out)`
+  (reads a file to its end into a `List[u8]`), which throw
+  `os.Error | AllocError`. `io.Writer` for `String` still doesn't
+  allocate: a trait method can't declare `uses alloc` that its trait
+  doesn't, and `io.Writer`'s methods don't.
+- **Sizes.** Hello world is 577 bytes and two system calls at `-O2`.
+  Every runnable program of tests/programs from before M8d is byte for
+  byte the same at `-O0` and `-O2` (216 builds), including the ones that
+  allocate: `list_numbers.lode` is 12,330 bytes. The same program (a
+  list of squares, `tests/allocation.rs`) is 9,209 bytes under the
+  default policy and 8,023 under `@oom(abort)` at `-O2`, where `push`
+  returns nothing. `arenas.lode` is 45,760 bytes; destroying an arena
+  while a list from it lives unmaps nothing, and the list's destruction
+  unmaps the arena's chunk (checked under `strace`).
+- **Not done in M8d.** Members of a union that depend on a type
+  parameter; a union converted to another by `throw e` (only `try`
+  converts); `io.Writer` for `String` with a union error;
+  `@root_allocator`; inferred error sets.
+
 After M8: `Map[K, V]`, linear types if wanted, `Box[dyn Trait]`, the region
 check for stack buffers, refinements on `inout` results, allocation at
 compile time (an evaluator heap whose values can't be a constant's value).
@@ -1341,9 +1460,9 @@ compile time (an evaluator heap whose values can't be a constant's value).
 **Status:** Decided 2026-10-06 by the user for 3 (with `pub let`), 5, 8 and
 11; the others keep the recommended answer unless the user changes them.
 M8a implements 1, 2, 3, 9 and 10 as written. M8b implements 4, and the
-context's part of 6 with a handle of two words until counted allocators
-(M8d). The prelude implements 11, with `Box`, and M8c adds `List` and
-`String` to it; M8c implements 8 for `List`.
+context's part of 6 with a handle of two words. The prelude implements
+11, with `Box`, and M8c adds `List` and `String` to it; M8c implements 8
+for `List`. M8d implements 5, the policy's part of 6, and 7.
 
 1. **Destruction is a method, `fn T.deinit(sink self)`**, not a `Drop`
    trait; it can't throw or allocate
@@ -1364,15 +1483,18 @@ context's part of 6 with a handle of two words until counted allocators
    lives until its last allocation is freed; stack-backed buffers aren't
    `with` allocators in safe code
    ([Allocators that end](#allocators-that-end-arenas-and-fixed-buffers)).
-   This is the main safety decision of M8. *Decided.*
+   This is the main safety decision of M8. *Decided; implemented (M8d):
+   `alloc.Counted[A]`, `alloc.Arena`; `alloc.FixedBuf` only through
+   `unsafe` code.*
 6. **The context is a hidden parameter** of `uses alloc` functions only,
    omitted when no `with` is reachable, and dispatched over the program's
    allocator types otherwise ([Lowering](#lowering-the-context)); **the
    `oom` policy is `@oom(abort)` in the main package**, default `error`
    ([Out of memory](#out-of-memory)). *Recommended; the context is
-   implemented (M8b), the policy is M8d.*
+   implemented (M8b), the policy too (M8d).*
 7. **Error-set unions `throws(A | B)` come in M8**, explicit, without
-   inference ([Out of memory](#out-of-memory)). *Recommended.*
+   inference ([Out of memory](#out-of-memory)). *Recommended; implemented
+   (M8d).*
 8. **`xs[i]` works on `List`** through a sealed, std-only projection to a
    slice, consistent with "no operator overloading" because it means
    exactly slice indexing ([`List[T]`](#listt)). *Decided; implemented

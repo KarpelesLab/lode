@@ -117,7 +117,7 @@ fn main() {
 | Compound assignment | `x += 1`, `x +%= 1`, `flags \|= bit`: every binary operator `op` has `x op= v` |
 | Function | `fn name(a: T, b: U) -> R { ... }` |
 | Function that can fail | `fn name(a: T) throws(E) -> R`, `try f()`, `f() catch e { ... }` (see below) |
-| Allocation | `fn name(a: T) uses alloc throws(AllocError) -> R` (`uses` after the parameters, before `throws`), `with alloc = h { ... }`, `alloc.Box.new(v)`, `b.value` ([allocation.md](allocation.md#m8b-in-the-compiler)) |
+| Allocation | `fn name(a: T) uses alloc throws(AllocError) -> R` (`uses` after the parameters, before `throws`), `with alloc = h { ... }`, `with alloc = arena { ... }`, `alloc.Box.new(v)`, `b.value`, `@oom(abort)` ([allocation.md](allocation.md#m8d-in-the-compiler)) |
 | Generic parameters | `fn max[T: Ordered](sink a: T, sink b: T) -> T` |
 | Parameter conventions | `inout x: T`, `sink x: T`, `set x: T`, passed `f(&x)` (see below) |
 | Optional | `?T`, `none`, `if let v = opt { ... }` |
@@ -394,6 +394,9 @@ fn main() -> u32 {
 ```
 
 - `throws(E)` comes after the parameters and before `-> T`.
+  `throws(A | B)` names a union of error types; a `match` on its value
+  names each member by its type, `A(a) =>` or `pkg.E(e) =>`
+  ([errors.md](errors.md#in-the-compiler-today)).
 - `try call` applies to the call that follows it: `try f() + 1` adds 1 to
   the value.
 - `call catch name { ... }`, `call catch _ { ... }`, `call catch value`.
@@ -751,6 +754,9 @@ fn word() -> str {
   marks one the compiler implements (`mem.swap`, `mem.take`,
   `mem.forget`): its body is empty and not used. Elsewhere it's an
   error.
+- `@oom(abort)` (or `@oom(error)`, the default) on its own line in the
+  main package sets the program's out-of-memory policy
+  ([allocation.md](allocation.md#out-of-memory)).
 - `if comptime cond { ... } else ...` in a body or among declarations.
   `else if comptime` continues the chain. The branches not taken must
   parse, nothing more. `if comptime let` doesn't exist.

@@ -70,17 +70,33 @@ match parse_u32(s) {                       // full control
 
 ## Error sets
 
-**Status:** Proposed. The compiler has only named error types, with no
-conversion (below). M8 proposes explicit unions, `throws(A | B)`, before
-inference ([allocation.md](allocation.md#out-of-memory)).
+**Status:** Explicit unions implemented (M8d, below); inference
+Proposed
 
-- `throws(E)` names a concrete error type.
+- `throws(E)` names a concrete error type, and `throws(A | B)` a union
+  of several ([allocation.md](allocation.md#out-of-memory)).
 - `throws` alone means "**inferred**": the compiler computes the union of every
   error the body can produce, as Zig does. This is convenient inside a package.
 - **Public functions must name their error type**, so an internal change can't
   silently change a public API. (Open: enforce by lint or by the compiler?)
 - A union of error types converts implicitly on `try` when the target set is a
   superset. Converting to an unrelated type is explicit (`catch e { throw .io(e) }`).
+
+```
+fn load(f: io.File) uses alloc throws(os.Error | AllocError | ParseError) -> Config {
+	var text = List[u8].new()
+	try string.read_all(f, &text)   // os.Error | AllocError
+	return try parse(text)          // ParseError
+}
+
+load(f) catch e {
+	match e {
+		ParseError(p) => ...      // a member, by its type
+		os.Error(o) => ...
+		AllocError => ...
+	}
+}
+```
 
 ## Error return traces
 
@@ -116,8 +132,8 @@ and `errdefer` cover the rest.
 - A call to a function that throws must be handled. A call that isn't is
   an error: "`f` can throw, and its error must be handled".
   - `try f()` is the call's value. On an error, the function leaves with
-    it. Only a function that throws can use `try`, and only with the same
-    error type: there's no conversion between error sets yet. To convert,
+    it. Only a function that throws can use `try`, with the same error
+    type, or one `try` converts (a union, below). To convert otherwise,
     catch and throw: `f() catch e { throw .io(...) }`.
   - `f() catch e { ... }` runs the block with `e` bound to the error.
     When the call's value is used (`let n = f() catch e { ... }`), the
@@ -164,9 +180,32 @@ and `errdefer` cover the rest.
   `{ ok(T), err(E) }` laid out like any enum
   ([types.md](types.md#in-the-compiler-today)), in storage the caller
   passes. `try`, `catch` and `match` test its tag. There's no unwinding.
+- **Unions** (M8d): `throws(A | B | C)` names several error types, each
+  an enum, each once. Its value is one of them: an enum the compiler
+  makes, with one variant per member, named as the member is written
+  (`ParseError`, `os.Error`), whose payload is the member's value. The
+  order of the members doesn't matter (`A | B` is `B | A`).
+  - `try` converts: a call that throws a member, or a union of some of
+    the members, passes its error on as the caller's union. Nothing else
+    converts: `try` of a union in a function that throws one of its
+    members is an error, as is `try` of an error that isn't a member.
+  - A member's value is a value of the union where the union is
+    expected: `throw ParseError.empty`, and `throw .empty` when exactly
+    one member has a variant `empty`.
+  - `catch e` binds the union. `match e { ParseError(p) => ..., os.Error
+    => ... }` names each member by its type, and binds its value; every
+    member must be matched (or `_`). A variant of a member is matched in
+    a `match` on that value.
+  - A member can't depend on a type parameter yet, and `throw e` of a
+    smaller union isn't converted (use `try`).
+- **`AllocError` under `@oom(abort)`**: the main package's `@oom(abort)`
+  says allocation failure ends the process (status 134). Then
+  `AllocError` never happens: a call that throws only it needs no `try`,
+  and `try` drops it from a union (`ParseError | AllocError` passes on
+  as `ParseError`) ([allocation.md](allocation.md#out-of-memory)).
 - Not yet: inferred error sets (`throws` alone is an error: "name the
-  error type"), conversion between error sets on `try`, error return
-  traces, and `errdefer` with the error (`errdefer |e|` in Zig).
+  error type"), error return traces, and `errdefer` with the error
+  (`errdefer |e|` in Zig).
 
 Decisions made for this subset:
 
@@ -175,6 +214,9 @@ Decisions made for this subset:
 - After `catch`, a `{` following a name starts the block, as after `if`:
   `catch e {`. A struct literal fallback goes in parentheses:
   `catch (Point{x: 0, y: 0})`.
+- A union is flat: its value holds the member's value, not every
+  member's variants side by side, since two members can have variants of
+  the same name.
 - Public functions name their error type, since nothing else is supported.
   Whether the compiler or a lint enforces that once inference exists is
   still Open.

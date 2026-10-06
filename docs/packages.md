@@ -207,7 +207,7 @@ Go's vocabulary, which is proven:
   - `swap`, `take`, `forget`, `from_addr`, `view` and `view_str` are
     implemented by the compiler: they're declared `@intrinsic`, which only
     the standard library can do, and their empty bodies aren't used.
-- `std/alloc`, allocation (M8b,
+- `std/alloc`, allocation (M8b and M8d,
   [allocation.md](allocation.md#m8b-in-the-compiler)):
   - `Allocator`, an `unsafe trait`: `alloc(self, size: usize, align: usize)
     throws(AllocError) -> *u8`, and the `unsafe` `resize(self, p, old, new,
@@ -218,12 +218,31 @@ Go's vocabulary, which is proven:
     allocator changes its state in `unsafe` code. `os.PageAllocator` and
     `Heap` implement it; both grow a large block with `mremap_move`.
   - `Handle`, which allocator, and where: what `with alloc = h` takes and
-    what a value that owns memory keeps. `current()` (`uses alloc`) is the
-    context's, `root()` the root allocator's, and `unsafe handle(a)` one of
-    the allocator `a`, which must outlive what it allocates (a `static`).
+    what a value that owns memory keeps. `root()` is the root allocator's;
+    `unsafe current()` (`uses alloc`) the context's; `unsafe handle(a)`
+    one of the allocator `a`, which must outlive what it allocates (a
+    `static`); `unsafe handle_at(p)` one of the allocator `p` points to.
     `h.alloc(size, align)`, `h.resize(...)` and `h.grow(...)` (`uses
-    alloc`) and `h.free(...)` call the handle's allocator. With no allocator but the
-    root in the program, a handle is zero-sized.
+    alloc`) and `h.free(...)` call the handle's allocator, and so does
+    `unsafe h.raw_alloc(size, align)`, without the context, for an
+    allocator that takes its memory from another. With no allocator but
+    the root in the program, a handle is zero-sized.
+  - Counted allocators (M8d,
+    [allocation.md](allocation.md#m8d-in-the-compiler)): `Counted[A]` owns
+    an allocator `A` in a control block, with a count of its live
+    allocations; its memory lives until the owner and every allocation
+    have ended. `Counted.new(sink a: A) uses alloc throws(AllocError)`,
+    `live(self) -> usize`, `unsafe handle(self)`. `Arena` is a counted
+    bump allocator: `Arena.new() uses alloc throws(AllocError)`,
+    `live(self)`, `reset(inout self) -> bool` (reuses its memory when
+    nothing from it is alive), `unsafe handle(self)`. Safe code allocates
+    from either with `with alloc = arena { ... }`.
+  - `FixedBuf`, an allocator over memory the caller gives: `unsafe
+    FixedBuf.new(p: *u8, n: usize) -> ?FixedBuf`, `room(self) -> usize`.
+    Not counted: `unsafe` code makes its handle (`handle(f)`).
+  - `out_of_memory() -> never`: writes `out of memory` to standard error
+    and ends the process with status 134. Under `@oom(abort)`, making an
+    `AllocError` calls it.
   - `Heap`, the general allocator, and `ROOT`, the one heap and the root
     allocator (a `pub static`, used in `unsafe` code): blocks of 16 to 2048
     bytes in size classes (powers of two), each class with a list of freed
@@ -278,6 +297,11 @@ Go's vocabulary, which is proven:
     throws(AllocError)` appends formatted text, as `io.print` writes it:
     once to count the bytes, `reserve`, then into the string. `format(fmt,
     args...)` makes a new string that way.
+  - `print_to(f: io.File, comptime fmt: str, args: ..A) uses alloc
+    throws(os.Error | AllocError)` formats into a new string, then writes
+    it in one call; `read_all(f: io.File, inout out: list.List[u8]) uses
+    alloc throws(os.Error | AllocError) -> usize` reads `f` to its end
+    into `out` (M8d).
   - `String` is in the prelude ([below](#the-prelude)).
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type

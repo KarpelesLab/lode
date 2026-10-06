@@ -82,6 +82,17 @@ What works:
   is written in Lode. A program that doesn't allocate pays nothing, and one
   with only the root allocator passes no context and keeps no handle in
   its boxes ([docs/allocation.md](docs/allocation.md#m8b-in-the-compiler))
+- arenas: `with alloc = arena { ... }` allocates from an `alloc.Arena`
+  (or any allocator wrapped in `alloc.Counted`), which counts its live
+  allocations: its memory lives until the arena and everything allocated
+  from it have ended, so a list made in the block can be returned. The
+  block borrows the arena: allocating after it changed is an error. A
+  fixed buffer over memory the caller gives is for `unsafe` code
+  ([docs/allocation.md](docs/allocation.md#m8d-in-the-compiler))
+- the out-of-memory policy: `@oom(abort)` in the main package ends the
+  process when memory runs out (status 134); then a call that throws only
+  `AllocError` throws nothing, and `try` on it compiles to nothing. The
+  same library code compiles under both policies
 - `List[T]`, a growable list on the heap: `xs.push(v)`, `xs.pop()`,
   `xs[i]` and `xs[i] = v` proven against `xs.len` like a slice's index,
   `xs[i..j]`, `for x in xs`, `slices.sort(&xs)`, `xs.clone()`; it grows
@@ -117,7 +128,9 @@ io.print("{}\n", s.len)    // error: `s` is used after `xs` changed, and `s` vie
 - errors as return values: `fn parse(s: []u8) throws(ParseError) -> u32`,
   `throw .empty`, and every call handled with `try f()`,
   `f() catch e { ... }`, `f() catch 0`, `f() catch _ {}` or `match`;
-  `defer` and `errdefer` ([docs/errors.md](docs/errors.md))
+  `defer` and `errdefer`; unions of error types, `throws(os.Error |
+  AllocError)`, which `try` converts into and `match` takes apart by
+  member type ([docs/errors.md](docs/errors.md#in-the-compiler-today))
 - parameter conventions: `inout x: T`, `sink x: T`, `set x: T`, with
   `swap(&a, &p.x)` at the call site and exclusivity checked
   ([docs/memory.md](docs/memory.md#parameter-conventions-in-the-compiler-today))
@@ -163,8 +176,9 @@ io.print("{}\n", s.len)    // error: `s` is used after `xs` changed, and `s` vie
   (bytes, whose storage isn't filled when it's made) and
   `std/vec.ArrayVec[T, N]` (of any type, resources too); `std/mem`
   (`swap`, `replace`, `take`, `destroy`, `forget`, `view`); `std/alloc`
-  (`Allocator`, `Handle`, `Heap`, `Box`); `std/list` (`List`) and
-  `std/string` (`String`); `io.Writer`,
+  (`Allocator`, `Handle`, `Heap`, `Box`, `Arena`, `Counted`, `FixedBuf`);
+  `std/list` (`List`) and `std/string` (`String`, `format`, `print_to`,
+  `read_all`); `io.Writer`,
   implemented by files and buffers; `std/encoding` (UTF-8 and ASCII over
   bytes)
 - `unsafe` blocks and functions, raw pointers to any type (`*T`, `s.ptr`
