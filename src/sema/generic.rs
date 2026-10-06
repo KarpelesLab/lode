@@ -1094,16 +1094,8 @@ impl Checker<'_> {
                     );
                     return None;
                 }
-                if cx.defer_depth > 0 && local < cx.defer_floor {
-                    // Checked at the exits the `defer` runs at.
-                    let (on_error, depth) = cx.defer_kind.expect("in a `defer`");
-                    cx.defer_moves.push(super::DeferMove {
-                        local,
-                        on_error,
-                        depth,
-                        span,
-                    });
-                }
+                // Checked at the exits the `defer` runs at.
+                cx.defer_use(local, true, span);
                 cx.env.declare_uninit(local);
                 cx.moved.insert(local);
                 cx.locals[local].drop_flag = true;

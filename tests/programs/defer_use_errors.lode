@@ -1,0 +1,255 @@
+// error: `s` views `xs`, which can change or end before a `defer` that uses `s` runs, at the end of its block
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: this `defer` uses `b`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: this `defer` moves `b`, which a `defer` written after it moves: that one runs first
+// error: this `defer` uses `b`, which a `defer` written after it moves: that one runs first
+// error: `r` may be moved or unusable at this exit, where a `defer` that uses it runs
+// error: `b` may be moved or unusable at this exit, where a `defer` that uses it runs
+// error: `f` may be moved or unusable at this exit, where an `errdefer` that uses it runs
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: `x` may be moved or unusable at this exit, where a `defer` that uses it runs
+// error: a `defer` body can't use `s`, which views `xs`: it runs when the block is left, after `xs` may have changed
+// error: `s` views `xs`, which can change or end before a `defer` that uses `s` runs, at this exit
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// error: this `defer` uses `r`, which may be moved or unusable at the end of its block, where the `defer` runs
+// help: a `defer` runs when its block is left: after it, don't move `r`, nor change what it views or reads in place
+// help: don't give `s` another value after the `defer`
+package main
+
+import "std/mem"
+
+fn show(s: []u32) -> u32 {
+	var total: u32 = 0
+	for x in s {
+		total = total +% x
+	}
+	return total
+}
+
+fn read(b: Box[[4]u32]) -> u32 {
+	return b.value[0]
+}
+
+fn consume(sink b: Box[[4]u32]) {
+}
+
+fn new_box(v: u32) uses alloc -> ?Box[[4]u32] {
+	return Box[[4]u32].new([v; 4]) catch _ {
+		return none
+	}
+}
+
+// The view is given a view of a list after the `defer`: the list is
+// destroyed before the `defer` runs.
+fn reassigned_view() uses alloc {
+	let z: [4]u32 = [0, 0, 0, 0]
+	var s: []u32 = z[..]
+	defer {
+		let k = show(s)
+	}
+	var xs = List[u32].new()
+	xs.extend([1, 2, 3, 4]) catch _ {}
+	s = xs.as_slice()
+}
+
+// The optional a binding reads in place is changed after the `defer`.
+fn binding_changed() uses alloc {
+	var o: ?Box[[4]u32] = new_box(1)
+	if let r = o {
+		defer {
+			let k = read(r)
+		}
+		o = none
+	}
+}
+
+// A variable the `defer` uses is moved after it.
+fn moved_after() uses alloc {
+	let b = Box[[4]u32].new([1, 2, 3, 4]) catch _ {
+		return
+	}
+	defer {
+		let k = read(b)
+	}
+	consume(b)
+}
+
+fn taken() uses alloc {
+	var o: ?Box[[4]u32] = new_box(1)
+	if let r = o {
+		defer {
+			let k = read(r)
+		}
+		let t = o.take()
+	}
+}
+
+fn swapped() uses alloc {
+	var o: ?Box[[4]u32] = new_box(1)
+	var p: ?Box[[4]u32] = none
+	if let r = o {
+		defer {
+			let k = read(r)
+		}
+		mem.swap(&o, &p)
+	}
+}
+
+// Two `defer`s that move one variable: the later one runs first.
+fn moved_twice() uses alloc {
+	let b = Box[[4]u32].new([1, 2, 3, 4]) catch _ {
+		return
+	}
+	defer {
+		consume(b)
+	}
+	defer {
+		consume(b)
+	}
+}
+
+// The later `defer` moves what the earlier one uses.
+fn used_after_moved() uses alloc {
+	let b = Box[[4]u32].new([1, 2, 3, 4]) catch _ {
+		return
+	}
+	defer {
+		let k = read(b)
+	}
+	defer {
+		consume(b)
+	}
+}
+
+// `continue` runs the `defer` after the change.
+fn in_loop() uses alloc {
+	var o: ?Box[[4]u32] = new_box(1)
+	for i in 0..3 {
+		if let r = o {
+			defer {
+				let k = read(r)
+			}
+			o = none
+			continue
+		}
+	}
+}
+
+// `return` runs it after the move.
+fn returned() uses alloc {
+	let b = Box[[4]u32].new([1, 2, 3, 4]) catch _ {
+		return
+	}
+	defer {
+		let k = read(b)
+	}
+	consume(b)
+	return
+}
+
+enum Failed {
+	failed
+}
+
+fn eat(sink f: Box[[4]u32]) throws(Failed) {
+}
+
+// An `errdefer` runs at a `try` whose call moved what it uses.
+fn errdefer_use(sink f: Box[[4]u32]) throws(Failed) {
+	errdefer {
+		let k = read(f)
+	}
+	try eat(f)
+}
+
+// A `defer` in a `defer`.
+fn nested() uses alloc {
+	var o: ?Box[[4]u32] = new_box(1)
+	if let r = o {
+		defer {
+			defer {
+				let k = read(r)
+			}
+		}
+		o = none
+	}
+}
+
+// A `for` element, used by a `defer` in the loop's body.
+fn element(inout xs: List[Box[[4]u32]]) {
+	for x in xs {
+		defer {
+			let k = read(x)
+		}
+		xs.clear()
+		break
+	}
+}
+
+// A `break` runs the `defer` after the view is given another value.
+fn view_at_break() uses alloc {
+	let z: [4]u32 = [0, 0, 0, 0]
+	var s: []u32 = z[..]
+	var xs = List[u32].new()
+	for i in 0..2 {
+		defer {
+			let k = show(s)
+		}
+		s = xs.as_slice()
+		break
+	}
+}
+
+// A `return` runs the `defer` after the view is given another value.
+fn view_at_return(n: u32) uses alloc {
+	let z: [4]u32 = [0, 0, 0, 0]
+	var s: []u32 = z[..]
+	var xs = List[u32].new()
+	defer {
+		let k = show(s)
+	}
+	s = xs.as_slice()
+	if n > 0 {
+		return
+	}
+	s = z[..]
+}
+
+fn clear_opt(inout o: ?Box[[4]u32]) -> bool {
+	o = none
+	return false
+}
+
+fn may() throws(Failed) -> bool {
+	throw .failed
+}
+
+// A `while` condition changes what the binding reads.
+fn while_cond(inout o: ?Box[[4]u32]) {
+	if let r = o {
+		defer {
+			let k = read(r)
+		}
+		while clear_opt(&o) {
+		}
+	}
+}
+
+// A `while` condition's `catch` block changes it.
+fn while_catch(inout o: ?Box[[4]u32]) {
+	if let r = o {
+		defer {
+			let k = read(r)
+		}
+		while may() catch _ {
+			o = none
+			break
+		} {
+		}
+	}
+}
+
+fn main() {
+}

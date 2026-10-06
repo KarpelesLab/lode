@@ -524,12 +524,14 @@ struct FnCx {
     /// The statements to add after the ones being checked, in their lists:
     /// the `Drop` of a local they declare. Innermost statement's last.
     after: Vec<TStmt>,
-    /// The variables `defer` bodies move, which must be assigned at every
-    /// exit they run at.
+    /// The variables `defer` bodies use or move, which must be assigned
+    /// (and, for a view, still view only what can't change) at every exit
+    /// they run at.
     defer_moves: Vec<DeferMove>,
-    /// In a `defer` body: whether it's an `errdefer`, and the depth of the
-    /// scope of the block it's in.
-    defer_kind: Option<(bool, usize)>,
+    /// The `defer` bodies being checked, innermost last.
+    defer_stack: Vec<DeferFrame>,
+    /// How many `defer`s the function has: the next one's number.
+    defer_count: usize,
     /// In a `deinit`: its `self`, which can't be moved.
     deinit_self: Option<LocalId>,
     /// Whether the function declares `uses alloc`: it may call functions
@@ -537,7 +539,8 @@ struct FnCx {
     uses_alloc: bool,
 }
 
-/// A variable a `defer` body moves (see [`FnCx::defer_moves`]).
+/// A variable declared outside a `defer` body that the body uses or moves
+/// (see [`FnCx::defer_moves`]).
 #[derive(Clone, Copy, Debug)]
 struct DeferMove {
     local: LocalId,
@@ -546,8 +549,48 @@ struct DeferMove {
     on_error: bool,
     /// The depth of the scope of the block the `defer` is in.
     depth: usize,
-    /// Where the body moves it.
+    /// Where the body uses or moves it.
     span: Span,
+    /// Whether the body moves it (otherwise it only uses it).
+    moves: bool,
+    /// The `defer`'s number in the function: the later ones run first.
+    id: usize,
+}
+
+/// A `defer` body being checked (see [`FnCx::defer_stack`]).
+#[derive(Clone, Copy, Debug)]
+struct DeferFrame {
+    id: usize,
+    /// The first local declared in the body.
+    floor: LocalId,
+    on_error: bool,
+    /// The depth of the scope of the block the `defer` is in.
+    depth: usize,
+}
+
+impl FnCx {
+    /// A `defer` body uses `local` (moves it, if `moves`) at `span`: each
+    /// `defer` being checked that `local` is declared outside of must find
+    /// it assigned at the exits it runs at.
+    fn defer_use(&mut self, local: LocalId, moves: bool, span: Span) {
+        for f in &self.defer_stack {
+            let known = self
+                .defer_moves
+                .iter()
+                .any(|m| m.id == f.id && m.local == local && m.moves == moves);
+            if local >= f.floor || known {
+                continue;
+            }
+            self.defer_moves.push(DeferMove {
+                local,
+                on_error: f.on_error,
+                depth: f.depth,
+                span,
+                moves,
+                id: f.id,
+            });
+        }
+    }
 }
 
 /// The facts where a loop's body leaves an iteration: at each back-edge
@@ -618,7 +661,8 @@ impl FnCx {
             temps: Vec::new(),
             after: Vec::new(),
             defer_moves: Vec::new(),
-            defer_kind: None,
+            defer_stack: Vec::new(),
+            defer_count: 0,
             deinit_self: None,
             uses_alloc: false,
         }
@@ -3899,9 +3943,11 @@ impl<'a> Checker<'a> {
 
     /// The variables the `defer` bodies that an exit runs move: those of
     /// the blocks deeper than `depth` (the scopes the exit leaves), and of
-    /// their `errdefer`s too for an exit with an error. Each must be
-    /// assigned here, at the exit `at` (`None`: a block's end); after the
-    /// exit, it isn't.
+    /// their `errdefer`s too for an exit with an error. Each variable they
+    /// use or move must be assigned here, at the exit `at` (`None`: a
+    /// block's end), and not moved by a `defer` that runs before (a later
+    /// one); a view they use must still view only what can't change. After
+    /// the exit, the variables they move aren't assigned.
     fn defer_moves_at(
         &mut self,
         cx: &FnCx,
@@ -3912,39 +3958,133 @@ impl<'a> Checker<'a> {
         if cx.env.dead {
             return Vec::new();
         }
-        let moves: Vec<DeferMove> = cx
+        let mut entries: Vec<DeferMove> = cx
             .defer_moves
             .iter()
             .filter(|m| m.depth > depth && (error || !m.on_error))
             .copied()
             .collect();
-        let mut out = Vec::new();
-        for m in moves {
-            if cx.env.is_uninit(m.local) && !out.contains(&m.local) {
-                let name = &cx.locals[m.local].name;
-                let (what, an) = if m.on_error {
-                    ("errdefer", "an")
-                } else {
-                    ("defer", "a")
-                };
-                let d = match at {
-                    Some(at) => Diagnostic::error(
-                        at,
-                        format!("`{name}` may be moved already at this exit, where {an} `{what}` that moves it runs"),
-                    )
-                    .with_note(m.span, format!("the `{what}` moves `{name}` here")),
-                    None => Diagnostic::error(
-                        m.span,
-                        format!("this `{what}` moves `{name}`, which may be moved already at the end of its block"),
-                    ),
-                };
-                self.diags.push(d.with_help(format!(
-                    "{an} `{what}` that moves a variable runs only where it's still assigned: don't move `{name}` after it"
-                )));
+        // In the order they run: the latest `defer` first; in one, the
+        // variables it moves first (a move is reported rather than a use).
+        entries.sort_by_key(|m| (std::cmp::Reverse(m.id), !m.moves));
+        let mut out: Vec<LocalId> = Vec::new();
+        let mut reported = Vec::new();
+        let mut k = 0;
+        while k < entries.len() {
+            let id = entries[k].id;
+            let group: Vec<DeferMove> = entries[k..]
+                .iter()
+                .take_while(|m| m.id == id)
+                .copied()
+                .collect();
+            k += group.len();
+            for m in &group {
+                if reported.contains(&m.local) {
+                    continue;
+                }
+                if let Some(d) = self.defer_use_error(cx, m, &out, at) {
+                    reported.push(m.local);
+                    // A use is reported once, at the first exit found.
+                    let shown =
+                        |o: &Diagnostic| o.span == m.span || o.notes.iter().any(|n| n.0 == m.span);
+                    if m.moves || !self.diags.iter().any(shown) {
+                        self.push_once(d);
+                    }
+                }
             }
-            out.push(m.local);
+            for m in group.iter().filter(|m| m.moves) {
+                if !out.contains(&m.local) {
+                    out.push(m.local);
+                }
+            }
         }
         out
+    }
+
+    /// What's wrong with the variable `m` of a `defer` that runs at the
+    /// exit `at` (`None`: its block's end), after the `defer`s that move
+    /// `gone`, if anything.
+    fn defer_use_error(
+        &self,
+        cx: &FnCx,
+        m: &DeferMove,
+        gone: &[LocalId],
+        at: Option<Span>,
+    ) -> Option<Diagnostic> {
+        let name = &cx.locals[m.local].name;
+        let (what, an) = if m.on_error {
+            ("errdefer", "an")
+        } else {
+            ("defer", "a")
+        };
+        let verb = if m.moves { "moves" } else { "uses" };
+        if gone.contains(&m.local) {
+            return Some(
+                Diagnostic::error(
+                    m.span,
+                    format!("this `{what}` {verb} `{name}`, which a `defer` written after it moves: that one runs first"),
+                )
+                .with_help("`defer` bodies run in reverse order when the block is left: move a variable in the last one that uses it"),
+            );
+        }
+        if cx.env.is_uninit(m.local) {
+            let d = match at {
+                Some(at) => Diagnostic::error(
+                    at,
+                    if m.moves {
+                        format!("`{name}` may be moved already at this exit, where {an} `{what}` that moves it runs")
+                    } else {
+                        format!("`{name}` may be moved or unusable at this exit, where {an} `{what}` that uses it runs")
+                    },
+                )
+                .with_note(m.span, format!("the `{what}` {verb} `{name}` here")),
+                None => Diagnostic::error(
+                    m.span,
+                    if m.moves {
+                        format!("this `{what}` moves `{name}`, which may be moved already at the end of its block")
+                    } else {
+                        format!("this `{what}` uses `{name}`, which may be moved or unusable at the end of its block, where the `{what}` runs")
+                    },
+                ),
+            };
+            let help = if m.moves {
+                format!(
+                    "{an} `{what}` that moves a variable runs only where it's still assigned: don't move `{name}` after it"
+                )
+            } else {
+                format!(
+                    "{an} `{what}` runs when its block is left: after it, don't move `{name}`, nor change what it views or reads in place"
+                )
+            };
+            return Some(d.with_help(help));
+        }
+        if m.moves {
+            return None;
+        }
+        let r = views::changing_root(cx, m.local)?;
+        let rname = &cx.locals[r].name;
+        let msg = format!(
+            "`{name}` views `{rname}`, which can change or end before {an} `{what}` that uses `{name}` runs"
+        );
+        let d = match at {
+            Some(at) => Diagnostic::error(at, format!("{msg}, at this exit"))
+                .with_note(m.span, format!("the `{what}` uses `{name}` here")),
+            None => Diagnostic::error(m.span, format!("{msg}, at the end of its block")),
+        };
+        Some(d.with_help(format!(
+            "a `{what}` body can use only views of what can't change (read-only parameters, and `let` variables of `Copy` types): don't give `{name}` another value after the `{what}`"
+        )))
+    }
+
+    /// Report `d` unless the same error is reported already.
+    fn push_once(&mut self, d: Diagnostic) {
+        if !self
+            .diags
+            .iter()
+            .any(|o| o.span == d.span && o.message == d.message)
+        {
+            self.diags.push(d);
+        }
     }
 
     /// `defer` or `errdefer` (`on_error`), followed by `rest` in its block.
@@ -3979,11 +4119,17 @@ impl<'a> Checker<'a> {
         }
         let loop_depth = std::mem::replace(&mut cx.loop_depth, 0);
         let floor = std::mem::replace(&mut cx.defer_floor, cx.locals.len());
-        let kind = cx.defer_kind.replace((on_error, cx.scopes.len()));
+        cx.defer_stack.push(DeferFrame {
+            id: cx.defer_count,
+            floor: cx.locals.len(),
+            on_error,
+            depth: cx.scopes.len(),
+        });
+        cx.defer_count += 1;
         cx.defer_depth += 1;
         let checked = self.block(cx, &body.stmts);
         cx.defer_depth -= 1;
-        cx.defer_kind = kind;
+        cx.defer_stack.pop();
         cx.defer_floor = floor;
         cx.loop_depth = loop_depth;
         cx.env = saved;

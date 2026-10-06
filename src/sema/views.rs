@@ -104,6 +104,24 @@ pub(super) fn changed_root(cx: &FnCx, e: &TExpr) -> Option<LocalId> {
     }
 }
 
+/// A variable the view local `view` borrows from that can change: not a
+/// read-only parameter, nor a `let` whose value is `Copy` (it's never
+/// assigned, changed or moved).
+pub(super) fn changing_root(cx: &FnCx, view: LocalId) -> Option<LocalId> {
+    if !cx.locals[view].ty.is_view() {
+        return None;
+    }
+    let fixed = |r: LocalId| {
+        let l = &cx.locals[r];
+        if r < cx.params {
+            l.convention == Some(Convention::Let)
+        } else {
+            !l.mutable && l.ty.is_copy() && !l.name.starts_with('$')
+        }
+    };
+    cx.borrows.get(&view)?.iter().copied().find(|&r| !fixed(r))
+}
+
 /// The depth of the block that declares `local` (0 for the parameters).
 fn scope_depth(cx: &FnCx, local: LocalId) -> usize {
     cx.scopes
@@ -439,20 +457,7 @@ impl Checker<'_> {
         if cx.defer_depth == 0 || local >= cx.defer_floor || !cx.locals[local].ty.is_view() {
             return true;
         }
-        let Some(roots) = cx.borrows.get(&local) else {
-            return true;
-        };
-        // A read-only parameter, or a `let` whose value is `Copy` (it's
-        // never assigned, changed or moved), stays as it is.
-        let fixed = |r: LocalId| {
-            let l = &cx.locals[r];
-            if r < cx.params {
-                l.convention == Some(Convention::Let)
-            } else {
-                !l.mutable && l.ty.is_copy() && !l.name.starts_with('$')
-            }
-        };
-        let Some(&r) = roots.iter().find(|&&r| !fixed(r)) else {
+        let Some(r) = changing_root(cx, local) else {
             return true;
         };
         let name = &cx.locals[local].name;

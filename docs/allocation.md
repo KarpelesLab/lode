@@ -974,7 +974,11 @@ What M8a does, and the choices made where the proposal left room:
   declared outside it; at each exit it runs at (the block's end, `break`,
   `continue`, `return`, and for `errdefer` only `throw` and a failed
   `try`), the variable must be assigned, or it's an error at that exit.
-  After the exit, it's unassigned.
+  After the exit, it's unassigned. A variable the body only uses is
+  checked the same way, and so is one used or moved by an earlier
+  `defer` that a later one moves (the later one runs first): reading a
+  variable moved after the `defer` read freed memory
+  ([memory.md](memory.md#views-in-the-compiler-today)).
 - **Instances.** `mono` makes the destruction of each concrete type that's
   destroyed: its `deinit`'s instance, or a function made for it
   (`main.Pair[main.Fd, u8].$destroy`) that destroys its parts. For an

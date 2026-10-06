@@ -2357,6 +2357,8 @@ impl Checker<'_> {
             if !self.check_deferred_view(cx, local, span) {
                 return None;
             }
+            // Checked at the exits the `defer` runs at.
+            cx.defer_use(local, false, span);
             let ty = cx.locals[local].ty;
             let term = Term::Local(local);
             let mut c = Checked::new(TExprKind::Local(local), ty, super::read_range(cx, term));

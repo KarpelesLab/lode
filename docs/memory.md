@@ -339,7 +339,22 @@ Roots are whole variables: changing `p.tag` stops a view of `p.rows` too.
 - A `defer` body can use a view declared outside it only if the view
   borrows from nothing that can change: read-only parameters, and `let`
   variables of `Copy` types. The body runs at the block's exits, after
-  code it isn't checked with.
+  code it isn't checked with, so this is checked where the body uses the
+  view and again at every exit the body runs at (the block's end,
+  `break`, `continue`, `return`, and for an `errdefer` `throw` and a
+  failed `try`): a view given a view of a list after the `defer`
+  (`s = xs.as_slice()`) is an error at the exit.
+- Every variable declared outside a `defer` body that the body uses (any
+  variable: a view, a binding read in place, a box) must be assigned and
+  usable at every exit the body runs at, as a variable the body moves
+  must ([allocation.md](allocation.md#m8a-in-the-compiler)), and not
+  moved by a `defer` written after it, which runs first. So after the
+  `defer`, moving the variable (`consume(b)`), changing what a binding
+  reads in place (`if let r = o { defer { use(r) } o = none }`), or
+  changing what a view it uses views, is an error at the exit (or, at the
+  block's end, at the use in the `defer`), unless the variable is
+  assigned again before the exit. Assigning it is fine: the body sees
+  the new value.
 
 **Returning a view.** A function returning a `[]T` or a `str` returns only
 views that borrow from its read-only or `inout` parameters, or from

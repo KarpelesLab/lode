@@ -1,0 +1,115 @@
+// stdout: 10 | 6 | 9 | 2 | 5 | 3 | 7 | 8 | 8 | 4\n
+package main
+
+import "std/io"
+
+fn show(s: []u32) -> u32 {
+	var total: u32 = 0
+	for x in s {
+		total = total +% x
+	}
+	return total
+}
+
+fn consume(sink b: Box[u32]) {
+	io.print("{} | ", b.value)
+}
+
+// A view of a read-only parameter.
+fn param_view(s: []u32) {
+	defer {
+		io.print("{} | ", show(s))
+	}
+	let t = s
+}
+
+// A view of a `let` array that's never given another value.
+fn let_view() {
+	let z: [3]u32 = [1, 2, 3]
+	let s: []u32 = z[..]
+	defer {
+		io.print("{} | ", show(s))
+	}
+}
+
+// A variable assigned again after the `defer`: it runs with the new value.
+fn assigned() uses alloc {
+	var b = Box[u32].new(1) catch _ {
+		return
+	}
+	defer {
+		io.print("{} | ", b.value)
+	}
+	b = Box[u32].new(9) catch _ {
+		return
+	}
+}
+
+// Moved, then assigned again before the block ends.
+fn moved_and_assigned() uses alloc {
+	var b = Box[u32].new(2) catch _ {
+		return
+	}
+	defer {
+		io.print("{} | ", b.value +% 3)
+	}
+	let n = Box[u32].new(2) catch _ {
+		return
+	}
+	let c = b
+	b = n
+	consume(c)
+}
+
+// A binding whose optional doesn't change.
+fn binding() uses alloc {
+	var o: ?Box[u32] = Box[u32].new(7) catch _ {
+		return
+	}
+	if let r = o {
+		defer {
+			io.print("{} | ", r.value)
+		}
+		io.print("3 | ")
+	}
+}
+
+// The earlier `defer` moves what the later one uses: the later one runs
+// first.
+fn ordered() uses alloc {
+	let b = Box[u32].new(8) catch _ {
+		return
+	}
+	defer {
+		consume(b)
+	}
+	defer {
+		io.print("{} | ", b.value)
+	}
+}
+
+// A `for` element used by a `defer` in the body, with the list unchanged.
+fn element() uses alloc {
+	var xs = List[Box[u32]].new()
+	let b = Box[u32].new(4) catch _ {
+		return
+	}
+	xs.push(b) catch _ {}
+	var other = List[u32].new()
+	for x in xs {
+		defer {
+			io.print("{}\n", x.value)
+		}
+		other.push(1) catch _ {}
+	}
+}
+
+fn main() uses alloc {
+	param_view([1, 2, 3, 4])
+	let_view()
+	assigned()
+	moved_and_assigned()
+	binding()
+	ordered()
+	element()
+}
