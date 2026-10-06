@@ -1004,11 +1004,15 @@ impl Checker<'_> {
         let local = path.root;
         let (param, fix) = not_copy(e.ty);
         let name = cx.locals[local].name.clone();
-        let mut text = place_text(cx, e).unwrap_or_else(|| "this value".to_owned());
-        if path.binding && !text.starts_with(name.as_str()) {
-            // Shown as "`v`, part of `o`,".
-            text = format!("{text}`, part of `{name}");
-        }
+        // The place as code (for `mem.replace(&place, v)`), and as shown in
+        // a sentence: "`v`, part of `o`".
+        let code = place_text(cx, e).unwrap_or_else(|| "this value".to_owned());
+        let part_of = path.binding && !code.starts_with(name.as_str());
+        let text = if part_of {
+            format!("{code}`, part of `{name}")
+        } else {
+            code.clone()
+        };
         if path.through_index {
             let mut d = Diagnostic::error(
                 span,
@@ -1020,7 +1024,7 @@ impl Checker<'_> {
             .with_help(fix.clone());
             if param.as_param().is_none() {
                 d = d.with_help(format!(
-                    "an element can't be moved out of its array: take it with `mem.replace(&{text}, v)` (`std/mem`), or read it in place"
+                    "an element can't be moved out of its array: take it with `mem.replace(&{code}, v)` (`std/mem`), or read it in place"
                 ));
             } else {
                 d = d.with_help("an element can't be moved out of its array; read it in place instead (compare it, call a method on it, or pass it to a parameter that isn't `sink`)");
@@ -1038,12 +1042,14 @@ impl Checker<'_> {
                         Diagnostic::error(
                             span,
                             format!(
-                                "`{text}` can't be moved out of `{}`, a `{}`, which has a `deinit`",
-                                step.text, step.holder
+                                "`{text}`{} can't be moved out of `{}`, a `{}`, which has a `deinit`",
+                                if part_of { "," } else { "" },
+                                step.text,
+                                step.holder
                             ),
                         )
                         .with_help(format!(
-                            "its `deinit` uses all of it: take the part with `mem.replace(&{text}, v)` (`std/mem`)"
+                            "its `deinit` uses all of it: take the part with `mem.replace(&{code}, v)` (`std/mem`)"
                         )),
                     );
                         return None;
@@ -1069,12 +1075,12 @@ impl Checker<'_> {
                         Diagnostic::error(
                             span,
                             format!(
-                                "moving `{text}` out of `{name}` would leave the rest of `{}` behind, and `{other}` isn't `Copy`",
+                                "moving `{code}` out of `{name}` would leave the rest of `{}` behind, and `{other}` isn't `Copy`",
                                 step.text
                             ),
                         )
                         .with_help(format!(
-                            "a part of a variable isn't moved alone: move `{name}` whole, or take the part with `mem.replace(&{text}, v)` (`std/mem`)"
+                            "a part of a variable isn't moved alone: move `{name}` whole, or take the part with `mem.replace(&{code}, v)` (`std/mem`)"
                         ))
                         .with_help(other_fix),
                     );

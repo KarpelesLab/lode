@@ -1,0 +1,83 @@
+// error: moving `t.a` out of `o` would leave the rest of `t` behind, and `Fd` isn't `Copy`
+// error: `w.f`, part of `o`, can't be moved out of `w`, a `Wrapped`, which has a `deinit`
+// error: this copies `xs[0]`, part of `o`, a `Fd`, but `Fd` isn't `Copy`
+// error: `s` can't keep a view of the value this `match` or `if let` looks into, which ends before `s` does
+// error: `s` can't keep a view of the value this `match` or `if let` looks into, which ends before `s` does
+// help: a part of a variable isn't moved alone: move `o` whole, or take the part with `mem.replace(&t.a, v)` (`std/mem`)
+// help: its `deinit` uses all of it: take the part with `mem.replace(&w.f, v)` (`std/mem`)
+// help: an element can't be moved out of its array: take it with `mem.replace(&xs[0], v)` (`std/mem`), or read it in place
+// help: store the value in a variable declared before `s`, and look into that
+package main
+
+// Messages about pattern bindings show code that can be written, and no
+// hidden names.
+struct Fd {
+	fd: i32
+}
+
+fn Fd.deinit(sink self) {
+}
+
+struct Two {
+	a: Fd
+	b: Fd
+}
+
+struct Wrapped {
+	f: Fd
+}
+
+fn Wrapped.deinit(sink self) {
+}
+
+fn close(sink f: Fd) {
+}
+
+fn part(sink o: ?Two) {
+	if let t = o {
+		close(t.a)
+	}
+}
+
+fn deinit_part(sink o: ?Wrapped) {
+	if let w = o {
+		close(w.f)
+	}
+}
+
+fn element(sink o: ?[2]Fd) {
+	if let xs = o {
+		close(xs[0])
+	}
+}
+
+struct Res {
+	data: [4]u32
+}
+
+fn Res.deinit(sink self) {
+}
+
+fn Res.items(self) -> []u32 {
+	return self.data
+}
+
+fn make() -> ?Res {
+	return Res{data: [1, 2, 3, 4]}
+}
+
+fn keep_view() -> u32 {
+	let z: [4]u32 = [0; 4]
+	var s: []u32 = z
+	if let r = make() {
+		s = r.items()
+	}
+	match make() {
+		some(r) => s = r.data[..]
+		none => {}
+	}
+	return s[0]
+}
+
+fn main() {
+}

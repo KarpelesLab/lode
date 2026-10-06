@@ -338,14 +338,35 @@ impl Checker<'_> {
                 return None;
             }
             if r != local && scope_depth(cx, r) > depth {
+                // A hidden local (its name starts with `$`) is described.
+                let (what, help) = match rname.as_str() {
+                    super::MATCHED => (
+                        "the value this `match` or `if let` looks into".to_owned(),
+                        format!(
+                            "a view can't outlive what it views: store the value in a variable declared before `{name}`, and look into that"
+                        ),
+                    ),
+                    n if n.starts_with('$') => (
+                        "a temporary value".to_owned(),
+                        format!(
+                            "a view can't outlive what it views: store the value in a variable declared before `{name}`"
+                        ),
+                    ),
+                    _ => (
+                        format!("`{rname}`"),
+                        format!(
+                            "a view can't outlive what it views: declare `{name}` in the block of `{rname}`"
+                        ),
+                    ),
+                };
                 self.diags.push(
                     Diagnostic::error(
                         span,
-                        format!("`{name}` can't keep a view of `{rname}`, which ends before `{name}` does"),
+                        format!(
+                            "`{name}` can't keep a view of {what}, which ends before `{name}` does"
+                        ),
                     )
-                    .with_help(format!(
-                        "a view can't outlive what it views: declare `{name}` in the block of `{rname}`"
-                    )),
+                    .with_help(help),
                 );
                 return None;
             }
