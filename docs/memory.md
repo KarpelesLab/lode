@@ -205,7 +205,8 @@ structures into one audited place.
 
 ### Views
 
-**Status:** Decided
+**Status:** Decided; implemented (M8c), as in
+[Views in the compiler today](#views-in-the-compiler-today)
 
 Slices (`[]T`), string views and iterators are *views* into another value. A
 view is a stored reference in disguise, so its use is restricted:
@@ -236,44 +237,108 @@ owns a copy or holds [handles](#shared-and-back-pointer-structures-belong-to-the
 This rule also lets scoped threads use views without copying
 ([concurrency.md](concurrency.md#structured-concurrency)).
 
-**In the compiler today:** views are parameters and locals, never fields,
-and functions don't return them yet. A few built-in projections make a view
-of another one: an array where a slice is expected, `s.bytes()`, the
-`[]u8` of a `str`, and a slice `a[i..j]` of an array or a slice. A
-projection views what its receiver views, so it obeys the same rules as the
-receiver: kept in a local, passed to a function, never stored.
+### Views in the compiler today
 
-Until rule 2 is checked, the compiler keeps a view from seeing what it
-views change with simpler rules:
+**Status:** Implemented: rule 1, and rule 2 since M8c (2026-10-06), as
+below ([allocation.md](allocation.md#m8c-in-the-compiler))
 
-- a slice kept in a local (`let s = a[i..j]`, or a `var` given one) may
-  only view a `let` array, an array constant, or another read-only view.
-  Of a `var` array, of a temporary, or of an `inout` slice, it can only be
-  passed straight to a function;
-- `for x in a[i..j]` views `a` for the whole loop, so the loop can't change
-  the array `a` (an `inout` slice is read as the loop goes, as in
-  `for x in xs`);
-- `&a[i..j]` passes part of a `var` array or of an `inout` slice to an
-  `inout` slice parameter, and the [exclusivity](#parameter-conventions-in-the-compiler-today)
-  rule counts it as overlapping all of `a`.
+Views are slices (`[]T`) and `str`. They're parameters, locals and
+results, never struct or payload fields, elements, optionals' values or
+type arguments. A few built-in projections make a view of a value: an
+array or a `List` where a slice is expected, `a[i..j]` of an array, a
+slice or a list, and `s.bytes()`, the `[]u8` of a `str`.
 
-A function can return a `str` whose storage is static, since it borrows
-from nothing: rule 2 holds trivially, without the checks it needs in
-general. The rule, checked per function:
+**What a view borrows from.** Each view has roots: the variables (locals
+and parameters) whose storage it may see.
 
-- a string literal is static;
-- the result of a call to a function returning a `str` is static (every
-  such function obeys this rule);
-- a local is static if every value it's ever given in the function is
-  static (a literal, such a call, or a copy of a static local). A
-  parameter never is: its string may live in the caller's storage.
+- A view of a variable, or of a part of it (`a[..2]`, `p.rows[1]`, `xs[..]`
+  of a list), borrows from the variable. A pattern binding read in place
+  is the variable it reads. A view parameter borrows from itself.
+- A slice of a view, its `bytes()` or a copy of it borrows from what the
+  view borrows from.
+- A string literal, an array constant and a `static` borrow from nothing:
+  their storage is static.
+- A call that returns a view borrows from each of its arguments that can
+  lend storage and isn't passed `sink` or `set`: from what a view argument
+  borrows from, and from the variable of any other one. A value lends
+  storage when it's a view, an array, a type parameter, a value that isn't
+  `Copy` (as a `List` or a `Box`), or a struct, an enum or an optional
+  holding one of those; an integer or a struct of integers can't be viewed,
+  so `name(day)` borrows from nothing. An argument that isn't a variable
+  (a temporary) makes the result a view of a temporary. This is rule 2's
+  conservative "borrows from all of them".
+- `mem.view(p, n)` and `mem.view_str(p, n)` (`unsafe`) borrow from every
+  parameter of the function that makes them which can lend storage: the
+  `unsafe` author promises the memory is theirs.
 
-Every `return` of a function returning a `str` must give a static value.
-The rule doesn't follow control flow: `var s = "x"` assigned a parameter
-anywhere makes every `return s` an error, even one before the assignment.
-Returning a view that borrows from the parameters, and returning slices,
-wait for rule 2 to be checked. A function that throws can't return a `str`
-yet (its result would hold a view in memory).
+**Keeping a view.** `let s = v`, `var s = v` and `s = v` give `s` the
+roots of `v`; a `var` given several values borrows from all of their
+roots. It's an error to keep a view of a temporary (it ends with its
+statement), a copy or a slice of an `inout` slice (its elements change
+during the call), or a view of a variable declared in a deeper block than
+`s` (it ends first).
+
+**Using a view.** A change of a root makes every view borrowing from it
+unusable, like a variable moved from, until it's given a value again. A
+change is an assignment to the variable or to a part of it, passing it or a
+part of it `&` (`inout` or `set`), calling a method that takes `inout self`
+on it, `opt.take()`, moving it, and a `defer` that moves it running at its
+block's end. Using the view after a change, on some path to the use
+(loops included), is an error at the use, which shows the change:
+
+```
+var xs = List[u32].new()
+try xs.push(1)
+let s = xs.as_slice()
+io.print("{}\n", s.len)    // fine: before the change
+try xs.push(2)              // may move the elements
+io.print("{}\n", s.len)    // error: `s` is used after `xs` changed, and `s` views `xs`
+```
+
+So a view borrows from its roots exactly while it's live: from where it's
+given a value to its last use, on each path. Nothing is checked after the
+last use: a variable can change once its views are no longer used.
+Roots are whole variables: changing `p.tag` stops a view of `p.rows` too.
+
+- In one expression, a view used together with a change of what it views,
+  `fill(&a, s)` or `xs.push(s[0])`, is an [exclusivity](#parameter-conventions-in-the-compiler-today)
+  error, as two overlapping places are; and so is a view used with a move
+  of what it views (`keep(s, xs)` with `xs` passed `sink`).
+- `for x in v` reads the view at each iteration. Changing what it views in
+  the body is an error at the next iteration ("this loop goes over a view
+  of `xs`, which the loop's body changes"). `for x in a[i..j]` whose body
+  assigns `a` is reported at the loop, as before.
+- A `catch` block after a call that changes a root sees the change: the
+  call may have changed it before it failed.
+- A `defer` body can use a view declared outside it only if the view
+  borrows from nothing that can change: read-only parameters, and `let`
+  variables of `Copy` types. The body runs at the block's exits, after
+  code it isn't checked with.
+
+**Returning a view.** A function returning a `[]T` or a `str` returns only
+views that borrow from its read-only or `inout` parameters, or from
+nothing: not from a local, a temporary, or a `sink` or `set` parameter
+(the function owns or assigns those). A string literal, the old special
+case, borrows from nothing. In the caller, the result borrows from the
+arguments as above. A function that throws can't return a view yet (its
+result would hold one in memory).
+
+```
+fn longer(a: []u32, b: []u32) -> []u32 {    // borrows from a and b
+	if a.len >= b.len {
+		return a
+	}
+	return b
+}
+
+fn List[T].as_slice(self) -> []T {          // borrows from self
+	return self[..]
+}
+```
+
+The check is a forward flow analysis over one function, like definite
+assignment: the roots are a set of variables per view local, and a change
+of a root makes the views unassigned. No lifetimes, no annotations.
 
 ## Copies
 

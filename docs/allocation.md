@@ -16,6 +16,8 @@ implemented (2026-10-06): resource types, destruction and moves, with
 what the compiler does in [M8a in the compiler](#m8a-in-the-compiler).
 M8b is implemented (2026-10-06): the allocator context, the root
 allocator and `Box`, in [M8b in the compiler](#m8b-in-the-compiler).
+M8c is implemented (2026-10-06): views returned from functions, `List`
+and `String`, in [M8c in the compiler](#m8c-in-the-compiler).
 
 ## Starting point
 
@@ -389,13 +391,14 @@ fn summarize(path: str) uses alloc throws(Error | AllocError) -> Summary {
 ### The `Allocator` trait
 
 **Status:** Implemented (M8b), with `resize` and `free` `unsafe`, and
-`AllocError` built in
+`AllocError` built in; `grow` added in M8c
 
 ```
 pub unsafe trait Allocator {
 	fn alloc(self, size: usize, align: usize) throws(AllocError) -> *u8
 	fn resize(self, p: *u8, old: usize, new: usize, align: usize) -> bool  // in place, or false
 	fn free(self, p: *u8, size: usize, align: usize)
+	fn grow(self, p: *u8, old: usize, new: usize, align: usize) throws(AllocError) -> *u8  // M8c
 }
 
 pub enum AllocError {
@@ -412,6 +415,13 @@ pub enum AllocError {
   memory; `free` only of what it gave).
 - A size that overflows (`n * size_of[T]()`) is `out_of_memory` too: no
   other variant is needed.
+- `grow` (M8c) moves a block to a larger one and keeps its bytes, in place
+  or not; a growing `List` calls it. Its default is `resize`, or else
+  `alloc`, a copy and `free`. The page allocator and the heap's large
+  blocks override it with `mremap` that may move: the kernel moves the
+  pages, without copying the bytes, so a list growing past 2 KiB costs one
+  system call per doubling. A value moves by its bytes, so moving a list's
+  elements this way is a move of each.
 - `align` is a power of two. The fact language can't say "power of two",
   so the trait could take its base-2 logarithm instead (`align_log2: u8
   where align_log2 < 64`, a refinement). Open.
@@ -599,7 +609,7 @@ changes what compiles (question 6).
 
 ### The unsafe toolkit
 
-**Status:** Implemented (M8b), but `mem.view` (M8c, with returned views)
+**Status:** Implemented (M8b); `mem.view` and `mem.view_str` in M8c
 
 Heap types are written in Lode, in std, with `unsafe` inside and a safe API
 outside, as memory.md decides for shared structures. They need:
@@ -649,7 +659,9 @@ let p = c.into_inner()                    // sink self -> T, frees the box
 
 ### `List[T]`
 
-**Status:** Proposed
+**Status:** Implemented (M8c), as `std/list`'s `List`, in the prelude; but
+`insert` and `remove`, and the projection for `ArrayVec` and `StackBuf`
+([M8c in the compiler](#m8c-in-the-compiler))
 
 A growable array: a pointer, a length, a capacity, and the allocator it
 came from.
@@ -722,7 +734,9 @@ This is what M8 must implement of rule 2; see
 
 ### `String`
 
-**Status:** Proposed
+**Status:** Implemented (M8c), as `std/string`'s `String`, in the
+prelude, with the differences in [M8c in the compiler](#m8c-in-the-compiler)
+and [strings.md](strings.md#string)
 
 An owned, growable UTF-8 string: strings.md's `String[utf8]`, named
 `String` until `Str[E]` and `String[E]` exist (the step after M7 in
@@ -757,7 +771,7 @@ optional. Not part of M8; `List` and `String` come first.
 
 ### `Eq` on heap types
 
-**Status:** Proposed
+**Status:** Proposed; not in M8c
 
 Generics' question 4 recommends that `Eq` is only ever derived. A derived
 `==` on `List` would compare pointers. Recommendation: a type with a raw
@@ -767,7 +781,9 @@ types holding std containers then derive it.
 
 ### Views into heap types
 
-**Status:** Proposed; rule 2 of [Views](memory.md#views), which is Decided
+**Status:** Implemented (M8c), with liveness found forward (the errors are
+at the use after the change), in
+[memory.md](memory.md#views-in-the-compiler-today)
 
 Today a function can't return a view (except static `str`), and a slice of
 a `var` array can only be passed to a function, never kept. `as_slice` and
@@ -794,7 +810,9 @@ use." Proposed implementation, per function:
 
 ## 4. Proof checker
 
-**Status:** Proposed
+**Status:** Implemented (M8c) as recommended: `xs.len` is a term, `len <=
+cap` a fact, no refinements of `inout` results, and `push_within` returns
+`?T`; but `insert` and `remove`
 
 - `xs.len` and `xs.cap` of a `List` local are integer fields of a struct
   local, which are already terms. With the sealed projection, `xs[i]`'s
@@ -823,7 +841,9 @@ use." Proposed implementation, per function:
 
 ## 5. Code size: pay only for what you use
 
-**Status:** Proposed
+**Status:** Implemented for M8a to M8c (the counted allocators are M8d);
+the reference program is `tests/programs/list_numbers.lode`, 12,330 bytes
+at `-O2`
 
 - **No `uses alloc` reachable from `main`**: no allocator, no hidden
   parameter, no `mmap`. Hello world is unchanged: 577 bytes, `write` and
@@ -1170,6 +1190,9 @@ What M8b does, and the choices made where the proposal left room:
 
 ### M8c: views from functions, `List` and `String`
 
+**Status:** Implemented (2026-10-06): see
+[M8c in the compiler](#m8c-in-the-compiler)
+
 - Rule 2 of views: returned views, the borrow sets of view locals,
   liveness, the errors at mutations; today's simple rules removed.
 - The sealed projection: `xs[i]`, slicing, `&xs`, `for`, `xs.len` terms on
@@ -1181,6 +1204,111 @@ What M8b does, and the choices made where the proposal left room:
   list. **Tests:** the growth example above rejected, `as_slice` kept
   across reads, proven indexing over `xs.len`, a word-count program reading
   standard input, `mremap` growth counted in system calls.
+
+### M8c in the compiler
+
+**Status:** Implemented (2026-10-06)
+
+What M8c does, and the choices made where the proposal left room:
+
+- **Rule 2 of views** ([memory.md](memory.md#views-in-the-compiler-today),
+  where the exact rule is). Functions return slices and `str`s that borrow
+  from their read-only and `inout` parameters. Each view local has roots,
+  the variables it may view: for a call, every argument that can lend
+  storage and isn't passed `sink` or `set` (the conservative rule), so the
+  caller needs nothing from the callee but its signature. A change of a
+  root (assigned, passed `&`, an `inout self` receiver, moved) makes the
+  views of it unassigned, as a move does, in the checker's
+  definite-assignment state: using one afterwards, on some path, is an
+  error at the use that points at the change. That's the proposal's rule
+  ("a borrowed place can't change while a view of it is live") found
+  forward, not by a backward liveness pass: a change followed by a use is
+  exactly a change while the view is live. The error is at the use,
+  rather than at the change; the message names both. A loop whose body
+  adds roots to a view declared before it is checked again, as one that
+  moves a variable is (`Checker::loop_body`), so a change in one iteration
+  reaches the next one's use. In one expression, exclusivity counts a view
+  as using its roots. `src/sema/views.rs` has it all.
+- **Today's simple rules are gone.** A slice of a `var` array can be kept,
+  and the array changed after the slice's last use; a `str` that borrows
+  from a parameter can be returned. The static-`str` rule is the case of a
+  view with no roots. Two rules stay: a view can't be kept from a
+  temporary, or copied out of an `inout` slice (its elements change
+  during the call). Two are new: a view can't borrow from a variable of a
+  deeper block than its own (before, a `var` slice could keep a view of a
+  `let` array of an inner block after the block ended: a bug), and a
+  `defer` body can only use views of what can't change (read-only
+  parameters, `let` variables of `Copy` types). Every other program
+  accepted before is still accepted.
+- **Roots are whole variables**, not places: changing `p.tag` stops a view
+  of `p.rows`. Places would need the paths exclusivity uses; nothing
+  needed them yet.
+- **`mem.view(p, n)` and `mem.view_str(p, n)`** (`unsafe`, `@intrinsic`)
+  make a slice or a `str` of memory; their result borrows from every
+  parameter that can lend. A function that throws still can't return a
+  view (its result would hold one in memory).
+- **The projection** (Decision 8). Rather than a sealed trait, the
+  compiler knows `std/list`'s `List` (as it knows `alloc.Box`): for a
+  value of it, `xs[i]`, `xs[i..j]`, `for x in xs`, `xs` where a slice is
+  expected, and `&xs` or `&xs[i..j]` where an `inout` slice is expected,
+  are those operations on `TExprKind::Elements(xs)`, the slice of its
+  `len` elements from its `ptr`, read from the list once. Its length is
+  the term `xs.len` when `xs` is a variable or a field of one, so `for i
+  in 0..xs.len { xs[i] }` and `if i < xs.len { xs[i] }` are proven as for
+  a slice. `xs[i] = v` changes an element of a `var` list (destroying the
+  old one); an element isn't moved out (`mem.replace(&xs[i], v)`), as an
+  array's. Inference sees a list's elements where a slice is expected:
+  `slices.sort(&xs)`. `ArrayVec` (whose slots are `?T`) and `StackBuf`
+  don't have the projection yet: a trait in std that says which fields
+  are the pointer and the length would replace the compiler's knowledge
+  of `List` when they do.
+- **`List[T]`** (`std/list`) is `ptr: *T`, `pub let len: usize where len
+  <= cap`, `pub let cap: usize` and the handle of its allocator. `new`
+  allocates nothing and holds the root's handle; the first allocation
+  takes the context's (`alloc.current()`), and growing and freeing go
+  through the list's own handle after that, wherever the list is. It
+  grows by doubling, at least to 4, with `Allocator.grow`. `push`,
+  `push_within`, `extend` (`T: Copy`), `reserve`, `with_capacity`, `pop`,
+  `get` (`T: Copy`), `as_slice`, `truncate`, `clear`, `Clone` for `T:
+  Clone`; its `deinit` destroys the elements, first to last, and frees.
+  After a call that changes it, the checker knows nothing of its fields
+  (an `inout` place), so `push` checks `len < cap` again after growing:
+  one comparison, which `grow` makes always true. `insert` and `remove`
+  aren't there yet.
+- **`String`** (`std/string`) is `pub let bytes: List[u8]`: its bytes are
+  read everywhere (`s.bytes.len`, `s.bytes[i]`) and changed only in
+  `std/string`, so the UTF-8 invariant needs no projection rule. Its
+  length is `s.len()`, a method, rather than the proposal's `pub let
+  len`, which would have duplicated `List`'s growth. `from`, `push_str`,
+  `push` (a character, `false` for a surrogate or past `0x10FFFF`),
+  `as_str` (with `mem.view_str`), `reserve`, `truncate` (at a character's
+  start), `clear`, `Clone` and `io.Format`. It's an `io.Writer` that
+  appends within its room, since a `Writer`'s methods can't declare
+  `uses alloc`, and refuses bytes that aren't UTF-8;
+  `string.write_fmt(&s, fmt, args...)` and `string.format(fmt, args...)`
+  format twice, to count and then to write, and allocate in between. `==`
+  and `Ordered` wait for `impl Eq` on types with pointer fields.
+- **`Allocator.grow`**, a fourth method with a default (`resize`, or
+  `alloc`, a copy and `free`), dispatched like the others
+  (`std/alloc.Handle.$grow`); `Heap` and `os.PageAllocator` grow a large
+  block with `mremap(MREMAP_MAYMOVE)`. Mappings are made top-down, so
+  growing one in place almost never works: before `grow`, a list growing
+  to 1 MiB made three system calls and a copy per doubling; now one
+  `mremap` (tests/allocation.rs).
+- **The prelude** has `List` and `String`.
+- **Sizes.** Programs that don't use them are unchanged: each of the
+  runnable programs of tests/programs is byte for byte the same at `-O0`
+  and `-O2` as before M8c, and hello world is 577 bytes and two system
+  calls. `list_numbers.lode` (a `List[u32]` from standard input, sorted
+  and printed) is 12,330 bytes at `-O2`; a program pushing a million bytes
+  into a `List[u8]` is 7,128 bytes and makes 11 memory system calls (one
+  chunk, one mapping, eight `mremap`s and the `munmap`).
+- **Not done in M8c.** `impl Eq` for types with pointer fields (so no
+  `==` on `List` or `String`), `List.insert` and `remove`, the projection
+  for `ArrayVec` and `StackBuf`, `String.from_bytes`, roots finer than
+  variables, refinements of a returned view's length (`-> []T where
+  result.len == self.len`), and narrowing a result's roots (`-> str from
+  s`, still Open).
 
 ### M8d: error-set unions, the `oom` policy and arenas
 
@@ -1207,7 +1335,8 @@ compile time (an evaluator heap whose values can't be a constant's value).
 11; the others keep the recommended answer unless the user changes them.
 M8a implements 1, 2, 3, 9 and 10 as written. M8b implements 4, and the
 context's part of 6 with a handle of two words until counted allocators
-(M8d); of 11, only `AllocError` is built in so far.
+(M8d). The prelude implements 11, with `Box`, and M8c adds `List` and
+`String` to it; M8c implements 8 for `List`.
 
 1. **Destruction is a method, `fn T.deinit(sink self)`**, not a `Drop`
    trait; it can't throw or allocate
@@ -1239,7 +1368,8 @@ context's part of 6 with a handle of two words until counted allocators
    inference ([Out of memory](#out-of-memory)). *Recommended.*
 8. **`xs[i]` works on `List`** through a sealed, std-only projection to a
    slice, consistent with "no operator overloading" because it means
-   exactly slice indexing ([`List[T]`](#listt)). *Decided.*
+   exactly slice indexing ([`List[T]`](#listt)). *Decided; implemented
+   (M8c) for `List`, which the compiler knows by name, as it knows `Box`.*
 9. **The explicit copy is `x.clone()`** from a `Clone` trait, rather than
    memory.md's `x.copy()` ([Explicit copies](#explicit-copies)).
    *Recommended, weakly: a naming choice; implemented (M8a).*
@@ -1250,5 +1380,6 @@ context's part of 6 with a handle of two words until counted allocators
     `list.List[u32]` everywhere. *Decided; `AllocError` is built in (M8b),
     `Box` is in the prelude, whose packages are loaded only by the
     programs that use their names ([packages.md](packages.md#the-prelude));
-    `List` and `String` join it with M8c. There's no `std/core`: each name
-    comes from the package that declares it.*
+    `List` (`std/list`) and `String` (`std/string`) joined it with M8c.
+    There's no `std/core`: each name comes from the package that declares
+    it.*

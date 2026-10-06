@@ -138,17 +138,16 @@ semantics.
   (`xs[i] = v`): the caller passes `&a` for a `var` array `a`
   ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)).
 - An array converts to a slice of all its elements where a slice is
-  expected: in a call argument, or in a `let`/`var` with a slice type. A slice
-  kept in a local may only view a `let` array (or part of one), so it never
-  sees the array change. This stands in for the [view rules](memory.md#views)
-  until they're checked.
+  expected: in a call argument, or in a `let`/`var` with a slice type. A
+  slice kept in a local borrows from the array: it can't be used after the
+  array changes ([view rules](memory.md#views-in-the-compiler-today)).
 - `a[i..j]` is a slice of the elements `i` up to, but not including, `j`,
   of an array or a slice (`s.bytes()` too). `a[i..]` goes to the end,
   `a[..j]` starts at 0, and `a[..]` is all of them. It views the same
   storage, without a copy. It must be [proven](safety.md#the-fact-language)
   that `0 <= i <= j <= a.len`; there's no run-time check. The bounds can
   have any integer type. A slice of a `var` array follows the rule above:
-  it can be passed to a function, but not kept in a local. `&a[i..j]`
+  kept in a local, it can't be used after the array changes. `&a[i..j]`
   passes part of a `var` array or of an `inout` slice to an `inout` slice
   parameter ([memory.md](memory.md#parameter-conventions-in-the-compiler-today)).
   A `str` can't be sliced: use `s.bytes()[i..j]`
@@ -170,7 +169,9 @@ semantics.
   checker knows the range of its elements: `DAYS[i]` is `28..=31`
   ([safety.md](safety.md#the-fact-language)). A constant can't be assigned
   or passed with `&`. At most 2^24 elements.
-- Not yet: returning a slice, and `a.get(i)`.
+- A function can return a slice of its parameters (M8c): `fn
+  first_half(xs: []u32) -> []u32 { return xs[..xs.len / 2] }`.
+- Not yet: `a.get(i)`.
 
 ### Structs
 

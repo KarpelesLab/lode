@@ -51,9 +51,9 @@ Go's vocabulary, which is proven:
   `std/io.print$3[u32, str]`. A `static` is `<import path>.<name>`
   (`std/alloc.ROOT`), and a function the compiler makes has a `$` in its
   name (`main.Pair[main.Fd, u8].$destroy`, `std/alloc.Handle.$alloc`).
-- So far there are nine packages: `std/os`, `std/io`, `std/mem`,
-  `std/alloc`, `std/math`, `std/slices`, `std/buf`, `std/vec` and
-  `std/encoding`.
+- So far there are eleven packages: `std/os`, `std/io`, `std/mem`,
+  `std/alloc`, `std/list`, `std/string`, `std/math`, `std/slices`,
+  `std/buf`, `std/vec` and `std/encoding`.
 - `std/os` is the Linux system calls, for x86-64 and AArch64 (see
   [Per-target code](#per-target-code)):
   - `write` (one `write` system call) and `write_all(fd, b: []u8)` (all of
@@ -102,13 +102,17 @@ Go's vocabulary, which is proven:
     and `mremap(addr: *u8, old: usize, new: usize) -> isize` (M8b,
     `unsafe`): memory of the process only, readable and writable and zero
     at first, mapped, unmapped, and grown or shrunk in place (never moved).
-    Each returns an address or 0, or a negative error number.
+    `mremap_move` (M8c) is `mremap` that may move the mapping: the kernel
+    moves its pages, without copying them. Each returns an address or 0,
+    or a negative error number.
   - `PageAllocator`, an allocator of whole pages (`PAGE_SIZE`, 4 KiB):
     `PageAllocator.new()`, `map(self, size: usize) throws(AllocError) ->
     *u8` (a mapping of its own, aligned to a page; `out_of_memory` past
     `MAP_MAX`, 2^46 bytes, or when the kernel has none), and the `unsafe`
-    `unmap(self, p: *u8, size: usize)` and `remap(self, p: *u8, old:
-    usize, new: usize) -> bool`. `std/alloc` makes it an `Allocator`.
+    `unmap(self, p: *u8, size: usize)`, `remap(self, p: *u8, old: usize,
+    new: usize) -> bool` (in place) and `move(self, p, old, new)
+    throws(AllocError) -> *u8` (in place or moved, M8c). `std/alloc` makes
+    it an `Allocator`.
 - `std/io`:
   - `File`, an open file: a struct holding its file descriptor in a
     private field. It doesn't own the descriptor, and doesn't close it: it's
@@ -194,22 +198,31 @@ Go's vocabulary, which is proven:
     is safe).
   - `from_addr[T](addr: usize) -> *T` (`unsafe`, M8b): an address as a
     pointer, the reverse of `p.addr()`.
-  - `swap`, `take`, `forget` and `from_addr` are implemented by the
-    compiler: they're declared `@intrinsic`, which only the standard
-    library can do, and their empty bodies aren't used.
+  - `view[T](p: *T, n: usize) -> []T` and `view_str(p: *u8, n: usize) ->
+    str` (`unsafe`, M8c): the `n` values at `p` as a slice, or the `n`
+    bytes as a `str` (which must be UTF-8). The view borrows from every
+    parameter of the function that makes it
+    ([memory.md](memory.md#views-in-the-compiler-today)): a container's
+    method returns a view of its memory this way.
+  - `swap`, `take`, `forget`, `from_addr`, `view` and `view_str` are
+    implemented by the compiler: they're declared `@intrinsic`, which only
+    the standard library can do, and their empty bodies aren't used.
 - `std/alloc`, allocation (M8b,
   [allocation.md](allocation.md#m8b-in-the-compiler)):
   - `Allocator`, an `unsafe trait`: `alloc(self, size: usize, align: usize)
     throws(AllocError) -> *u8`, and the `unsafe` `resize(self, p, old, new,
-    align) -> bool` (in place) and `free(self, p, size, align)`. Its
-    methods take `self` read-only: an allocator changes its state in
-    `unsafe` code. `os.PageAllocator` and `Heap` implement it.
+    align) -> bool` (in place), `free(self, p, size, align)` and (M8c)
+    `grow(self, p, old, new, align) throws(AllocError) -> *u8`, which
+    keeps the block's bytes, in place or moved: by default, `resize`, or
+    else `alloc`, a copy and `free`. Its methods take `self` read-only: an
+    allocator changes its state in `unsafe` code. `os.PageAllocator` and
+    `Heap` implement it; both grow a large block with `mremap_move`.
   - `Handle`, which allocator, and where: what `with alloc = h` takes and
     what a value that owns memory keeps. `current()` (`uses alloc`) is the
     context's, `root()` the root allocator's, and `unsafe handle(a)` one of
     the allocator `a`, which must outlive what it allocates (a `static`).
-    `h.alloc(size, align)` and `h.resize(...)` (`uses alloc`) and
-    `h.free(...)` call the handle's allocator. With no allocator but the
+    `h.alloc(size, align)`, `h.resize(...)` and `h.grow(...)` (`uses
+    alloc`) and `h.free(...)` call the handle's allocator. With no allocator but the
     root in the program, a handle is zero-sized.
   - `Heap`, the general allocator, and `ROOT`, the one heap and the root
     allocator (a `pub static`, used in `unsafe` code): blocks of 16 to 2048
@@ -225,6 +238,47 @@ Go's vocabulary, which is proven:
     prelude ([below](#the-prelude)): it needs no import.
   - `AllocError` itself is built into the compiler, like `Ordering`:
     `throws(AllocError)` needs no import.
+- `std/list`, growable lists (M8c,
+  [allocation.md](allocation.md#m8c-in-the-compiler)):
+  - `List[T]`, elements of any type on the heap: `ptr` (private), `pub let
+    len: usize where len <= cap` and `pub let cap: usize`, and the handle
+    of the allocator its storage came from. `xs[i]`, `xs[i..j]`, `for x in
+    xs`, `xs` where a slice is expected and `&xs` (or `&xs[i..j]`) where
+    an `inout` slice is, are those of the slice of its elements; `xs[i]`
+    is proven against `xs.len` like a slice's index, and assigned in a
+    `var` list.
+  - `List[T].new()` (allocates nothing), `with_capacity(n) uses alloc
+    throws(AllocError)`, `push(inout self, sink v: T) uses alloc
+    throws(AllocError)`, `push_within(inout self, sink v: T) -> ?T` (no
+    allocation: `v` back when full), `extend(inout self, xs: []T)` (`T:
+    Copy`, `uses alloc`), `reserve(inout self, n) uses alloc`, `pop(inout
+    self) -> ?T`, `get(self, i) -> ?T` (`T: Copy`), `as_slice(self) ->
+    []T` (a view borrowing from the list), `truncate(inout self, n)`,
+    `clear(inout self)`, and `Clone` when `T` is. Its `deinit` destroys
+    the elements, first to last, and frees the storage through the list's
+    allocator.
+  - Growing doubles the capacity (at least 4) through the list's own
+    allocator, with `Allocator.grow`: a large list is remapped by the
+    kernel, without copying.
+  - `List` is in the prelude ([below](#the-prelude)).
+- `std/string`, owned text (M8c, [strings.md](strings.md#string)):
+  - `String`, UTF-8 text on the heap: `pub let bytes: list.List[u8]`, its
+    bytes, read everywhere and changed only by `std/string`, which adds
+    only whole characters, so they're always valid UTF-8.
+  - `String.new()`, `from(s: str) uses alloc throws(AllocError)`,
+    `len(self) -> usize` (bytes), `as_str(self) -> str` (a view borrowing
+    from the string), `push_str(inout self, s: str)` and `push(inout self,
+    r: u32) -> bool` (a character; `false` for a surrogate or past
+    `0x10FFFF`), both `uses alloc throws(AllocError)`, `reserve`,
+    `truncate(inout self, n) -> bool` (`false` if `n` isn't at a
+    character's start) and `clear`. `Clone`, `io.Format` (its text) and
+    `io.Writer`, which appends only within the room left (a `Writer`
+    can't allocate) and refuses bytes that aren't UTF-8.
+  - `write_fmt(inout s: String, comptime fmt: str, args: ..A) uses alloc
+    throws(AllocError)` appends formatted text, as `io.print` writes it:
+    once to count the bytes, `reserve`, then into the string. `format(fmt,
+    args...)` makes a new string that way.
+  - `String` is in the prelude ([below](#the-prelude)).
 - `std/math`, generic:
   - `min(a, b)`, `max(a, b)` and `clamp(x, lo, hi)` for any `Ordered` type
     (the integers, `bool`, and the structs and enums with an
@@ -348,12 +402,15 @@ A few names every package uses without an import:
 | Name | What it is |
 |---|---|
 | `Box` | `std/alloc`'s `Box[T]`: the same type as `alloc.Box` |
+| `List` | `std/list`'s `List[T]` (M8c) |
+| `String` | `std/string`'s `String` (M8c) |
 | `AllocError`, `Ordering` | built into the compiler |
 | `Eq`, `Ordered`, `Copy`, `Clone`, `Integer`, `Unsigned`, `Signed` | the built-in traits |
 
-`List` and `String` join `Box` when they're in the standard library
-(allocation.md, M8c). The table of the names that come from a package is
-`PRELUDE` in `src/prelude.rs`: adding one is a line there.
+The table of the names that come from a package is `PRELUDE` in
+`src/prelude.rs`: adding one is a line there. The packages of `List` and
+`String` don't use the prelude: `std/string` names `list.List`, after an
+import.
 
 **Resolution.** A prelude name is the last place an unqualified name is
 looked up. A local variable or a type parameter of that name, an item of

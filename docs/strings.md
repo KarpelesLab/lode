@@ -99,10 +99,9 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   the same length (the checker knows `s.bytes().len` is `s.len`, and a
   literal's length). It's read-only, like every slice that isn't `inout`.
   Byte indexing goes through it: `s.bytes()[i]`; `s[i]` is an error.
-  It's a built-in projection of its receiver, not a function returning a
-  view: like any view, it can be kept in a local and passed to functions,
-  but not stored in a struct field or returned
-  ([memory.md](memory.md#views)).
+  It's a built-in projection of its receiver: like any view, it can be
+  kept in a local, passed to functions and returned, but not stored in a
+  struct field ([memory.md](memory.md#views-in-the-compiler-today)).
 - slicing the bytes: `s.bytes()[i..j]` is a `[]u8`
   ([types.md](types.md#in-the-compiler-today)). `s[i..j]` is an error: a
   `str` must stay valid UTF-8, and the checker can't prove that `i` and `j`
@@ -110,17 +109,59 @@ bytes, always valid UTF-8 (a literal that isn't is rejected). What works:
   [Operations](#operations)), a byte slice makes clear it may split a
   character.
 
-- returning a `str` with static storage: a string literal, another such
-  function's result, or a local that only ever holds those, as in
-  `fn Day.name(self) -> str { ... return "Mon" ... }`
-  ([memory.md](memory.md#views))
+- returning a `str`: a string literal (`fn Day.name(self) -> str { ...
+  return "Mon" ... }`), or one that borrows from the parameters, as in
+  `fn pick(a: str, b: str) -> str`; the caller's result borrows from what
+  it passed, and can't be used after that changes (M8c,
+  [memory.md](memory.md#views-in-the-compiler-today))
+- `String` (M8c, [String](#string) below)
 
 - `std/encoding` has the `Encoding` trait, implemented by `Utf8` and
   `Ascii`, as a library over bytes: `decode` returns a `Decoded[Rune]`
   struct, as there are no tuples
   ([packages.md](packages.md#the-standard-library-in-the-compiler-today)).
 
-Not yet: returning a `str` that borrows from a parameter (it needs the view
-rules of [memory.md](memory.md#views)), comparing strings, slicing a `str`
+Not yet: comparing strings (`==` on `str` or `String`), slicing a `str`
 itself, rune iteration, and other encodings.
+
+## String
+
+**Status:** Implemented (M8c): `std/string`'s `String`, in the prelude
+
+`String` is strings.md's `String[utf8]`, named `String` until `Str[E]` and
+`String[E]` exist: owned UTF-8 text on the heap
+([allocation.md](allocation.md#string)).
+
+```
+var s = try String.from("hello")
+try s.push_str(", world")
+let ok = try s.push(0x1f600)             // a character: false for a surrogate
+io.print("{} ({} bytes)\n", s, s.len())
+let t = s.as_str()                       // a `str` borrowing from `s`
+let f = try string.format("{} items", n) // formatted into a new string
+```
+
+- Its bytes are `s.bytes`, a `List[u8]` that's `pub let`: read everywhere
+  (`s.bytes.len`, `s.bytes[i]`, proven like a slice's), changed only by
+  `std/string`. Every way to add to it adds whole characters (a `str`, a
+  scalar value, or bytes checked to be UTF-8), so they're always valid
+  UTF-8, and `s.as_str()` can view them as a `str` with no check.
+- `String.new()` allocates nothing; `String.from(s)`, `push_str`, `push`
+  and `reserve` allocate (`uses alloc throws(AllocError)`), through the
+  allocator the string's bytes came from once it has some.
+  `truncate(n) -> bool` keeps the first `n` bytes if `n` is at a
+  character's start; `clear()` keeps the storage.
+- `s.len()` is the length in bytes, a method: the field is `s.bytes.len`.
+- It's `Clone`, and `io.Format`: `io.print("{}", s)` writes its text.
+- It's an `io.Writer` that never allocates: a `Writer`'s methods can't
+  declare `uses alloc`, or every writer's callers, `io.print` too, would
+  need it. It appends bytes that fit in the room left (and throws
+  `no_space`, appending nothing, otherwise), and refuses bytes that aren't
+  UTF-8 (`other(EILSEQ)`). `string.write_fmt(&s, fmt, args...)` formats
+  twice: once into a counter, to `reserve` the room, then into the string.
+  An argument whose `Format` writes more the second time is cut where the
+  room ends.
+- Not yet: `==` and ordering (an `impl Eq` for types with pointer fields,
+  [allocation.md](allocation.md#eq-on-heap-types)), `String.from_bytes`,
+  and a `Writer` whose error type can be `AllocError` (M8d's unions).
 

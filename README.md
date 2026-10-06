@@ -82,9 +82,33 @@ What works:
   is written in Lode. A program that doesn't allocate pays nothing, and one
   with only the root allocator passes no context and keeps no handle in
   its boxes ([docs/allocation.md](docs/allocation.md#m8b-in-the-compiler))
-- the prelude: `Box`, `AllocError`, `Ordering` and the built-in traits
-  need no import; a program loads `std/alloc` for `Box` only if it may use
-  the name, so one that doesn't still checks for every target
+- `List[T]`, a growable list on the heap: `xs.push(v)`, `xs.pop()`,
+  `xs[i]` and `xs[i] = v` proven against `xs.len` like a slice's index,
+  `xs[i..j]`, `for x in xs`, `slices.sort(&xs)`, `xs.clone()`; it grows
+  through the allocator it came from (a large one by `mremap`, without a
+  copy), and destroys its elements and frees its storage when it's
+  destroyed. `String`, owned UTF-8 text: `String.from("hi")`,
+  `s.push_str(t)`, `s.as_str()`, `io.print("{}", s)`, `string.format("{}
+  items", n)` ([docs/allocation.md](docs/allocation.md#m8c-in-the-compiler))
+- views returned from functions: `fn longer(a: []u32, b: []u32) ->
+  []u32` borrows from `a` and `b`, `xs.as_slice()` from `xs`; a view kept
+  in a local can't be used after what it views changes (assigned, passed
+  `&`, pushed to, moved), on any path, so a list can grow once its views
+  are no longer used, and a view can't outlive what it views
+  ([docs/memory.md](docs/memory.md#views-in-the-compiler-today))
+
+```
+var xs = List[u32].new()
+try xs.push(1)
+let s = xs.as_slice()
+try xs.push(2)              // may move the elements
+io.print("{}\n", s.len)    // error: `s` is used after `xs` changed, and `s` views `xs`
+```
+
+- the prelude: `Box`, `List`, `String`, `AllocError`, `Ordering` and the
+  built-in traits need no import; a program loads `std/alloc` for `Box`
+  (or `std/list`, `std/string`) only if it may use the name, so one that
+  doesn't still checks for every target
   ([docs/packages.md](docs/packages.md#the-prelude))
 - enums with payloads (`Shape.circle(p, 2)`) and C-style enums
   (`enum Color: u8 { red = 1 ... }`), exhaustive `match` (also on integers and `bool`: `0 => ...`, `1..=9 | 20 => ...`, `_ => ...`), and optionals
@@ -138,8 +162,9 @@ What works:
   element type that fits; fixed-capacity containers `std/buf.StackBuf[N]`
   (bytes, whose storage isn't filled when it's made) and
   `std/vec.ArrayVec[T, N]` (of any type, resources too); `std/mem`
-  (`swap`, `replace`, `take`, `destroy`, `forget`); `std/alloc`
-  (`Allocator`, `Handle`, `Heap`, `Box`); `io.Writer`,
+  (`swap`, `replace`, `take`, `destroy`, `forget`, `view`); `std/alloc`
+  (`Allocator`, `Handle`, `Heap`, `Box`); `std/list` (`List`) and
+  `std/string` (`String`); `io.Writer`,
   implemented by files and buffers; `std/encoding` (UTF-8 and ASCII over
   bytes)
 - `unsafe` blocks and functions, raw pointers to any type (`*T`, `s.ptr`
@@ -166,7 +191,8 @@ What works:
   reports the error); `io.File.from_fd(f.fd)` reads and writes it
 - `s.bytes()`, the bytes of a `str` as a read-only `[]u8` (sliced with
   `s.bytes()[i..j]`; a `str` itself can't be sliced yet), and returning a
-  `str` literal from a function (`fn Day.name(self) -> str`)
+  `str` from a function, a literal or one of the parameters
+  (`fn Day.name(self) -> str`)
 - the proof rules from [docs/safety.md](docs/safety.md): plain
   `+ - * / % <<`, conversions like `u8(x)` and indexing `a[i]` must be proven
   safe, and so must slicing `a[i..j]`. The checker follows value ranges and

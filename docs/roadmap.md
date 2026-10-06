@@ -154,6 +154,21 @@ aggregate before a failed `try`, and a `set` parameter assigned before a
 `throw`, are destroyed once. Programs that don't allocate are unchanged:
 hello world is still 577 bytes and two system calls.
 
+**M8c: Views from functions, `List` and `String`** (2026-10-06,
+[allocation.md](allocation.md#m8c-in-the-compiler)). Rule 2 of
+[views](memory.md#views-in-the-compiler-today): functions return slices
+and `str`s borrowing from their parameters, a view local borrows from the
+variables it may see, and a change of one of them (an assignment, `&`, an
+`inout self` call, a move) makes the view unusable after, on every path,
+so a variable can change once its views are no longer used. The simple
+rules before it are gone (a slice of a `var` array can be kept).
+`mem.view` and `mem.view_str`. `std/list`'s `List[T]`, with `xs[i]`,
+slicing, `for` and `&xs` on its elements, proven against `xs.len`; it grows
+through its own allocator with `Allocator.grow` (one `mremap` per doubling
+for a large list). `std/string`'s `String`, UTF-8, with `as_str`,
+`io.Format`, an `io.Writer` and `string.format`. Both are in the prelude.
+Programs that don't use them are byte for byte the same.
+
 ## Next
 
 - **M8: Allocation and heap types** (decided 2026-10-06 as the milestone
@@ -161,12 +176,14 @@ hello world is still 577 bytes and two system calls.
   four steps: M8a, resource types, `deinit` and moves for every type, and
   field visibility (done); M8b, `uses alloc`, `with`, the root allocator
   and `Box[T]` (done); M8c, views returned from functions (rule 2 of
-  [memory.md](memory.md#views)), `List[T]`, `String` and `mem.view`; M8d,
-  error-set unions, the `oom` policy, arenas and counted allocators (which
-  make `alloc.handle` safe). The prelude is done: `Box` without an
-  import, loaded only by the programs that name it
-  ([packages.md](packages.md#the-prelude)); `List` and `String` join it
-  with M8c. Its open questions are in
+  [memory.md](memory.md#views)), `List[T]`, `String` and `mem.view`
+  (done); M8d, error-set unions, the `oom` policy, arenas and counted
+  allocators (which make `alloc.handle` safe). The prelude is done: `Box`,
+  `List` and `String` without an import, loaded only by the programs that
+  name them ([packages.md](packages.md#the-prelude)). Left from M8c:
+  `impl Eq` for types with pointer fields (`==` on `List` and `String`),
+  `List.insert` and `remove`, the projection for `ArrayVec` and
+  `StackBuf`. Its open questions are in
   [allocation.md](allocation.md#7-decisions).
 - **Checker: filling buffers.** A plain array must be filled before use
   (`[0; 21]`), even when only the part that's written is ever read.
